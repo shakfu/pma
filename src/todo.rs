@@ -240,7 +240,9 @@ pub fn parse(text: &str) -> Parsed {
     if first_content {
         out.report(1, Severity::Error, "the file must start with `# TODO`");
     }
-    if out.items.is_empty() && ignored_bullets > 0 {
+    // A file with priority sections has adopted the format, so bullets outside
+    // them are deliberate: notes, declined work, ideas.
+    if out.items.is_empty() && ignored_bullets > 0 && seen_sections.is_empty() {
         out.report(
             1,
             Severity::Warning,
@@ -603,6 +605,7 @@ mod tests {
         assert_reports(text, 1, Severity::Warning, "no items; 2 list entries");
         assert_clean("# TODO\n\n## Ideas\n\n- one\n\n## Low\n\n- [ ] real\n");
         assert_clean("# TODO\n\n## High\n");
+        assert_clean("# TODO\n\n## Low\n\n## Declined\n\n- not doing this\n");
     }
 
     #[test]

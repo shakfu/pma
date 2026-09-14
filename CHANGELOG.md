@@ -4,6 +4,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+**`pma lint` accepts bullets outside the priority sections in a migrated
+file.** The "no items" warning now fires only when a file also has no priority
+section. A file with `## Critical` to `## Low` and no open items is valid, and
+its declined or deferred work can stay as plain bullets instead of becoming
+tasks.
+
 ## [0.1.0] - 2026-09-14
 
 ### Added
@@ -30,5 +38,5 @@ AST, so later stages can edit one line without re-rendering the file. A file
 with no items but with plain bullets elsewhere is flagged. Otherwise such a
 file lints clean while `pma` sees none of its tasks.
 
-[Unreleased]: https://github.com/shakfu/pma/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/shakfu/pma/releases/tag/v0.1.0
+[Unreleased]: https://github.com/shakfu/pma/compare/0.1.0...HEAD
+[0.1.0]: https://github.com/shakfu/pma/releases/tag/0.1.0

@@ -7,12 +7,34 @@
 use std::collections::HashMap;
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Priority {
     Critical,
     High,
     Medium,
     Low,
+}
+
+impl Priority {
+    pub const ALL: [Priority; 4] = [
+        Priority::Critical,
+        Priority::High,
+        Priority::Medium,
+        Priority::Low,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Priority::Critical => "critical",
+            Priority::High => "high",
+            Priority::Medium => "medium",
+            Priority::Low => "low",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Priority> {
+        Self::ALL.into_iter().find(|p| p.name() == s)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -324,7 +346,7 @@ fn item_line(line: &str, n: usize, section: Section, out: &mut Parsed) -> Option
 
     for word in &words[split..] {
         if let Some(date) = word.strip_prefix("due:") {
-            if !valid_date(date) {
+            if crate::dates::parse(date).is_none() {
                 out.report(
                     n,
                     Severity::Error,
@@ -381,7 +403,7 @@ fn item_line(line: &str, n: usize, section: Section, out: &mut Parsed) -> Option
 
 /// A trailing token: `#tag`, `due:...` or `gh:...`. Malformed `due:` and `gh:`
 /// values still count, so they are reported rather than read as text.
-fn is_token(word: &str) -> bool {
+pub fn is_token(word: &str) -> bool {
     if word.starts_with("due:") || word.starts_with("gh:") {
         return true;
     }
@@ -392,26 +414,6 @@ fn is_token(word: &str) -> bool {
         && tag
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
-fn valid_date(s: &str) -> bool {
-    let b = s.as_bytes();
-    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
-        return false;
-    }
-    let num = |r: std::ops::Range<usize>| s[r].parse::<u32>().ok();
-    let (Some(y), Some(m), Some(d)) = (num(0..4), num(5..7), num(8..10)) else {
-        return false;
-    };
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let days = match m {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        _ => return false,
-    };
-    (1..=days).contains(&d)
 }
 
 /// Unsynced items are identified by their normalised text, and synced ones by

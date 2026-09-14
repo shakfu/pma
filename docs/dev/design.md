@@ -85,16 +85,25 @@ A task is urgent when any of these hold:
 Default `stale_after`: tier 1 30 days, tier 2 60, tier 3 90, tiers 4 and 5
 never. Without the last rule, Q1 would depend on remembering to write `due:`.
 
-Age is the earlier of `git blame -M` on the line and the first time `pma` saw
-the task. `-M` keeps the date when an item moves between sections. Rewording an
-item resets both, so it counts as a new task.
+Age is the earlier of two times: the commit where the item's text first
+appeared in `TODO.md`'s history, and the first scan that saw it. Text is
+compared without list markers, checkbox, heading marks, trailing tokens, case
+or repeated spaces. An item therefore keeps its age when it moves between
+sections, gains a tag, or changes from a `###` heading into an item. Rewording
+resets it, so a reworded item counts as a new task.
+
+`git blame -M` was the first choice and was rejected on real data. Migrating a
+file to v1 adds a tag to every item line, and blame then dates each line to the
+migration commit. Every migrated repo's ages restarted at 0.
+
+Days are UTC calendar days, so a due date turns at UTC midnight.
 
 The rule also applies to tasks that are not important. An old `Low` item in a
 tier-1 project moves from Q4 to Q3 after 30 days.
 
 ### Ordering and limits
 
-Within a quadrant: importance, then days to due, then age from `git blame`.
+Within a quadrant: importance, then days to due (dated tasks first), then age.
 The matrix view shows the top `quadrant_limit` tasks (default 10, as the source
 advises) and a count of the rest.
 
@@ -192,8 +201,15 @@ written tasks and maintenance. They are never written to `TODO.md`.
 |-|-|-|-|-|-|
 | ci | `gh run list` on the default branch | fix CI | when failing | High | yes |
 | deps | per ecosystem: `cargo`, `go list -u -m all`, `uv` | update dependencies | no | Medium | yes |
-| activity | `git log`, excluding commits whose paths all match `activity.ignore` | review project | no | Low | no |
-| hygiene | dirty files, unpushed commits, leftover `pma` worktrees | resolve local changes | no | Medium | no |
+| activity | `git log`, excluding commits whose paths all match `activity.ignore` | review project, once idle beyond the tier's horizon | no | Low | no |
+| hygiene | changed files (`git status`), unpushed commits; later, leftover `pma` worktrees | resolve local changes | no | Medium | no |
+
+A review-project task is as old as the time since the horizon was crossed, not
+the time since the last commit. Otherwise it would reach `stale_after` on the
+day it appears.
+
+CI looks at each workflow's latest run on the default branch that succeeded or
+failed. Cancelled and skipped runs are passed over.
 
 Priorities are configurable per signal. With `High`, failing CI is important in
 tiers 1 and 2 (0.5, 0.4) and urgent, so it lands in Q1. In tiers 3-5 it lands in
@@ -214,7 +230,16 @@ The deps signal is deferred: it needs one adapter per language.
 A separate per-project view ranks projects rather than tasks:
 
 `health = tier[t] * sum(w_i * s_i) / sum(w_i)`, each `s_i` in 0..1 (1 = needs
-attention), over `critical`, `activity`, `ci`, `deps`, `hygiene`.
+attention). The sums run over measured signals only, so an unmeasured signal
+neither lowers nor raises the score.
+
+| Signal | `s` |
+|-|-|
+| tasks | `1 - exp(-x / 3)`, `x` the summed priority weights of open items |
+| activity | days idle / tier horizon, capped at 1; 1 when no counted commit exists |
+| ci | failing 1, passing 0, no runs 0.5; unmeasured when unknown or `--offline` |
+| deps | unmeasured until implemented |
+| hygiene | 0.5 for changed files, plus 0.5 for unpushed commits |
 
 `pma status --explain` prints each signal's contribution. Weights cannot be
 calibrated without it.
@@ -262,6 +287,13 @@ high     = 0.5
 medium   = 0.2
 low      = 0.05
 
+[weights]                                # project health
+tasks    = 5
+activity = 1
+ci       = 3
+deps     = 1
+hygiene  = 2
+
 [stale_after]                            # days open without due: before urgent
 1 = 30
 2 = 60
@@ -274,7 +306,7 @@ activity = "low"
 hygiene  = "medium"
 
 [activity]
-ignore  = [".github/**", "*.lock"]
+ignore  = [".github/**", "*.lock", "TODO.md"]
 horizon = { 1 = 30, 2 = 60, 3 = 120, 4 = 240, 5 = 365 }   # days
 
 [projects.cyllama]
@@ -284,8 +316,20 @@ publish = "push"                          # overrides the global value
 ```
 
 Shown as TOML for readability. The values are stored in `projects.db` and set
-with `pma config`. A project under a root with no tier is listed as untiered and
-left out of the matrix.
+with `pma config <key> <value>`, using dotted keys such as `tiers.2` or
+`activity.horizon.1`. `activity.ignore` takes a comma-separated list.
+
+`TODO.md` is in `activity.ignore` so that editing the list is not maintenance.
+Adding an empty `TODO.md` to 19 repos in one run would otherwise have marked all
+of them active.
+
+A glob without `/` matches a file name in any directory. `*` matches within one
+path segment, and `**` matches any number of segments.
+
+Projects are the git repos directly under each root, named by directory. A
+project under a root with no tier is listed as untiered and left out of the
+matrix. A full `pma scan` forgets projects no longer found, including their
+tier, and says so. `PMA_HOME` overrides `~/.config/pma`.
 
 ## Agents
 

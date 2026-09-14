@@ -4,7 +4,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [0.1.0]
+## [0.1.0] - 2026-09-14
 
 ### Added
 
@@ -12,8 +12,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 its section, shown as a column in `pma matrix`. A group comes from the
 item's position in the file rather than a tag. Migrated files can keep their
 original sub-headings without a long per-item tag. The trade-off: an item moved
-to another place changes group. The database schema is now version 2, and a
-version 1 database gains the column when opened.
+to another place changes group.
 
 **`pma scan`, `pma matrix`, `pma status`.** Scan the git repos under the roots
 into SQLite, place the tasks of tiered projects in an Eisenhower matrix, and
@@ -29,10 +28,7 @@ restarted at 0, and no item could become urgent by age for a month.
 `docs/dev/design.md`. The parser works line by line, not through a markdown
 AST, so later stages can edit one line without re-rendering the file. A file
 with no items but with plain bullets elsewhere is flagged. Otherwise such a
-file lints clean while `pma` sees none of its tasks: 25 of 65 existing files
-are like this.
+file lints clean while `pma` sees none of its tasks.
 
-### Fixed
-
-**`due:` accepted a sign.** Date fields were parsed with `u32::parse`, which
-accepts a leading `+`, so `due:2026-+1-01` passed lint.
+[Unreleased]: https://github.com/shakfu/pma/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/shakfu/pma/releases/tag/v0.1.0

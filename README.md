@@ -8,8 +8,18 @@ health. Agent dispatch is not built yet.
 ## Install
 
 ```sh
-make install          # cargo install --path .
+cargo install pma
 ```
+
+From a clone: `make install`.
+
+Requirements:
+
+- macOS or Linux. The database location is derived from `HOME`.
+- Rust 1.88 or later, and a C compiler: SQLite is compiled in.
+- `git` on `PATH`.
+- `gh`, authenticated, for CI status. Without it, CI is recorded as unknown and
+  left out of health; `pma scan --offline` skips GitHub on purpose.
 
 ## TODO.md format
 
@@ -42,14 +52,14 @@ are optional. The full rules are in the
 
 ```sh
 pma lint                        # ./TODO.md
-pma lint ~/projects/*/  	    # every project; a directory means its TODO.md
+pma lint ~/projects/*/          # every project; a directory means its TODO.md
 ```
 
 Output is `path:line: severity: message`. Exit status is 1 when any file has an
 error or cannot be read. Warnings alone exit 0.
 
 ```sh
-pma root add ~/projects/ 		  # git repos directly under it are projects
+pma root add ~/projects/          # git repos directly under it are projects
 pma tier cyllama 1                # 1 (most important) to 5, or none
 pma scan                          # TODO.md, git state, CI via gh; about 15s for 95 repos
 pma scan --offline cyllama        # one project, without GitHub
@@ -63,6 +73,7 @@ pma config                        # every setting; `pma config tiers.2 0.7`, `--
 projects appear in them.
 
 The database is `~/.config/pma/projects.db`, or `$PMA_HOME/projects.db`.
+Dates are compared as UTC calendar days.
 
 ## Development
 

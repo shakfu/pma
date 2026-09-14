@@ -43,12 +43,16 @@ enum Command {
     },
     /// Show or set a project's tier: 1 (most important) to 5, or `none`.
     Tier {
+        /// The project's directory name under a root.
         project: String,
+        /// 1 to 5, or `none`; omit to show the current tier.
         tier: Option<String>,
     },
     /// List settings, show one, or set one.
     Config {
+        /// A setting such as `tiers.2` or `weights.ci`; omit to list all.
         key: Option<String>,
+        /// The new value; omit to show the current one.
         value: Option<String>,
         /// Restore the default for KEY.
         #[arg(long, requires = "key", conflicts_with = "value")]
@@ -58,6 +62,7 @@ enum Command {
     ///
     /// With no names, scans every project and forgets projects no longer found.
     Scan {
+        /// Project names; defaults to every project.
         projects: Vec<String>,
         /// Skip GitHub; CI is recorded as unknown.
         #[arg(long)]
@@ -86,7 +91,10 @@ enum Command {
 
 #[derive(Subcommand)]
 enum RootAction {
+    /// Add a directory: the git repos directly under it, or the directory
+    /// itself if it is one, become projects.
     Add { dir: PathBuf },
+    /// Remove a directory; its projects are forgotten at the next full scan.
     Rm { dir: PathBuf },
 }
 

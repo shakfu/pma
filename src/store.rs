@@ -16,7 +16,7 @@ use crate::todo::Priority;
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 2;
+const VERSION: i64 = 1;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -110,10 +110,6 @@ impl Store {
         match version {
             0 => {
                 conn.execute_batch(SCHEMA)?;
-                conn.pragma_update(None, "user_version", VERSION)?;
-            }
-            1 => {
-                conn.execute_batch("ALTER TABLE tasks ADD COLUMN heading TEXT")?;
                 conn.pragma_update(None, "user_version", VERSION)?;
             }
             VERSION => {}
@@ -398,31 +394,6 @@ mod tests {
         );
         assert!(store.reset_config("tiers.1").unwrap());
         assert!(!store.reset_config("tiers.1").unwrap());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn version_1_databases_gain_the_heading_column() {
-        let dir = scratch("migrate");
-        let db = dir.join("p.db");
-        let conn = Connection::open(&db).unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        conn.execute_batch("ALTER TABLE tasks DROP COLUMN heading")
-            .unwrap();
-        conn.pragma_update(None, "user_version", 1).unwrap();
-        drop(conn);
-
-        let mut store = Store::open(&db).unwrap();
-        store
-            .save_scan(&[facts("one", vec![item("x", 1)])], true, 5)
-            .unwrap();
-        assert_eq!(store.tasks().unwrap()[0].group.as_deref(), Some("Security"));
-        drop(store);
-        let conn = Connection::open(&db).unwrap();
-        let version: i64 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, VERSION);
         let _ = std::fs::remove_dir_all(dir);
     }
 

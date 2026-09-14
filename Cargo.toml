@@ -2,6 +2,23 @@
 name = "pma"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Lint TODO.md files across many git repositories and rank their tasks in an Eisenhower matrix"
+license = "MIT"
+repository = "https://github.com/shakfu/pma"
+readme = "README.md"
+keywords = ["todo", "eisenhower", "git", "maintenance", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "/src/**/*.rs",
+    "/tests/**/*.rs",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/docs/dev/design.md",
+]
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }

@@ -16,7 +16,7 @@ use crate::todo::Priority;
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 1;
+const VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -44,6 +44,7 @@ CREATE TABLE tasks (
     tags TEXT NOT NULL,
     due TEXT,
     gh INTEGER,
+    heading TEXT,
     added_at INTEGER,
     first_seen INTEGER NOT NULL,
     PRIMARY KEY (project, key)
@@ -78,6 +79,7 @@ pub struct TaskRow {
     pub tags: Vec<String>,
     pub due: Option<String>,
     pub gh: Option<i64>,
+    pub group: Option<String>,
     pub added_at: Option<i64>,
     pub first_seen: i64,
 }
@@ -108,6 +110,10 @@ impl Store {
         match version {
             0 => {
                 conn.execute_batch(SCHEMA)?;
+                conn.pragma_update(None, "user_version", VERSION)?;
+            }
+            1 => {
+                conn.execute_batch("ALTER TABLE tasks ADD COLUMN heading TEXT")?;
                 conn.pragma_update(None, "user_version", VERSION)?;
             }
             VERSION => {}
@@ -215,7 +221,7 @@ impl Store {
 
     pub fn tasks(&self) -> Result<Vec<TaskRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT project, line, priority, text, tags, due, gh, added_at, first_seen
+            "SELECT project, line, priority, text, tags, due, gh, added_at, first_seen, heading
              FROM tasks ORDER BY project, line",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -231,6 +237,7 @@ impl Store {
                 gh: r.get(6)?,
                 added_at: r.get(7)?,
                 first_seen: r.get(8)?,
+                group: r.get(9)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -282,8 +289,8 @@ impl Store {
             tx.execute("DELETE FROM tasks WHERE project = ?1", [&f.name])?;
             for item in f.todo.iter().flat_map(|t| &t.items) {
                 tx.execute(
-                    "INSERT INTO tasks (project, key, line, priority, text, tags, due, gh, added_at, first_seen)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    "INSERT INTO tasks (project, key, line, priority, text, tags, due, gh, added_at, first_seen, heading)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         f.name,
                         item.key,
@@ -295,6 +302,7 @@ impl Store {
                         item.gh,
                         item.added_at,
                         first_seen.get(&item.key).copied().unwrap_or(now),
+                        item.group,
                     ],
                 )?;
             }
@@ -354,6 +362,7 @@ mod tests {
             tags: vec!["a".into(), "b".into()],
             due: Some("2026-10-01".into()),
             gh: Some(4),
+            group: Some("Security".into()),
             added_at: Some(100),
         }
     }
@@ -389,6 +398,31 @@ mod tests {
         );
         assert!(store.reset_config("tiers.1").unwrap());
         assert!(!store.reset_config("tiers.1").unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn version_1_databases_gain_the_heading_column() {
+        let dir = scratch("migrate");
+        let db = dir.join("p.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch("ALTER TABLE tasks DROP COLUMN heading")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        drop(conn);
+
+        let mut store = Store::open(&db).unwrap();
+        store
+            .save_scan(&[facts("one", vec![item("x", 1)])], true, 5)
+            .unwrap();
+        assert_eq!(store.tasks().unwrap()[0].group.as_deref(), Some("Security"));
+        drop(store);
+        let conn = Connection::open(&db).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, VERSION);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -449,6 +483,7 @@ mod tests {
             "x is gone, y keeps its first scan"
         );
         assert_eq!(tasks[0].tags, ["a", "b"]);
+        assert_eq!(tasks[0].group.as_deref(), Some("Security"));
         assert_eq!(
             (tasks[0].due.as_deref(), tasks[0].gh, tasks[0].added_at),
             (Some("2026-10-01"), Some(4), Some(100))

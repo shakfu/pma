@@ -44,6 +44,8 @@ pub struct ScannedItem {
     pub tags: Vec<String>,
     pub due: Option<String>,
     pub gh: Option<i64>,
+    /// The nearest `###` heading above the item.
+    pub group: Option<String>,
     /// Commit time at which the item's text first appeared in TODO.md.
     pub added_at: Option<i64>,
 }
@@ -208,6 +210,7 @@ fn todo_facts(text: &str, added: &HashMap<String, i64>) -> TodoFacts {
                 tags: item.tags,
                 due: item.due,
                 gh: item.gh.map(|n| n as i64),
+                group: item.group,
                 added_at: added.get(&normal).copied(),
             })
         })

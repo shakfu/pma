@@ -157,7 +157,9 @@ not.
 - Other `##` sections are allowed and ignored. A checkbox item in one, or before
   the first `##`, is ignored (W). A file with no items but with plain bullets in
   other sections is flagged once (W): its tasks are invisible to `pma`.
-- `###` and deeper headings group items without changing their section.
+- A `###` heading sets the group of the items below it, until the next `###` or
+  `##`. `pma matrix` shows it. A bare `###` clears the group. `####` and deeper
+  headings change neither section nor group.
 - An item is one line: `- [ ] text` or `- [x] text`. Other checkbox spellings
   (`* [ ]`, `- [X]`, `1. [ ]`) (E). A plain bullet in a known section (E). Prose
   in a known section (W).

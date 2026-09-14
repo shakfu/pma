@@ -4,7 +4,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.0]
+
 ### Added
+
+**Item groups.** An item's group is the nearest `###` heading above it within
+its section, shown as a column in `pma matrix`. A group comes from the
+item's position in the file rather than a tag. Migrated files can keep their
+original sub-headings without a long per-item tag. The trade-off: an item moved
+to another place changes group. The database schema is now version 2, and a
+version 1 database gains the column when opened.
 
 **`pma scan`, `pma matrix`, `pma status`.** Scan the git repos under the roots
 into SQLite, place the tasks of tiered projects in an Eisenhower matrix, and

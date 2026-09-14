@@ -33,22 +33,23 @@ make install          # cargo install --path .
 - [x] drop python 3.9
 ```
 
-The section gives the priority. Trailing `#tag`, `due:YYYY-MM-DD` and `gh:N`
-(a linked issue) are optional. The full rules are in the
+The section gives the priority. A `###` heading inside a section groups the
+items below it. Trailing `#tag`, `due:YYYY-MM-DD` and `gh:N` (a linked issue)
+are optional. The full rules are in the
 [design](docs/dev/design.md#todomd-format-v1).
 
 ## Commands
 
 ```sh
 pma lint                        # ./TODO.md
-pma lint ~/projects/personal/*/ # every project; a directory means its TODO.md
+pma lint ~/projects/*/  	    # every project; a directory means its TODO.md
 ```
 
 Output is `path:line: severity: message`. Exit status is 1 when any file has an
 error or cannot be read. Warnings alone exit 0.
 
 ```sh
-pma root add ~/projects/personal  # git repos directly under it are projects
+pma root add ~/projects/ 		  # git repos directly under it are projects
 pma tier cyllama 1                # 1 (most important) to 5, or none
 pma scan                          # TODO.md, git state, CI via gh; about 15s for 95 repos
 pma scan --offline cyllama        # one project, without GitHub

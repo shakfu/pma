@@ -65,6 +65,8 @@ pub struct Task {
     pub text: String,
     /// TODO.md line; `None` for signal tasks.
     pub line: Option<i64>,
+    /// The nearest `###` heading above the item.
+    pub group: Option<String>,
     /// Day number of `due:`.
     pub due: Option<i64>,
     pub tagged_urgent: bool,
@@ -152,6 +154,7 @@ pub fn signal_tasks(cfg: &Config, p: &Project) -> Vec<Task> {
         priority,
         text,
         line: None,
+        group: None,
         due: None,
         tagged_urgent: false,
         signal_urgent: urgent,
@@ -325,6 +328,7 @@ mod tests {
             priority,
             text: "t".into(),
             line: Some(1),
+            group: None,
             due: None,
             tagged_urgent: false,
             signal_urgent: false,

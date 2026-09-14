@@ -36,6 +36,9 @@ fn table(rows: &[Vec<String>], indent: &str) -> String {
 /// Longest task text shown in the matrix, in characters.
 const TEXT_WIDTH: usize = 100;
 
+/// Longest group shown in the matrix, in characters.
+const GROUP_WIDTH: usize = 24;
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -81,6 +84,8 @@ pub fn matrix(
             out.push('\n');
         }
         out.push_str(&format!("{q:?} {}: {count}\n", q.title()));
+        // The group column appears only when a shown task has a group.
+        let grouped = tasks[..shown].iter().any(|p| p.task.group.is_some());
         let rows: Vec<Vec<String>> = tasks[..shown]
             .iter()
             .map(|p| {
@@ -94,6 +99,9 @@ pub fn matrix(
                     (None, Some(due)) => format!("due in {}d", due - today),
                     _ => when(p),
                 });
+                if grouped {
+                    row.push(truncate(t.group.as_deref().unwrap_or(""), GROUP_WIDTH));
+                }
                 row.push(truncate(&t.text, TEXT_WIDTH));
                 row
             })
@@ -231,6 +239,7 @@ mod tests {
                 priority: Priority::High,
                 text: format!("text of {project}"),
                 line,
+                group: None,
                 due,
                 tagged_urgent: false,
                 signal_urgent: false,
@@ -271,6 +280,27 @@ mod tests {
             "{q2}"
         );
         assert!(!q2.contains("Q1"), "{q2}");
+    }
+
+    #[test]
+    fn group_column_appears_only_when_a_shown_task_has_one() {
+        let mut a = placed("a", Some(1), Quadrant::Q2, None, None);
+        a.task.group = Some("Security Hardening".into());
+        let b = placed("b", Some(2), Quadrant::Q2, None, None);
+        let c = placed("c", Some(3), Quadrant::Q4, None, None);
+        let out = matrix(&[a, b, c], None, None, 0);
+        assert!(
+            out.contains("  a:1  T1  high  open 12d  Security Hardening  text of a\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  b:2  T1  high  open 12d                      text of b\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  c:3  T1  high  open 12d  text of c\n"),
+            "{out}"
+        );
     }
 
     #[test]

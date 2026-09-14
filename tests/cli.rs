@@ -157,7 +157,7 @@ fn scan_rank_and_explain_a_real_repo() {
     git(&alpha, &["init", "-q"], None);
     fs::write(
         alpha.join("TODO.md"),
-        "# TODO\n\n## High\n\n- [ ] old high\n\n## Low\n\n- [ ] old low\n",
+        "# TODO\n\n## High\n\n### core\n\n- [ ] old high\n\n## Low\n\n- [ ] old low\n",
     )
     .unwrap();
     fs::write(alpha.join("lib.rs"), "\n").unwrap();
@@ -167,14 +167,14 @@ fn scan_rank_and_explain_a_real_repo() {
     // its age; the commit only touched TODO.md, so it is not activity.
     fs::write(
         alpha.join("TODO.md"),
-        "# TODO\n\n## High\n\n- [ ] old high\n\n## Low\n\n- [ ] old low #later\n",
+        "# TODO\n\n## High\n\n### core\n\n- [ ] old high\n\n## Low\n\n- [ ] old low #later\n",
     )
     .unwrap();
     git(&alpha, &["commit", "-qam", "retag"], Some(now() - 50 * DAY));
     // Not committed: a new item, which also leaves the tree dirty.
     fs::write(
         alpha.join("TODO.md"),
-        "# TODO\n\n## High\n\n- [ ] old high\n- [ ] new high\n\n## Low\n\n- [ ] old low #later\n",
+        "# TODO\n\n## High\n\n### core\n\n- [ ] old high\n- [ ] new high\n\n## Low\n\n- [ ] old low #later\n",
     )
     .unwrap();
 
@@ -203,13 +203,13 @@ fn scan_rank_and_explain_a_real_repo() {
     let matrix = ok(&home, &["matrix", "--all"]);
     let expected = "\
 Q1 Do right away: 1
-  alpha:5  T1  high  open 100d  old high
+  alpha:7  T1  high  open 100d  core  old high
 
 Q2 Schedule for later: 1
-  alpha:6  T1  high  open 0d  new high
+  alpha:8  T1  high  open 0d  core  new high
 
 Q3 Delegate or avoid: 2
-  alpha:10  T1  low  open 100d  old low
+  alpha:12  T1  low  open 100d  old low
   alpha     T1  low  open 70d   review project: no code commits in 100 days
 
 Q4 Remove: 1

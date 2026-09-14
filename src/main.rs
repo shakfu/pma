@@ -404,6 +404,7 @@ fn portfolio(names: &[String]) -> Result<Portfolio> {
             priority: t.priority,
             text: t.text.clone(),
             line: Some(t.line),
+            group: t.group.clone(),
             due: t.due.as_deref().and_then(dates::parse),
             tagged_urgent: t.tags.iter().any(|g| g == "urgent"),
             signal_urgent: false,

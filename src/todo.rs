@@ -65,6 +65,8 @@ pub struct Item {
     /// `YYYY-MM-DD`, already validated.
     pub due: Option<String>,
     pub gh: Option<u64>,
+    /// Text of the nearest `###` heading above the item in its section.
+    pub group: Option<String>,
     /// Indented lines under the item, verbatim.
     pub description: Vec<String>,
 }
@@ -135,6 +137,7 @@ pub fn parse(text: &str) -> Parsed {
     // Plain bullets outside the known sections, reported when nothing else is
     // an item: that file's tasks are invisible to pma.
     let mut ignored_bullets = 0;
+    let mut group: Option<String> = None;
 
     for (index, raw) in text.lines().enumerate() {
         let n = index + 1;
@@ -194,16 +197,26 @@ pub fn parse(text: &str) -> Parsed {
 
         if let Some(name) = line.strip_prefix("## ") {
             place = section_heading(name.trim(), n, &mut seen_sections, &mut out);
+            group = None;
+            continue;
+        }
+        // `###` alone clears the group; trimming removed any trailing space.
+        if let Some(name) = line
+            .strip_prefix("###")
+            .filter(|rest| rest.is_empty() || rest.starts_with(' '))
+        {
+            group = Some(name.trim().to_string()).filter(|g| !g.is_empty());
             continue;
         }
         if line.starts_with('#') {
-            // Deeper headings group items without changing their section.
+            // `####` and deeper change neither the section nor the group.
             continue;
         }
 
         match place {
             Place::Known(section) => {
-                if let Some(item) = item_line(line, n, section, &mut out) {
+                if let Some(mut item) = item_line(line, n, section, &mut out) {
+                    item.group = group.clone();
                     open = Some(item);
                 }
             }
@@ -341,6 +354,7 @@ fn item_line(line: &str, n: usize, section: Section, out: &mut Parsed) -> Option
         tags: Vec::new(),
         due: None,
         gh: None,
+        group: None,
         description: Vec::new(),
     };
 
@@ -559,6 +573,28 @@ mod tests {
         assert_eq!(parsed.items[0].priority, Some(Priority::High));
         assert_reports(text, 6, Severity::Warning, "ignored");
         assert_eq!(parsed.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn items_take_the_nearest_level_three_heading_in_their_section() {
+        let text = "# TODO\n\n## High\n\n- [ ] ungrouped\n\n### Security Hardening \n\n- [ ] a\n\n#### detail\n\n- [ ] b\n\n### \n\n- [ ] c\n\n## Low\n\n- [ ] d\n\n### Later\n\n- [ ] e\n";
+        let groups: Vec<_> = parse(text)
+            .items
+            .into_iter()
+            .map(|i| (i.text, i.group))
+            .collect();
+        let g = |s: &str| Some(s.to_string());
+        assert_eq!(
+            groups,
+            [
+                ("ungrouped".into(), None),
+                ("a".into(), g("Security Hardening")),
+                ("b".into(), g("Security Hardening")),
+                ("c".into(), None),
+                ("d".into(), None),
+                ("e".into(), g("Later")),
+            ]
+        );
     }
 
     #[test]

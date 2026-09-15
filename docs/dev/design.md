@@ -1,6 +1,6 @@
 # pma design (draft)
 
-Status: draft for review. Nothing here is built.
+Status: stages 1, 2, 4 and 5 are built. Stage 3 is built for `claude` only.
 
 ## Problem
 
@@ -225,7 +225,25 @@ A fix-CI dispatch includes `gh run view --log-failed` output in the prompt.
 local `verify` passing does not prove CI passes on other platforms. With
 `publish = "pr"`, CI runs before merge.
 
-The deps signal is deferred: it needs one adapter per language.
+The deps signal counts outdated dependencies as each tool reports them. The
+tools write nothing to the project:
+
+| Ecosystem | Applies with | Command | Counts |
+|-|-|-|-|
+| cargo | `Cargo.lock` | `cargo update --dry-run` | semver-compatible lock updates, transitive included |
+| uv | `uv.lock` | `uv tree --frozen --outdated --depth 1` | direct dependencies with a newer release |
+| go | `go.mod` | `go list -u -m all`, direct modules | modules with a newer version |
+
+The counts are not comparable across ecosystems: cargo's includes transitive
+crates. On 2026-09-15 across 52 repos, cargo projects reached 147 while uv
+projects stayed under 15. The score saturates at 10 outdated, so the difference
+does not dominate health.
+
+Measuring takes 0.6s (uv) to 10s (go) per project, and 44s for the 52 repos.
+It runs only with `pma scan --deps`. Other scans keep the last measurement and
+its date, which `status --explain` shows. A project with none of the three
+files, or whose tools all fail, is unmeasured. A tool's failure is kept in the
+detail. A deps task is dispatched with that detail as the list to update.
 
 ### Project health
 
@@ -240,7 +258,7 @@ neither lowers nor raises the score.
 | tasks | `1 - exp(-x / 3)`, `x` the summed priority weights of open items |
 | activity | days idle / tier horizon, capped at 1; 1 when no counted commit exists |
 | ci | failing 1, passing 0, no runs 0.5; unmeasured when unknown or `--offline` |
-| deps | unmeasured until implemented |
+| deps | outdated count / 10, capped at 1; unmeasured when never measured |
 | hygiene | 0.5 for changed files, plus 0.5 for unpushed commits |
 
 `pma status --explain` prints each signal's contribution. Weights cannot be
@@ -265,6 +283,13 @@ This assumes one user and one session at a time. Under that assumption:
 
 Tiers, weights and notes are edited through `pma` commands, not a text editor.
 
+Notes are portfolio-wide, with no project field: a note about one project
+belongs in its repo. `pma note add`, `pma note edit <id>`, `pma note rm <id>`,
+and `pma note` to list.
+
+Schema changes are applied in order on open, inside one transaction, from the
+file's `user_version`.
+
 ## Configuration
 
 ```toml
@@ -275,6 +300,10 @@ dispatch_quadrants  = ["Q1", "Q2"]
 overflow_quadrants  = []                 # ["Q3"] to continue past Q1 and Q2
 publish             = "pr"               # or "push"
 attribution         = "user"             # or "co-author"
+max_parallel        = 2                  # agents at once
+batch_budget        = 5.0                # USD per dispatch batch
+agent_budget        = 1.0                # USD per agent run
+timeout             = 30                 # minutes per agent run, and per verify
 
 [tiers]
 1 = 1.0
@@ -313,7 +342,7 @@ horizon = { 1 = 30, 2 = 60, 3 = 120, 4 = 240, 5 = 365 }   # days
 
 [projects.cyllama]
 tier    = 1
-verify  = "make test"                     # default: detected
+verify  = "make test"                     # default: detected; "none" disables
 publish = "push"                          # overrides the global value
 ```
 
@@ -348,71 +377,125 @@ against each tool's `--help` on 2026-09-14.
 Unverified: which permissions each agent needs to run the project's tests
 unattended, and whether each one's JSON output reports cost.
 
+`claude` reports `total_cost_usd`. Its budget cap is checked between turns, so a
+run can exceed it: a one-word reply under a $0.05 cap cost $0.09 on 2026-09-15.
+`batch_budget` therefore bounds how many runs start, not what they spend.
+
 Only `codex` has a sandbox. `cursor-agent --force` and `opencode --auto`
 auto-approve every command; opencode's own help calls this "dangerous".
 A worktree limits where an agent starts, not what it can reach.
 
 Because `pma` owns commits and pushes, the agent environment drops push
 credentials: `GH_TOKEN` and `GITHUB_TOKEN` unset, `GH_CONFIG_DIR` pointed at an
-empty directory, `SSH_AUTH_SOCK` unset, and `GIT_TERMINAL_PROMPT=0`. This makes
-an accidental push fail. It does not stop a determined process.
+empty directory, `SSH_AUTH_SOCK` unset, and `GIT_TERMINAL_PROMPT=0`. Through
+`GIT_CONFIG_COUNT`, credential helpers are cleared and `remote.origin.pushurl`
+is set to an unusable URL. This makes an accidental push fail. It does not stop
+a determined process. The verify command runs in the same environment.
 
 ## Dispatch
 
+`pma dispatch cynn:31` names a TODO.md line from the last scan, and
+`pma dispatch cynn:ci` names failing CI. `pma dispatch --auto -n N` takes the
+top N dispatchable tasks of tiered projects, as ordered in the matrix. A task
+with a run that is not shipped or rejected is skipped.
+
 1. `git fetch`, then `git worktree add` from the remote default branch into
    `<data>/worktrees/<project>/<slug>`, on branch `pma/<slug>`. The user's working
-   tree is never touched, so a dirty tree does not block dispatch.
+   tree is never touched, so a dirty tree does not block dispatch. The slug is
+   the task text's first words, up to 40 bytes, with `-2`, `-3` on collision.
+   The item must be open in the remote `TODO.md`; an item only in the local
+   file is refused. Otherwise ship could not mark it done.
 2. Run the agent template with a timeout and, where supported, a budget.
 3. The prompt carries the task, its description, and "do not commit". The
    project's own `CLAUDE.md` or `AGENTS.md` still applies.
 4. If the branch has commits beyond its base, `pma` flags the run. The output
    was meant to be uncommitted.
 5. `pma` runs the project's `verify` command itself. The agent's report is not
-   trusted as proof.
+   trusted as proof. Without `projects.<name>.verify`, the first match wins:
+   a Makefile `test:` target, `Cargo.toml`, `go.mod`, a `package.json` with a
+   `test` script, `pyproject.toml` (`uv run pytest` with `uv.lock`, else
+   `python3 -m pytest`). A failed verify still leaves the run ready; the
+   reviewer decides.
 6. Record: agent, diffstat, verify result, agent summary, cost where reported,
    duration.
 
-Limits: `max_parallel` agents and a USD budget per batch.
+Limits: `max_parallel` agents, and `batch_budget`. A run starts only while
+the batch's spent cost plus `agent_budget` for each running and starting run
+stays within `batch_budget`. A run that does not start is marked failed, with
+its worktree kept for rework or rejection.
+
+`pma dispatch` blocks until every run finishes. A run left queued or running by
+an interrupted session is marked failed at the next dispatch or review.
 
 ## Review
 
-States: `queued -> running -> ready | failed -> approved | rejected | rework`.
+States: `queued -> running -> ready | failed`, then `approved -> shipped`, or
+`rejected`. Rework returns a ready, failed or approved run to `running`.
 
-`pma review` shows each ready task: task text, quadrant, verify result, agent
-summary, and `git diff` in the worktree. Actions:
+`pma review` lists runs not shipped or rejected. `pma review <id>` shows task
+text, quadrant, verify result, cost, agent summary, and `git diff` against the
+base, untracked files included. Actions:
 
-- approve
-- reject (removes the worktree)
-- rework with feedback (dispatches again in the same worktree)
+- `--approve`, from ready
+- `--reject`, removing the worktree and branch
+- `--rework <feedback>`, running the agent again in the same worktree, with
+  the feedback after the original prompt
 
 ## Ship
 
 `pma ship` processes approved tasks, per project:
 
-1. In the worktree, mark the item `[x]` and move it to `Done`.
-2. `git add -A`, then commit with the task text as the subject. Add `Closes #N`
+1. `git add -A`, then commit with the task text as the subject. Add `Closes #N`
    when `gh:N` is set. Author is the user. With `attribution = "co-author"`, a
    trailer names the agent.
-3. Publish per `publish`:
-   - `push`: rebase onto the remote default branch and push.
-   - `pr`: push `pma/<slug>` and `gh pr create`.
-4. Remove the worktree.
+2. With `publish = "push"`, rebase onto the remote default branch.
+3. Mark the item `[x]`, move it to the top of `Done`, and amend the commit.
+   This follows the rebase. Two tasks shipped from one project each insert at
+   the top of `Done`, so editing before the rebase conflicts on the second.
+   A fix-CI run has no item and skips this step.
+4. Publish per `publish`:
+   - `push`: push to the default branch.
+   - `pr`: push `pma/<slug>` and `gh pr create`. `gh` is required up front.
+5. Remove the worktree and branch.
 
 A failure in one project, such as a rebase conflict, stops that project and does
-not stop the batch. The report lists each outcome.
+not stop the batch. Its runs stay approved, so `pma ship` can be run again. The
+report lists each outcome.
+
+The user's clone is not updated. After a push it is behind its remote, and an
+uncommitted `TODO.md` edit there can conflict on pull.
 
 ## Sync (hybrid)
 
 - `TODO.md` to Issues: `Critical` items without `gh:N` get an issue labelled
   `pma:critical`. `pma` writes `gh:N` back into the line.
-- Issues to `TODO.md`: an issue closed on GitHub marks its line `[x]`.
+- Issues to `TODO.md`: an issue closed on GitHub marks its line `[x]` and moves
+  it to `Done`.
 - Conflicts: `TODO.md` wins on text and priority. GitHub wins on closed state.
+  A linked open item whose issue title differs retitles the issue. A linked
+  item moved out of `Critical` loses the label; one moved in gains it.
 - Issues opened by other people are listed as untriaged, not imported.
+- A `gh:N` that names no issue is a warning. A finished item whose issue is
+  still open is left alone; `Closes #N` from ship closes it.
 
 Sync keys on the `Critical` heading, not on Q1. A quadrant shifts as due dates
 approach, which would open and close issues without any edit.
 
-Write-backs are uncommitted changes, shipped with the next batch.
+`pma sync` lists the plan; `pma sync --apply` carries it out. Every scanned
+project with a GitHub origin is synced, tiered or not: `Critical` is a property
+of the file, tiers only rank. A `TODO.md` with lint errors is skipped, since
+duplicate text or `gh:N` breaks item identity.
+
+Each `gh:N` is written to the file right after its issue is created. A sync
+that stops between the two leaves an open, labelled issue with the item's
+title and no link. The next sync links that issue instead of opening another.
+
+Write-backs are uncommitted edits to `TODO.md` in the user's clone, not a
+`pma ship` batch: ship commits worktrees, and the clone is the file the matrix
+reads. `scripts/commit_todo.py` commits them.
+
+Adding `gh:N` changes an item's key from its text to the issue number. Dispatch,
+ship, and the one-run-per-task check therefore match a task by key or by text.
 
 ## Implementation
 
@@ -422,7 +505,11 @@ Write-backs are uncommitted changes, shipped with the next batch.
 - GitHub: run `gh`, not `octocrab`, so its existing authentication is reused.
 - Processes: `std::process` and threads. The parallelism is child processes, so
   an async runtime is not needed.
-- TUI (later): `ratatui`, with the matrix as a 2x2 layout.
+- TUI: `ratatui` with only its crossterm backend, 69 crates rather than the
+  default features' 152. `pma tui` shows the matrix as a 2x2 layout, Q1 top
+  left, and the selected task with its `pma dispatch` target. It reads the last
+  scan and changes nothing. Focus is a thick border and selection a `> ` marker
+  in reverse video, so neither depends on colour.
 
 ## Stages
 
@@ -431,9 +518,12 @@ Each stage is used before the next one is built.
 1. Format spec, `pma lint`, and migration of the 64 files.
 2. `pma scan`, `pma matrix`, `pma status --explain`, with tiers and weights.
 3. `pma dispatch`, `pma review`, `pma ship`, with `claude` first, then the other
-   three agent templates.
-4. `pma sync` with Issues.
-5. Notes commands, deps signal, TUI.
+   three agent templates. Built: `claude`. Not built: the other three agents,
+   offering Q4 items for removal, and leftover worktrees in the hygiene
+   signal.
+4. `pma sync` with Issues. Built.
+5. Notes commands, deps signal, TUI. Built. The deps signal covers cargo, uv
+   and go; npm (2 repos here) is not covered.
 
 ## Open questions
 

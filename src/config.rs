@@ -1,6 +1,10 @@
-//! Ranking configuration: built-in defaults plus overrides stored in the
-//! database, addressed by flat keys such as `tiers.2` or `weights.ci`.
+//! Configuration: built-in defaults plus overrides stored in the database,
+//! addressed by flat keys such as `tiers.2`, `weights.ci` or
+//! `projects.cyllama.verify`.
 
+use std::collections::BTreeMap;
+
+use crate::rank::Quadrant;
 use crate::todo::Priority;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +25,43 @@ pub struct Config {
     pub activity_ignore: Vec<String>,
     /// Days without activity at which the activity signal reaches 1, per tier.
     pub activity_horizon: [i64; 5],
+    /// Quadrants `pma dispatch --auto` draws from.
+    pub dispatch_quadrants: Vec<Quadrant>,
+    /// Drawn from once `dispatch_quadrants` has no candidate left.
+    pub overflow_quadrants: Vec<Quadrant>,
+    pub publish: Publish,
+    pub attribution: Attribution,
+    /// Agents running at once.
+    pub max_parallel: i64,
+    /// USD a dispatch batch may spend.
+    pub batch_budget: f64,
+    /// USD one agent run may spend.
+    pub agent_budget: f64,
+    /// Minutes an agent run, or a verify run, may take.
+    pub timeout: i64,
+    pub projects: BTreeMap<String, ProjectSettings>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Publish {
+    /// Rebase onto the default branch and push it.
+    Push,
+    /// Push the task branch and open a pull request.
+    Pr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attribution {
+    User,
+    CoAuthor,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProjectSettings {
+    /// Shell command that checks an agent's work; `None` detects one.
+    pub verify: Option<String>,
+    /// Overrides the global `publish`.
+    pub publish: Option<Publish>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +107,15 @@ impl Default for Config {
             // added an empty one to many repos at once, is not maintenance.
             activity_ignore: vec![".github/**".into(), "*.lock".into(), "TODO.md".into()],
             activity_horizon: [30, 60, 120, 240, 365],
+            dispatch_quadrants: vec![Quadrant::Q1, Quadrant::Q2],
+            overflow_quadrants: vec![],
+            publish: Publish::Pr,
+            attribution: Attribution::User,
+            max_parallel: 2,
+            batch_budget: 5.0,
+            agent_budget: 1.0,
+            timeout: 30,
+            projects: BTreeMap::new(),
         }
     }
 }
@@ -78,6 +128,26 @@ enum Slot<'a> {
     Never(&'a mut Option<i64>),
     Priority(&'a mut Priority),
     List(&'a mut Vec<String>),
+    Quadrants(&'a mut Vec<Quadrant>),
+    Publish(&'a mut Publish),
+    OptPublish(&'a mut Option<Publish>),
+    Attribution(&'a mut Attribution),
+    /// Empty text is `None`.
+    OptText(&'a mut Option<String>),
+}
+
+const PUBLISH: [(&str, Publish); 2] = [("push", Publish::Push), ("pr", Publish::Pr)];
+
+fn publish_name(p: Publish) -> &'static str {
+    PUBLISH.iter().find(|(_, v)| *v == p).map_or("", |(n, _)| n)
+}
+
+fn parse_publish(s: &str) -> Result<Publish, String> {
+    PUBLISH
+        .iter()
+        .find(|(n, _)| *n == s)
+        .map(|(_, v)| *v)
+        .ok_or_else(|| "expected push or pr".into())
 }
 
 impl Config {
@@ -93,6 +163,19 @@ impl Config {
         keys.extend(["ci", "deps", "activity", "hygiene"].map(|s| format!("signals.{s}")));
         keys.push("activity.ignore".into());
         keys.extend(per_tier("activity.horizon"));
+        keys.extend(
+            [
+                "dispatch_quadrants",
+                "overflow_quadrants",
+                "publish",
+                "attribution",
+                "max_parallel",
+                "batch_budget",
+                "agent_budget",
+                "timeout",
+            ]
+            .map(String::from),
+        );
         keys
     }
 
@@ -117,10 +200,30 @@ impl Config {
             Slot::Never(v) => v.map_or("never".into(), |n| n.to_string()),
             Slot::Priority(p) => p.name().into(),
             Slot::List(v) => v.join(","),
+            Slot::Quadrants(v) => v
+                .iter()
+                .map(|q| format!("{q:?}").to_lowercase())
+                .collect::<Vec<_>>()
+                .join(","),
+            Slot::Publish(p) => publish_name(*p).into(),
+            Slot::OptPublish(p) => p.map_or("", publish_name).into(),
+            Slot::Attribution(a) => match a {
+                Attribution::User => "user".into(),
+                Attribution::CoAuthor => "co-author".into(),
+            },
+            Slot::OptText(v) => v.clone().unwrap_or_default(),
         })
     }
 
+    /// Sets one value; on error, nothing changes.
     pub fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
+        let mut next = self.clone();
+        next.set_in_place(key, value)?;
+        *self = next;
+        Ok(())
+    }
+
+    fn set_in_place(&mut self, key: &str, value: &str) -> Result<(), String> {
         let slot = self
             .slot(key)
             .ok_or_else(|| format!("unknown setting `{key}`"))?;
@@ -163,6 +266,33 @@ impl Config {
                     .map(String::from)
                     .collect();
             }
+            Slot::Quadrants(v) => {
+                *v = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        Quadrant::ALL
+                            .into_iter()
+                            .find(|q| format!("{q:?}").eq_ignore_ascii_case(s))
+                            .ok_or_else(|| format!("`{s}` is not q1, q2, q3 or q4"))
+                    })
+                    .collect::<Result<_, _>>()?;
+            }
+            Slot::Publish(p) => *p = parse_publish(value)?,
+            Slot::OptPublish(p) => {
+                *p = (!value.is_empty())
+                    .then(|| parse_publish(value))
+                    .transpose()?
+            }
+            Slot::Attribution(a) => {
+                *a = match value {
+                    "user" => Attribution::User,
+                    "co-author" => Attribution::CoAuthor,
+                    _ => return Err("expected user or co-author".into()),
+                }
+            }
+            Slot::OptText(v) => *v = (!value.is_empty()).then(|| value.to_string()),
         }
         Ok(())
     }
@@ -179,6 +309,14 @@ impl Config {
                 "important_threshold" => Slot::Number(&mut self.important_threshold, 0.0),
                 "urgent_within" => Slot::Count(&mut self.urgent_within, 0),
                 "quadrant_limit" => Slot::Count(&mut self.quadrant_limit, 1),
+                "dispatch_quadrants" => Slot::Quadrants(&mut self.dispatch_quadrants),
+                "overflow_quadrants" => Slot::Quadrants(&mut self.overflow_quadrants),
+                "publish" => Slot::Publish(&mut self.publish),
+                "attribution" => Slot::Attribution(&mut self.attribution),
+                "max_parallel" => Slot::Count(&mut self.max_parallel, 1),
+                "batch_budget" => Slot::Number(&mut self.batch_budget, 0.0),
+                "agent_budget" => Slot::Number(&mut self.agent_budget, 0.0),
+                "timeout" => Slot::Count(&mut self.timeout, 1),
                 _ => return None,
             },
             Some(("tiers", t)) => Slot::Number(&mut self.tiers[tier(t)?], 0.0),
@@ -210,6 +348,19 @@ impl Config {
                 let t = rest.strip_prefix("horizon.")?;
                 Slot::Count(&mut self.activity_horizon[tier(t)?], 1)
             }
+            Some(("projects", rest)) => {
+                let (name, field) = rest.rsplit_once('.')?;
+                if name.is_empty() || name.contains('.') || !["verify", "publish"].contains(&field)
+                {
+                    return None;
+                }
+                let settings = self.projects.entry(name.to_string()).or_default();
+                match field {
+                    "verify" => Slot::OptText(&mut settings.verify),
+                    "publish" => Slot::OptPublish(&mut settings.publish),
+                    _ => return None,
+                }
+            }
             _ => return None,
         })
     }
@@ -221,6 +372,14 @@ impl Config {
     pub fn priority(&self, p: Priority) -> f64 {
         self.priorities[p as usize]
     }
+
+    pub fn project(&self, name: &str) -> ProjectSettings {
+        self.projects.get(name).cloned().unwrap_or_default()
+    }
+
+    pub fn publish_for(&self, name: &str) -> Publish {
+        self.project(name).publish.unwrap_or(self.publish)
+    }
 }
 
 #[cfg(test)]
@@ -230,7 +389,7 @@ mod tests {
     #[test]
     fn every_key_reads_and_round_trips() {
         let keys = Config::keys();
-        assert_eq!(keys.len(), 32);
+        assert_eq!(keys.len(), 40);
         let defaults = Config::default();
         let mut copy = Config::default();
         for key in &keys {
@@ -262,6 +421,22 @@ mod tests {
         assert_eq!(cfg.signals.ci, Priority::Critical);
         assert_eq!(cfg.activity_ignore, ["docs/**", "*.md"]);
         assert_eq!(cfg.activity_horizon[1], 14);
+
+        cfg.set("dispatch_quadrants", "Q1, q3").unwrap();
+        cfg.set("overflow_quadrants", "").unwrap();
+        cfg.set("publish", "push").unwrap();
+        cfg.set("attribution", "co-author").unwrap();
+        cfg.set("projects.cyllama.verify", " make check ").unwrap();
+        cfg.set("projects.cyllama.publish", "pr").unwrap();
+        assert_eq!(cfg.dispatch_quadrants, [Quadrant::Q1, Quadrant::Q3]);
+        assert!(cfg.overflow_quadrants.is_empty());
+        assert_eq!(cfg.attribution, Attribution::CoAuthor);
+        assert_eq!(cfg.project("cyllama").verify.as_deref(), Some("make check"));
+        assert_eq!(cfg.publish_for("cyllama"), Publish::Pr);
+        assert_eq!(cfg.publish_for("other"), Publish::Push);
+        assert_eq!(cfg.get("projects.cyllama.publish").unwrap(), "pr");
+        cfg.set("projects.cyllama.publish", "").unwrap();
+        assert_eq!(cfg.publish_for("cyllama"), Publish::Push, "empty unsets");
     }
 
     #[test]
@@ -279,6 +454,13 @@ mod tests {
             ("signals.ci", "urgent"),
             ("weights.nope", "1"),
             ("activity.horizon.1", "0"),
+            ("dispatch_quadrants", "q1,q5"),
+            ("publish", "merge"),
+            ("attribution", "agent"),
+            ("max_parallel", "0"),
+            ("projects.a.b.verify", "x"),
+            ("projects.a.colour", "x"),
+            ("projects.a.publish", "merge"),
             ("nope", "1"),
         ] {
             assert!(cfg.set(key, value).is_err(), "{key} = {value} was accepted");

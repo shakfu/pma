@@ -55,6 +55,9 @@ pub struct Project {
     pub ci: Ci,
     pub dirty: i64,
     pub ahead: Option<i64>,
+    /// Outdated dependencies and days since measured; `None` if never measured
+    /// or not applicable.
+    pub deps: Option<(i64, i64)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,6 +68,9 @@ pub struct Task {
     pub text: String,
     /// TODO.md line; `None` for signal tasks.
     pub line: Option<i64>,
+    /// What `pma dispatch` works on: an item's key, or `ci`. `None` for
+    /// signals agents cannot act on.
+    pub key: Option<String>,
     /// The nearest `###` heading above the item.
     pub group: Option<String>,
     /// Day number of `due:`.
@@ -145,8 +151,8 @@ fn due_order(a: Option<i64>, b: Option<i64>) -> Ordering {
     }
 }
 
-/// Tasks for project conditions: failing CI, local changes, and inactivity
-/// beyond the tier's horizon.
+/// Tasks for project conditions: failing CI, outdated dependencies, local
+/// changes, and inactivity beyond the tier's horizon.
 pub fn signal_tasks(cfg: &Config, p: &Project) -> Vec<Task> {
     let task = |priority, text: String, urgent, age_days| Task {
         project: p.name.clone(),
@@ -154,6 +160,7 @@ pub fn signal_tasks(cfg: &Config, p: &Project) -> Vec<Task> {
         priority,
         text,
         line: None,
+        key: None,
         group: None,
         due: None,
         tagged_urgent: false,
@@ -162,12 +169,26 @@ pub fn signal_tasks(cfg: &Config, p: &Project) -> Vec<Task> {
     };
     let mut tasks = Vec::new();
     if let Ci::Failing(workflows) = &p.ci {
-        tasks.push(task(
-            cfg.signals.ci,
-            format!("fix CI: {}", workflows.join(", ")),
-            true,
-            0,
-        ));
+        tasks.push(Task {
+            key: Some("ci".into()),
+            ..task(
+                cfg.signals.ci,
+                format!("fix CI: {}", workflows.join(", ")),
+                true,
+                0,
+            )
+        });
+    }
+    if let Some((n, _)) = p.deps.filter(|(n, _)| *n > 0) {
+        tasks.push(Task {
+            key: Some("deps".into()),
+            ..task(
+                cfg.signals.deps,
+                format!("update dependencies: {n} outdated"),
+                false,
+                0,
+            )
+        });
     }
     let local = local_changes(p);
     if !local.is_empty() {
@@ -225,6 +246,9 @@ pub struct Component {
 /// gives a score of 1 - 1/e.
 const TASKS_SCALE: f64 = 3.0;
 
+/// Outdated dependencies at which the deps signal reaches 1.
+const DEPS_SCALE: f64 = 10.0;
+
 /// `tier * sum(w_i * s_i) / sum(w_i)` over the measured signals.
 pub fn health(cfg: &Config, p: &Project) -> (f64, Vec<Component>) {
     let load: f64 = p.open.iter().map(|&pr| cfg.priority(pr)).sum();
@@ -279,7 +303,27 @@ pub fn health(cfg: &Config, p: &Project) -> (f64, Vec<Component>) {
             ),
             Ci::Unknown(why) => ("ci", None, cfg.weights.ci, format!("unknown: {why}")),
         },
-        ("deps", None, cfg.weights.deps, "not measured yet".into()),
+        match p.deps {
+            Some((n, age)) => (
+                "deps",
+                Some((n as f64 / DEPS_SCALE).min(1.0)),
+                cfg.weights.deps,
+                format!(
+                    "{n} outdated, measured {}",
+                    match age {
+                        0 => "today".to_string(),
+                        1 => "1 day ago".to_string(),
+                        d => format!("{d} days ago"),
+                    }
+                ),
+            ),
+            None => (
+                "deps",
+                None,
+                cfg.weights.deps,
+                "not measured; `pma scan --deps`".into(),
+            ),
+        },
         {
             let local = local_changes(p);
             let score = 0.5 * f64::from(u8::from(p.dirty > 0))
@@ -328,6 +372,7 @@ mod tests {
             priority,
             text: "t".into(),
             line: Some(1),
+            key: Some("t".into()),
             group: None,
             due: None,
             tagged_urgent: false,
@@ -349,6 +394,7 @@ mod tests {
             ci: Ci::Passing,
             dirty: 0,
             ahead: Some(0),
+            deps: None,
         }
     }
 
@@ -480,13 +526,14 @@ mod tests {
             dirty: 1,
             ahead: Some(2),
             idle_days: Some(31),
+            deps: Some((3, 2)),
             ..project(1)
         };
         let tasks = signal_tasks(&cfg, &p);
         let ages: Vec<i64> = tasks.iter().map(|t| t.age_days).collect();
         assert_eq!(
             ages,
-            [0, 0, 1],
+            [0, 0, 0, 1],
             "an idle task is as old as the time past its horizon"
         );
         let got: Vec<_> = tasks
@@ -497,6 +544,7 @@ mod tests {
             got,
             [
                 (Priority::High, "fix CI: test, wheels", true),
+                (Priority::Medium, "update dependencies: 3 outdated", false),
                 (
                     Priority::Medium,
                     "resolve local changes: 1 changed file, 2 unpushed commits",
@@ -557,6 +605,18 @@ mod tests {
 
         let deps = parts.iter().find(|c| c.signal == "deps").unwrap();
         assert_eq!((deps.score, deps.contribution), (None, 0.0));
+
+        let measured = Project {
+            deps: Some((4, 1)),
+            ..p.clone()
+        };
+        let (with_deps, parts) = health(&cfg, &measured);
+        let expected = 0.8 * (5.0 * tasks + activity + 3.0 + 2.0 * 0.5 + 0.4) / 12.0;
+        assert!(
+            (with_deps - expected).abs() < 1e-12,
+            "{with_deps} vs {expected}"
+        );
+        assert_eq!(parts[3].detail, "4 outdated, measured 1 day ago");
         assert_eq!(parts[0].detail, "open: 1 critical, 2 high");
         assert_eq!(parts[4].detail, "4 changed files");
 

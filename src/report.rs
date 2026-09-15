@@ -3,10 +3,11 @@
 use crate::config::Config;
 use crate::rank::{self, Placed, Project, Quadrant, Urgency};
 use crate::scan::Ci;
+use crate::store::{Run, RunState};
 
 /// Lays out rows as left-aligned columns separated by two spaces. The last
 /// column is not padded.
-fn table(rows: &[Vec<String>], indent: &str) -> String {
+pub fn table(rows: &[Vec<String>], indent: &str) -> String {
     let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
     let widths: Vec<usize> = (0..cols)
         .map(|c| {
@@ -48,7 +49,8 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-fn when(p: &Placed) -> String {
+/// Why a task is urgent, or how far off it is.
+pub fn when(p: &Placed, today: i64) -> String {
     match (p.urgency, p.task.due) {
         (Some(Urgency::Due(d)), _) if d < 0 => format!("overdue {}d", -d),
         (Some(Urgency::Due(0)), _) => "due today".into(),
@@ -56,7 +58,7 @@ fn when(p: &Placed) -> String {
         (Some(Urgency::Tagged), _) => "#urgent".into(),
         (Some(Urgency::Signal), _) => "signal".into(),
         (Some(Urgency::Stale(a)), _) => format!("open {a}d"),
-        (None, Some(due)) => format!("due {due}"),
+        (None, Some(due)) => format!("due in {}d", due - today),
         (None, None) => format!("open {}d", p.task.age_days),
     }
 }
@@ -95,10 +97,7 @@ pub fn matrix(
                     None => t.project.clone(),
                 };
                 let mut row = vec![place, format!("T{}", t.tier), t.priority.name().into()];
-                row.push(match (p.urgency, t.due) {
-                    (None, Some(due)) => format!("due in {}d", due - today),
-                    _ => when(p),
-                });
+                row.push(when(p, today));
                 if grouped {
                     row.push(truncate(t.group.as_deref().unwrap_or(""), GROUP_WIDTH));
                 }
@@ -133,7 +132,7 @@ pub fn status(cfg: &Config, rows: &[StatusRow], explain: bool) -> String {
 
     let mut cells = vec![
         [
-            "project", "tier", "health", "open", "idle", "ci", "local", "todo",
+            "project", "tier", "health", "open", "idle", "ci", "deps", "local", "todo",
         ]
         .map(String::from)
         .to_vec(),
@@ -161,6 +160,7 @@ pub fn status(cfg: &Config, rows: &[StatusRow], explain: bool) -> String {
                 Ci::Unknown(_) => "unknown",
             }
             .into(),
+            p.deps.map_or("-".into(), |(n, _)| n.to_string()),
             if local.is_empty() {
                 "clean".into()
             } else {
@@ -210,6 +210,118 @@ pub fn status(cfg: &Config, rows: &[StatusRow], explain: bool) -> String {
     out
 }
 
+fn verify_cell(run: &Run) -> String {
+    match (run.verify.as_deref(), run.verify_ok) {
+        (_, Some(true)) => "verify ok".into(),
+        (_, Some(false)) => "verify FAILED".into(),
+        (None, None) if run.state == RunState::Ready => "no verify".into(),
+        _ => "-".into(),
+    }
+}
+
+fn duration(seconds: Option<i64>) -> String {
+    match seconds {
+        None => "-".into(),
+        Some(s) if s < 60 => format!("{s}s"),
+        Some(s) => format!("{}m{:02}s", s / 60, s % 60),
+    }
+}
+
+fn run_cells(run: &Run) -> Vec<String> {
+    vec![
+        format!("#{}", run.id),
+        run.state.name().into(),
+        run.project.clone(),
+        verify_cell(run),
+        run.cost_usd.map_or("-".into(), |c| format!("${c:.2}")),
+        duration(run.seconds),
+        truncate(&run.text, 60),
+    ]
+}
+
+/// One line per finished run, for `pma dispatch`.
+pub fn run_line(run: &Run) -> String {
+    let mut line = run_cells(run).join("  ");
+    if let Some(e) = &run.error {
+        line.push_str(&format!("\n  {e}"));
+    }
+    line
+}
+
+pub fn runs(runs: &[Run]) -> String {
+    let rows: Vec<Vec<String>> = runs.iter().map(run_cells).collect();
+    table(&rows, "")
+}
+
+pub fn run_detail(run: &Run, diff: &str) -> String {
+    let mut rows = vec![
+        vec!["task".into(), run.text.clone()],
+        vec![
+            "agent".into(),
+            format!(
+                "{}, {}, {}",
+                run.agent,
+                run.cost_usd
+                    .map_or("cost not reported".into(), |c| format!("${c:.2}")),
+                duration(run.seconds)
+            ),
+        ],
+        vec![
+            "branch".into(),
+            format!("{} in {}", run.branch, run.worktree.display()),
+        ],
+        vec![
+            "verify".into(),
+            match (&run.verify, run.verify_ok) {
+                (Some(v), Some(true)) => format!("`{v}` passed"),
+                (Some(v), Some(false)) => format!("`{v}` FAILED"),
+                (Some(v), None) => format!("`{v}` not run"),
+                (None, _) => "none detected; set projects.<name>.verify".into(),
+            },
+        ],
+    ];
+    if let Some(stat) = &run.diffstat {
+        rows.push(vec!["changes".into(), stat.clone()]);
+    }
+    if let Some(n) = run.commits.filter(|n| *n > 0) {
+        rows.push(vec![
+            "commits".into(),
+            format!("{n} beyond the base; the agent was told not to commit"),
+        ]);
+    }
+    for (label, value) in [
+        ("feedback", &run.feedback),
+        ("error", &run.error),
+        ("outcome", &run.outcome),
+    ] {
+        if let Some(v) = value {
+            rows.push(vec![label.into(), v.clone()]);
+        }
+    }
+    let mut out = format!(
+        "#{} {}  {}{}\n",
+        run.id,
+        run.state.name(),
+        run.project,
+        run.quadrant
+            .as_deref()
+            .map_or(String::new(), |q| format!("  {q}"))
+    );
+    out.push_str(&table(&rows, "  "));
+    if let Some(summary) = run.summary.as_deref().filter(|s| !s.trim().is_empty()) {
+        out.push_str("\nsummary:\n");
+        for line in summary.lines() {
+            out.push_str(&format!("  {line}\n").replace("  \n", "\n"));
+        }
+    }
+    out.push_str("\ndiff:\n");
+    out.push_str(diff);
+    if !diff.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 pub fn ago(seconds: i64) -> String {
     match seconds {
         s if s < 90 => "just now".into(),
@@ -239,6 +351,7 @@ mod tests {
                 priority: Priority::High,
                 text: format!("text of {project}"),
                 line,
+                key: None,
                 group: None,
                 due,
                 tagged_urgent: false,
@@ -324,6 +437,7 @@ mod tests {
             ci: Ci::Passing,
             dirty: 0,
             ahead: Some(0),
+            deps: None,
         };
         let busy = Project {
             name: "busy".into(),
@@ -331,6 +445,7 @@ mod tests {
             ci: Ci::Unknown("offline".into()),
             dirty: 2,
             ahead: Some(1),
+            deps: Some((3, 0)),
             ..quiet.clone()
         };
         let rows = [
@@ -351,7 +466,7 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(
             lines[0],
-            "project  tier  health  open  idle  ci       local               todo"
+            "project  tier  health  open  idle  ci       deps  local               todo"
         );
         assert!(
             lines[1].starts_with("busy     1     0.")
@@ -360,7 +475,7 @@ mod tests {
         );
         assert_eq!(
             lines[2],
-            "quiet    1     0.00    0     1d    passing  clean               ok"
+            "quiet    1     0.00    0     1d    passing  -     clean               ok"
         );
         assert!(out.contains("\nbusy  tier 1 (x1)  health"), "{out}");
         assert!(

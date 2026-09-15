@@ -10,7 +10,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::todo::{self, Priority};
+use crate::todo::{self, Priority, normal_text};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Facts {
@@ -24,7 +24,18 @@ pub struct Facts {
     /// Unix time of the newest commit touching a path outside `activity.ignore`.
     pub last_activity: Option<i64>,
     pub ci: Ci,
+    /// `None` when this scan did not measure dependencies.
+    pub deps: Option<DepsFacts>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DepsFacts {
+    /// Outdated dependencies; `None` when no ecosystem applies or every
+    /// tool failed.
+    pub outdated: Option<i64>,
+    /// One `ecosystem: name current -> latest`, or `ecosystem: error: ...`, per line.
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -123,7 +134,14 @@ pub fn discover(roots: &[PathBuf]) -> (Vec<(String, PathBuf)>, Vec<String>) {
 }
 
 /// Scans projects on up to 8 threads, returning facts in input order.
-pub fn scan_all(projects: &[(String, PathBuf)], ignore: &[String], offline: bool) -> Vec<Facts> {
+/// Dependencies are measured only with `deps`, since it takes seconds per
+/// project.
+pub fn scan_all(
+    projects: &[(String, PathBuf)],
+    ignore: &[String],
+    offline: bool,
+    deps: bool,
+) -> Vec<Facts> {
     let next = AtomicUsize::new(0);
     let results = Mutex::new(Vec::with_capacity(projects.len()));
     std::thread::scope(|s| {
@@ -134,7 +152,7 @@ pub fn scan_all(projects: &[(String, PathBuf)], ignore: &[String], offline: bool
                     let Some((name, path)) = projects.get(i) else {
                         break;
                     };
-                    let facts = scan_project(name, path, ignore, offline);
+                    let facts = scan_project(name, path, ignore, offline, deps);
                     results.lock().unwrap().push((i, facts));
                 }
             });
@@ -145,7 +163,13 @@ pub fn scan_all(projects: &[(String, PathBuf)], ignore: &[String], offline: bool
     results.into_iter().map(|(_, f)| f).collect()
 }
 
-pub fn scan_project(name: &str, path: &Path, ignore: &[String], offline: bool) -> Facts {
+pub fn scan_project(
+    name: &str,
+    path: &Path,
+    ignore: &[String],
+    offline: bool,
+    deps: bool,
+) -> Facts {
     let mut facts = Facts {
         name: name.into(),
         path: path.into(),
@@ -154,6 +178,7 @@ pub fn scan_project(name: &str, path: &Path, ignore: &[String], offline: bool) -
         ahead: None,
         last_activity: None,
         ci: Ci::Unknown("offline".into()),
+        deps: None,
         error: None,
     };
 
@@ -175,6 +200,9 @@ pub fn scan_project(name: &str, path: &Path, ignore: &[String], offline: bool) -
     facts.last_activity = last_activity(path, ignore);
     if !offline {
         facts.ci = ci_state(path);
+        if deps {
+            facts.deps = Some(crate::deps::measure(path));
+        }
     }
     facts
 }
@@ -193,10 +221,7 @@ fn todo_facts(text: &str, added: &HashMap<String, i64>) -> TodoFacts {
         .filter_map(|item| {
             let priority = item.priority.filter(|_| !item.done)?;
             let normal = normal_text(&item.text);
-            let key = match item.gh {
-                Some(n) => format!("gh:{n}"),
-                None => normal.clone(),
-            };
+            let key = item.key();
             // Duplicates are lint errors; the first occurrence stands.
             if !keys.insert(key.clone()) {
                 return None;
@@ -221,7 +246,8 @@ fn todo_facts(text: &str, added: &HashMap<String, i64>) -> TodoFacts {
     }
 }
 
-fn git(dir: &Path, args: &[&str]) -> Option<String> {
+/// Runs `git -C dir`; stdout when it succeeds.
+pub fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -312,14 +338,6 @@ fn normalise(line: &str) -> String {
     normal_text(&words.join(" "))
 }
 
-/// An item's parsed text in comparable form: lowercase, single-spaced.
-fn normal_text(text: &str) -> String {
-    text.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
 fn last_activity(dir: &Path, ignore: &[String]) -> Option<i64> {
     let log = git(
         dir,
@@ -393,6 +411,18 @@ fn segment_match(p: &[u8], s: &[u8]) -> bool {
     p[pi..].iter().all(|&b| b == b'*')
 }
 
+pub const DEFAULT_BRANCH_UNKNOWN: &str =
+    "default branch unknown; run `git remote set-head origin -a`";
+
+/// The branch `origin/HEAD` points at, without the remote prefix.
+pub fn default_branch(dir: &Path) -> Option<String> {
+    let full = git(
+        dir,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    )?;
+    Some(full.trim().trim_start_matches("origin/").to_string())
+}
+
 fn ci_state(dir: &Path) -> Ci {
     let Some(url) = git(dir, &["remote", "get-url", "origin"]) else {
         return Ci::Unknown("no origin remote".into());
@@ -400,13 +430,10 @@ fn ci_state(dir: &Path) -> Ci {
     let Some(slug) = github_slug(url.trim()) else {
         return Ci::Unknown("origin is not on GitHub".into());
     };
-    let Some(branch) = git(
-        dir,
-        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-    ) else {
-        return Ci::Unknown("default branch unknown; run `git remote set-head origin -a`".into());
+    let Some(branch) = default_branch(dir) else {
+        return Ci::Unknown(DEFAULT_BRANCH_UNKNOWN.into());
     };
-    let branch = branch.trim().trim_start_matches("origin/");
+    let branch = branch.as_str();
     let out = Command::new("gh")
         .args([
             "run", "list", "-R", &slug, "--branch", branch, "--limit", "50",
@@ -455,7 +482,7 @@ fn parse_runs(tsv: &str) -> Ci {
     }
 }
 
-fn github_slug(url: &str) -> Option<String> {
+pub fn github_slug(url: &str) -> Option<String> {
     let rest = url.split_once("github.com")?.1;
     let rest = rest.strip_prefix(':').or_else(|| rest.strip_prefix('/'))?;
     let rest = rest.trim_end_matches('/');

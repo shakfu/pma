@@ -2,13 +2,19 @@
 //!
 //! Design: `docs/dev/design.md`.
 
+mod agent;
 mod config;
 mod dates;
+mod deps;
+mod dispatch;
 mod rank;
 mod report;
 mod scan;
+mod ship;
 mod store;
+mod sync;
 mod todo;
+mod tui;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -17,7 +23,7 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 
 use config::Config;
-use store::{Result, Store};
+use store::{Result, RunState, Store};
 
 #[derive(Parser)]
 #[command(name = "pma", version, about = "Maintain many projects from one place")]
@@ -67,6 +73,10 @@ enum Command {
         /// Skip GitHub; CI is recorded as unknown.
         #[arg(long)]
         offline: bool,
+        /// Also measure outdated dependencies (cargo, uv, go); seconds per
+        /// project. Without it, the last measurement is kept.
+        #[arg(long, conflicts_with = "offline")]
+        deps: bool,
     },
     /// Show tasks of tiered projects in the Eisenhower matrix.
     Matrix {
@@ -87,6 +97,79 @@ enum Command {
         #[arg(long)]
         explain: bool,
     },
+    /// Run an agent on tasks, each in its own worktree of the remote default
+    /// branch.
+    ///
+    /// A target is `project:line`, a TODO.md line from the last scan,
+    /// `project:ci` for failing CI, or `project:deps` for outdated
+    /// dependencies. Blocks until every agent has finished.
+    Dispatch {
+        /// Targets; with --auto, projects to draw from.
+        targets: Vec<String>,
+        /// Draw the top tasks from `dispatch_quadrants`, then
+        /// `overflow_quadrants`.
+        #[arg(long)]
+        auto: bool,
+        /// With --auto, how many tasks; defaults to `max_parallel`.
+        #[arg(short = 'n', long, requires = "auto")]
+        count: Option<usize>,
+    },
+    /// List runs that are not shipped or rejected, show one, or act on it.
+    Review {
+        /// A run id; omit to list runs.
+        id: Option<i64>,
+        /// Mark a ready run for `pma ship`.
+        #[arg(long, requires = "id", conflicts_with_all = ["reject", "rework"])]
+        approve: bool,
+        /// Remove the run's worktree and branch.
+        #[arg(long, requires = "id", conflicts_with = "rework")]
+        reject: bool,
+        /// Run the agent again in the same worktree with this feedback.
+        #[arg(long, requires = "id", value_name = "FEEDBACK")]
+        rework: Option<String>,
+    },
+    /// Commit and publish approved runs, then remove their worktrees.
+    Ship {
+        /// Limit to these projects.
+        projects: Vec<String>,
+    },
+    /// List portfolio notes, or add, edit or remove one.
+    Note {
+        #[command(subcommand)]
+        action: Option<NoteAction>,
+    },
+    /// Browse the matrix in the terminal. Reads the last scan.
+    Tui,
+    /// Sync `Critical` items with GitHub Issues. Dry run unless --apply.
+    ///
+    /// Opens an issue per Critical item and writes `gh:N` into its line,
+    /// marks items done when their issue is closed, keeps issue titles and
+    /// the `pma:critical` label in line with TODO.md, and lists open issues
+    /// by other people that no item links. TODO.md edits stay uncommitted.
+    Sync {
+        /// Limit to these projects; defaults to every scanned project.
+        projects: Vec<String>,
+        /// Make the changes instead of listing them.
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum NoteAction {
+    /// Add a note; the words are joined by spaces.
+    Add {
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
+    /// Replace a note's text.
+    Edit {
+        id: i64,
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
+    /// Remove a note.
+    Rm { id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -111,13 +194,32 @@ fn main() -> ExitCode {
         Command::Root { action } => root(action),
         Command::Tier { project, tier } => set_tier(&project, tier.as_deref()),
         Command::Config { key, value, reset } => configure(key.as_deref(), value.as_deref(), reset),
-        Command::Scan { projects, offline } => run_scan(&projects, offline),
+        Command::Scan {
+            projects,
+            offline,
+            deps,
+        } => run_scan(&projects, offline, deps),
         Command::Matrix {
             projects,
             quadrant,
             all,
         } => show_matrix(&projects, quadrant, all),
         Command::Status { projects, explain } => show_status(&projects, explain),
+        Command::Dispatch {
+            targets,
+            auto,
+            count,
+        } => run_dispatch(&targets, auto, count),
+        Command::Review {
+            id,
+            approve,
+            reject,
+            rework,
+        } => run_review(id, approve, reject, rework.as_deref()),
+        Command::Ship { projects } => run_ship(&projects),
+        Command::Sync { projects, apply } => run_sync(&projects, apply),
+        Command::Note { action } => note(action),
+        Command::Tui => run_tui(),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -256,6 +358,9 @@ fn configure(key: Option<&str>, value: Option<&str>, reset: bool) -> Result<()> 
                     if set { "  (set)" } else { "" }
                 );
             }
+            for (k, v) in rows.iter().filter(|(k, _)| k.starts_with("projects.")) {
+                println!("{k} = {v}  (set)");
+            }
             for (k, v) in rows
                 .iter()
                 .filter(|(k, _)| Config::default().get(k).is_none())
@@ -293,7 +398,7 @@ fn load_config(store: &Store) -> Result<Config> {
     )?)
 }
 
-fn run_scan(names: &[String], offline: bool) -> Result<()> {
+fn run_scan(names: &[String], offline: bool, deps: bool) -> Result<()> {
     let mut store = Store::open_default()?;
     let cfg = load_config(&store)?;
     let roots = store.roots()?;
@@ -320,7 +425,7 @@ fn run_scan(names: &[String], offline: bool) -> Result<()> {
     };
 
     let started = Instant::now();
-    let facts = scan::scan_all(&selected, &cfg.activity_ignore, offline);
+    let facts = scan::scan_all(&selected, &cfg.activity_ignore, offline, deps);
     for f in facts.iter().filter(|f| f.error.is_some()) {
         eprintln!(
             "warning: {}: {}",
@@ -354,6 +459,13 @@ fn run_scan(names: &[String], offline: bool) -> Result<()> {
             .filter(|f| matches!(f.ci, scan::Ci::Unknown(_)))
             .count();
         summary.push_str(&format!(", CI failing in {failing}, unknown in {unknown}"));
+    }
+    if deps {
+        let outdated = facts
+            .iter()
+            .filter(|f| f.deps.as_ref().is_some_and(|d| d.outdated > Some(0)))
+            .count();
+        summary.push_str(&format!(", outdated dependencies in {outdated}"));
     }
     println!("{summary}");
     Ok(())
@@ -405,6 +517,9 @@ fn portfolio(names: &[String]) -> Result<Portfolio> {
             ci: row.ci.clone(),
             dirty: row.dirty,
             ahead: row.ahead,
+            deps: row
+                .deps
+                .map(|n| (n, row.deps_at.map_or(0, |t| (today - dates::day(t)).max(0)))),
         };
         tasks.extend(own.iter().map(|t| rank::Task {
             project: row.name.clone(),
@@ -412,6 +527,7 @@ fn portfolio(names: &[String]) -> Result<Portfolio> {
             priority: t.priority,
             text: t.text.clone(),
             line: Some(t.line),
+            key: Some(t.key.clone()),
             group: t.group.clone(),
             due: t.due.as_deref().and_then(dates::parse),
             tagged_urgent: t.tags.iter().any(|g| g == "urgent"),
@@ -432,13 +548,17 @@ fn portfolio(names: &[String]) -> Result<Portfolio> {
     })
 }
 
-fn header(p: &Portfolio) {
-    println!(
-        "last scan {}; {} tiered projects, {} untiered (pma tier <project> <1-5>)\n",
+fn header_text(p: &Portfolio) -> String {
+    format!(
+        "last scan {}; {} tiered projects, {} untiered (pma tier <project> <1-5>)",
         report::ago(p.scanned_ago),
         p.projects.len(),
         p.untiered
-    );
+    )
+}
+
+fn header(p: &Portfolio) {
+    println!("{}\n", header_text(p));
 }
 
 fn show_matrix(names: &[String], quadrant: Option<rank::Quadrant>, all: bool) -> Result<()> {
@@ -464,5 +584,370 @@ fn show_status(names: &[String], explain: bool) -> Result<()> {
         })
         .collect();
     print!("{}", report::status(&p.cfg, &rows, explain));
+    Ok(())
+}
+
+/// Whether a task already has a run that is not shipped or rejected. Text is
+/// compared too, since sync may have added `gh:N` after dispatch.
+fn has_run(runs: &[store::Run], project: &str, key: &str, text: &str) -> bool {
+    runs.iter().any(|r| {
+        !r.state.is_final()
+            && r.project == project
+            && (r.task_key == key || todo::normal_text(&r.text) == todo::normal_text(text))
+    })
+}
+
+fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>) -> Result<()> {
+    let store = Store::open_default()?;
+    let home = store::home()?;
+    store.fail_interrupted_runs()?;
+    let active = store.runs()?;
+    let rows = store.projects()?;
+    let p = portfolio(if auto { targets } else { &[] })?;
+    let placed = rank::place(&p.cfg, p.tasks, p.today);
+    let quadrant = |project: &str, key: &str| {
+        placed
+            .iter()
+            .find(|x| x.task.project == project && x.task.key.as_deref() == Some(key))
+            .map(|x| format!("{:?}", x.quadrant))
+    };
+    let repo = |project: &str| -> Result<PathBuf> {
+        Ok(rows
+            .iter()
+            .find(|r| r.name == project)
+            .ok_or_else(|| format!("unknown project `{project}`"))?
+            .path
+            .clone())
+    };
+
+    let mut picks = Vec::new();
+    if auto {
+        let wanted = count.unwrap_or(p.cfg.max_parallel as usize);
+        let lists = [&p.cfg.dispatch_quadrants, &p.cfg.overflow_quadrants];
+        for list in lists {
+            for x in placed.iter().filter(|x| list.contains(&x.quadrant)) {
+                let Some(key) = &x.task.key else { continue };
+                let taken = picks
+                    .iter()
+                    .any(|q: &dispatch::Pick| q.project == x.task.project && &q.key == key);
+                if picks.len() == wanted
+                    || taken
+                    || has_run(&active, &x.task.project, key, &x.task.text)
+                {
+                    continue;
+                }
+                picks.push(dispatch::Pick {
+                    project: x.task.project.clone(),
+                    repo: repo(&x.task.project)?,
+                    key: key.clone(),
+                    text: x.task.text.clone(),
+                    gh: None,
+                    quadrant: Some(format!("{:?}", x.quadrant)),
+                });
+            }
+        }
+        let tasks = store.tasks()?;
+        for pick in &mut picks {
+            pick.gh = tasks
+                .iter()
+                .find(|t| t.project == pick.project && t.key == pick.key)
+                .and_then(|t| t.gh);
+        }
+    } else {
+        if targets.is_empty() {
+            return Err("name a target such as `cynn:31`, or use --auto".into());
+        }
+        let tasks = store.tasks()?;
+        for target in targets {
+            let (project, what) = target.rsplit_once(':').ok_or_else(|| {
+                format!("`{target}`: expected project:line, project:ci or project:deps")
+            })?;
+            let row = rows
+                .iter()
+                .find(|r| r.name == project)
+                .ok_or_else(|| format!("unknown project `{project}`"))?;
+            let (key, text, gh) = if what == "deps" {
+                match row.deps.filter(|n| *n > 0) {
+                    Some(n) => (
+                        "deps".to_string(),
+                        format!("update dependencies: {n} outdated"),
+                        None,
+                    ),
+                    None => {
+                        return Err(format!(
+                            "{project}: no outdated dependencies at the last `pma scan --deps`"
+                        )
+                        .into());
+                    }
+                }
+            } else if what == "ci" {
+                match &row.ci {
+                    scan::Ci::Failing(w) => {
+                        ("ci".to_string(), format!("fix CI: {}", w.join(", ")), None)
+                    }
+                    _ => {
+                        return Err(
+                            format!("{project}: CI was not failing at the last scan").into()
+                        );
+                    }
+                }
+            } else {
+                let line: i64 = what.parse().map_err(|_| {
+                    format!("`{target}`: expected project:line, project:ci or project:deps")
+                })?;
+                let t = tasks
+                    .iter()
+                    .find(|t| t.project == project && t.line == line)
+                    .ok_or_else(|| {
+                        format!("{project}:{line} is not an open item at the last scan")
+                    })?;
+                (t.key.clone(), t.text.clone(), t.gh)
+            };
+            if has_run(&active, project, &key, &text) {
+                return Err(format!("{target} already has a run; see `pma review`").into());
+            }
+            picks.push(dispatch::Pick {
+                project: project.into(),
+                repo: row.path.clone(),
+                quadrant: quadrant(project, &key),
+                key,
+                text,
+                gh,
+            });
+        }
+    }
+    if picks.is_empty() {
+        println!("nothing to dispatch");
+        return Ok(());
+    }
+
+    let mut queued = Vec::new();
+    for pick in &picks {
+        match dispatch::prepare(&store, &home, &p.cfg, pick) {
+            Ok(run) => {
+                println!("#{} {}: {}", run.id, run.project, run.text);
+                queued.push(run);
+            }
+            Err(e) => eprintln!("warning: {e}"),
+        }
+    }
+    if queued.is_empty() {
+        return Err("no run started".into());
+    }
+    let finished = dispatch::execute(&store, &home, &p.cfg, queued, |run| {
+        println!("{}", report::run_line(run));
+    })?;
+    let ready = finished
+        .iter()
+        .filter(|r| r.state == RunState::Ready)
+        .count();
+    let spent = finished
+        .iter()
+        .filter_map(|r| r.cost_usd)
+        .fold(0.0, |a, c| a + c);
+    println!(
+        "{ready} ready, {} failed, ${spent:.2} spent; see `pma review`",
+        finished.len() - ready
+    );
+    Ok(())
+}
+
+fn run_review(id: Option<i64>, approve: bool, reject: bool, rework: Option<&str>) -> Result<()> {
+    let store = Store::open_default()?;
+    store.fail_interrupted_runs()?;
+    let Some(id) = id else {
+        let runs: Vec<_> = store
+            .runs()?
+            .into_iter()
+            .filter(|r| !r.state.is_final())
+            .collect();
+        if runs.is_empty() {
+            println!("no runs to review");
+        } else {
+            print!("{}", report::runs(&runs));
+        }
+        return Ok(());
+    };
+    let mut run = store.run(id)?;
+    if approve {
+        dispatch::approve(&store, &mut run)?;
+    } else if reject {
+        dispatch::reject(&store, &mut run)?;
+    } else if let Some(feedback) = rework {
+        let cfg = load_config(&store)?;
+        dispatch::rework(&store, &store::home()?, &cfg, &mut run, feedback)?;
+        println!("{}", report::run_line(&run));
+    } else {
+        let diff = dispatch::diff(&run).unwrap_or_else(|e| format!("(no diff: {e})"));
+        print!("{}", report::run_detail(&run, &diff));
+    }
+    Ok(())
+}
+
+fn run_ship(projects: &[String]) -> Result<()> {
+    let store = Store::open_default()?;
+    let cfg = load_config(&store)?;
+    let runs: Vec<_> = store
+        .runs()?
+        .into_iter()
+        .filter(|r| r.state == RunState::Approved)
+        .filter(|r| projects.is_empty() || projects.contains(&r.project))
+        .collect();
+    if runs.is_empty() {
+        println!("nothing approved");
+        return Ok(());
+    }
+    let mut failed = 0;
+    ship::ship(&store, &cfg, runs, |run, outcome| match outcome {
+        Ok(o) => println!("#{} {}: {o}", run.id, run.project),
+        Err(e) => {
+            failed += 1;
+            println!("#{} {}: {e}", run.id, run.project);
+        }
+    })?;
+    if failed > 0 {
+        return Err(format!("{failed} runs not shipped; they stay approved").into());
+    }
+    Ok(())
+}
+
+fn run_sync(names: &[String], apply: bool) -> Result<()> {
+    let store = Store::open_default()?;
+    let rows = store.projects()?;
+    for n in names {
+        if !rows.iter().any(|r| &r.name == n) {
+            return Err(format!("unknown project `{n}`").into());
+        }
+    }
+    let me = sync::login()?;
+    let (mut changes, mut failed, mut edited) = (0, 0, Vec::new());
+    for row in rows
+        .iter()
+        .filter(|r| names.is_empty() || names.contains(&r.name))
+    {
+        let path = row.path.join("TODO.md");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let skip = |why: &str| println!("{}: skipped: {why}", row.name);
+        let parsed = todo::parse(&text);
+        if parsed.has_errors() {
+            skip("TODO.md has lint errors; see `pma lint`");
+            continue;
+        }
+        let Some(repo) = scan::git(&row.path, &["remote", "get-url", "origin"])
+            .and_then(|url| scan::github_slug(url.trim()))
+        else {
+            if !names.is_empty() {
+                skip("origin is not on GitHub");
+            }
+            continue;
+        };
+        let issues = match sync::issues(&repo) {
+            Ok(i) => i,
+            Err(e) => {
+                skip(&e);
+                failed += 1;
+                continue;
+            }
+        };
+        let actions = sync::plan(&parsed, &issues, &me);
+        for a in &actions {
+            match a.line() {
+                Some(line) => println!("{}:{line}: {}", row.name, a.describe()),
+                None => println!("{}: {}", row.name, a.describe()),
+            }
+        }
+        let planned = actions.iter().filter(|a| a.is_change()).count();
+        if !apply || planned == 0 {
+            changes += planned;
+            continue;
+        }
+        let before = text;
+        match sync::apply(&repo, &path, &actions) {
+            Ok(n) => changes += n,
+            Err(e) => {
+                println!("{}: stopped: {e}", row.name);
+                failed += 1;
+            }
+        }
+        if std::fs::read_to_string(&path).is_ok_and(|after| after != before) {
+            edited.push(row.name.clone());
+        }
+    }
+    if changes == 0 && failed == 0 {
+        println!("in sync");
+    } else if apply {
+        println!("{changes} changes made");
+    } else if changes > 0 {
+        println!("{changes} changes; run `pma sync --apply` to make them");
+    }
+    if !edited.is_empty() {
+        println!(
+            "TODO.md changed, uncommitted, in: {}; commit, then `pma scan`",
+            edited.join(", ")
+        );
+    }
+    if failed > 0 {
+        return Err(format!("{failed} projects not synced").into());
+    }
+    Ok(())
+}
+
+fn note(action: Option<NoteAction>) -> Result<()> {
+    let store = Store::open_default()?;
+    let text = |words: Vec<String>| -> Result<String> {
+        let t = words.join(" ").trim().to_string();
+        if t.is_empty() {
+            return Err("a note needs text".into());
+        }
+        Ok(t)
+    };
+    let missing = |id: i64| format!("no note #{id}");
+    match action {
+        None => {
+            let rows: Vec<Vec<String>> = store
+                .notes()?
+                .into_iter()
+                .map(|n| {
+                    vec![
+                        format!("#{}", n.id),
+                        dates::format(dates::day(n.updated_at)),
+                        n.text,
+                    ]
+                })
+                .collect();
+            if rows.is_empty() {
+                println!("no notes; add one with `pma note add <text>`");
+            }
+            print!("{}", report::table(&rows, ""));
+        }
+        Some(NoteAction::Add { text: words }) => {
+            let id = store.add_note(&text(words)?, dates::now())?;
+            println!("#{id}");
+        }
+        Some(NoteAction::Edit { id, text: words }) => {
+            if !store.edit_note(id, &text(words)?, dates::now())? {
+                return Err(missing(id).into());
+            }
+        }
+        Some(NoteAction::Rm { id }) => {
+            if !store.remove_note(id)? {
+                return Err(missing(id).into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_tui() -> Result<()> {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        return Err("pma tui needs a terminal; use `pma matrix` otherwise".into());
+    }
+    let p = portfolio(&[])?;
+    let header = header_text(&p);
+    let placed = rank::place(&p.cfg, p.tasks, p.today);
+    tui::run(tui::App::new(header, placed, p.today))?;
     Ok(())
 }

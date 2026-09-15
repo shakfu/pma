@@ -41,6 +41,21 @@ pub fn parse(s: &str) -> Option<i64> {
     (1..=days).contains(&d).then(|| from_civil(y, m, d))
 }
 
+/// `YYYY-MM-DD` for a day number.
+/// Algorithm from https://howardhinnant.github.io/date_algorithms.html#civil_from_days
+pub fn format(day: i64) -> String {
+    let z = day + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// Days from 1970-01-01 to a proleptic Gregorian date.
 /// Algorithm from https://howardhinnant.github.io/date_algorithms.html#days_from_civil
 fn from_civil(y: i64, m: i64, d: i64) -> i64 {
@@ -67,6 +82,7 @@ mod tests {
             ("2100-03-01", 47541),
         ] {
             assert_eq!(parse(s), Some(want), "{s}");
+            assert_eq!(format(want), s);
         }
     }
 

@@ -71,6 +71,31 @@ pub struct Item {
     pub description: Vec<String>,
 }
 
+impl Item {
+    /// Identity across scans and edits: `gh:N`, or the text in comparable form.
+    pub fn key(&self) -> String {
+        match self.gh {
+            Some(n) => format!("gh:{n}"),
+            None => normal_text(&self.text),
+        }
+    }
+
+    /// Whether this is the task known by `key` or by `text`. Sync adds `gh:N`
+    /// to an item, which changes its key but not its text.
+    pub fn is_task(&self, key: &str, text: &str) -> bool {
+        self.key() == key
+            || (!text.trim().is_empty() && normal_text(&self.text) == normal_text(text))
+    }
+}
+
+/// Item text in comparable form: lowercase, single-spaced.
+pub fn normal_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
     Warning,
@@ -432,6 +457,88 @@ pub fn is_token(word: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// Marks the open item that `is_task(key, task_text)` finished and moves it,
+/// with its description, to the top of `## Done`, which is appended when
+/// missing. Other lines are left byte for byte. `None` when no open item
+/// matches.
+pub fn mark_done(text: &str, key: &str, task_text: &str) -> Option<String> {
+    let parsed = parse(text);
+    let item = parsed
+        .items
+        .iter()
+        .find(|i| !i.done && i.priority.is_some() && i.is_task(key, task_text))?;
+    let mut lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let start = item.line - 1;
+    let moved: Vec<String> = lines
+        .drain(start..start + 1 + item.description.len())
+        .enumerate()
+        .map(|(i, l)| {
+            if i == 0 {
+                format!("- [x]{}", &l[5..])
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    let ending = if text.contains("\r\n") { "\r\n" } else { "\n" };
+
+    let mut in_fence = false;
+    let done = lines.iter().position(|l| {
+        if l.starts_with("```") || l.starts_with("~~~") {
+            in_fence = !in_fence;
+        }
+        !in_fence && l.trim_end() == "## Done"
+    });
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    if let Some(last) = out.last_mut()
+        && !last.ends_with('\n')
+    {
+        last.push_str(ending);
+    }
+    let mut moved = moved;
+    if let Some(last) = moved.last_mut()
+        && !last.ends_with('\n')
+    {
+        last.push_str(ending);
+    }
+    match done {
+        Some(h) => {
+            let mut at = h + 1;
+            while at < out.len() && out[at].trim().is_empty() {
+                at += 1;
+            }
+            if at == h + 1 {
+                out.insert(at, ending.to_string());
+                at += 1;
+            }
+            out.splice(at..at, moved);
+        }
+        None => {
+            if out.last().is_some_and(|l| !l.trim().is_empty()) {
+                out.push(ending.to_string());
+            }
+            out.push(format!("## Done{ending}"));
+            out.push(ending.to_string());
+            out.extend(moved);
+        }
+    }
+    Some(out.concat())
+}
+
+/// Appends ` token` to the item on 1-based `line`, keeping the line ending.
+/// `None` when that line is not an item.
+pub fn add_token(text: &str, line: usize, token: &str) -> Option<String> {
+    if !parse(text).items.iter().any(|i| i.line == line) {
+        return None;
+    }
+    let mut lines: Vec<String> = text.split_inclusive('\n').map(String::from).collect();
+    let target = lines.get_mut(line - 1)?;
+    let body = target.trim_end_matches(['\r', '\n']).trim_end().to_string();
+    let ending = target[target.trim_end_matches(['\r', '\n']).len()..].to_string();
+    *target = format!("{body} {token}{ending}");
+    Some(lines.concat())
+}
+
 /// Unsynced items are identified by their normalised text, and synced ones by
 /// `gh:N`, so either repeating breaks identity.
 fn check_duplicates(out: &mut Parsed) {
@@ -741,6 +848,64 @@ mod tests {
             "no text",
         );
         assert_reports("# TODO\n\n## Low\n\n- [ ]\n", 5, Severity::Error, "no text");
+    }
+
+    #[test]
+    fn mark_done_moves_the_item_and_its_description() {
+        let text = "# TODO\n\n## High\n\n- [ ] first #bug\n  why\n\n  more\n- [ ] Second  gh:4\n\n## Done\n\n- [x] old\n";
+        let out = mark_done(text, "first", "").unwrap();
+        assert_eq!(
+            out,
+            "# TODO\n\n## High\n\n- [ ] Second  gh:4\n\n## Done\n\n- [x] first #bug\n  why\n\n  more\n- [x] old\n"
+        );
+        assert_clean(&out);
+        let out = mark_done(&out, "gh:4", "").unwrap();
+        assert!(
+            out.contains("## High\n\n\n## Done\n\n- [x] Second  gh:4\n- [x] first"),
+            "{out}"
+        );
+        assert_eq!(
+            mark_done(text, "old", "old"),
+            None,
+            "finished items are not open"
+        );
+        assert_eq!(mark_done(text, "missing", ""), None);
+        assert!(
+            mark_done(text, "second", "SECOND").is_some(),
+            "a key that gained gh:N still matches by text"
+        );
+    }
+
+    #[test]
+    fn mark_done_adds_a_done_section_when_missing() {
+        let out = mark_done("# TODO\n\n## Low\n\n- [ ] only", "only", "").unwrap();
+        assert_eq!(out, "# TODO\n\n## Low\n\n## Done\n\n- [x] only\n");
+        let out = mark_done("# TODO\r\n\r\n## Low\r\n- [ ] a\r\n## Done\r\n", "a", "").unwrap();
+        assert_eq!(out, "# TODO\r\n\r\n## Low\r\n## Done\r\n\r\n- [x] a\r\n");
+        let fenced = "# TODO\n\n## Low\n\n- [ ] a\n  ```\n## Notes\n\n```\n## Done\n```\n";
+        assert!(
+            mark_done(fenced, "a", "")
+                .unwrap()
+                .ends_with("```\n\n## Done\n\n- [x] a\n  ```\n")
+        );
+    }
+
+    #[test]
+    fn add_token_appends_to_item_lines_only() {
+        let text = "# TODO\r\n\r\n## Critical\r\n\r\n- [ ] crash #bug  \r\n- [ ] last";
+        let out = add_token(text, 5, "gh:12").unwrap();
+        assert_eq!(
+            out,
+            "# TODO\r\n\r\n## Critical\r\n\r\n- [ ] crash #bug gh:12\r\n- [ ] last"
+        );
+        assert_eq!(parse(&out).items[0].gh, Some(12));
+        assert!(
+            add_token(text, 6, "gh:3")
+                .unwrap()
+                .ends_with("- [ ] last gh:3")
+        );
+        assert_eq!(add_token(text, 3, "gh:1"), None, "a heading is not an item");
+        assert_eq!(add_token(text, 99, "gh:1"), None);
     }
 
     #[test]

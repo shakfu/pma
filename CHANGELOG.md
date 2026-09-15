@@ -4,6 +4,50 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+**Deps signal.** `pma scan --deps` counts outdated dependencies with
+`cargo update --dry-run`, `uv tree --outdated` and `go list -u -m all`, adds
+an "update dependencies" task, and scores deps in health. It is opt-in because
+it took 44s for 52 repos against 1s for a plain scan. Plain scans keep the last
+measurement. Counts differ in kind between tools: cargo's include transitive
+crates.
+
+**`pma note`** adds, edits, removes and lists portfolio notes.
+
+**`pma tui`** shows the matrix as a 2x2 layout with the selected task's
+details. `ratatui` is built with only its crossterm backend, which adds 69
+crates instead of 152.
+
+**`pma sync`.** Opens an issue labelled `pma:critical` for each `## Critical`
+item and writes `gh:N` into its line, marks items done when their issue is
+closed, retitles and relabels linked issues to match TODO.md, and lists open
+issues by other people. A dry run unless `--apply`. Write-backs stay
+uncommitted in the clone rather than going through `pma ship`, which commits
+worktrees only.
+
+Each `gh:N` is saved as soon as its issue exists, and an open labelled issue
+with an unlinked item's title is linked rather than duplicated, so an
+interrupted sync does not open a second issue. Adding `gh:N` changes an item's
+key, so dispatch and ship now match a task by key or by text.
+
+**`pma dispatch`, `pma review`, `pma ship`.** Run `claude` on tasks in
+worktrees of the remote default branch, verify the result with the project's
+own tests, review the diff, then commit, push or open a PR, and mark the item
+done. Settings: `max_parallel`, `batch_budget`, `agent_budget`, `timeout`,
+`publish`, `attribution`, `dispatch_quadrants`, `overflow_quadrants`, and
+per project `projects.<name>.verify` and `projects.<name>.publish`. The
+database schema moves to version 2; version 1 databases are upgraded on open.
+
+The item is marked done after the rebase, not before. Two tasks from one
+project each insert at the top of `## Done`, so editing first made the second
+rebase conflict. An item must be open in the remote `TODO.md` to be
+dispatched; otherwise ship would have no line to mark.
+
+`claude --max-budget-usd` is checked between turns and was exceeded in use
+($0.09 under a $0.05 cap). `batch_budget` limits which runs start, not their
+total spend.
+
 ### Changed
 
 **`pma lint` accepts bullets outside the priority sections in a migrated

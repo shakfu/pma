@@ -142,6 +142,7 @@ pub fn status(cfg: &Config, rows: &[StatusRow], explain: bool) -> String {
         let local = [
             (p.dirty > 0).then(|| format!("{} changed", p.dirty)),
             p.ahead.filter(|n| *n > 0).map(|n| format!("{n} ahead")),
+            (p.leftover > 0).then(|| format!("{} leftover", p.leftover)),
         ]
         .into_iter()
         .flatten()
@@ -436,6 +437,7 @@ mod tests {
             idle_days: Some(1),
             ci: Ci::Passing,
             dirty: 0,
+            leftover: 0,
             ahead: Some(0),
             deps: None,
         };

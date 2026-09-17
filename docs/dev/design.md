@@ -123,7 +123,7 @@ task in `dispatch_quadrants` is dispatched, in review, or not dispatchable.
 This departs from the source, which says to do Q1 yourself and delegate Q3.
 Agents here work on the important tasks, so the review stage is the control.
 
-## TODO.md format, v1
+## TODO.md format, v2
 
 ```markdown
 # TODO
@@ -142,8 +142,6 @@ Agents here work on the important tasks, so the review stage is the control.
 
 ## Low
 
-## Done
-
 - [x] drop python 3.9
 ```
 
@@ -152,8 +150,8 @@ not.
 
 - The first non-blank line is `# TODO` (E). No second `#` heading (E).
 - Priority comes from the enclosing `##` section: `Critical`, `High`, `Medium`,
-  `Low`. `Done` holds finished items. Names are exact, including case (E), and
-  each appears at most once (E).
+  `Low`. Names are exact, including case (E), and each appears at most once
+  (E).
 - Other `##` sections are allowed and ignored. A checkbox item in one, or before
   the first `##`, is ignored (W). A file with no items but with plain bullets in
   other sections is flagged once (W): its tasks are invisible to `pma`.
@@ -166,7 +164,11 @@ not.
 - Indented lines under an item are its description, carried verbatim, including
   blank lines between them. An indented line with no item above it (W).
 - Unindented fenced code blocks are skipped.
-- `- [ ]` under `## Done` (E). `- [x]` in a priority section (W).
+- `- [x]` marks a finished item, which stays in its section. `pma prune`
+  removes finished items and their descriptions; a file with errors is skipped.
+- `## Done`, from v1, is an unknown section whose checkbox items warn (W).
+  `pma prune` removes the section whole, whatever it holds, and lists any open
+  item in it.
 - Trailing tokens, read from the end of the line until a word is not a token:
   - `#tag`: a letter, then letters, digits, `-` or `_`. `#urgent` is a tag.
   - `due:YYYY-MM-DD`: a real calendar date (E), at most one (E).
@@ -204,7 +206,7 @@ written tasks and maintenance. They are never written to `TODO.md`.
 | ci | `gh run list` on the default branch | fix CI | when failing | High | yes |
 | deps | per ecosystem: `cargo`, `go list -u -m all`, `uv` | update dependencies | no | Medium | yes |
 | activity | `git log`, excluding commits whose paths all match `activity.ignore` | review project, once idle beyond the tier's horizon | no | Low | no |
-| hygiene | changed files (`git status`), unpushed commits; later, leftover `pma` worktrees | resolve local changes | no | Medium | no |
+| hygiene | changed files (`git status`), unpushed commits, leftover `pma/` branches | resolve local changes | no | Medium | no |
 
 A review-project task is as old as the time since the horizon was crossed, not
 the time since the last commit. Otherwise it would reach `stale_after` on the
@@ -219,6 +221,12 @@ Q3.
 
 Hygiene and activity tasks concern the user's working tree or judgement, which
 agents never touch, so they are not dispatchable.
+
+Every `pma` worktree is made with a `pma/` branch, so counting branches finds
+worktrees too, and branches whose worktree is gone. A branch is leftover when no
+open run of that project owns it at scan time. Ship and reject remove the branch
+before a run becomes final, so leftovers come from interrupted dispatches or a
+lost database.
 
 A fix-CI dispatch includes `gh run view --log-failed` output in the prompt.
 `pma` fetches it, because the agent environment has no GitHub credentials. The
@@ -259,7 +267,7 @@ neither lowers nor raises the score.
 | activity | days idle / tier horizon, capped at 1; 1 when no counted commit exists |
 | ci | failing 1, passing 0, no runs 0.5; unmeasured when unknown or `--offline` |
 | deps | outdated count / 10, capped at 1; unmeasured when never measured |
-| hygiene | 0.5 for changed files, plus 0.5 for unpushed commits |
+| hygiene | 0.5 each for changed files, unpushed commits and leftover `pma/` branches, capped at 1 |
 
 `pma status --explain` prints each signal's contribution. Weights cannot be
 calibrated without it.
@@ -449,9 +457,9 @@ base, untracked files included. Actions:
    when `gh:N` is set. Author is the user. With `attribution = "co-author"`, a
    trailer names the agent.
 2. With `publish = "push"`, rebase onto the remote default branch.
-3. Mark the item `[x]`, move it to the top of `Done`, and amend the commit.
-   This follows the rebase. Two tasks shipped from one project each insert at
-   the top of `Done`, so editing before the rebase conflicts on the second.
+3. Mark the item `[x]` in place and amend the commit. This follows the rebase.
+   Git treats changes to adjacent lines as a conflict, so two tasks ticked
+   before the rebase could conflict.
    A fix-CI run has no item and skips this step.
 4. Publish per `publish`:
    - `push`: push to the default branch.
@@ -469,8 +477,7 @@ uncommitted `TODO.md` edit there can conflict on pull.
 
 - `TODO.md` to Issues: `Critical` items without `gh:N` get an issue labelled
   `pma:critical`. `pma` writes `gh:N` back into the line.
-- Issues to `TODO.md`: an issue closed on GitHub marks its line `[x]` and moves
-  it to `Done`.
+- Issues to `TODO.md`: an issue closed on GitHub marks its line `[x]`.
 - Conflicts: `TODO.md` wins on text and priority. GitHub wins on closed state.
   A linked open item whose issue title differs retitles the issue. A linked
   item moved out of `Critical` loses the label; one moved in gains it.
@@ -518,9 +525,9 @@ Each stage is used before the next one is built.
 1. Format spec, `pma lint`, and migration of the 64 files.
 2. `pma scan`, `pma matrix`, `pma status --explain`, with tiers and weights.
 3. `pma dispatch`, `pma review`, `pma ship`, with `claude` first, then the other
-   three agent templates. Built: `claude`. Not built: the other three agents,
-   offering Q4 items for removal, and leftover worktrees in the hygiene
-   signal.
+   three agent templates. Built: `claude`, and leftover worktrees in the
+   hygiene signal. Not built: the other three agents, and offering Q4 items
+   for removal.
 4. `pma sync` with Issues. Built.
 5. Notes commands, deps signal, TUI. Built. The deps signal covers cargo, uv
    and go; npm (2 repos here) is not covered.

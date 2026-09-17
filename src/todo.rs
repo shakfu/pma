@@ -1,4 +1,4 @@
-//! Parser and linter for the TODO.md format, v1.
+//! Parser and linter for the TODO.md format, v2.
 //!
 //! The format is specified in `docs/dev/design.md`. Parsing is line-based so
 //! that later edits can rewrite single lines without re-rendering content the
@@ -37,28 +37,18 @@ impl Priority {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Section {
-    Priority(Priority),
-    Done,
-}
-
-impl Section {
-    const ALL: [(&'static str, Section); 5] = [
-        ("Critical", Section::Priority(Priority::Critical)),
-        ("High", Section::Priority(Priority::High)),
-        ("Medium", Section::Priority(Priority::Medium)),
-        ("Low", Section::Priority(Priority::Low)),
-        ("Done", Section::Done),
-    ];
-}
+const SECTIONS: [(&str, Priority); 4] = [
+    ("Critical", Priority::Critical),
+    ("High", Priority::High),
+    ("Medium", Priority::Medium),
+    ("Low", Priority::Low),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
     /// 1-based line number of the item line.
     pub line: usize,
-    /// The enclosing priority section; `None` for items under `## Done`.
-    pub priority: Option<Priority>,
+    pub priority: Priority,
     pub done: bool,
     pub text: String,
     pub tags: Vec<String>,
@@ -122,6 +112,17 @@ pub struct Diagnostic {
 pub struct Parsed {
     pub items: Vec<Item>,
     pub diagnostics: Vec<Diagnostic>,
+    /// Each `## Done` section, a v1 leftover.
+    pub done_sections: Vec<DoneSection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoneSection {
+    /// 1-based lines of the heading and of the section's last line.
+    pub first: usize,
+    pub last: usize,
+    /// Line number and text of each `- [ ]` item, which v1 did not allow here.
+    pub open: Vec<(usize, String)>,
 }
 
 impl Parsed {
@@ -140,18 +141,20 @@ impl Parsed {
     }
 }
 
-/// Where the parser is: before any `##`, in a known section, or in another one.
+/// Where the parser is: before any `##`, in a priority section, in v1's
+/// `## Done`, or in another section.
 #[derive(Clone, Copy)]
 enum Place {
     Preamble,
-    Known(Section),
+    Known(Priority),
+    Done,
     Other,
 }
 
 pub fn parse(text: &str) -> Parsed {
     let mut out = Parsed::default();
     let mut place = Place::Preamble;
-    let mut seen_sections: HashMap<Section, usize> = HashMap::new();
+    let mut seen_sections: HashMap<Priority, usize> = HashMap::new();
     let mut title_line: Option<usize> = None;
     let mut first_content = true;
     let mut in_fence = false;
@@ -221,7 +224,19 @@ pub fn parse(text: &str) -> Parsed {
         }
 
         if let Some(name) = line.strip_prefix("## ") {
+            if matches!(place, Place::Done)
+                && let Some(section) = out.done_sections.last_mut()
+            {
+                section.last = n - 1;
+            }
             place = section_heading(name.trim(), n, &mut seen_sections, &mut out);
+            if matches!(place, Place::Done) {
+                out.done_sections.push(DoneSection {
+                    first: n,
+                    last: text.lines().count(),
+                    open: Vec::new(),
+                });
+            }
             group = None;
             continue;
         }
@@ -239,21 +254,25 @@ pub fn parse(text: &str) -> Parsed {
         }
 
         match place {
-            Place::Known(section) => {
-                if let Some(mut item) = item_line(line, n, section, &mut out) {
+            Place::Known(priority) => {
+                if let Some(mut item) = item_line(line, n, priority, &mut out) {
                     item.group = group.clone();
                     open = Some(item);
                 }
             }
-            Place::Preamble | Place::Other => {
+            Place::Preamble | Place::Done | Place::Other => {
                 if is_checkbox(line) {
                     let msg = match place {
                         Place::Preamble => "item outside a section is ignored",
-                        _ => {
-                            "item in this section is ignored; use Critical, High, Medium, Low or Done"
-                        }
+                        Place::Done => "`## Done` is not part of format v2; `pma prune` removes it",
+                        _ => "item in this section is ignored; use Critical, High, Medium or Low",
                     };
                     out.report(n, Severity::Warning, msg);
+                    if let (Place::Done, Some(' '), Some(section)) =
+                        (place, checkbox_mark(line), out.done_sections.last_mut())
+                    {
+                        section.open.push((n, line.to_string()));
+                    }
                 } else if is_bullet(line) {
                     ignored_bullets += 1;
                 }
@@ -272,7 +291,7 @@ pub fn parse(text: &str) -> Parsed {
             1,
             Severity::Warning,
             format!(
-                "no items; {ignored_bullets} list entries outside Critical, High, Medium, Low and Done are ignored"
+                "no items; {ignored_bullets} list entries outside Critical, High, Medium and Low are ignored"
             ),
         );
     }
@@ -289,10 +308,13 @@ fn finish(open: &mut Option<Item>, out: &mut Parsed) {
 fn section_heading(
     name: &str,
     n: usize,
-    seen: &mut HashMap<Section, usize>,
+    seen: &mut HashMap<Priority, usize>,
     out: &mut Parsed,
 ) -> Place {
-    let Some((canonical, section)) = Section::ALL
+    if name == "Done" {
+        return Place::Done;
+    }
+    let Some((canonical, priority)) = SECTIONS
         .iter()
         .find(|(known, _)| known.eq_ignore_ascii_case(name))
     else {
@@ -305,14 +327,14 @@ fn section_heading(
             format!("write the heading as `## {canonical}`"),
         );
     }
-    if let Some(first) = seen.insert(*section, n) {
+    if let Some(first) = seen.insert(*priority, n) {
         out.report(
             n,
             Severity::Error,
             format!("`## {canonical}` appears again; the first is on line {first}"),
         );
     }
-    Place::Known(*section)
+    Place::Known(*priority)
 }
 
 fn is_bullet(line: &str) -> bool {
@@ -338,7 +360,7 @@ fn checkbox_mark(line: &str) -> Option<char> {
     rest[1 + mark.len_utf8()..].starts_with(']').then_some(mark)
 }
 
-fn item_line(line: &str, n: usize, section: Section, out: &mut Parsed) -> Option<Item> {
+fn item_line(line: &str, n: usize, priority: Priority, out: &mut Parsed) -> Option<Item> {
     let canonical = match line.get(..5) {
         Some("- [ ]") => Some(false),
         Some("- [x]") => Some(true),
@@ -372,10 +394,7 @@ fn item_line(line: &str, n: usize, section: Section, out: &mut Parsed) -> Option
 
     let mut item = Item {
         line: n,
-        priority: match section {
-            Section::Priority(p) => Some(p),
-            Section::Done => None,
-        },
+        priority,
         done,
         text: words[..split].join(" "),
         tags: Vec::new(),
@@ -432,13 +451,6 @@ fn item_line(line: &str, n: usize, section: Section, out: &mut Parsed) -> Option
     if item.text.is_empty() {
         out.report(n, Severity::Error, "the item has no text");
     }
-    match (section, done) {
-        (Section::Done, false) => out.report(n, Severity::Error, "open item under `## Done`"),
-        (Section::Priority(_), true) => {
-            out.report(n, Severity::Warning, "finished item; move it to `## Done`")
-        }
-        _ => {}
-    }
     Some(item)
 }
 
@@ -457,72 +469,57 @@ pub fn is_token(word: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// Marks the open item that `is_task(key, task_text)` finished and moves it,
-/// with its description, to the top of `## Done`, which is appended when
-/// missing. Other lines are left byte for byte. `None` when no open item
-/// matches.
+/// Ticks the open item that `is_task(key, task_text)` finished, where it
+/// stands. Other bytes are unchanged. `None` when no open item matches.
 pub fn mark_done(text: &str, key: &str, task_text: &str) -> Option<String> {
-    let parsed = parse(text);
-    let item = parsed
+    let item = parse(text)
         .items
-        .iter()
-        .find(|i| !i.done && i.priority.is_some() && i.is_task(key, task_text))?;
+        .into_iter()
+        .find(|i| !i.done && i.is_task(key, task_text))?;
     let mut lines: Vec<&str> = text.split_inclusive('\n').collect();
-    let start = item.line - 1;
-    let moved: Vec<String> = lines
-        .drain(start..start + 1 + item.description.len())
-        .enumerate()
-        .map(|(i, l)| {
-            if i == 0 {
-                format!("- [x]{}", &l[5..])
-            } else {
-                l.to_string()
-            }
-        })
-        .collect();
-    let ending = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let target = format!("- [x]{}", &lines[item.line - 1][5..]);
+    lines[item.line - 1] = &target;
+    Some(lines.concat())
+}
 
-    let mut in_fence = false;
-    let done = lines.iter().position(|l| {
-        if l.starts_with("```") || l.starts_with("~~~") {
-            in_fence = !in_fence;
-        }
-        !in_fence && l.trim_end() == "## Done"
-    });
-    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
-    if let Some(last) = out.last_mut()
-        && !last.ends_with('\n')
-    {
-        last.push_str(ending);
+#[derive(Debug, PartialEq)]
+pub struct Pruned {
+    pub text: String,
+    pub items: Vec<Item>,
+    /// Each removed `## Done` section.
+    pub done_sections: Vec<DoneSection>,
+}
+
+/// Removes finished items with their descriptions, and each `## Done`
+/// section whole. Blank lines before a section that ends the file go too.
+/// Other lines are unchanged.
+pub fn prune(text: &str) -> Pruned {
+    let parsed = parse(text);
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut drop = vec![false; lines.len()];
+    let items: Vec<Item> = parsed.items.into_iter().filter(|i| i.done).collect();
+    for item in &items {
+        drop[item.line - 1..item.line + item.description.len()].fill(true);
     }
-    let mut moved = moved;
-    if let Some(last) = moved.last_mut()
-        && !last.ends_with('\n')
-    {
-        last.push_str(ending);
-    }
-    match done {
-        Some(h) => {
-            let mut at = h + 1;
-            while at < out.len() && out[at].trim().is_empty() {
-                at += 1;
+    for &DoneSection { first, last, .. } in &parsed.done_sections {
+        let mut start = first - 1;
+        if last == lines.len() {
+            while start > 0 && lines[start - 1].trim().is_empty() {
+                start -= 1;
             }
-            if at == h + 1 {
-                out.insert(at, ending.to_string());
-                at += 1;
-            }
-            out.splice(at..at, moved);
         }
-        None => {
-            if out.last().is_some_and(|l| !l.trim().is_empty()) {
-                out.push(ending.to_string());
-            }
-            out.push(format!("## Done{ending}"));
-            out.push(ending.to_string());
-            out.extend(moved);
-        }
+        drop[start..last].fill(true);
     }
-    Some(out.concat())
+    Pruned {
+        text: lines
+            .iter()
+            .zip(&drop)
+            .filter(|(_, d)| !**d)
+            .map(|(l, _)| *l)
+            .collect(),
+        items,
+        done_sections: parsed.done_sections,
+    }
 }
 
 /// Appends ` token` to the item on 1-based `line`, keeping the line ending.
@@ -615,8 +612,6 @@ mod tests {
 
 ## Low
 
-## Done
-
 - [x] drop python 3.9
 ";
 
@@ -631,15 +626,10 @@ mod tests {
         assert_eq!(
             summary,
             vec![
-                (
-                    5,
-                    Some(Priority::Critical),
-                    false,
-                    "segfault on empty input"
-                ),
-                (9, Some(Priority::High), false, "support ggml 0.9"),
-                (13, Some(Priority::Medium), false, "flaky test on linux"),
-                (19, None, true, "drop python 3.9"),
+                (5, Priority::Critical, false, "segfault on empty input"),
+                (9, Priority::High, false, "support ggml 0.9"),
+                (13, Priority::Medium, false, "flaky test on linux"),
+                (17, Priority::Low, true, "drop python 3.9"),
             ]
         );
         assert_eq!(parsed.items[0].tags, ["bug"]);
@@ -679,7 +669,7 @@ mod tests {
             "# TODO\n\n## Notes\n\nprose\n- [ ] ignored\n\n## High\n\n### parser\n\n- [ ] kept\n";
         let parsed = parse(text);
         assert_eq!(parsed.items.len(), 1);
-        assert_eq!(parsed.items[0].priority, Some(Priority::High));
+        assert_eq!(parsed.items[0].priority, Priority::High);
         assert_reports(text, 6, Severity::Warning, "ignored");
         assert_eq!(parsed.diagnostics.len(), 1);
     }
@@ -721,7 +711,7 @@ mod tests {
             "# TODO\n\n## High\n\n```\n## Done\n- [ ] not an item\n```\n\n- [ ] real\n",
         );
         assert_eq!(parsed.items.len(), 1);
-        assert_eq!(parsed.items[0].priority, Some(Priority::High));
+        assert_eq!(parsed.items[0].priority, Priority::High);
     }
 
     #[test]
@@ -828,19 +818,8 @@ mod tests {
     }
 
     #[test]
-    fn item_state_must_match_section() {
-        assert_reports(
-            "# TODO\n\n## Done\n\n- [ ] open\n",
-            5,
-            Severity::Error,
-            "open item under `## Done`",
-        );
-        assert_reports(
-            "# TODO\n\n## Low\n\n- [x] closed\n",
-            5,
-            Severity::Warning,
-            "move it to `## Done`",
-        );
+    fn items_need_text_and_may_be_finished_in_place() {
+        assert_clean("# TODO\n\n## Low\n\n- [x] closed\n");
         assert_reports(
             "# TODO\n\n## Low\n\n- [ ] #only-tags\n",
             5,
@@ -851,19 +830,14 @@ mod tests {
     }
 
     #[test]
-    fn mark_done_moves_the_item_and_its_description() {
-        let text = "# TODO\n\n## High\n\n- [ ] first #bug\n  why\n\n  more\n- [ ] Second  gh:4\n\n## Done\n\n- [x] old\n";
+    fn mark_done_ticks_the_item_in_place() {
+        let text = "# TODO\n\n## High\n\n- [ ] first #bug\n  why\n- [ ] Second  gh:4\n- [x] old\n";
         let out = mark_done(text, "first", "").unwrap();
         assert_eq!(
             out,
-            "# TODO\n\n## High\n\n- [ ] Second  gh:4\n\n## Done\n\n- [x] first #bug\n  why\n\n  more\n- [x] old\n"
+            "# TODO\n\n## High\n\n- [x] first #bug\n  why\n- [ ] Second  gh:4\n- [x] old\n"
         );
         assert_clean(&out);
-        let out = mark_done(&out, "gh:4", "").unwrap();
-        assert!(
-            out.contains("## High\n\n\n## Done\n\n- [x] Second  gh:4\n- [x] first"),
-            "{out}"
-        );
         assert_eq!(
             mark_done(text, "old", "old"),
             None,
@@ -874,20 +848,60 @@ mod tests {
             mark_done(text, "second", "SECOND").is_some(),
             "a key that gained gh:N still matches by text"
         );
-    }
-
-    #[test]
-    fn mark_done_adds_a_done_section_when_missing() {
-        let out = mark_done("# TODO\n\n## Low\n\n- [ ] only", "only", "").unwrap();
-        assert_eq!(out, "# TODO\n\n## Low\n\n## Done\n\n- [x] only\n");
-        let out = mark_done("# TODO\r\n\r\n## Low\r\n- [ ] a\r\n## Done\r\n", "a", "").unwrap();
-        assert_eq!(out, "# TODO\r\n\r\n## Low\r\n## Done\r\n\r\n- [x] a\r\n");
-        let fenced = "# TODO\n\n## Low\n\n- [ ] a\n  ```\n## Notes\n\n```\n## Done\n```\n";
+        assert_eq!(
+            mark_done("# TODO\r\n\r\n## Low\r\n- [ ] a gh:2", "gh:2", "").unwrap(),
+            "# TODO\r\n\r\n## Low\r\n- [x] a gh:2"
+        );
+        let fenced = "# TODO\n\n## Low\n\n```\n- [ ] a\n```\n- [ ] a\n";
         assert!(
             mark_done(fenced, "a", "")
                 .unwrap()
-                .ends_with("```\n\n## Done\n\n- [x] a\n  ```\n")
+                .ends_with("```\n- [ ] a\n```\n- [x] a\n")
         );
+    }
+
+    #[test]
+    fn prune_removes_finished_items_with_their_descriptions() {
+        let text = "# TODO\r\n\r\n## High\r\n\r\n- [x] done #bug\r\n  why\r\n\r\n  more\r\n- [ ] open\r\n  kept\r\n\r\n## Low\r\n\r\n```\r\n- [x] fenced\r\n```\r\n- [x] last";
+        let pruned = prune(text);
+        assert_eq!(
+            pruned.text,
+            "# TODO\r\n\r\n## High\r\n\r\n- [ ] open\r\n  kept\r\n\r\n## Low\r\n\r\n```\r\n- [x] fenced\r\n```\r\n"
+        );
+        let removed: Vec<_> = pruned
+            .items
+            .iter()
+            .map(|i| (i.line, i.text.as_str()))
+            .collect();
+        assert_eq!(removed, [(5, "done"), (17, "last")]);
+        assert!(pruned.done_sections.is_empty());
+        assert_clean(&pruned.text);
+        assert_eq!(prune(&pruned.text).text, pruned.text);
+    }
+
+    #[test]
+    fn prune_removes_done_sections_whole() {
+        let text = "# TODO\n\n## Low\n\n- [ ] a\n\n## Done\n\n### old\n\n- [x] b\n  why\nprose\n- [ ] open\n```\n## Notes\n```\n\n## Notes\n\nkept\n\n## Done\n\n- [x] c\n\n";
+        assert_reports(text, 11, Severity::Warning, "`pma prune` removes it");
+        let pruned = prune(text);
+        let spans: Vec<_> = pruned
+            .done_sections
+            .iter()
+            .map(|d| (d.first, d.last, d.open.clone()))
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                (7, 18, vec![(14, "- [ ] open".to_string())]),
+                (23, 26, vec![])
+            ]
+        );
+        assert!(pruned.items.is_empty());
+        assert_eq!(
+            pruned.text,
+            "# TODO\n\n## Low\n\n- [ ] a\n\n## Notes\n\nkept\n"
+        );
+        assert_clean(&pruned.text);
     }
 
     #[test]
@@ -910,7 +924,7 @@ mod tests {
 
     #[test]
     fn duplicates_break_identity() {
-        let text = "# TODO\n\n## High\n\n- [ ] Fix  it gh:3\n\n## Low\n\n- [ ] fix it\n- [ ] other gh:3\n\n## Done\n\n- [x] fix it\n";
+        let text = "# TODO\n\n## High\n\n- [ ] Fix  it gh:3\n\n## Low\n\n- [ ] fix it\n- [ ] other gh:3\n- [x] fix it\n";
         assert_reports(text, 9, Severity::Error, "open item on line 5");
         assert_reports(text, 10, Severity::Error, "also on line 5");
         assert_eq!(

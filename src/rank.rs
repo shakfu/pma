@@ -54,6 +54,8 @@ pub struct Project {
     pub idle_days: Option<i64>,
     pub ci: Ci,
     pub dirty: i64,
+    /// `pma/` branches that no open run owns.
+    pub leftover: i64,
     pub ahead: Option<i64>,
     /// Outdated dependencies and days since measured; `None` if never measured
     /// or not applicable.
@@ -228,6 +230,9 @@ pub fn local_changes(p: &Project) -> String {
     if let Some(n) = p.ahead.filter(|n| *n > 0) {
         parts.push(plural(n, "unpushed commit"));
     }
+    if p.leftover > 0 {
+        parts.push(plural(p.leftover, "leftover pma branch"));
+    }
     parts.join(", ")
 }
 
@@ -326,8 +331,8 @@ pub fn health(cfg: &Config, p: &Project) -> (f64, Vec<Component>) {
         },
         {
             let local = local_changes(p);
-            let score = 0.5 * f64::from(u8::from(p.dirty > 0))
-                + 0.5 * f64::from(u8::from(p.ahead.unwrap_or(0) > 0));
+            let flags = [p.dirty > 0, p.ahead.unwrap_or(0) > 0, p.leftover > 0];
+            let score = (0.5 * flags.iter().filter(|f| **f).count() as f64).min(1.0);
             (
                 "hygiene",
                 Some(score),
@@ -393,6 +398,7 @@ mod tests {
             idle_days: Some(0),
             ci: Ci::Passing,
             dirty: 0,
+            leftover: 0,
             ahead: Some(0),
             deps: None,
         }
@@ -525,6 +531,7 @@ mod tests {
             ci: Ci::Failing(vec!["test".into(), "wheels".into()]),
             dirty: 1,
             ahead: Some(2),
+            leftover: 1,
             idle_days: Some(31),
             deps: Some((3, 2)),
             ..project(1)
@@ -547,7 +554,7 @@ mod tests {
                 (Priority::Medium, "update dependencies: 3 outdated", false),
                 (
                     Priority::Medium,
-                    "resolve local changes: 1 changed file, 2 unpushed commits",
+                    "resolve local changes: 1 changed file, 2 unpushed commits, 1 leftover pma branch",
                     false
                 ),
                 (
@@ -619,6 +626,25 @@ mod tests {
         assert_eq!(parts[3].detail, "4 outdated, measured 1 day ago");
         assert_eq!(parts[0].detail, "open: 1 critical, 2 high");
         assert_eq!(parts[4].detail, "4 changed files");
+
+        let hygiene = |p: &Project| {
+            let (_, parts) = health(&cfg, p);
+            parts[4].score
+        };
+        let stray = Project {
+            leftover: 2,
+            ..project(1)
+        };
+        assert_eq!(hygiene(&stray), Some(0.5));
+        assert_eq!(
+            hygiene(&Project {
+                dirty: 1,
+                ahead: Some(1),
+                ..stray
+            }),
+            Some(1.0),
+            "capped at 1"
+        );
 
         let (clean, _) = health(&cfg, &project(1));
         assert_eq!(

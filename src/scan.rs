@@ -19,6 +19,8 @@ pub struct Facts {
     /// `None` when the project has no TODO.md.
     pub todo: Option<TodoFacts>,
     pub dirty: i64,
+    /// Local branches under `pma/`, each made for a run's worktree.
+    pub pma_branches: Vec<String>,
     /// Commits not on the upstream; `None` without an upstream.
     pub ahead: Option<i64>,
     /// Unix time of the newest commit touching a path outside `activity.ignore`.
@@ -175,6 +177,7 @@ pub fn scan_project(
         path: path.into(),
         todo: None,
         dirty: 0,
+        pma_branches: Vec::new(),
         ahead: None,
         last_activity: None,
         ci: Ci::Unknown("offline".into()),
@@ -195,6 +198,16 @@ pub fn scan_project(
             return facts;
         }
     }
+    facts.pma_branches = git(
+        path,
+        &[
+            "for-each-ref",
+            "--format=%(refname:lstrip=2)",
+            "refs/heads/pma/",
+        ],
+    )
+    .map(|out| out.lines().map(String::from).collect())
+    .unwrap_or_default();
     facts.ahead =
         git(path, &["rev-list", "--count", "@{u}..HEAD"]).and_then(|s| s.trim().parse().ok());
     facts.last_activity = last_activity(path, ignore);
@@ -219,7 +232,9 @@ fn todo_facts(text: &str, added: &HashMap<String, i64>) -> TodoFacts {
         .items
         .into_iter()
         .filter_map(|item| {
-            let priority = item.priority.filter(|_| !item.done)?;
+            if item.done {
+                return None;
+            }
             let normal = normal_text(&item.text);
             let key = item.key();
             // Duplicates are lint errors; the first occurrence stands.
@@ -230,7 +245,7 @@ fn todo_facts(text: &str, added: &HashMap<String, i64>) -> TodoFacts {
             Some(ScannedItem {
                 key,
                 line,
-                priority,
+                priority: item.priority,
                 text: item.text,
                 tags: item.tags,
                 due: item.due,
@@ -633,7 +648,7 @@ mod tests {
 
     #[test]
     fn todo_facts_keep_open_prioritised_items_once() {
-        let text = "# TODO\n\n## High\n\n- [ ] one #a due:2026-10-01\n- [ ] linked gh:7\n- [ ] One\n- [x] finished\n\n## Done\n\n- [x] old\n";
+        let text = "# TODO\n\n## High\n\n- [ ] one #a due:2026-10-01\n- [ ] linked gh:7\n- [ ] One\n- [x] finished\n";
         let facts = todo_facts(text, &HashMap::from([("one".to_string(), 50)]));
         assert_eq!(facts.lint_errors, 1, "the duplicate is a lint error");
         let got: Vec<_> = facts

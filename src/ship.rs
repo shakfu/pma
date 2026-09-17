@@ -73,7 +73,8 @@ fn ship_one(cfg: &Config, run: &Run) -> Result<String> {
         }
     }
 
-    // After the rebase, so tasks shipped together do not conflict in `## Done`.
+    // After the rebase, so ticks on nearby lines by tasks shipped together do
+    // not conflict.
     if !crate::dispatch::is_signal(&run.task_key) {
         let path = wt.join("TODO.md");
         let text =

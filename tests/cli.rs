@@ -51,16 +51,64 @@ fn clean_file_exits_zero_silently() {
 #[test]
 fn warnings_alone_exit_zero() {
     let s = Scratch::new("warn");
-    let dir = s.project("a", "# TODO\n\n## Low\n\n- [x] finished\n");
+    let dir = s.project("a", "# TODO\n\n## Low\n\n- [x] finished #42\n");
     let out = pma(&["lint".as_ref(), dir.as_os_str()]);
     assert!(out.status.success());
     let todo = dir.join("TODO.md");
     assert_eq!(
         stdout(&out),
         format!(
-            "{}:5: warning: finished item; move it to `## Done`\n",
+            "{}:5: warning: `#42` is text; write `gh:42` to link the issue\n",
             todo.display()
         )
+    );
+}
+
+#[test]
+fn prune_lists_then_removes_finished_items() {
+    let s = Scratch::new("prune");
+    let text = "# TODO\n\n## High\n\n- [x] shipped\n  notes\n- [ ] open\n\n## Done\n\n- [x] old\n- [ ] stray\n";
+    let a = s.project("a", text);
+    let bad = s.project("bad", "## High\n\n- [x] kept\n");
+    let todo = a.join("TODO.md");
+
+    let out = pma(&["prune".as_ref(), a.as_os_str(), bad.as_os_str()]);
+    assert!(out.status.success());
+    assert_eq!(
+        stdout(&out),
+        format!(
+            "{0}:9: remove `## Done`, lines 9-12\n\
+             {0}:12: remove open item with `## Done`: `- [ ] stray`\n\
+             {0}:5: remove `shipped`\n\
+             {1}: skipped: lint errors; see `pma lint`\n\
+             2 removals; run `pma prune --apply` to make them\n",
+            todo.display(),
+            bad.join("TODO.md").display()
+        )
+    );
+    assert_eq!(fs::read_to_string(&todo).unwrap(), text);
+
+    let out = pma(&["prune".as_ref(), "--apply".as_ref(), a.as_os_str()]);
+    assert!(out.status.success());
+    assert!(
+        stdout(&out).ends_with("2 removals made; TODO.md edits are uncommitted\n"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(
+        fs::read_to_string(&todo).unwrap(),
+        "# TODO\n\n## High\n\n- [ ] open\n"
+    );
+    let out = pma(&[
+        "prune".as_ref(),
+        a.as_os_str(),
+        s.0.join("none").as_os_str(),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stdout(&out).ends_with("nothing to prune\n"),
+        "{}",
+        stdout(&out)
     );
 }
 
@@ -171,6 +219,8 @@ fn scan_rank_and_explain_a_real_repo() {
     )
     .unwrap();
     git(&alpha, &["commit", "-qam", "retag"], Some(now() - 50 * DAY));
+    // A branch left by a run the database no longer knows.
+    git(&alpha, &["branch", "pma/stray"], None);
     // Not committed: a new item, which also leaves the tree dirty.
     fs::write(
         alpha.join("TODO.md"),
@@ -213,7 +263,7 @@ Q3 Delegate or avoid: 2
   alpha     T1  low  open 70d   review project: no code commits in 100 days
 
 Q4 Remove: 1
-  alpha  T1  medium  open 0d  resolve local changes: 1 changed file
+  alpha  T1  medium  open 0d  resolve local changes: 1 changed file, 1 leftover pma branch
 ";
     let (head, body) = matrix.split_once("\n\n").unwrap();
     assert_eq!(
@@ -333,7 +383,7 @@ fn dispatch_review_rework_and_ship() {
     git(&seed, &["init", "-q", "-b", "main"], None);
     fs::write(
         seed.join("TODO.md"),
-        "# TODO\n\n## High\n\n- [ ] add greeting\n  say hello in hello.txt\n- [ ] second task gh:7\n- [ ] third task\n\n## Done\n",
+        "# TODO\n\n## High\n\n- [ ] add greeting\n  say hello in hello.txt\n- [ ] second task gh:7\n- [ ] third task\n",
     )
     .unwrap();
     fs::write(seed.join("Makefile"), "test:\n\ttest -f hello.txt\n").unwrap();
@@ -421,7 +471,7 @@ fn dispatch_review_rework_and_ship() {
     );
     assert_eq!(
         git_out(&origin, &["show", "main:TODO.md"]),
-        "# TODO\n\n## High\n\n- [ ] third task\n\n## Done\n\n- [x] second task gh:7\n- [x] add greeting\n  say hello in hello.txt\n"
+        "# TODO\n\n## High\n\n- [x] add greeting\n  say hello in hello.txt\n- [x] second task gh:7\n- [ ] third task\n"
     );
     assert_eq!(git_out(&origin, &["show", "main:second.txt"]), "two\n");
     assert_eq!(git_out(&origin, &["branch", "--list", "agent"]), "");
@@ -565,7 +615,7 @@ fn sync_plans_then_applies_and_settles() {
     );
     assert_eq!(
         fs::read_to_string(alpha.join("TODO.md")).unwrap(),
-        "# TODO\n\n## Critical\n\n- [ ] segfault on empty input gh:4\n  when stdin is empty\n- [ ] renamed crash gh:2\n\n## High\n\n## Done\n\n- [x] fixed elsewhere gh:1\n"
+        "# TODO\n\n## Critical\n\n- [ ] segfault on empty input gh:4\n  when stdin is empty\n- [ ] renamed crash gh:2\n\n## High\n\n- [x] fixed elsewhere gh:1\n"
     );
 
     let (out, _) = sync(&["sync", "alpha"]);

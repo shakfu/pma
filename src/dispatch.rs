@@ -200,7 +200,7 @@ fn item_description(worktree: &Path, key: &str, text: &str) -> Option<String> {
     let item = todo::parse(&file)
         .items
         .into_iter()
-        .find(|i| !i.done && i.priority.is_some() && i.is_task(key, text))?;
+        .find(|i| !i.done && i.is_task(key, text))?;
     Some(
         item.description
             .iter()

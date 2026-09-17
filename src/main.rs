@@ -42,6 +42,18 @@ enum Command {
         /// Files or directories; defaults to the current directory.
         paths: Vec<PathBuf>,
     },
+    /// Remove finished items and `## Done` sections from TODO.md files. Dry
+    /// run unless --apply.
+    ///
+    /// Each path is a TODO.md file or a directory containing one. A file with
+    /// lint errors is skipped. Edits stay uncommitted.
+    Prune {
+        /// Files or directories; defaults to the current directory.
+        paths: Vec<PathBuf>,
+        /// Remove them instead of listing them.
+        #[arg(long)]
+        apply: bool,
+    },
     /// List, add or remove the directories whose git repos are projects.
     Root {
         #[command(subcommand)]
@@ -191,6 +203,7 @@ fn parse_quadrant(s: &str) -> std::result::Result<rank::Quadrant, String> {
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Lint { paths } => return lint(&paths),
+        Command::Prune { paths, apply } => return prune(&paths, apply),
         Command::Root { action } => root(action),
         Command::Tier { project, tier } => set_tier(&project, tier.as_deref()),
         Command::Config { key, value, reset } => configure(key.as_deref(), value.as_deref(), reset),
@@ -230,21 +243,26 @@ fn main() -> ExitCode {
     }
 }
 
-fn lint(paths: &[PathBuf]) -> ExitCode {
-    let default = [PathBuf::from(".")];
-    let paths = if paths.is_empty() {
-        &default[..]
-    } else {
-        paths
-    };
+/// The TODO.md each path names: the file itself, or the one in a directory.
+fn todo_files(paths: &[PathBuf]) -> Vec<PathBuf> {
+    if paths.is_empty() {
+        return vec![PathBuf::from("./TODO.md")];
+    }
+    paths
+        .iter()
+        .map(|p| {
+            if p.is_dir() {
+                p.join("TODO.md")
+            } else {
+                p.clone()
+            }
+        })
+        .collect()
+}
 
+fn lint(paths: &[PathBuf]) -> ExitCode {
     let (mut errors, mut warnings, mut failed) = (0, 0, false);
-    for path in paths {
-        let file = if path.is_dir() {
-            path.join("TODO.md")
-        } else {
-            path.to_path_buf()
-        };
+    for file in todo_files(paths) {
         let text = match std::fs::read_to_string(&file) {
             Ok(text) => text,
             Err(err) => {
@@ -274,6 +292,67 @@ fn lint(paths: &[PathBuf]) -> ExitCode {
 
     if errors + warnings > 0 {
         eprintln!("{errors} errors, {warnings} warnings");
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn prune(paths: &[PathBuf], apply: bool) -> ExitCode {
+    let (mut count, mut failed) = (0, false);
+    for file in todo_files(paths) {
+        let fail = |why: String| println!("{}: error: {why}", file.display());
+        let text = match std::fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(err) => {
+                fail(err.to_string());
+                failed = true;
+                continue;
+            }
+        };
+        if todo::parse(&text).has_errors() {
+            println!("{}: skipped: lint errors; see `pma lint`", file.display());
+            continue;
+        }
+        let pruned = todo::prune(&text);
+        for done in &pruned.done_sections {
+            println!(
+                "{}:{}: remove `## Done`, lines {}-{}",
+                file.display(),
+                done.first,
+                done.first,
+                done.last
+            );
+            for (n, line) in &done.open {
+                println!(
+                    "{}:{n}: remove open item with `## Done`: `{line}`",
+                    file.display()
+                );
+            }
+        }
+        for item in &pruned.items {
+            println!("{}:{}: remove `{}`", file.display(), item.line, item.text);
+        }
+        let removals = pruned.done_sections.len() + pruned.items.len();
+        if apply
+            && removals > 0
+            && let Err(err) = std::fs::write(&file, pruned.text)
+        {
+            fail(err.to_string());
+            failed = true;
+            continue;
+        }
+        count += removals;
+    }
+
+    if count == 0 {
+        println!("nothing to prune");
+    } else if apply {
+        println!("{count} removals made; TODO.md edits are uncommitted");
+    } else {
+        println!("{count} removals; run `pma prune --apply` to make them");
     }
     if failed {
         ExitCode::FAILURE
@@ -516,6 +595,7 @@ fn portfolio(names: &[String]) -> Result<Portfolio> {
             idle_days: row.last_activity.map(|t| (today - dates::day(t)).max(0)),
             ci: row.ci.clone(),
             dirty: row.dirty,
+            leftover: row.leftover,
             ahead: row.ahead,
             deps: row
                 .deps

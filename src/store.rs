@@ -16,7 +16,7 @@ use crate::todo::Priority;
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 3;
+const VERSION: i64 = 4;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -97,6 +97,11 @@ CREATE TABLE notes (
 );
 ";
 
+/// Version 4. `pma/` branches that no open run owned at the last scan.
+const LEFTOVER: &str = "
+ALTER TABLE projects ADD COLUMN leftover INTEGER NOT NULL DEFAULT 0;
+";
+
 pub struct Store {
     conn: Connection,
 }
@@ -110,6 +115,8 @@ pub struct ProjectRow {
     pub has_todo: bool,
     pub lint_errors: i64,
     pub dirty: i64,
+    /// `pma/` branches that no open run owned at the last scan.
+    pub leftover: i64,
     pub ahead: Option<i64>,
     pub last_activity: Option<i64>,
     pub ci: Ci,
@@ -161,7 +168,7 @@ impl Store {
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0..VERSION => {
-                let steps = [SCHEMA, RUNS, DEPS_AND_NOTES];
+                let steps = [SCHEMA, RUNS, DEPS_AND_NOTES, LEFTOVER];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
                     tx.execute_batch(step)?;
@@ -251,7 +258,8 @@ impl Store {
     pub fn projects(&self) -> Result<Vec<ProjectRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT name, path, tier, scanned_at, has_todo, lint_errors, dirty, ahead,
-                    last_activity, ci, ci_detail, scan_error, deps, deps_detail, deps_at
+                    last_activity, ci, ci_detail, scan_error, deps, deps_detail, deps_at,
+                    leftover
              FROM projects ORDER BY name",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -270,6 +278,7 @@ impl Store {
                 deps: r.get(12)?,
                 deps_detail: r.get(13)?,
                 deps_at: r.get(14)?,
+                leftover: r.get(15)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -309,19 +318,34 @@ impl Store {
         full: bool,
         now: i64,
     ) -> Result<Vec<(String, Option<u8>)>> {
+        let open_runs: Vec<Run> = self
+            .runs()?
+            .into_iter()
+            .filter(|r| !r.state.is_final())
+            .collect();
         let tx = self.conn.transaction()?;
         for f in facts {
             let (ci, ci_detail) = f.ci.to_columns();
+            let leftover = f
+                .pma_branches
+                .iter()
+                .filter(|b| {
+                    !open_runs
+                        .iter()
+                        .any(|r| r.project == f.name && &r.branch == *b)
+                })
+                .count() as i64;
             tx.execute(
                 "INSERT INTO projects (name, path, scanned_at, has_todo, lint_errors, dirty, ahead,
-                                       last_activity, ci, ci_detail, scan_error)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                                       last_activity, ci, ci_detail, scan_error, leftover)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT (name) DO UPDATE SET
                     path = excluded.path, scanned_at = excluded.scanned_at,
                     has_todo = excluded.has_todo, lint_errors = excluded.lint_errors,
                     dirty = excluded.dirty, ahead = excluded.ahead,
                     last_activity = excluded.last_activity, ci = excluded.ci,
-                    ci_detail = excluded.ci_detail, scan_error = excluded.scan_error",
+                    ci_detail = excluded.ci_detail, scan_error = excluded.scan_error,
+                    leftover = excluded.leftover",
                 params![
                     f.name,
                     path_str(&f.path)?,
@@ -334,6 +358,7 @@ impl Store {
                     ci,
                     ci_detail,
                     f.error,
+                    leftover,
                 ],
             )?;
 
@@ -671,6 +696,7 @@ mod tests {
                 items,
             }),
             dirty: 3,
+            pma_branches: vec![],
             ahead: None,
             last_activity: Some(42),
             ci: Ci::Failing(vec!["test".into(), "wheels".into()]),
@@ -700,7 +726,11 @@ mod tests {
     #[test]
     fn older_databases_are_upgraded_in_place() {
         let dir = scratch("migrate");
-        for (version, steps) in [(1, &[SCHEMA][..]), (2, &[SCHEMA, RUNS][..])] {
+        for (version, steps) in [
+            (1, &[SCHEMA][..]),
+            (2, &[SCHEMA, RUNS][..]),
+            (3, &[SCHEMA, RUNS, DEPS_AND_NOTES][..]),
+        ] {
             let db = dir.join(format!("v{version}.db"));
             let conn = Connection::open(&db).unwrap();
             for step in steps {
@@ -715,7 +745,11 @@ mod tests {
             drop(conn);
             let store = Store::open(&db).unwrap();
             let p = store.project("kept").unwrap().unwrap();
-            assert_eq!((p.deps, p.deps_detail.as_str()), (None, ""), "v{version}");
+            assert_eq!(
+                (p.deps, p.deps_detail.as_str(), p.leftover),
+                (None, "", 0),
+                "v{version}"
+            );
             assert!(store.runs().unwrap().is_empty());
             assert!(store.notes().unwrap().is_empty());
             drop(store);
@@ -755,7 +789,7 @@ mod tests {
     #[test]
     fn runs_round_trip_and_interrupted_runs_fail() {
         let dir = scratch("runs");
-        let store = Store::open(&dir.join("p.db")).unwrap();
+        let mut store = Store::open(&dir.join("p.db")).unwrap();
         let mut run = Run {
             id: 0,
             project: "p".into(),
@@ -801,6 +835,24 @@ mod tests {
         assert_eq!(failed.state, RunState::Failed);
         assert!(failed.error.unwrap().starts_with("interrupted"));
         assert!(store.run(99).is_err());
+
+        // A branch is leftover unless an open run of the same project owns it.
+        let mut scanned = facts("p", vec![]);
+        scanned.pma_branches = vec!["pma/fix-it".into(), "pma/stray".into()];
+        let mut other = facts("q", vec![]);
+        other.pma_branches = vec!["pma/fix-it".into()];
+        let leftover = |store: &mut Store, facts: &[Facts]| {
+            store.save_scan(facts, false, 1).unwrap();
+            let projects = store.projects().unwrap();
+            projects.iter().map(|p| p.leftover).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            leftover(&mut store, &[scanned.clone(), other.clone()]),
+            [1, 1]
+        );
+        run.state = RunState::Shipped;
+        store.update_run(&run).unwrap();
+        assert_eq!(leftover(&mut store, &[scanned, other]), [2, 1]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

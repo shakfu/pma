@@ -105,12 +105,8 @@ pub fn plan(parsed: &Parsed, issues: &[Issue], me: &str) -> Vec<Action> {
     let mut claimed: Vec<u64> = Vec::new();
     let mut actions = Vec::new();
 
-    for item in parsed
-        .items
-        .iter()
-        .filter(|i| !i.done && i.priority.is_some())
-    {
-        let critical = item.priority == Some(Priority::Critical);
+    for item in parsed.items.iter().filter(|i| !i.done) {
+        let critical = item.priority == Priority::Critical;
         let Some(number) = item.gh else {
             if !critical {
                 continue;
@@ -307,12 +303,7 @@ pub fn apply(repo: &str, todo_path: &Path, actions: &[Action]) -> Result<usize, 
     };
 
     let mut applied = 0;
-    // Line numbers hold until an item moves, so every `Close` comes last.
-    let (closes, others): (Vec<&Action>, Vec<&Action>) = actions
-        .iter()
-        .filter(|a| a.is_change())
-        .partition(|a| matches!(a, Action::Close { .. }));
-    for action in others.into_iter().chain(closes) {
+    for action in actions.iter().filter(|a| a.is_change()) {
         match action {
             Action::Create { line, title, body } => {
                 ensure_label(&mut label_ready)?;
@@ -407,9 +398,6 @@ mod tests {
 
 - [ ] demoted gh:4
 - [ ] not critical
-
-## Done
-
 - [x] old gh:5
 ";
         let parsed = todo::parse(text);

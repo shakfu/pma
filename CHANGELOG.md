@@ -13,6 +13,16 @@ it took 44s for 52 repos against 1s for a plain scan. Plain scans keep the last
 measurement. Counts differ in kind between tools: cargo's include transitive
 crates.
 
+**`pma prune`** removes finished items and their descriptions from TODO.md
+files, and each v1 `## Done` section whole. A dry run unless `--apply`. Files
+with lint errors are skipped.
+
+**Leftover worktrees in the hygiene signal.** A scan counts local `pma/`
+branches that no open run owns, and "resolve local changes" lists them. Each
+`pma` worktree has such a branch, so the count also finds branches whose
+worktree is gone. Hygiene scores 0.5 per condition, capped at 1, which keeps the
+existing values. The database schema moves to version 4.
+
 **`pma note`** adds, edits, removes and lists portfolio notes.
 
 **`pma tui`** shows the matrix as a 2x2 layout with the selected task's
@@ -39,9 +49,9 @@ done. Settings: `max_parallel`, `batch_budget`, `agent_budget`, `timeout`,
 per project `projects.<name>.verify` and `projects.<name>.publish`. The
 database schema moves to version 2; version 1 databases are upgraded on open.
 
-The item is marked done after the rebase, not before. Two tasks from one
-project each insert at the top of `## Done`, so editing first made the second
-rebase conflict. An item must be open in the remote `TODO.md` to be
+The item is marked done after the rebase, not before. Git treats changes to
+adjacent lines as a conflict, so ticking first could conflict for two tasks
+from one project. An item must be open in the remote `TODO.md` to be
 dispatched; otherwise ship would have no line to mark.
 
 `claude --max-budget-usd` is checked between turns and was exceeded in use
@@ -49,6 +59,12 @@ dispatched; otherwise ship would have no line to mark.
 total spend.
 
 ### Changed
+
+**TODO.md format v2: finished items stay in their priority section.** `## Done`
+is no longer part of the format. Ship and sync tick `- [ ]` to `- [x]` in place, and lint accepts
+`- [x]` in any priority section. A `## Done` section grows without limit;
+`pma prune` removes finished items when wanted. Each item in an existing
+`## Done` raises a warning that names `pma prune`.
 
 **`pma lint` accepts bullets outside the priority sections in a migrated
 file.** The "no items" warning now fires only when a file also has no priority

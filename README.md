@@ -41,21 +41,21 @@ Requirements:
 
 ## Low
 
-## Done
-
 - [x] drop python 3.9
 ```
 
-The section gives the priority. A `###` heading inside a section groups the
+The section gives the priority. A finished item is ticked where it stands;
+`pma prune` removes finished items. A `###` heading inside a section groups the
 items below it. Trailing `#tag`, `due:YYYY-MM-DD` and `gh:N` (a linked issue)
 are optional. The full rules are in the
-[design](docs/dev/design.md#todomd-format-v1).
+[design](docs/dev/design.md#todomd-format-v2).
 
 ## Commands
 
 ```sh
 pma lint                        # ./TODO.md
 pma lint ~/projects/*/          # every project; a directory means its TODO.md
+pma prune ~/projects/*/         # plan: finished items and `## Done` to remove; --apply
 ```
 
 Output is `path:line: severity: message`. Exit status is 1 when any file has an
@@ -101,7 +101,7 @@ pma sync --apply cyllama           # carry it out for one project
 ```
 
 Each `## Critical` item gets an issue labelled `pma:critical`, and `gh:N` is
-written into its line. An item whose issue is closed moves to `## Done`. TODO.md
+written into its line. An item whose issue is closed is ticked. TODO.md
 edits are left uncommitted; `scripts/commit_todo.py` commits them.
 
 The database is `~/.config/pma/projects.db`, or `$PMA_HOME/projects.db`.

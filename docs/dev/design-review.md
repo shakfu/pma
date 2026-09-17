@@ -4,6 +4,8 @@
 
 Purpose under review: maintain many repositories from one place, by ranking work and dispatching agents to it. `pma` is a Project Management Agent: an orchestrator that delegates to sub-agents, not only a command-line tool that runs one.
 
+Sequenced work from this review: `implementation-plan.md`.
+
 ## Verdict
 
 Build the core: one ranked queue across repos, and a safe path from task to merged change (worktree, no push credentials, `pma` runs the tests, review, ship). Nothing off the shelf does both for 94 personal repos.
@@ -43,7 +45,9 @@ Urgency answers: what must happen before other work can proceed. The current rul
 Replace it with three sources:
 
 1. **External deadline.** `due:` within `urgent_within`. Unchanged.
+
 2. **Blocking other work.** A task that other tasks wait on. Failing CI is the clearest case: nothing in that repo merges until it passes, which is why it is urgent as a signal already.
+
 3. **Explicit marking.** `#urgent`, for what the other two rules miss.
 
 The inverse state matters as much. A blocked task cannot start, so it is neither urgent nor dispatchable, and it should leave the queue until its blocker closes. Today such a task sits in the queue and can be dispatched.
@@ -57,7 +61,9 @@ Dependencies need stable item ids. The format says no per-item ids, and identifi
 Three options, in order of cost:
 
 1. **Signals only.** No format change. Failing CI is urgent because it blocks; deps and hygiene are not. Cross-project edges come from manifests (below). Covers the common case at zero cost to the file format.
+
 2. **Short ids written back.** `pma` assigns `id:a7` the way sync writes `gh:N`, then `needs:a7` and `#blocked` become expressible. Reverses one decision, and makes the format carry a graph.
+
 3. **Issue links only.** `needs:gh:42`, available only for synced items, which today means `Critical` alone.
 
 Recommendation: option 1 now, option 2 only if real tasks turn out to block each other often enough to notice.
@@ -73,7 +79,9 @@ This is derivable in a scan, needs no format change, and orders work across repo
 Importance is the wrong gate for delegation. Three properties decide whether a task suits an agent:
 
 1. **Machine-checkable acceptance.** Something other than the agent's own report says the change works.
+
 2. **Bounded blast radius.** The files a correct change touches can be stated in advance.
+
 3. **Cheap rollback.** A revert or a force-push undoes it.
 
 All three hold, and review is a skim. None hold, and the agent generates work for the reviewer.
@@ -142,7 +150,9 @@ Requirement: `pma` estimates each task's complexity and dispatches it to an agen
 Estimation inputs, cheapest first:
 
 1. Deterministic features: task class, whether the item names a file or symbol, length of its text and description, repository size, whether a `verify` command exists and how long it takes, and the recorded success rate for that class in that repository.
+
 2. An LLM estimate over the item and repository context, returning `{complexity: 1-5, expected_paths, rationale}` under a schema.
+
 3. The outcome of previous attempts at the same task.
 
 Routing policy, config-driven rather than compiled in:
@@ -190,7 +200,9 @@ Everything the matching needs, the tool computes without an LLM: class from the 
 Adopting a revision has three cheap checks, in order:
 
 1. **Replay.** Apply the candidate matrix to the recorded runs and report what it would have routed differently, and at what cost. The `runs` table is the corpus.
+
 2. **Shadow.** Compute the route, log it, dispatch by the current matrix. Compare over a week.
+
 3. **Canary.** Apply it to tier 4 and 5 repositories first, then wider.
 
 A second agent may review a proposed revision for risk, and report `{approve, deny, notes}` against the autonomy rules below. It reviews the policy, not each task. The user approves any revision that raises autonomy.
@@ -239,7 +251,9 @@ The record must carry what the design's agent table already shows differing: how
 Consequences:
 
 - One normalized `Report {ok, summary, cost, error}`, as `parse_claude` already produces. A worker that reports no cost gets `None`, and `batch_budget` then bounds runs started rather than spend.
+
 - The trust boundary must not depend on the worker. No allowlist support means the worktree, the stripped credentials and the path-scope check carry it. `pma` verifies either way.
+
 - Routing can then mix vendors, not only models, and the recorded outcomes say which combination earns which class.
 
 ### Manager architecture
@@ -253,10 +267,15 @@ Start with two LLM steps, both testable against a hand-labeled set of your own i
 ## Keep
 
 - `TODO.md` as the source: offline, diffable, next to the code, no API limits.
+
 - The line-based parser. Editing one line without re-rendering a file `pma` does not own is what makes ship and sync safe.
+
 - Worktrees from the remote default branch, with push credentials removed.
+
 - `pma` running `verify` itself. Not trusting the agent's report is the most valuable check in the pipeline.
+
 - `git` and `gh` as binaries, for the user's own authentication and configuration.
+
 - The run lifecycle now that a run ends at merge rather than at ship.
 
 ## Cut or park
@@ -274,7 +293,9 @@ Start with two LLM steps, both testable against a hand-labeled set of your own i
 ## Three measurements before more features
 
 1. **Agent success.** Dispatch 20 tasks across 3 repos. Record the share passing `verify` and the share approved. The `runs` table holds both already.
+
 2. **Review cost.** Time those 20 reviews. At 10 minutes each, parallelism is irrelevant and the review gate is the design problem to solve.
+
 3. **Does task text predict success?** Compare the 10 most detailed items against 10 one-liners. If detail decides, then eligibility means "specified well enough", and the format needs an acceptance line.
 
 ## Changes worth making now
@@ -284,10 +305,15 @@ Start with two LLM steps, both testable against a hand-labeled set of your own i
 2. Path scope per class, checked against the diff at review.
 
 3. Separate eligibility from importance. Importance orders the queue. Eligibility decides what an agent may take: CI and deps tasks at any tier, plus items tagged `#agent`.
+
 4. Replace `stale_after` with the sequencing model above. Five settings go.
+
 5. Add `default_tier`, so untiered projects appear at all.
+
 6. Decide what `pma review` is for when `publish = pr`. Today the diff is reviewed twice, once in `pma` and once on GitHub.
+
 7. Record the defaults as guesses, each with the measurement that would settle it. The design presents them as decided.
+
 8. Add a state for a task an agent failed twice, so `--auto` stops choosing it, and record which model each attempt used.
 
 9. Move the worker from a constant to a config record, with `claude` as one entry. Add `model` and `route` to `runs` before routing exists, so the data to calibrate a matrix accumulates from the first dispatch.
@@ -333,7 +359,9 @@ Missing defences: fetched text marked as untrusted data in the prompt rather tha
 ## Open questions
 
 1. Is the unit of work the task or the project? Tasks feed agents. Projects decide attention. `pma` models both and keeps two rankings.
+
 2. If measurement 1 fails, is the cross-repo queue still worth the scan pipeline? Probably yes, but it is a much smaller tool.
+
 3. Does a maintenance portfolio need signals this tool does not have: security advisories, open bot pull requests, unreleased commits since the last tag? Unverified; each needs a tool check.
 
 4. Is auto-merge acceptable for class A on low-tier repositories? If not, review stays the bottleneck and the classes matter less.

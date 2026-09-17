@@ -458,15 +458,20 @@ fn ci_state(dir: &Path) -> Ci {
         .output();
     match out {
         Ok(o) if o.status.success() => parse_runs(&String::from_utf8_lossy(&o.stdout)),
-        Ok(o) => Ci::Unknown(
-            String::from_utf8_lossy(&o.stderr)
-                .lines()
-                .last()
-                .unwrap_or("gh failed")
-                .to_string(),
-        ),
+        Ok(o) => Ci::Unknown(gh_error(&String::from_utf8_lossy(&o.stderr))),
         Err(e) => Ci::Unknown(format!("gh: {e}")),
     }
+}
+
+/// The first line of `gh`'s stderr. It names the cause; later lines add
+/// alternatives or an update notice.
+fn gh_error(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("gh failed")
+        .to_string()
 }
 
 /// Reads `gh run list` rows, newest first, as `workflow \t status \t conclusion`.
@@ -559,6 +564,18 @@ mod tests {
         );
         assert_eq!(parse_runs("a\tcompleted\tcancelled\n"), Ci::NoRuns);
         assert_eq!(parse_runs(""), Ci::NoRuns);
+    }
+
+    #[test]
+    fn gh_errors_keep_the_first_line() {
+        let unauthenticated = "To get started with GitHub CLI, please run:  gh auth login\n\
+            Alternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\n";
+        assert_eq!(
+            gh_error(unauthenticated),
+            "To get started with GitHub CLI, please run:  gh auth login"
+        );
+        assert_eq!(gh_error("\n  HTTP 404  \n"), "HTTP 404");
+        assert_eq!(gh_error(""), "gh failed");
     }
 
     #[test]

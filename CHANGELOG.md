@@ -72,6 +72,13 @@ section. A file with `## Critical` to `## Low` and no open items is valid, and
 its declined or deferred work can stay as plain bullets instead of becoming
 tasks.
 
+### Fixed
+
+**CI detail names the cause of a `gh` failure.** It kept the last line of
+`gh`'s stderr, which is an alternative or an update notice. Without
+authentication every project read "Alternatively, populate the GH_TOKEN
+environment variable..." instead of "please run: gh auth login".
+
 ## [0.1.0] - 2026-09-14
 
 ### Added

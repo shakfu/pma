@@ -23,7 +23,7 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 
 use config::Config;
-use store::{Result, RunState, Store};
+use store::{Result, RunState, Session, Store};
 
 #[derive(Parser)]
 #[command(name = "pma", version, about = "Maintain many projects from one place")]
@@ -680,7 +680,9 @@ fn has_run(runs: &[store::Run], project: &str, key: &str, text: &str) -> bool {
 fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>) -> Result<()> {
     let store = Store::open_default()?;
     let home = store::home()?;
-    store.fail_interrupted_runs()?;
+    let session = Session::acquire(&home)?;
+    store.fail_interrupted_runs(&session)?;
+    settle_prs(&store)?;
     let active = store.runs()?;
     let rows = store.projects()?;
     let p = portfolio(if auto { targets } else { &[] })?;
@@ -700,9 +702,14 @@ fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>) -> Result<
             .clone())
     };
 
+    // With --auto, every candidate in matrix order; `wanted` of them are
+    // queued, so a refused candidate gives its place to the next.
     let mut picks = Vec::new();
+    let wanted = match auto {
+        true => count.unwrap_or(p.cfg.max_parallel as usize),
+        false => targets.len(),
+    };
     if auto {
-        let wanted = count.unwrap_or(p.cfg.max_parallel as usize);
         let lists = [&p.cfg.dispatch_quadrants, &p.cfg.overflow_quadrants];
         for list in lists {
             for x in placed.iter().filter(|x| list.contains(&x.quadrant)) {
@@ -710,10 +717,7 @@ fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>) -> Result<
                 let taken = picks
                     .iter()
                     .any(|q: &dispatch::Pick| q.project == x.task.project && &q.key == key);
-                if picks.len() == wanted
-                    || taken
-                    || has_run(&active, &x.task.project, key, &x.task.text)
-                {
+                if taken || has_run(&active, &x.task.project, key, &x.task.text) {
                     continue;
                 }
                 picks.push(dispatch::Pick {
@@ -796,19 +800,31 @@ fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>) -> Result<
             });
         }
     }
-    if picks.is_empty() {
+    if picks.is_empty() || wanted == 0 {
         println!("nothing to dispatch");
         return Ok(());
     }
 
     let mut queued = Vec::new();
+    // A project-level failure, such as a failed fetch, skips the project.
+    let mut unreachable: Vec<&str> = Vec::new();
     for pick in &picks {
+        if queued.len() == wanted {
+            break;
+        }
+        if unreachable.contains(&pick.project.as_str()) {
+            continue;
+        }
         match dispatch::prepare(&store, &home, &p.cfg, pick) {
-            Ok(run) => {
+            Ok(dispatch::Prepared::Queued(run)) => {
                 println!("#{} {}: {}", run.id, run.project, run.text);
-                queued.push(run);
+                queued.push(*run);
             }
-            Err(e) => eprintln!("warning: {e}"),
+            Ok(dispatch::Prepared::Refused(why)) => eprintln!("warning: {why}"),
+            Err(e) => {
+                eprintln!("warning: {}: {e}", pick.project);
+                unreachable.push(&pick.project);
+            }
         }
     }
     if queued.is_empty() {
@@ -832,10 +848,34 @@ fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>) -> Result<
     Ok(())
 }
 
+/// Reports runs whose pull request was merged or closed since the last check.
+fn settle_prs(store: &Store) -> Result<()> {
+    ship::settle(store, |run, outcome| match outcome {
+        Ok(o) => println!("#{} {}: {o}", run.id, run.project),
+        Err(e) => eprintln!(
+            "warning: #{} {}: pull request state unknown: {e}",
+            run.id, run.project
+        ),
+    })
+}
+
 fn run_review(id: Option<i64>, approve: bool, reject: bool, rework: Option<&str>) -> Result<()> {
     let store = Store::open_default()?;
-    store.fail_interrupted_runs()?;
+    let home = store::home()?;
+    // Free, the lock proves that no session is running agents.
+    let session = Session::try_acquire(&home)?;
+    if let Some(s) = &session {
+        store.fail_interrupted_runs(s)?;
+    }
+    // Reject and rework change the worktree, so they keep the lock. Others
+    // release it now, so a starting dispatch does not wait on them.
+    let session = match (session, reject || rework.is_some()) {
+        (Some(s), true) => Some(s),
+        (None, true) => Some(Session::acquire(&home)?),
+        (_, false) => None,
+    };
     let Some(id) = id else {
+        settle_prs(&store)?;
         let runs: Vec<_> = store
             .runs()?
             .into_iter()
@@ -855,17 +895,19 @@ fn run_review(id: Option<i64>, approve: bool, reject: bool, rework: Option<&str>
         dispatch::reject(&store, &mut run)?;
     } else if let Some(feedback) = rework {
         let cfg = load_config(&store)?;
-        dispatch::rework(&store, &store::home()?, &cfg, &mut run, feedback)?;
+        dispatch::rework(&store, &home, &cfg, &mut run, feedback)?;
         println!("{}", report::run_line(&run));
     } else {
         let diff = dispatch::diff(&run).unwrap_or_else(|e| format!("(no diff: {e})"));
         print!("{}", report::run_detail(&run, &diff));
     }
+    drop(session);
     Ok(())
 }
 
 fn run_ship(projects: &[String]) -> Result<()> {
     let store = Store::open_default()?;
+    let _session = Session::acquire(&store::home()?)?;
     let cfg = load_config(&store)?;
     let runs: Vec<_> = store
         .runs()?

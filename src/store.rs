@@ -7,7 +7,10 @@
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rusqlite::{Connection, params};
 
@@ -16,7 +19,7 @@ use crate::todo::Priority;
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 4;
+const VERSION: i64 = 5;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -102,6 +105,13 @@ const LEFTOVER: &str = "
 ALTER TABLE projects ADD COLUMN leftover INTEGER NOT NULL DEFAULT 0;
 ";
 
+/// Version 5. Runs may be `pr-open`, which an older `pma` would read as
+/// `failed`. Runs shipped as pull requests before it return to `pr-open`, so
+/// the next settle checks whether they were merged.
+const PR_OPEN: &str = "
+UPDATE runs SET state = 'pr-open' WHERE state = 'shipped' AND outcome LIKE 'https://%/pull/%';
+";
+
 pub struct Store {
     conn: Connection,
 }
@@ -143,6 +153,62 @@ pub struct TaskRow {
     pub first_seen: i64,
 }
 
+/// Exclusive right to run agents and change worktrees. `flock` releases it
+/// when the process exits, so a crash leaves no stale lock.
+pub struct Session {
+    _file: File,
+}
+
+impl Session {
+    /// `None` when another process holds the lock.
+    pub fn try_acquire(dir: &Path) -> Result<Option<Session>> {
+        let path = dir.join("session.lock");
+        let io = |e: std::io::Error| format!("{}: {e}", path.display());
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(io)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Error(e)) => return Err(io(e).into()),
+        }
+        file.set_len(0).map_err(io)?;
+        write!(file, "{}", std::process::id()).map_err(io)?;
+        Ok(Some(Session { _file: file }))
+    }
+
+    /// Like `try_acquire`, but waits out a brief hold, such as `pma review`
+    /// checking for a live session. A lock still held is an error naming its
+    /// holder.
+    pub fn acquire(dir: &Path) -> Result<Session> {
+        const WAIT: Duration = Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(session) = Session::try_acquire(dir)? {
+                return Ok(session);
+            }
+            if started.elapsed() >= WAIT {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Err({
+            let pid = std::fs::read_to_string(dir.join("session.lock")).unwrap_or_default();
+            let holder = match pid.trim() {
+                "" => String::new(),
+                pid => format!(" (pid {pid})"),
+            };
+            format!(
+                "another pma session{holder} is dispatching, reworking, rejecting or shipping; wait for it to finish"
+            )
+            .into()
+        })
+    }
+}
+
 /// `~/.config/pma`, or `PMA_HOME` when set.
 pub fn home() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("PMA_HOME") {
@@ -165,10 +231,12 @@ impl Store {
             r.get::<_, String>(0)
         })?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Other commands may write while a session runs agents.
+        conn.busy_timeout(Duration::from_secs(5))?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0..VERSION => {
-                let steps = [SCHEMA, RUNS, DEPS_AND_NOTES, LEFTOVER];
+                let steps = [SCHEMA, RUNS, DEPS_AND_NOTES, LEFTOVER, PR_OPEN];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
                     tx.execute_batch(step)?;
@@ -551,9 +619,9 @@ impl Store {
             .ok_or_else(|| format!("no run #{id}").into())
     }
 
-    /// Marks runs left queued or running by a session that ended as failed. One
-    /// session at a time is assumed, so none of them is still running.
-    pub fn fail_interrupted_runs(&self) -> Result<usize> {
+    /// Marks runs left queued or running by a session that ended as failed.
+    /// Only a `Session` holder runs agents, so while it is held none is live.
+    pub fn fail_interrupted_runs(&self, _held: &Session) -> Result<usize> {
         Ok(self.conn.execute(
             "UPDATE runs SET state = 'failed', error = 'interrupted: pma exited during the run'
              WHERE state IN ('queued', 'running')",
@@ -584,17 +652,20 @@ pub enum RunState {
     Ready,
     Failed,
     Approved,
+    /// Published as a pull request that is neither merged nor closed.
+    PrOpen,
     Rejected,
     Shipped,
 }
 
 impl RunState {
-    const ALL: [(&'static str, RunState); 7] = [
+    const ALL: [(&'static str, RunState); 8] = [
         ("queued", RunState::Queued),
         ("running", RunState::Running),
         ("ready", RunState::Ready),
         ("failed", RunState::Failed),
         ("approved", RunState::Approved),
+        ("pr-open", RunState::PrOpen),
         ("rejected", RunState::Rejected),
         ("shipped", RunState::Shipped),
     ];
@@ -652,7 +723,7 @@ pub struct Run {
     pub verify: Option<String>,
     pub verify_ok: Option<bool>,
     pub error: Option<String>,
-    /// What shipping did: a pushed commit or a pull request URL.
+    /// What shipping did: a pushed commit, or a pull request URL.
     pub outcome: Option<String>,
 }
 
@@ -730,6 +801,7 @@ mod tests {
             (1, &[SCHEMA][..]),
             (2, &[SCHEMA, RUNS][..]),
             (3, &[SCHEMA, RUNS, DEPS_AND_NOTES][..]),
+            (4, &[SCHEMA, RUNS, DEPS_AND_NOTES, LEFTOVER][..]),
         ] {
             let db = dir.join(format!("v{version}.db"));
             let conn = Connection::open(&db).unwrap();
@@ -742,6 +814,18 @@ mod tests {
                 [],
             )
             .unwrap();
+            if version >= 2 {
+                for outcome in ["https://github.com/o/r/pull/3", "pushed abc to main"] {
+                    conn.execute(
+                        "INSERT INTO runs (project, task_key, text, agent, repo, branch, worktree,
+                                           default_branch, base, prompt, state, outcome)
+                         VALUES ('kept', 'k', 't', 'claude', '/k', 'pma/t', '/w', 'main', 'b',
+                                 'p', 'shipped', ?1)",
+                        [outcome],
+                    )
+                    .unwrap();
+                }
+            }
             drop(conn);
             let store = Store::open(&db).unwrap();
             let p = store.project("kept").unwrap().unwrap();
@@ -750,7 +834,14 @@ mod tests {
                 (None, "", 0),
                 "v{version}"
             );
-            assert!(store.runs().unwrap().is_empty());
+            let states: Vec<_> = store.runs().unwrap().iter().map(|r| r.state).collect();
+            if version >= 2 {
+                assert_eq!(
+                    states,
+                    [RunState::PrOpen, RunState::Shipped],
+                    "v{version}: a shipped pull request is open again"
+                );
+            }
             assert!(store.notes().unwrap().is_empty());
             drop(store);
             assert!(Store::open(&db).is_ok(), "v{version} reopens");
@@ -828,9 +919,15 @@ mod tests {
         store.update_run(&run).unwrap();
         assert_eq!(store.run(run.id).unwrap(), run);
 
+        run.state = RunState::PrOpen;
+        store.update_run(&run).unwrap();
+        assert_eq!(store.run(run.id).unwrap().state, RunState::PrOpen);
+        assert!(!run.state.is_final(), "an open pull request holds its task");
+
         run.state = RunState::Running;
         store.update_run(&run).unwrap();
-        assert_eq!(store.fail_interrupted_runs().unwrap(), 1);
+        let session = Session::acquire(&dir).unwrap();
+        assert_eq!(store.fail_interrupted_runs(&session).unwrap(), 1);
         let failed = store.run(run.id).unwrap();
         assert_eq!(failed.state, RunState::Failed);
         assert!(failed.error.unwrap().starts_with("interrupted"));
@@ -853,6 +950,29 @@ mod tests {
         run.state = RunState::Shipped;
         store.update_run(&run).unwrap();
         assert_eq!(leftover(&mut store, &[scanned, other]), [2, 1]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn one_session_holds_the_lock_until_dropped() {
+        let dir = scratch("session");
+        let first = Session::acquire(&dir).unwrap();
+        assert!(Session::try_acquire(&dir).unwrap().is_none());
+        let err = Session::acquire(&dir).err().unwrap().to_string();
+        assert!(
+            err.contains(&format!("(pid {})", std::process::id())),
+            "{err}"
+        );
+        drop(first);
+        assert!(Session::try_acquire(&dir).unwrap().is_some());
+
+        let brief = Session::acquire(&dir).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(brief);
+        });
+        assert!(Session::acquire(&dir).is_ok(), "a brief hold is waited out");
+        release.join().unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 

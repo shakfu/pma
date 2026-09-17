@@ -65,12 +65,33 @@ pub fn run_limited(mut cmd: Command, log: &Path, timeout: Duration) -> std::io::
     })
 }
 
-pub fn claude(prompt: &str, budget_usd: f64) -> Command {
+/// `claude -p` that may edit files and run `verify`, and nothing else
+/// without a rule in the user's own settings.
+pub fn claude(prompt: &str, budget_usd: f64, verify: Option<&str>) -> Command {
     let mut cmd = Command::new(AGENT);
     cmd.args(["-p", prompt, "--output-format", "json"])
         .args(["--permission-mode", "acceptEdits"])
         .args(["--max-budget-usd", &budget_usd.to_string()]);
+    let rules = verify.map(bash_rules).unwrap_or_default();
+    if !rules.is_empty() {
+        cmd.arg("--allowedTools").args(rules);
+    }
     cmd
+}
+
+/// One exact `Bash(...)` rule per subcommand. Claude Code checks each part of
+/// a compound command against the rules separately. Quoting is not parsed: a
+/// rule that fails to match only denies the agent that command.
+fn bash_rules(command: &str) -> Vec<String> {
+    // `>&` and `&>` are redirections, not separators.
+    let command = command.replace(">&", "\u{0}").replace("&>", "\u{1}");
+    command
+        .replace("|&", "\n")
+        .split(['\n', ';', '|', '&'])
+        .map(|part| part.trim().replace('\u{0}', ">&").replace('\u{1}', "&>"))
+        .filter(|part| !part.is_empty())
+        .map(|part| format!("Bash({part})"))
+        .collect()
 }
 
 #[derive(Debug, PartialEq)]
@@ -174,6 +195,30 @@ mod tests {
         let junk = parse_claude("Error: not logged in\n");
         assert!(!junk.ok);
         assert_eq!(junk.summary, "Error: not logged in");
+    }
+
+    #[test]
+    fn the_agent_may_run_the_verify_command() {
+        let args = |verify| {
+            claude("do it", 0.5, verify)
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            args(Some("make test")).ends_with(&["--allowedTools".into(), "Bash(make test)".into()])
+        );
+        assert!(!args(None).contains(&"--allowedTools".to_string()));
+        assert_eq!(
+            bash_rules("make check && uv run pytest -q 2>&1 | tail -5; cargo test &> log"),
+            [
+                "Bash(make check)",
+                "Bash(uv run pytest -q 2>&1)",
+                "Bash(tail -5)",
+                "Bash(cargo test &> log)"
+            ]
+        );
+        assert_eq!(bash_rules("a || b |& c"), ["Bash(a)", "Bash(b)", "Bash(c)"]);
     }
 
     #[test]

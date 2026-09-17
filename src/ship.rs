@@ -1,4 +1,6 @@
-//! Ship: commit approved runs, publish them, and remove their worktrees.
+//! Ship: commit approved runs, publish them, and remove their worktrees. A
+//! run published as a pull request stays `pr-open`, holding its task, until
+//! the pull request is merged or closed.
 
 use std::process::Command;
 
@@ -8,8 +10,8 @@ use crate::store::{Result, Run, RunState, Store};
 use crate::todo;
 
 /// Ships approved runs in id order, project by project. A failure stops the
-/// rest of that project and leaves its runs approved. `done` sees each run
-/// with its outcome.
+/// rest of that project and leaves its runs approved; running `ship` again
+/// resumes them. `done` sees each run with its outcome.
 pub fn ship(
     store: &Store,
     cfg: &Config,
@@ -27,11 +29,24 @@ pub fn ship(
         }
         match ship_one(cfg, &run) {
             Ok(outcome) => {
-                run.state = RunState::Shipped;
+                run.state = match cfg.publish_for(&run.project) {
+                    Publish::Push => RunState::Shipped,
+                    Publish::Pr => RunState::PrOpen,
+                };
                 run.outcome = Some(outcome.clone());
                 run.error = None;
+                // Saved before cleanup, so a cleanup failure cannot hide
+                // what was published.
                 store.update_run(&run)?;
-                done(&run, &Ok(outcome));
+                let report = match remove_worktree(&run.repo, &run.worktree, &run.branch) {
+                    Ok(()) => outcome,
+                    Err(e) => {
+                        run.error = Some(format!("cleanup: {e}"));
+                        store.update_run(&run)?;
+                        format!("{outcome}; warning: worktree not removed: {e}")
+                    }
+                };
+                done(&run, &Ok(report));
             }
             Err(e) => {
                 run.error = Some(format!("ship: {e}"));
@@ -63,6 +78,14 @@ fn ship_one(cfg: &Config, run: &Run) -> Result<String> {
     let upstream = format!("origin/{}", run.default_branch);
     if publish == Publish::Push {
         git(wt, &["fetch", "--quiet", "origin"])?;
+        // An earlier ship pushed these commits and stopped before recording
+        // it. Pushed commits keep their ids, so HEAD is in the upstream.
+        let head = git(wt, &["rev-parse", "HEAD"])?;
+        if head != run.base && git(wt, &["merge-base", "--is-ancestor", "HEAD", &upstream]).is_ok()
+        {
+            let sha = git(wt, &["rev-parse", "--short", "HEAD"])?;
+            return Ok(format!("already pushed {sha} to {}", run.default_branch));
+        }
         if let Err(e) = git(wt, &["rebase", "--quiet", &upstream]) {
             let _ = git(wt, &["rebase", "--abort"]);
             return Err(format!(
@@ -109,32 +132,102 @@ fn ship_one(cfg: &Config, run: &Run) -> Result<String> {
         }
         Publish::Pr => {
             git(wt, &["push", "--quiet", "-u", "origin", &run.branch])?;
-            let (title, body) = message.split_once("\n\n").unwrap_or((&message, ""));
-            let out = Command::new("gh")
-                .args([
+            // A retry after `gh pr create` failed may find the pull request
+            // made anyway.
+            let open = gh_in(
+                wt,
+                &[
                     "pr",
-                    "create",
-                    "--base",
-                    &run.default_branch,
+                    "list",
                     "--head",
                     &run.branch,
-                ])
-                .args(["--title", title, "--body", body])
-                .current_dir(wt)
-                .output()
-                .map_err(|e| format!("gh: {e}"))?;
-            if !out.status.success() {
-                return Err(format!(
-                    "gh pr create: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )
-                .into());
+                    "--state",
+                    "open",
+                    "--json",
+                    "url",
+                    "--jq",
+                    ".[0].url // empty",
+                ],
+            )?;
+            if open.is_empty() {
+                let (title, body) = message.split_once("\n\n").unwrap_or((&message, ""));
+                gh_in(
+                    wt,
+                    &[
+                        "pr",
+                        "create",
+                        "--base",
+                        &run.default_branch,
+                        "--head",
+                        &run.branch,
+                        "--title",
+                        title,
+                        "--body",
+                        body,
+                    ],
+                )?
+            } else {
+                open
             }
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
         }
     };
-    remove_worktree(&run.repo, wt, &run.branch)?;
     Ok(outcome)
+}
+
+/// Moves each `pr-open` run to `shipped` when its pull request is merged, or
+/// to `rejected` when it is closed unmerged. `done` sees each settled run, and
+/// each run whose pull request `gh` cannot read, which stays `pr-open`.
+pub fn settle(
+    store: &Store,
+    mut done: impl FnMut(&Run, &std::result::Result<String, String>),
+) -> Result<()> {
+    for mut run in store.runs()? {
+        if run.state != RunState::PrOpen {
+            continue;
+        }
+        let url = run.outcome.clone().unwrap_or_default();
+        let state =
+            match crate::sync::gh(&["pr", "view", &url, "--json", "state", "--jq", ".state"]) {
+                Ok(s) => s,
+                Err(e) => {
+                    done(&run, &Err(e));
+                    continue;
+                }
+            };
+        let outcome = match state.trim() {
+            "MERGED" => {
+                run.state = RunState::Shipped;
+                format!("pull request merged: {url}")
+            }
+            "CLOSED" => {
+                run.state = RunState::Rejected;
+                run.error = Some("pull request closed without merging".into());
+                format!("pull request closed without merging: {url}")
+            }
+            _ => continue,
+        };
+        store.update_run(&run)?;
+        done(&run, &Ok(outcome));
+    }
+    Ok(())
+}
+
+/// Runs `gh` in `dir`, so it finds the repository from the git remote.
+fn gh_in(dir: &std::path::Path, args: &[&str]) -> Result<String> {
+    let out = Command::new("gh")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("gh: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "gh {}: {}",
+            args[..2].join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// The task text as subject; `Closes #N` and the co-author trailer as body.

@@ -72,9 +72,19 @@ pub fn slug(text: &str) -> String {
     if out.is_empty() { "task".into() } else { out }
 }
 
-/// Creates the worktree and branch for `pick` from the remote default branch,
-/// and records a queued run.
-pub fn prepare(store: &Store, home: &Path, cfg: &Config, pick: &Pick) -> Result<Run> {
+/// What `prepare` made of a pick.
+#[derive(Debug)]
+pub enum Prepared {
+    Queued(Box<Run>),
+    /// The task is not dispatchable as the last scan described it. Other
+    /// tasks of the project may still be.
+    Refused(String),
+}
+
+/// Checks `pick` against the remote default branch, then creates its worktree
+/// and branch and records a queued run. An error concerns the whole project,
+/// such as a failed fetch.
+pub fn prepare(store: &Store, home: &Path, cfg: &Config, pick: &Pick) -> Result<Prepared> {
     let repo = &pick.repo;
     git(repo, &["fetch", "--quiet", "origin"])?;
     let default_branch = scan::default_branch(repo).ok_or(scan::DEFAULT_BRANCH_UNKNOWN)?;
@@ -85,10 +95,49 @@ pub fn prepare(store: &Store, home: &Path, cfg: &Config, pick: &Pick) -> Result<
             &format!("refs/remotes/origin/{default_branch}"),
         ],
     )?;
-    let ci_log = if pick.key == "ci" {
-        Some(failed_ci_log(repo, &default_branch)?)
-    } else {
-        None
+    let refuse = |why: String| Ok(Prepared::Refused(format!("{}: {why}", pick.project)));
+
+    let details = match pick.key.as_str() {
+        "ci" => {
+            let Some(scan::Ci::Failing(workflows)) = store.project(&pick.project)?.map(|p| p.ci)
+            else {
+                return refuse("CI was not failing at the last scan".into());
+            };
+            match failed_ci_logs(repo, &default_branch, &workflows)? {
+                Ok(logs) => logs,
+                Err(why) => return refuse(why),
+            }
+        }
+        "deps" => {
+            let detail = store
+                .project(&pick.project)?
+                .map(|p| p.deps_detail)
+                .unwrap_or_default();
+            format!(
+                "Outdated dependencies at the last `pma scan --deps`:\n\n```\n{detail}\n```\n\n\
+                 Update them within the project's version constraints first. Change a \
+                 constraint only where the tests still pass, and list any dependency you \
+                 left behind, with the reason.\n"
+            )
+        }
+        _ => {
+            let file = git(repo, &["show", &format!("{base}:TODO.md")]).ok();
+            match on_origin(file.as_deref(), &pick.key, &pick.text) {
+                OnOrigin::Open(description) => description,
+                OnOrigin::Done => {
+                    return refuse(format!(
+                        "`{}` is already done on origin/{default_branch}; pull the clone, then `pma scan`",
+                        pick.text
+                    ));
+                }
+                OnOrigin::Absent => {
+                    return refuse(format!(
+                        "`{}` is not in TODO.md on origin/{default_branch}; commit and push it first",
+                        pick.text
+                    ));
+                }
+            }
+        }
     };
 
     let parent = home.join("worktrees").join(&pick.project);
@@ -100,17 +149,15 @@ pub fn prepare(store: &Store, home: &Path, cfg: &Config, pick: &Pick) -> Result<
         })
         .map(|s| (s.clone(), parent.join(&s)))
         .find(|(s, path)| {
+            // A remote branch is left by an earlier pull request; pushing
+            // over it would be rejected.
             !path.exists()
-                && git(
-                    repo,
-                    &[
-                        "rev-parse",
-                        "--verify",
-                        "--quiet",
-                        &format!("refs/heads/pma/{s}"),
-                    ],
-                )
-                .is_err()
+                && [
+                    format!("refs/heads/pma/{s}"),
+                    format!("refs/remotes/origin/pma/{s}"),
+                ]
+                .iter()
+                .all(|r| git(repo, &["rev-parse", "--verify", "--quiet", r]).is_err())
         })
         .expect("an unused slug exists");
     let branch = format!("pma/{slug}");
@@ -128,34 +175,6 @@ pub fn prepare(store: &Store, home: &Path, cfg: &Config, pick: &Pick) -> Result<
         ],
     )?;
 
-    let details = match &ci_log {
-        Some(log) => format!(
-            "Failing log from `gh run view --log-failed`, last {CI_LOG_LINES} lines:\n\n```\n{log}\n```\n"
-        ),
-        None if pick.key == "deps" => {
-            let detail = store
-                .project(&pick.project)?
-                .map(|p| p.deps_detail)
-                .unwrap_or_default();
-            format!(
-                "Outdated dependencies at the last `pma scan --deps`:\n\n```\n{detail}\n```\n\n\
-                 Update them within the project's version constraints first. Change a \
-                 constraint only where the tests still pass, and list any dependency you \
-                 left behind, with the reason.\n"
-            )
-        }
-        None => match item_description(&worktree, &pick.key, &pick.text) {
-            Some(lines) => lines,
-            None => {
-                remove_worktree(repo, &worktree, &branch)?;
-                return Err(format!(
-                    "{}: `{}` is not an open item in TODO.md on origin/{default_branch}; commit and push it first",
-                    pick.project, pick.text
-                )
-                .into());
-            }
-        },
-    };
     let verify = verify_command(cfg, &pick.project, &worktree);
     let mut run = Run {
         id: 0,
@@ -186,7 +205,7 @@ pub fn prepare(store: &Store, home: &Path, cfg: &Config, pick: &Pick) -> Result<
     };
     run.prompt = prompt(&run, &details, verify.as_deref());
     run.id = store.insert_run(&run)?;
-    Ok(run)
+    Ok(Prepared::Queued(Box::new(run)))
 }
 
 fn path_arg(path: &Path) -> Result<&str> {
@@ -194,43 +213,74 @@ fn path_arg(path: &Path) -> Result<&str> {
         .ok_or_else(|| format!("{} is not valid UTF-8", path.display()).into())
 }
 
-/// The item's description lines, or `None` when it is not open in the file.
-fn item_description(worktree: &Path, key: &str, text: &str) -> Option<String> {
-    let file = std::fs::read_to_string(worktree.join("TODO.md")).ok()?;
-    let item = todo::parse(&file)
-        .items
-        .into_iter()
-        .find(|i| !i.done && i.is_task(key, text))?;
-    Some(
-        item.description
-            .iter()
-            .map(|l| format!("{}\n", l.trim_start()))
-            .collect(),
-    )
+/// A task's item in the remote `TODO.md`.
+#[derive(Debug, PartialEq)]
+enum OnOrigin {
+    /// Open, with its description lines.
+    Open(String),
+    Done,
+    /// Not in the file, or no file.
+    Absent,
 }
 
-fn failed_ci_log(repo: &Path, branch: &str) -> Result<String> {
+fn on_origin(file: Option<&str>, key: &str, text: &str) -> OnOrigin {
+    let Some(file) = file else {
+        return OnOrigin::Absent;
+    };
+    let items = todo::parse(file).items;
+    let mut matching = items.iter().filter(|i| i.is_task(key, text));
+    match matching.clone().find(|i| !i.done) {
+        Some(item) => OnOrigin::Open(
+            item.description
+                .iter()
+                .map(|l| format!("{}\n", l.trim_start()))
+                .collect(),
+        ),
+        None if matching.next().is_some() => OnOrigin::Done,
+        None => OnOrigin::Absent,
+    }
+}
+
+/// The failed-job log of each workflow's latest decisive run, the run scan
+/// judged failing. The inner error refuses the task: a workflow passes now.
+fn failed_ci_logs(
+    repo: &Path,
+    branch: &str,
+    workflows: &[String],
+) -> Result<std::result::Result<String, String>> {
+    use crate::sync::gh;
     let url = git(repo, &["remote", "get-url", "origin"])?;
     let slug = scan::github_slug(&url).ok_or("origin is not on GitHub")?;
-    use crate::sync::gh;
-    let id = gh(&[
-        "run",
-        "list",
-        "-R",
-        &slug,
-        "--branch",
-        branch,
-        "--status",
-        "failure",
-        "--limit",
-        "1",
-        "--json",
-        "databaseId",
-        "--jq",
-        ".[0].databaseId",
-    ])?;
-    let log = gh(&["run", "view", id.trim(), "-R", &slug, "--log-failed"])?;
-    Ok(agent::tail(&log, CI_LOG_LINES))
+    let mut logs = String::new();
+    for workflow in workflows {
+        let runs = gh(&[
+            "run",
+            "list",
+            "-R",
+            &slug,
+            "--branch",
+            branch,
+            "--workflow",
+            workflow,
+            "--limit",
+            "20",
+            "--json",
+            "databaseId,status,conclusion",
+        ])?;
+        let Some(id) = scan::latest_failed_run(&runs)? else {
+            return Ok(Err(format!(
+                "`{workflow}` no longer fails on {branch}; run `pma scan`"
+            )));
+        };
+        // A startup failure has no job log; the agent still gets the run id.
+        let log = gh(&["run", "view", &id.to_string(), "-R", &slug, "--log-failed"])
+            .map(|log| agent::tail(&log, CI_LOG_LINES))
+            .unwrap_or_else(|e| format!("(no failed-job log: {e})"));
+        logs.push_str(&format!(
+            "Workflow `{workflow}`, run {id}, last {CI_LOG_LINES} lines of `gh run view --log-failed`:\n\n```\n{log}\n```\n\n"
+        ));
+    }
+    Ok(Ok(logs))
 }
 
 fn prompt(run: &Run, details: &str, verify: Option<&str>) -> String {
@@ -249,7 +299,7 @@ fn prompt(run: &Run, details: &str, verify: Option<&str>) -> String {
     );
     if let Some(v) = verify {
         p.push_str(&format!(
-            "- pma runs `{v}` after you finish, to check the change.\n"
+            "- Run `{v}` to check your change. pma runs it again after you finish.\n"
         ));
     }
     p.push_str("\nEnd with a short summary of what you changed and what is left undone.\n");
@@ -365,7 +415,8 @@ fn attempt(home: &Path, cfg: &Config, run: &mut Run, feedback: Option<&str>) {
         ),
         None => run.prompt.clone(),
     };
-    let mut cmd = agent::claude(&prompt, cfg.agent_budget);
+    run.verify = verify_command(cfg, &run.project, &run.worktree);
+    let mut cmd = agent::claude(&prompt, cfg.agent_budget, run.verify.as_deref());
     cmd.current_dir(&run.worktree);
     agent::restrict(&mut cmd, &empty);
     run.started_at = Some(crate::dates::now());
@@ -404,7 +455,6 @@ fn attempt(home: &Path, cfg: &Config, run: &mut Run, feedback: Option<&str>) {
         return;
     }
 
-    run.verify = verify_command(cfg, &run.project, &run.worktree);
     run.verify_ok = None;
     if let Some(v) = &run.verify {
         let mut cmd = Command::new("sh");
@@ -459,6 +509,14 @@ pub fn approve(store: &Store, run: &mut Run) -> Result<()> {
 }
 
 pub fn reject(store: &Store, run: &mut Run) -> Result<()> {
+    if run.state == RunState::PrOpen {
+        return Err(format!(
+            "run #{} has an open pull request; merge or close it: {}",
+            run.id,
+            run.outcome.as_deref().unwrap_or_default()
+        )
+        .into());
+    }
     if run.state.is_final() || matches!(run.state, RunState::Queued | RunState::Running) {
         return Err(format!(
             "run #{} is {}; it cannot be rejected",
@@ -584,7 +642,27 @@ mod tests {
             "{p}"
         );
         assert!(p.contains("Do not commit"));
-        assert!(p.contains("pma runs `make test`"));
+        assert!(p.contains("Run `make test` to check your change."));
         assert!(!prompt(&run, "", None).contains("pma runs"));
+    }
+
+    #[test]
+    fn items_are_open_done_or_absent_on_origin() {
+        let file = "# TODO\n\n## High\n\n- [ ] open one gh:3\n  why\n- [x] finished\n";
+        assert_eq!(
+            on_origin(Some(file), "gh:3", "open one"),
+            OnOrigin::Open("why\n".into())
+        );
+        assert_eq!(
+            on_origin(Some(file), "open one", "open one"),
+            OnOrigin::Open("why\n".into()),
+            "a key that lost gh:N still matches by text"
+        );
+        assert_eq!(
+            on_origin(Some(file), "finished", "finished"),
+            OnOrigin::Done
+        );
+        assert_eq!(on_origin(Some(file), "other", "other"), OnOrigin::Absent);
+        assert_eq!(on_origin(None, "open one", "open one"), OnOrigin::Absent);
     }
 }

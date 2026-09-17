@@ -318,14 +318,14 @@ struct Env {
 }
 
 impl Env {
-    fn run(&self, args: &[&str]) -> (String, String, bool) {
+    fn command(&self, args: &[&str]) -> Command {
         let path = format!(
             "{}:{}",
             self.bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let out = Command::new(env!("CARGO_BIN_EXE_pma"))
-            .env("PMA_HOME", &self.home)
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_pma"));
+        cmd.env("PMA_HOME", &self.home)
             .env("PATH", path)
             .env("PUSH_LOG", &self.push_log)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -334,9 +334,12 @@ impl Env {
             .env("GIT_AUTHOR_EMAIL", "u@example.com")
             .env("GIT_COMMITTER_NAME", "u")
             .env("GIT_COMMITTER_EMAIL", "u@example.com")
-            .args(args)
-            .output()
-            .unwrap();
+            .args(args);
+        cmd
+    }
+
+    fn run(&self, args: &[&str]) -> (String, String, bool) {
+        let out = self.command(args).output().unwrap();
         (
             String::from_utf8_lossy(&out.stdout).into_owned(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -362,15 +365,18 @@ fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-#[test]
-fn dispatch_review_rework_and_ship() {
+/// Installs `scripts` as executables on the `PATH` of a new `Env`, and a
+/// tiered project `alpha` cloned from `origin.git`. Returns the env, origin
+/// and the clone.
+fn dispatch_env(s: &Scratch, scripts: &[(&str, &str)]) -> (Env, PathBuf, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
 
-    let s = Scratch::new("stage3");
     let bin = s.0.join("bin");
     fs::create_dir_all(&bin).unwrap();
-    fs::write(bin.join("claude"), FAKE_CLAUDE).unwrap();
-    fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
+    for (name, script) in scripts {
+        fs::write(bin.join(name), script).unwrap();
+        fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let env = Env {
         home: s.0.join("home"),
         bin,
@@ -399,6 +405,13 @@ fn dispatch_review_rework_and_ship() {
     env.ok(&["root", "add", root.to_str().unwrap()]);
     env.ok(&["tier", "alpha", "1"]);
     env.ok(&["scan", "--offline"]);
+    (env, origin, alpha)
+}
+
+#[test]
+fn dispatch_review_rework_and_ship() {
+    let s = Scratch::new("stage3");
+    let (env, origin, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
     env.ok(&["config", "publish", "push"]);
 
     // Both runs start from origin; the second fails its verify.
@@ -492,6 +505,249 @@ fn dispatch_review_rework_and_ship() {
         "{out}"
     );
     env.ok(&["review", "4", "--reject"]);
+}
+
+/// A stand-in for `gh pr`, driven by files in `$PMA_HOME`: `pr-state` for
+/// `pr view`, `pr-list` for an open pull request, `pr-create-fails`.
+const FAKE_GH_PR: &str = r#"#!/bin/sh
+case "$1 $2" in
+  "pr create")
+    if [ -e "$PMA_HOME/pr-create-fails" ]; then echo "HTTP 502" >&2; exit 1; fi
+    echo "https://github.com/me/alpha/pull/1" ;;
+  "pr list") if [ -e "$PMA_HOME/pr-list" ]; then cat "$PMA_HOME/pr-list"; fi ;;
+  "pr view") cat "$PMA_HOME/pr-state" ;;
+  *) echo "fake gh: unexpected $*" >&2; exit 1 ;;
+esac
+"#;
+
+#[test]
+fn a_pull_request_holds_its_task_until_merged_or_closed() {
+    let s = Scratch::new("pr");
+    let (env, origin, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE), ("gh", FAKE_GH_PR)]);
+    let pr_state = env.home.join("pr-state");
+
+    env.ok(&["dispatch", "alpha:5"]);
+    env.ok(&["review", "1", "--approve"]);
+    let out = env.ok(&["ship"]);
+    assert_eq!(out, "#1 alpha: https://github.com/me/alpha/pull/1\n");
+    assert_eq!(
+        git_out(&origin, &["branch", "--list", "pma/*"]),
+        "  pma/add-greeting\n"
+    );
+
+    fs::write(&pr_state, "OPEN\n").unwrap();
+    assert!(env.ok(&["review"]).contains("#1  pr-open  alpha"));
+    let out = env.ok(&["dispatch", "--auto", "-n", "1"]);
+    assert!(out.contains("#2 alpha: second task"), "{out}");
+    env.ok(&["review", "2", "--reject"]);
+    let (_, err, success) = env.run(&["dispatch", "alpha:5"]);
+    assert!(!success && err.contains("already has a run"), "{err}");
+    let (_, err, success) = env.run(&["review", "1", "--reject"]);
+    assert!(
+        !success && err.contains("open pull request; merge or close it"),
+        "{err}"
+    );
+
+    // A closed pull request frees the task. Its remote branch stays, so the
+    // new run takes another name.
+    fs::write(&pr_state, "CLOSED\n").unwrap();
+    let out = env.ok(&["review"]);
+    assert!(
+        out.starts_with("#1 alpha: pull request closed without merging: https://"),
+        "{out}"
+    );
+    let out = env.ok(&["dispatch", "alpha:5"]);
+    assert!(out.contains("#3 alpha: add greeting"), "{out}");
+    assert!(env.ok(&["review", "3"]).contains("pma/add-greeting-2 in"));
+
+    env.ok(&["review", "3", "--approve"]);
+    env.ok(&["ship"]);
+    fs::write(&pr_state, "MERGED\n").unwrap();
+    let out = env.ok(&["review"]);
+    assert_eq!(
+        out,
+        "#3 alpha: pull request merged: https://github.com/me/alpha/pull/1\nno runs to review\n"
+    );
+    assert!(!alpha.join("hello.txt").exists(), "the clone is untouched");
+}
+
+#[test]
+fn ship_resumes_after_a_partial_failure() {
+    let s = Scratch::new("resume");
+    let (env, origin, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE), ("gh", FAKE_GH_PR)]);
+    env.ok(&["config", "publish", "push"]);
+
+    // The push succeeds and removing the worktree fails.
+    env.ok(&["dispatch", "alpha:5"]);
+    env.ok(&["review", "1", "--approve"]);
+    let worktree = env.home.join("worktrees/alpha/add-greeting");
+    git(
+        &alpha,
+        &["worktree", "lock", worktree.to_str().unwrap()],
+        None,
+    );
+    let out = env.ok(&["ship"]);
+    assert!(
+        out.starts_with("#1 alpha: pushed ") && out.contains("; warning: worktree not removed: "),
+        "{out}"
+    );
+    assert_eq!(
+        env.ok(&["review"]),
+        "no runs to review\n",
+        "shipped all the same"
+    );
+
+    // As if pma had stopped between the push and recording it.
+    rusqlite::Connection::open(env.home.join("projects.db"))
+        .unwrap()
+        .execute("UPDATE runs SET state = 'approved' WHERE id = 1", [])
+        .unwrap();
+    git(
+        &alpha,
+        &["worktree", "unlock", worktree.to_str().unwrap()],
+        None,
+    );
+    let out = env.ok(&["ship"]);
+    assert!(out.starts_with("#1 alpha: already pushed "), "{out}");
+    assert!(!worktree.exists());
+    assert_eq!(
+        git_out(&origin, &["log", "--format=%s", "main"]),
+        "add greeting\ninit\n",
+        "pushed once"
+    );
+
+    // `gh pr create` fails after the push; the retry finds the pull request.
+    env.ok(&["config", "publish", "pr"]);
+    env.ok(&["dispatch", "alpha:7"]);
+    env.ok(&["review", "2", "--approve"]);
+    fs::write(env.home.join("pr-create-fails"), "").unwrap();
+    let (out, _, success) = env.run(&["ship"]);
+    assert!(!success && out.contains("gh pr create: HTTP 502"), "{out}");
+    assert!(env.ok(&["review"]).contains("#2  approved"));
+    fs::remove_file(env.home.join("pr-create-fails")).unwrap();
+    fs::write(
+        env.home.join("pr-list"),
+        "https://github.com/me/alpha/pull/9\n",
+    )
+    .unwrap();
+    assert_eq!(
+        env.ok(&["ship"]),
+        "#2 alpha: https://github.com/me/alpha/pull/9\n"
+    );
+}
+
+#[test]
+fn auto_dispatch_passes_over_refused_tasks_and_names_the_cause() {
+    let s = Scratch::new("refused");
+    let (env, origin, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+
+    // The clone has an unpushed item first, and is behind a tick on origin.
+    let todo = fs::read_to_string(alpha.join("TODO.md")).unwrap();
+    fs::write(
+        alpha.join("TODO.md"),
+        todo.replace("- [ ] add greeting", "- [ ] local only\n- [ ] add greeting"),
+    )
+    .unwrap();
+    let other = s.0.join("other");
+    git(
+        &s.0,
+        &["clone", "-q", origin.to_str().unwrap(), "other"],
+        None,
+    );
+    let ticked = fs::read_to_string(other.join("TODO.md"))
+        .unwrap()
+        .replace("- [ ] third task", "- [x] third task");
+    fs::write(other.join("TODO.md"), ticked).unwrap();
+    git(&other, &["commit", "-qam", "tick"], None);
+    git(&other, &["push", "-q"], None);
+    env.ok(&["scan", "--offline"]);
+
+    let (out, err, success) = env.run(&["dispatch", "--auto", "-n", "1"]);
+    assert!(success, "{err}");
+    assert!(
+        err.contains("warning: alpha: `local only` is not in TODO.md on origin/main; commit and push it first"),
+        "{err}"
+    );
+    assert!(out.starts_with("#1 alpha: add greeting\n"), "{out}");
+
+    let (_, err, success) = env.run(&["dispatch", "alpha:9"]);
+    assert!(
+        !success && err.contains("`third task` is already done on origin/main; pull the clone"),
+        "{err}"
+    );
+}
+
+/// A stand-in for `claude -p` that finishes once `$PMA_HOME/release` exists,
+/// or after about 60s.
+const SLOW_CLAUDE: &str = r#"#!/bin/sh
+n=0
+while [ ! -e "$PMA_HOME/release" ] && [ $n -lt 1200 ]; do sleep 0.05; n=$((n + 1)); done
+echo hi > hello.txt
+echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","total_cost_usd":0.1}'
+"#;
+
+#[test]
+fn a_second_session_leaves_running_runs_alone() {
+    let s = Scratch::new("session");
+    let (env, _, _) = dispatch_env(&s, &[("claude", SLOW_CLAUDE)]);
+
+    /// Releases the agent when the test ends, passing or not.
+    struct Release(PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, "");
+        }
+    }
+    let release = Release(env.home.join("release"));
+
+    // Piped, so a failed test does not wait on the child holding its output.
+    let mut dispatch = env
+        .command(&["dispatch", "alpha:5"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    let mut last = String::new();
+    while !last.contains("#1  running") {
+        if dispatch.try_wait().unwrap().is_some() || started.elapsed().as_secs() >= 30 {
+            let _ = dispatch.kill();
+            let out = dispatch.wait_with_output().unwrap();
+            panic!(
+                "the run never started; review: {last}\ndispatch: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        last = env.ok(&["review"]);
+    }
+
+    assert!(
+        env.ok(&["review"]).contains("#1  running"),
+        "review does not fail a live run"
+    );
+    for args in [
+        &["dispatch", "alpha:6"][..],
+        &["ship"],
+        &["review", "1", "--reject"],
+    ] {
+        let (_, err, success) = env.run(args);
+        assert!(
+            !success && err.contains("another pma session (pid "),
+            "{args:?}: {err}"
+        );
+    }
+
+    drop(release);
+    let out = dispatch.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 ready, 0 failed"),
+        "{stdout}"
+    );
+    assert!(env.ok(&["review"]).contains("#1  ready"));
+    env.ok(&["review", "1", "--reject"]);
 }
 
 /// A stand-in for `gh` backed by `issues.json`; mutating calls are logged.

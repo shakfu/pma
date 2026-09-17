@@ -474,6 +474,35 @@ fn gh_error(stderr: &str) -> String {
         .to_string()
 }
 
+/// Whether a run failed: `None` for a run that is unfinished, cancelled or
+/// skipped, which does not decide a workflow's state.
+fn failed(status: &str, conclusion: &str) -> Option<bool> {
+    if status != "completed" {
+        return None;
+    }
+    match conclusion {
+        "success" => Some(false),
+        "failure" | "timed_out" | "startup_failure" => Some(true),
+        _ => None,
+    }
+}
+
+/// The id of a workflow's latest decisive run when that run failed, from
+/// `gh run list --json databaseId,status,conclusion`, newest first. `None`
+/// when the workflow now passes or has no decisive run.
+pub fn latest_failed_run(json: &str) -> Result<Option<u64>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("gh run list: {e}"))?;
+    let runs = value.as_array().ok_or("gh run list: expected an array")?;
+    Ok(runs
+        .iter()
+        .find_map(|r| {
+            failed(r["status"].as_str()?, r["conclusion"].as_str()?)
+                .map(|f| f.then(|| r["databaseId"].as_u64()).flatten())
+        })
+        .flatten())
+}
+
 /// Reads `gh run list` rows, newest first, as `workflow \t status \t conclusion`.
 /// Each workflow is judged by its latest run that succeeded or failed.
 fn parse_runs(tsv: &str) -> Ci {
@@ -484,13 +513,13 @@ fn parse_runs(tsv: &str) -> Ci {
         let (Some(name), Some(status), Some(conclusion)) = (f.next(), f.next(), f.next()) else {
             continue;
         };
-        if status != "completed" || decided.contains(name) {
+        if decided.contains(name) {
             continue;
         }
-        match conclusion {
-            "success" => {}
-            "failure" | "timed_out" | "startup_failure" => failing.push(name.to_string()),
-            _ => continue,
+        match failed(status, conclusion) {
+            None => continue,
+            Some(true) => failing.push(name.to_string()),
+            Some(false) => {}
         }
         decided.insert(name);
     }
@@ -564,6 +593,34 @@ mod tests {
         );
         assert_eq!(parse_runs("a\tcompleted\tcancelled\n"), Ci::NoRuns);
         assert_eq!(parse_runs(""), Ci::NoRuns);
+    }
+
+    #[test]
+    fn a_workflow_failed_when_its_latest_decisive_run_failed() {
+        let json = |rows: &str| format!("[{rows}]");
+        let run = |id: u64, status: &str, conclusion: &str| {
+            format!(r#"{{"databaseId":{id},"status":"{status}","conclusion":"{conclusion}"}}"#)
+        };
+        let failing = json(
+            &[
+                run(9, "in_progress", ""),
+                run(8, "completed", "cancelled"),
+                run(7, "completed", "timed_out"),
+                run(6, "completed", "success"),
+            ]
+            .join(","),
+        );
+        assert_eq!(latest_failed_run(&failing), Ok(Some(7)));
+        let fixed = json(
+            &[
+                run(5, "completed", "success"),
+                run(4, "completed", "failure"),
+            ]
+            .join(","),
+        );
+        assert_eq!(latest_failed_run(&fixed), Ok(None), "fixed since");
+        assert_eq!(latest_failed_run("[]"), Ok(None));
+        assert!(latest_failed_run("{}").is_err());
     }
 
     #[test]

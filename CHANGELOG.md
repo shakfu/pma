@@ -6,7 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-Everything below turns the agent loop from one prompt per task into a measured, gated pipeline. `docs/dev/implementation-plan.md` sequences it; `docs/dev/plan-review.md` is the review it answers.
+The agent-loop entries below turn one prompt per task into a measured, gated pipeline. `docs/dev/implementation-plan.md` sequences it; `docs/dev/plan-review.md` is the review it answers.
 
 **Per-attempt records.** Each agent invocation and the verification after it is an append-only `attempts` row with its own summary, cost, duration, verify result and model. `runs` kept one mutable row per task, so a rework overwrote the previous attempt and a task that failed twice before succeeding recorded only the success -- the case calibration most needs. `pma review <id>` lists the attempts when there is more than one. Schema 6.
 
@@ -25,6 +25,7 @@ Everything below turns the agent loop from one prompt per task into a measured, 
 ```
 read this run because:
   - outside class B: .github/workflows/ci.yml
+
   - the base already passed, so no check discriminates this change
 ```
 
@@ -102,7 +103,17 @@ The item is marked done after the rebase, not before. Git treats changes to adja
 
 `claude --max-budget-usd` is checked between turns and was exceeded in use ($0.09 under a $0.05 cap). `batch_budget` limits which runs start, not their total spend.
 
+**Each project's GitHub `owner/name`**, read from the origin URL by the scan and stored on the project row. `pma sync` derived it per invocation and no other command could reach it, so an item's `gh:N` was an issue number with no repository to resolve it against. The local path remains the project's identity. Every scan re-reads the slug, so an origin that moves off GitHub clears it. Schema 17.
+
+**`pma forget <project>`** deletes an absent project's record -- its tasks, tags, attempt counters, cached base checks and campaign memberships -- and is a dry run until `--apply`. Nothing else deletes a project row now that a full scan only marks, so a repository that is gone for good would otherwise stay indefinitely. It refuses a project still under a root, which the next scan would restore anyway, and one with runs that are not shipped or rejected, since each may still own a worktree; finished runs are kept.
+
+**Private project tags.** `pma tag add ai cyllama inferna` groups projects, `pma tag` lists the tags with their counts, and `pma tag show <tag>` names the members. Every command that takes project names also takes `--tag`, repeatable, selecting the union: `pma status --tag ai --tag audio` covers both groups and lists a project carrying both of them once. Tags are local to the database, never read from or written to GitHub, whose topics describe a repository for search rather than group one's own work.
+
+A `--tag` that matches no project is an error, because an empty selection means the whole portfolio everywhere else, and `pma sync --tag typo --apply` would then act on every project. A tag selection also makes `pma scan` partial: as a full scan it would mark every project it did not name absent. Schema 19.
+
 ### Changed
+
+**A full scan marks a project absent instead of deleting it.** The row keeps its tier, its tasks and their `first_seen`, and records when it stopped being found; `pma scan` reports `absent: <name> is no longer under a root`. Deleting dropped the tier and every task's `first_seen`, and a later scan can rebuild neither, so a project moved between roots came back with all of its work aged from the day it returned. `pma dispatch`, `pma campaign` and `pma sync` refuse an absent project and name where it was last seen, since its recorded path no longer holds a working tree. Schema 18.
 
 **Eligibility replaces quadrant gating.** `pma dispatch --auto` draws from the tasks an agent may take -- the `ci` and `deps` signals at any tier, and items tagged `#agent` -- in matrix order. Importance orders the queue; eligibility decides what is taken from it. `Medium` and `Low` are never important at any tier, so quadrant gating hid exactly the mechanical maintenance agents are best at, and a `deps` task landed in Q4 where `--auto` never reached it. `dispatch_quadrants` and `overflow_quadrants` are retired; the 2x2 remains a view.
 
@@ -132,7 +143,7 @@ The item is marked done after the rebase, not before. Git treats changes to adja
 
 **CI detail names the cause of a `gh` failure.** It kept the last line of `gh`'s stderr, which is an alternative or an update notice. Without authentication every project read "Alternatively, populate the GH_TOKEN environment variable..." instead of "please run: gh auth login".
 
-## [0.1.0] - 2026-09-14
+## [0.1.0]
 
 ### Added
 
@@ -144,4 +155,3 @@ An item's age is taken from the commit where its text first appeared in `TODO.md
 
 **`pma lint`.** Checks TODO.md files against format v1, defined in `docs/dev/design.md`. The parser works line by line, not through a markdown AST, so later stages can edit one line without re-rendering the file. A file with no items but with plain bullets elsewhere is flagged. Otherwise such a file lints clean while `pma` sees none of its tasks.
 
-[Unreleased]: https://github.com/shakfu/pma/compare/0.1.0...HEAD [0.1.0]: https://github.com/shakfu/pma/releases/tag/0.1.0

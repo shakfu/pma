@@ -87,6 +87,10 @@ enum Command {
     Scan {
         /// Project names; defaults to every project.
         projects: Vec<String>,
+        /// Also select every project carrying this tag; repeatable.
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+
         /// Skip GitHub; CI is recorded as unknown.
         #[arg(long)]
         offline: bool,
@@ -99,6 +103,10 @@ enum Command {
     Matrix {
         /// Limit to these projects.
         projects: Vec<String>,
+        /// Also select every project carrying this tag; repeatable.
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+
         /// Show one quadrant: q1, q2, q3 or q4.
         #[arg(short, long, value_parser = parse_quadrant)]
         quadrant: Option<rank::Quadrant>,
@@ -110,6 +118,10 @@ enum Command {
     Status {
         /// Limit to these projects.
         projects: Vec<String>,
+        /// Also select every project carrying this tag; repeatable.
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+
         /// Show each signal's contribution.
         #[arg(long)]
         explain: bool,
@@ -122,6 +134,10 @@ enum Command {
     Dispatch {
         /// Targets; with --auto, projects to draw from.
         targets: Vec<String>,
+        /// With --auto, also draw from every project carrying this tag;
+        /// repeatable.
+        #[arg(long = "tag", value_name = "TAG", requires = "auto")]
+        tags: Vec<String>,
         /// Draw the top tasks from `dispatch_quadrants`, then
         /// `overflow_quadrants`.
         #[arg(long)]
@@ -154,6 +170,9 @@ enum Command {
     Stale {
         /// Limit to these projects.
         projects: Vec<String>,
+        /// Also select every project carrying this tag; repeatable.
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
         /// How many to show; defaults to `quadrant_limit`.
         #[arg(short = 'n', long)]
         count: Option<usize>,
@@ -184,11 +203,35 @@ enum Command {
     Ship {
         /// Limit to these projects.
         projects: Vec<String>,
+        /// Also select every project carrying this tag; repeatable.
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
     },
     /// List portfolio notes, or add, edit or remove one.
     Note {
         #[command(subcommand)]
         action: Option<NoteAction>,
+    },
+    /// Delete an absent project's record: its tasks, tags, attempt counters
+    /// and campaign memberships.
+    ///
+    /// Only a project that no full scan can find is forgotten, since one that
+    /// is still under a root returns on the next scan. Its runs are kept:
+    /// their worktrees may still exist. Dry run unless --apply.
+    Forget {
+        /// The project's name, as `pma status` shows it.
+        project: String,
+        /// Delete it instead of reporting what would go.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Group projects with private tags. A project may carry several.
+    ///
+    /// Tags are local to this database and are never read from or written to
+    /// GitHub. Commands that take project names also take `--tag`.
+    Tag {
+        #[command(subcommand)]
+        action: Option<TagAction>,
     },
     /// Browse the matrix in the terminal. Reads the last scan.
     Tui,
@@ -201,10 +244,32 @@ enum Command {
     Sync {
         /// Limit to these projects; defaults to every scanned project.
         projects: Vec<String>,
+        /// Also select every project carrying this tag; repeatable.
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+
         /// Make the changes instead of listing them.
         #[arg(long)]
         apply: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum TagAction {
+    /// Give projects a tag.
+    Add {
+        tag: String,
+        #[arg(required = true)]
+        projects: Vec<String>,
+    },
+    /// Take a tag off projects.
+    Rm {
+        tag: String,
+        #[arg(required = true)]
+        projects: Vec<String>,
+    },
+    /// List the projects carrying a tag.
+    Show { tag: String },
 }
 
 #[derive(Subcommand)]
@@ -323,21 +388,28 @@ fn main() -> ExitCode {
         Command::Config { key, value, reset } => configure(key.as_deref(), value.as_deref(), reset),
         Command::Scan {
             projects,
+            tags,
             offline,
             deps,
-        } => run_scan(&projects, offline, deps),
+        } => run_scan(&projects, &tags, offline, deps),
         Command::Matrix {
             projects,
+            tags,
             quadrant,
             all,
-        } => show_matrix(&projects, quadrant, all),
-        Command::Status { projects, explain } => show_status(&projects, explain),
+        } => show_matrix(&projects, &tags, quadrant, all),
+        Command::Status {
+            projects,
+            tags,
+            explain,
+        } => show_status(&projects, &tags, explain),
         Command::Dispatch {
             targets,
+            tags,
             auto,
             count,
             retry,
-        } => run_dispatch(&targets, auto, count, retry),
+        } => run_dispatch(&targets, &tags, auto, count, retry),
         Command::Review {
             ids,
             approve,
@@ -345,14 +417,24 @@ fn main() -> ExitCode {
             rework,
             minutes,
         } => run_review(&ids, approve, reject, rework.as_deref(), minutes),
-        Command::Stale { projects, count } => show_stale(&projects, count),
+        Command::Stale {
+            projects,
+            tags,
+            count,
+        } => show_stale(&projects, &tags, count),
         Command::Campaign { action } => campaign_command(action),
         Command::Route { action } => route_command(action),
         Command::Agent { action } => agent_command(action),
         Command::Report { by } => run_report(by.as_deref()),
-        Command::Ship { projects } => run_ship(&projects),
-        Command::Sync { projects, apply } => run_sync(&projects, apply),
+        Command::Ship { projects, tags } => run_ship(&projects, &tags),
+        Command::Sync {
+            projects,
+            tags,
+            apply,
+        } => run_sync(&projects, &tags, apply),
         Command::Note { action } => note(action),
+        Command::Forget { project, apply } => forget(&project, apply),
+        Command::Tag { action } => tag(action),
         Command::Tui => run_tui(),
     };
     match result {
@@ -511,6 +593,113 @@ fn root(action: Option<RootAction>) -> Result<()> {
     Ok(())
 }
 
+fn forget(name: &str, apply: bool) -> Result<()> {
+    let mut store = Store::open_default()?;
+    let row = store
+        .project(name)?
+        .ok_or_else(|| format!("unknown project `{name}`"))?;
+    if row.absent_since.is_none() {
+        return Err(format!(
+            "{name} is still under a root at {}; `pma root rm` its root or delete the \
+             checkout, run `pma scan`, then forget it",
+            row.path.display()
+        )
+        .into());
+    }
+    let f = store.project_footprint(name)?;
+    if !f.open_runs.is_empty() {
+        let ids: Vec<String> = f.open_runs.iter().map(|id| format!("#{id}")).collect();
+        return Err(format!(
+            "{name} has runs that are not shipped or rejected: {}. Each may own a worktree; \
+             settle them with `pma review` first",
+            ids.join(" ")
+        )
+        .into());
+    }
+
+    println!(
+        "{name}: {} tasks, {} tags, {} campaign memberships",
+        f.tasks, f.tags, f.campaigns
+    );
+    if f.runs > 0 {
+        println!("{name}: {} finished runs are kept", f.runs);
+    }
+    if !apply {
+        println!("run `pma forget {name} --apply` to delete the record");
+        return Ok(());
+    }
+    store.forget_project(name)?;
+    println!("{name} is forgotten");
+    Ok(())
+}
+
+fn tag(action: Option<TagAction>) -> Result<()> {
+    let store = Store::open_default()?;
+    let known = |names: &[String]| -> Result<()> {
+        let rows = store.projects()?;
+        for n in names {
+            if !rows.iter().any(|r| &r.name == n) {
+                return Err(format!("unknown project `{n}`; run `pma scan`").into());
+            }
+        }
+        Ok(())
+    };
+    match action {
+        None => {
+            let pairs = store.project_tags()?;
+            if pairs.is_empty() {
+                println!("no tags; add one with `pma tag add <tag> <project>...`");
+                return Ok(());
+            }
+            let mut counts: Vec<(String, usize)> = Vec::new();
+            for (_, t) in pairs {
+                match counts.iter_mut().find(|(name, _)| name == &t) {
+                    Some((_, n)) => *n += 1,
+                    None => counts.push((t, 1)),
+                }
+            }
+            counts.sort();
+            for (t, n) in counts {
+                println!("{t}  {n}");
+            }
+        }
+        Some(TagAction::Add { tag, projects }) => {
+            let tag = normal_tag(&tag)?;
+            known(&projects)?;
+            for p in &projects {
+                if !store.add_project_tag(p, &tag)? {
+                    println!("{p} already carries `{tag}`");
+                }
+            }
+        }
+        Some(TagAction::Rm { tag, projects }) => {
+            let tag = normal_tag(&tag)?;
+            for p in &projects {
+                if !store.remove_project_tag(p, &tag)? {
+                    println!("{p} does not carry `{tag}`");
+                }
+            }
+        }
+        Some(TagAction::Show { tag }) => {
+            let tag = normal_tag(&tag)?;
+            for p in store.projects_tagged(&[tag])? {
+                println!("{p}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Tags are matched exactly, so they are lowercased once here rather than
+/// leaving `ai` and `AI` as two groups.
+fn normal_tag(tag: &str) -> Result<String> {
+    let tag = tag.trim().to_lowercase();
+    if tag.is_empty() || tag.split_whitespace().count() > 1 {
+        return Err("a tag is one word".into());
+    }
+    Ok(tag)
+}
+
 fn set_tier(name: &str, tier: Option<&str>) -> Result<()> {
     let store = Store::open_default()?;
     let known = store.project(name)?;
@@ -598,9 +787,10 @@ fn load_config(store: &Store) -> Result<Config> {
     )?)
 }
 
-fn run_scan(names: &[String], offline: bool, deps: bool) -> Result<()> {
+fn run_scan(names: &[String], tags: &[String], offline: bool, deps: bool) -> Result<()> {
     let mut store = Store::open_default()?;
     let cfg = load_config(&store)?;
+    let names = &select(&store, names, tags)?;
     let roots = store.roots()?;
     if roots.is_empty() {
         return Err("no roots; add one with `pma root add <dir>`".into());
@@ -633,9 +823,8 @@ fn run_scan(names: &[String], offline: bool, deps: bool) -> Result<()> {
             f.error.as_deref().unwrap_or_default()
         );
     }
-    for (name, tier) in store.save_scan(&facts, names.is_empty(), dates::now())? {
-        let lost = tier.map_or(String::new(), |t| format!("; its tier {t} is forgotten"));
-        eprintln!("removed {name}: no longer under a root{lost}");
+    for name in store.save_scan(&facts, names.is_empty(), dates::now())? {
+        eprintln!("absent: {name} is no longer under a root; its record is kept");
     }
 
     let with_todo = facts.iter().filter(|f| f.todo.is_some()).count();
@@ -681,7 +870,26 @@ struct Portfolio {
     scanned_ago: i64,
 }
 
-fn portfolio(names: &[String]) -> Result<Portfolio> {
+/// The projects named outright together with every project carrying one of
+/// `tags`. Empty means all of them, so a `--tag` that matches nothing is an
+/// error rather than a silent selection of the whole portfolio.
+fn select(store: &Store, names: &[String], tags: &[String]) -> Result<Vec<String>> {
+    if tags.is_empty() {
+        return Ok(names.to_vec());
+    }
+    let mut out = names.to_vec();
+    for project in store.projects_tagged(tags)? {
+        if !out.contains(&project) {
+            out.push(project);
+        }
+    }
+    if out.is_empty() {
+        return Err(format!("no project carries `{}`", tags.join("` or `")).into());
+    }
+    Ok(out)
+}
+
+fn portfolio(names: &[String], tags: &[String]) -> Result<Portfolio> {
     let store = Store::open_default()?;
     let cfg = load_config(&store)?;
     let now = dates::now();
@@ -690,8 +898,9 @@ fn portfolio(names: &[String]) -> Result<Portfolio> {
         .last_scan()?
         .ok_or("nothing scanned yet; run `pma scan`")?;
 
+    let names = select(&store, names, tags)?;
     let rows = store.projects()?;
-    for n in names {
+    for n in &names {
         if !rows.iter().any(|r| &r.name == n) {
             return Err(format!("unknown project `{n}`").into());
         }
@@ -769,8 +978,13 @@ fn header(p: &Portfolio) {
     println!("{}\n", header_text(p));
 }
 
-fn show_matrix(names: &[String], quadrant: Option<rank::Quadrant>, all: bool) -> Result<()> {
-    let p = portfolio(names)?;
+fn show_matrix(
+    names: &[String],
+    tags: &[String],
+    quadrant: Option<rank::Quadrant>,
+    all: bool,
+) -> Result<()> {
+    let p = portfolio(names, tags)?;
     header(&p);
     let limit = (!all).then_some(p.cfg.quadrant_limit as usize);
     let placed = rank::place(&p.cfg, p.tasks, p.today);
@@ -778,8 +992,8 @@ fn show_matrix(names: &[String], quadrant: Option<rank::Quadrant>, all: bool) ->
     Ok(())
 }
 
-fn show_status(names: &[String], explain: bool) -> Result<()> {
-    let p = portfolio(names)?;
+fn show_status(names: &[String], tags: &[String], explain: bool) -> Result<()> {
+    let p = portfolio(names, tags)?;
     header(&p);
     let rows: Vec<report::StatusRow> = p
         .projects
@@ -805,7 +1019,13 @@ fn has_run(runs: &[store::Run], project: &str, key: &str, text: &str) -> bool {
     })
 }
 
-fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>, retry: bool) -> Result<()> {
+fn run_dispatch(
+    targets: &[String],
+    tags: &[String],
+    auto: bool,
+    count: Option<usize>,
+    retry: bool,
+) -> Result<()> {
     let store = Store::open_default()?;
     let home = store::home()?;
     let session = Session::acquire(&home)?;
@@ -813,7 +1033,10 @@ fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>, retry: boo
     settle_prs(&store)?;
     let active = store.runs()?;
     let rows = store.projects()?;
-    let p = portfolio(if auto { targets } else { &[] })?;
+    let p = portfolio(
+        if auto { targets } else { &[] },
+        if auto { tags } else { &[] },
+    )?;
     let placed = rank::place(&p.cfg, p.tasks, p.today);
     let quadrant = |project: &str, key: &str| {
         placed
@@ -854,6 +1077,9 @@ fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>, retry: boo
                 continue;
             }
             let r = row(&x.task.project)?;
+            if r.absent_since.is_some() {
+                continue;
+            }
             picks.push(dispatch::Pick {
                 project: x.task.project.clone(),
                 repo: r.path.clone(),
@@ -886,6 +1112,14 @@ fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>, retry: boo
                 .iter()
                 .find(|r| r.name == project)
                 .ok_or_else(|| format!("unknown project `{project}`"))?;
+            if row.absent_since.is_some() {
+                return Err(format!(
+                    "{project} is not under a root; it was last seen at {}. \
+                     Clone it back and run `pma scan`",
+                    row.path.display()
+                )
+                .into());
+            }
             let (key, text, gh) = if what == "deps" {
                 match row.deps.filter(|n| *n > 0) {
                     Some(n) => (
@@ -1090,8 +1324,8 @@ fn run_review(
     Ok(())
 }
 
-fn show_stale(names: &[String], count: Option<usize>) -> Result<()> {
-    let p = portfolio(names)?;
+fn show_stale(names: &[String], tags: &[String], count: Option<usize>) -> Result<()> {
+    let p = portfolio(names, tags)?;
     header(&p);
     let limit = count.unwrap_or(p.cfg.quadrant_limit as usize);
     let placed = rank::place(&p.cfg, p.tasks, p.today);
@@ -1222,8 +1456,11 @@ fn run_campaign(name: &str, count: Option<usize>) -> Result<()> {
             );
             continue;
         }
-        let Some(row) = rows.iter().find(|r| &r.name == project) else {
-            eprintln!("warning: {project} is no longer scanned; skipped");
+        let Some(row) = rows
+            .iter()
+            .find(|r| &r.name == project && r.absent_since.is_none())
+        else {
+            eprintln!("warning: {project} is not under a root; skipped");
             continue;
         };
         picks.push(dispatch::Pick {
@@ -1531,10 +1768,11 @@ fn approve_many(store: &Store, ids: &[i64]) -> Result<()> {
     Ok(())
 }
 
-fn run_ship(projects: &[String]) -> Result<()> {
+fn run_ship(projects: &[String], tags: &[String]) -> Result<()> {
     let store = Store::open_default()?;
     let _session = Session::acquire(&store::home()?)?;
     let cfg = load_config(&store)?;
+    let projects = &select(&store, projects, tags)?;
     let runs: Vec<_> = store
         .runs()?
         .into_iter()
@@ -1565,8 +1803,9 @@ fn run_ship(projects: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn run_sync(names: &[String], apply: bool) -> Result<()> {
+fn run_sync(names: &[String], tags: &[String], apply: bool) -> Result<()> {
     let store = Store::open_default()?;
+    let names = &select(&store, names, tags)?;
     let rows = store.projects()?;
     for n in names {
         if !rows.iter().any(|r| &r.name == n) {
@@ -1579,6 +1818,12 @@ fn run_sync(names: &[String], apply: bool) -> Result<()> {
         .iter()
         .filter(|r| names.is_empty() || names.contains(&r.name))
     {
+        if row.absent_since.is_some() {
+            if !names.is_empty() {
+                println!("{}: skipped: not under a root", row.name);
+            }
+            continue;
+        }
         let path = row.path.join("TODO.md");
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
@@ -1589,15 +1834,13 @@ fn run_sync(names: &[String], apply: bool) -> Result<()> {
             skip("TODO.md has lint errors; see `pma lint`");
             continue;
         }
-        let Some(repo) = scan::git(&row.path, &["remote", "get-url", "origin"])
-            .and_then(|url| scan::github_slug(url.trim()))
-        else {
+        let Some(repo) = row.slug.as_deref() else {
             if !names.is_empty() {
-                skip("origin is not on GitHub");
+                skip("no GitHub origin recorded; run `pma scan`");
             }
             continue;
         };
-        let issues = match sync::issues(&repo) {
+        let issues = match sync::issues(repo) {
             Ok(i) => i,
             Err(e) => {
                 skip(&e);
@@ -1618,7 +1861,7 @@ fn run_sync(names: &[String], apply: bool) -> Result<()> {
             continue;
         }
         let before = text;
-        match sync::apply(&repo, &path, &actions) {
+        match sync::apply(repo, &path, &actions) {
             Ok(n) => changes += n,
             Err(e) => {
                 println!("{}: stopped: {e}", row.name);
@@ -1699,7 +1942,7 @@ fn run_tui() -> Result<()> {
     if !std::io::stdout().is_terminal() {
         return Err("pma tui needs a terminal; use `pma matrix` otherwise".into());
     }
-    let p = portfolio(&[])?;
+    let p = portfolio(&[], &[])?;
     let header = header_text(&p);
     let placed = rank::place(&p.cfg, p.tasks, p.today);
     tui::run(tui::App::new(header, placed, p.today))?;

@@ -16,6 +16,8 @@ use crate::todo::{self, Priority, normal_text};
 pub struct Facts {
     pub name: String,
     pub path: PathBuf,
+    /// `owner/name` from the origin URL; `None` without a GitHub origin.
+    pub slug: Option<String>,
     /// `None` when the project has no TODO.md.
     pub todo: Option<TodoFacts>,
     pub dirty: i64,
@@ -175,6 +177,7 @@ pub fn scan_project(
     let mut facts = Facts {
         name: name.into(),
         path: path.into(),
+        slug: None,
         todo: None,
         dirty: 0,
         pma_branches: Vec::new(),
@@ -190,6 +193,9 @@ pub fn scan_project(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => facts.error = Some(format!("TODO.md: {e}")),
     }
+
+    facts.slug =
+        git(path, &["remote", "get-url", "origin"]).and_then(|url| github_slug(url.trim()));
 
     match git(path, &["status", "--porcelain"]) {
         Some(out) => facts.dirty = out.lines().count() as i64,

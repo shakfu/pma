@@ -58,9 +58,9 @@ Output is `path:line: severity: message`. Exit status is 1 when any file has an 
 
 ```sh
 pma root add ~/projects/          # git repos directly under it are projects
-pma tier cyllama 1                # 1 (most important) to 5, or none
+pma tier topproj 1                # 1 (most important) to 5, or none
 pma scan                          # TODO.md, git state, CI via gh; about 15s for 95 repos
-pma scan --offline cyllama        # one project, without GitHub
+pma scan --offline topproj        # one project, without GitHub
 pma scan --deps                   # also count outdated cargo, uv and go dependencies
 pma matrix                        # tiered projects' tasks in the Eisenhower matrix
 pma matrix -q q1 --all
@@ -87,7 +87,7 @@ Each run gets a worktree of the remote default branch under `~/.config/pma/workt
 
 ```sh
 pma sync                          # plan: issues to open, items to mark done
-pma sync --apply cyllama           # carry it out for one project
+pma sync --apply topproj           # carry it out for one project
 ```
 
 Each `## Critical` item gets an issue labelled `pma:critical`, and `gh:N` is written into its line. An item whose issue is closed is ticked. TODO.md edits are left uncommitted; `scripts/commit_todo.py` commits them.

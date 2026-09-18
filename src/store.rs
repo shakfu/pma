@@ -23,7 +23,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 16;
+const VERSION: i64 = 19;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -307,6 +307,34 @@ CREATE TABLE campaign_members (
 );
 ";
 
+/// Version 19. A project's private tags, for grouping and for selecting a set
+/// to act on. A project carries several, so the tags cannot live in a column
+/// on its row. Kept out of `projects` for a second reason: a tag is the user's
+/// own, and every column there is overwritten by the next scan.
+const PROJECT_TAGS: &str = "
+CREATE TABLE project_tags (
+    project TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    PRIMARY KEY (project, tag)
+);
+CREATE INDEX idx_project_tags_tag ON project_tags(tag);
+";
+
+/// Version 18. When a full scan stopped finding a project under any root.
+/// The row used to be deleted, which also dropped its tier and every task's
+/// `first_seen` -- neither of which a later scan can rebuild, so a project
+/// that left a root and came back lost the age of all its work.
+const ABSENCE: &str = "
+ALTER TABLE projects ADD COLUMN absent_since INTEGER;
+";
+
+/// Version 17. `owner/name` on GitHub, recorded by the scan. `sync` derived it
+/// per invocation from the origin URL and no other command could reach it, so
+/// an item's `gh:N` was a number with no repository to resolve it against.
+const SLUG: &str = "
+ALTER TABLE projects ADD COLUMN slug TEXT;
+";
+
 pub struct Store {
     conn: Connection,
 }
@@ -315,6 +343,12 @@ pub struct Store {
 pub struct ProjectRow {
     pub name: String,
     pub path: PathBuf,
+    /// `owner/name` on GitHub; `None` without a GitHub origin, or until the
+    /// project is scanned again.
+    pub slug: Option<String>,
+    /// When a full scan stopped finding the project under any root; `None`
+    /// while it is present. `path` is then where it was last seen.
+    pub absent_since: Option<i64>,
     pub tier: Option<u8>,
     pub scanned_at: Option<i64>,
     pub has_todo: bool,
@@ -331,6 +365,18 @@ pub struct ProjectRow {
     /// One `ecosystem: name current -> latest` per line.
     pub deps_detail: String,
     pub deps_at: Option<i64>,
+}
+
+/// What a project's record consists of, for `pma forget`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Footprint {
+    pub tasks: i64,
+    pub tags: i64,
+    pub campaigns: i64,
+    /// Runs are kept, so this is reported rather than deleted.
+    pub runs: i64,
+    /// Runs that are not shipped or rejected; each may own a worktree.
+    pub open_runs: Vec<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -448,6 +494,9 @@ impl Store {
                     ROUTES,
                     APPROVAL_EVIDENCE,
                     CAMPAIGNS,
+                    SLUG,
+                    ABSENCE,
+                    PROJECT_TAGS,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -542,7 +591,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT name, path, tier, scanned_at, has_todo, lint_errors, dirty, ahead,
                     last_activity, ci, ci_detail, scan_error, deps, deps_detail, deps_at,
-                    leftover
+                    leftover, slug, absent_since
              FROM projects ORDER BY name",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -562,6 +611,8 @@ impl Store {
                 deps_detail: r.get(13)?,
                 deps_at: r.get(14)?,
                 leftover: r.get(15)?,
+                slug: r.get(16)?,
+                absent_since: r.get(17)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -595,12 +646,10 @@ impl Store {
     /// Records scan results. Each task keeps the `first_seen` it had in the
     /// previous scan. With `full`, projects not in `facts` are deleted and
     /// returned with the tier they had.
-    pub fn save_scan(
-        &mut self,
-        facts: &[Facts],
-        full: bool,
-        now: i64,
-    ) -> Result<Vec<(String, Option<u8>)>> {
+    /// Records the scan. A full scan marks every project it did not find as
+    /// absent and returns their names; the rows stay, since a project that
+    /// leaves a root is usually a move, not a deletion.
+    pub fn save_scan(&mut self, facts: &[Facts], full: bool, now: i64) -> Result<Vec<String>> {
         let open_runs: Vec<Run> = self
             .runs()?
             .into_iter()
@@ -620,15 +669,16 @@ impl Store {
                 .count() as i64;
             tx.execute(
                 "INSERT INTO projects (name, path, scanned_at, has_todo, lint_errors, dirty, ahead,
-                                       last_activity, ci, ci_detail, scan_error, leftover)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                                       last_activity, ci, ci_detail, scan_error, leftover, slug)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT (name) DO UPDATE SET
                     path = excluded.path, scanned_at = excluded.scanned_at,
                     has_todo = excluded.has_todo, lint_errors = excluded.lint_errors,
                     dirty = excluded.dirty, ahead = excluded.ahead,
                     last_activity = excluded.last_activity, ci = excluded.ci,
                     ci_detail = excluded.ci_detail, scan_error = excluded.scan_error,
-                    leftover = excluded.leftover",
+                    leftover = excluded.leftover, slug = excluded.slug,
+                    absent_since = NULL",
                 params![
                     f.name,
                     path_str(&f.path)?,
@@ -642,6 +692,7 @@ impl Store {
                     ci_detail,
                     f.error,
                     leftover,
+                    f.slug,
                 ],
             )?;
 
@@ -680,24 +731,103 @@ impl Store {
             }
         }
 
-        let mut removed = Vec::new();
+        let mut absent = Vec::new();
         if full {
             let scanned: std::collections::HashSet<&str> =
                 facts.iter().map(|f| f.name.as_str()).collect();
-            let mut stmt = tx.prepare("SELECT name, tier FROM projects")?;
-            let all: Vec<(String, Option<u8>)> = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            let mut stmt = tx.prepare("SELECT name FROM projects WHERE absent_since IS NULL")?;
+            let present: Vec<String> = stmt
+                .query_map([], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?;
             drop(stmt);
-            for (name, tier) in all {
+            for name in present {
                 if !scanned.contains(name.as_str()) {
-                    tx.execute("DELETE FROM projects WHERE name = ?1", [&name])?;
-                    removed.push((name, tier));
+                    tx.execute(
+                        "UPDATE projects SET absent_since = ?2 WHERE name = ?1",
+                        params![name, now],
+                    )?;
+                    absent.push(name);
                 }
             }
         }
         tx.commit()?;
-        Ok(removed)
+        Ok(absent)
+    }
+
+    /// What forgetting a project would delete, and what would hold it back.
+    pub fn project_footprint(&self, name: &str) -> Result<Footprint> {
+        let count =
+            |sql: &str| -> Result<i64> { Ok(self.conn.query_row(sql, [name], |r| r.get(0))?) };
+        let open_runs = self
+            .runs()?
+            .into_iter()
+            .filter(|r| r.project == name && !r.state.is_final())
+            .map(|r| r.id)
+            .collect();
+        Ok(Footprint {
+            tasks: count("SELECT count(*) FROM tasks WHERE project = ?1")?,
+            tags: count("SELECT count(*) FROM project_tags WHERE project = ?1")?,
+            campaigns: count("SELECT count(*) FROM campaign_members WHERE project = ?1")?,
+            runs: count("SELECT count(*) FROM runs WHERE project = ?1")?,
+            open_runs,
+        })
+    }
+
+    /// Deletes a project's record and everything keyed to it but its runs,
+    /// whose worktrees may still exist and which the design keeps beyond a
+    /// project's removal. Caller checks that nothing holds it back.
+    pub fn forget_project(&mut self, name: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for sql in [
+            "DELETE FROM project_tags WHERE project = ?1",
+            "DELETE FROM campaign_members WHERE project = ?1",
+            "DELETE FROM exhaustion WHERE project = ?1",
+            "DELETE FROM verify_base WHERE project = ?1",
+            // `tasks` follows by ON DELETE CASCADE.
+            "DELETE FROM projects WHERE name = ?1",
+        ] {
+            tx.execute(sql, [name])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every `(project, tag)` pair, ordered by project then tag.
+    pub fn project_tags(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT project, tag FROM project_tags ORDER BY project, tag")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Returns false when the project already had the tag.
+    pub fn add_project_tag(&self, project: &str, tag: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "INSERT OR IGNORE INTO project_tags (project, tag) VALUES (?1, ?2)",
+            params![project, tag],
+        )? > 0)
+    }
+
+    /// Returns false when the project did not have the tag.
+    pub fn remove_project_tag(&self, project: &str, tag: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM project_tags WHERE project = ?1 AND tag = ?2",
+            params![project, tag],
+        )? > 0)
+    }
+
+    /// The projects carrying any of `tags`, in name order. A project in
+    /// several of them appears once.
+    pub fn projects_tagged(&self, tags: &[String]) -> Result<Vec<String>> {
+        let mut found: Vec<String> = Vec::new();
+        for (project, tag) in self.project_tags()? {
+            if tags.iter().any(|t| t == &tag) && !found.contains(&project) {
+                found.push(project);
+            }
+        }
+        found.sort();
+        Ok(found)
     }
 
     pub fn notes(&self) -> Result<Vec<Note>> {
@@ -1629,6 +1759,7 @@ mod tests {
         Facts {
             name: name.into(),
             path: PathBuf::from(format!("/r/{name}")),
+            slug: Some(format!("shakfu/{name}")),
             todo: Some(TodoFacts {
                 lint_errors: 1,
                 items,
@@ -2093,6 +2224,113 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Unlike `deps`, the slug is read on every scan, so the last scan wins
+    /// and a project whose GitHub origin is gone loses it.
+    #[test]
+    fn the_last_scan_owns_the_slug() {
+        let dir = scratch("slug");
+        let mut store = Store::open(&dir.join("p.db")).unwrap();
+        store
+            .save_scan(&[facts("one", vec![])], true, 1000)
+            .unwrap();
+        assert_eq!(
+            store.project("one").unwrap().unwrap().slug.as_deref(),
+            Some("shakfu/one")
+        );
+
+        let mut moved = facts("one", vec![]);
+        moved.slug = None;
+        store.save_scan(&[moved], true, 2000).unwrap();
+        assert_eq!(store.project("one").unwrap().unwrap().slug, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Forgetting clears the record but not the runs, whose worktrees may
+    /// still exist.
+    #[test]
+    fn forgetting_a_project_keeps_its_runs() {
+        let dir = scratch("forget");
+        let mut store = Store::open(&dir.join("p.db")).unwrap();
+        store
+            .save_scan(
+                &[facts("a", vec![item("t", 1)]), facts("b", vec![])],
+                true,
+                1,
+            )
+            .unwrap();
+        store.set_tier("a", Path::new("/r/a"), Some(1)).unwrap();
+        store.add_project_tag("a", "ai").unwrap();
+        store.add_project_tag("b", "ai").unwrap();
+        let mut run = Run::blank();
+        run.project = "a".into();
+        store.insert_run(&mut run).unwrap();
+        store.consume_attempt("a", "t").unwrap();
+
+        let f = store.project_footprint("a").unwrap();
+        assert_eq!((f.tasks, f.tags, f.runs), (1, 1, 1));
+        assert_eq!(f.open_runs, [run.id], "an open run holds a worktree");
+
+        let mut open = store.run(run.id).unwrap();
+        open.state = RunState::Shipped;
+        store.update_run(&open).unwrap();
+        assert!(store.project_footprint("a").unwrap().open_runs.is_empty());
+
+        store.forget_project("a").unwrap();
+        assert!(store.project("a").unwrap().is_none());
+        assert!(store.tasks().unwrap().is_empty(), "its tasks go");
+        assert_eq!(
+            store.projects_tagged(&["ai".into()]).unwrap(),
+            ["b"],
+            "another project keeps the tag"
+        );
+        assert_eq!(store.consumed_attempts("a", "t").unwrap(), 0);
+        assert_eq!(store.run(run.id).unwrap().project, "a", "the run is kept");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_project_carries_several_tags() {
+        let dir = scratch("tags");
+        let store = Store::open(&dir.join("p.db")).unwrap();
+        assert!(store.add_project_tag("cyllama", "ai").unwrap());
+        assert!(
+            !store.add_project_tag("cyllama", "ai").unwrap(),
+            "idempotent"
+        );
+        store.add_project_tag("cyllama", "audio").unwrap();
+        store.add_project_tag("cysox", "audio").unwrap();
+
+        assert_eq!(
+            store.project_tags().unwrap(),
+            [
+                ("cyllama".to_string(), "ai".to_string()),
+                ("cyllama".to_string(), "audio".to_string()),
+                ("cysox".to_string(), "audio".to_string()),
+            ]
+        );
+        assert_eq!(
+            store.projects_tagged(&["audio".into()]).unwrap(),
+            ["cyllama", "cysox"]
+        );
+        assert_eq!(
+            store
+                .projects_tagged(&["ai".into(), "audio".into()])
+                .unwrap(),
+            ["cyllama", "cysox"],
+            "a project in both tags is listed once"
+        );
+
+        assert!(store.remove_project_tag("cyllama", "audio").unwrap());
+        assert!(!store.remove_project_tag("cyllama", "audio").unwrap());
+        assert_eq!(store.projects_tagged(&["audio".into()]).unwrap(), ["cysox"]);
+        assert_eq!(
+            store.projects_tagged(&["ai".into()]).unwrap(),
+            ["cyllama"],
+            "removing one tag leaves the other"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn roots_add_and_remove() {
         let dir = scratch("roots");
@@ -2133,6 +2371,7 @@ mod tests {
         let p = store.project("one").unwrap().unwrap();
         assert_eq!(p.tier, Some(2), "a scan keeps the tier");
         assert_eq!((p.deps, p.deps_at), (None, None));
+        assert_eq!(p.slug.as_deref(), Some("shakfu/one"));
 
         let mut measured = facts("one", vec![item("y", 7), item("z", 8)]);
         measured.deps = Some(DepsFacts {
@@ -2181,7 +2420,7 @@ mod tests {
     }
 
     #[test]
-    fn full_scan_removes_projects_no_longer_found() {
+    fn full_scan_marks_projects_no_longer_found() {
         let dir = scratch("full");
         let mut store = Store::open(&dir.join("p.db")).unwrap();
         store
@@ -2193,9 +2432,12 @@ mod tests {
             .unwrap();
         store.set_tier("a", Path::new("/r/a"), Some(1)).unwrap();
 
-        assert_eq!(
-            store.save_scan(&[facts("b", vec![])], false, 2).unwrap(),
-            []
+        assert!(
+            store
+                .save_scan(&[facts("b", vec![])], false, 2)
+                .unwrap()
+                .is_empty(),
+            "a partial scan marks nothing"
         );
         assert_eq!(
             store.projects().unwrap().len(),
@@ -2203,12 +2445,32 @@ mod tests {
             "a partial scan removes nothing"
         );
 
-        let removed = store.save_scan(&[facts("b", vec![])], true, 3).unwrap();
-        assert_eq!(removed, [("a".to_string(), Some(1))]);
-        assert!(
-            store.tasks().unwrap().is_empty(),
-            "tasks go with their project"
+        let absent = store.save_scan(&[facts("b", vec![])], true, 3).unwrap();
+        assert_eq!(absent, ["a"]);
+        let a = store.project("a").unwrap().unwrap();
+        assert_eq!(a.absent_since, Some(3));
+        assert_eq!(a.tier, Some(1), "an absent project keeps its tier");
+        assert_eq!(
+            store.tasks().unwrap().len(),
+            1,
+            "its tasks and their first_seen are kept"
         );
+
+        // Reported once, not on every later scan.
+        assert!(
+            store
+                .save_scan(&[facts("b", vec![])], true, 4)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.project("a").unwrap().unwrap().absent_since, Some(3));
+
+        // Finding it again makes it present, without a second first_seen.
+        store
+            .save_scan(&[facts("a", vec![item("t", 1)])], false, 5)
+            .unwrap();
+        assert_eq!(store.project("a").unwrap().unwrap().absent_since, None);
+        assert_eq!(store.tasks().unwrap()[0].first_seen, 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

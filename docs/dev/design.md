@@ -310,7 +310,7 @@ Shown as TOML for readability. The values are stored in `projects.db` and set wi
 
 A glob without `/` matches a file name in any directory. `*` matches within one path segment, and `**` matches any number of segments.
 
-Projects are the git repos directly under each root, named by directory. A project under a root with no tier is listed as untiered and left out of the matrix. A full `pma scan` forgets projects no longer found, including their tier, and says so. `PMA_HOME` overrides `~/.config/pma`.
+Projects are the git repos directly under each root, named by directory. A project under a root with no tier is listed as untiered and left out of the matrix. A full `pma scan` marks projects it no longer finds as absent and says so, keeping the row, its tier and its tasks; commands that need a working tree refuse an absent project. `pma forget` deletes an absent project's record when the repository is gone for good; it refuses one with an unsettled run, whose worktree may still exist. Leaving a root is usually a move, and a rescan cannot rebuild a tier or a task's `first_seen`. Tags group projects for selection: a project carries several, and `--tag` on a name-taking command adds every project carrying it. They are private to the database, since GitHub topics describe a repository for search rather than organise a portfolio. `PMA_HOME` overrides `~/.config/pma`.
 
 ## Agents
 
@@ -407,7 +407,7 @@ The user's clone is not updated. After a push it is behind its remote, and an un
 
 Sync keys on the `Critical` heading, not on Q1. A quadrant shifts as due dates approach, which would open and close issues without any edit.
 
-`pma sync` lists the plan; `pma sync --apply` carries it out. Every scanned project with a GitHub origin is synced, tiered or not: `Critical` is a property of the file, tiers only rank. A `TODO.md` with lint errors is skipped, since duplicate text or `gh:N` breaks item identity.
+`pma sync` lists the plan; `pma sync --apply` carries it out. Every project whose last scan recorded a GitHub `owner/name` is synced, tiered or not: `Critical` is a property of the file, tiers only rank. A `TODO.md` with lint errors is skipped, since duplicate text or `gh:N` breaks item identity.
 
 Each `gh:N` is written to the file right after its issue is created. A sync that stops between the two leaves an open, labelled issue with the item's title and no link. The next sync links that issue instead of opening another.
 

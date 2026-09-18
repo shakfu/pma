@@ -14,12 +14,13 @@ use std::time::Duration;
 
 use rusqlite::{Connection, params};
 
+use crate::class::Class;
 use crate::scan::{Ci, Facts};
 use crate::todo::Priority;
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 5;
+const VERSION: i64 = 10;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -110,6 +111,104 @@ ALTER TABLE projects ADD COLUMN leftover INTEGER NOT NULL DEFAULT 0;
 /// the next settle checks whether they were merged.
 const PR_OPEN: &str = "
 UPDATE runs SET state = 'pr-open' WHERE state = 'shipped' AND outcome LIKE 'https://%/pull/%';
+";
+
+/// Version 6. `runs` holds one mutable row per task, so a rework overwrites
+/// the previous attempt's summary, cost, verify result and start time. An
+/// attempt is now its own append-only row, and `runs` keeps the lifecycle
+/// summary plus a timestamp per transition. Existing runs contribute their
+/// last attempt, whose outcome was not recorded and stays null.
+const ATTEMPTS: &str = "
+CREATE TABLE attempts (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    n INTEGER NOT NULL,
+    agent TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    feedback TEXT,
+    started_at INTEGER NOT NULL,
+    seconds INTEGER,
+    cost_usd REAL,
+    summary TEXT,
+    verify TEXT,
+    verify_ok INTEGER,
+    error TEXT,
+    outcome TEXT,
+    UNIQUE (run_id, n)
+);
+ALTER TABLE runs ADD COLUMN dispatched_at INTEGER;
+ALTER TABLE runs ADD COLUMN ready_at INTEGER;
+ALTER TABLE runs ADD COLUMN decided_at INTEGER;
+ALTER TABLE runs ADD COLUMN published_at INTEGER;
+ALTER TABLE runs ADD COLUMN review_seconds INTEGER;
+INSERT INTO attempts (run_id, n, agent, prompt, feedback, started_at, seconds,
+                      cost_usd, summary, verify, verify_ok, error, outcome)
+SELECT id, 1, agent, prompt, feedback, started_at, seconds, cost_usd, summary,
+       verify, verify_ok, error, NULL
+FROM runs WHERE started_at IS NOT NULL;
+UPDATE runs SET dispatched_at = started_at WHERE started_at IS NOT NULL;
+ALTER TABLE runs DROP COLUMN started_at;
+";
+
+/// Version 7. The decision a dispatch made, snapshotted on the run and never
+/// updated. A rescan or a reworded item changes the scanned task, and the
+/// project's tier and the budgets change under `pma config`, so none of them
+/// can be read back later from the task. Runs dispatched before this version
+/// have no snapshot and stay null.
+const SNAPSHOT: &str = "
+ALTER TABLE runs ADD COLUMN class TEXT;
+ALTER TABLE runs ADD COLUMN scope TEXT;
+ALTER TABLE runs ADD COLUMN tier INTEGER;
+ALTER TABLE runs ADD COLUMN description TEXT;
+ALTER TABLE runs ADD COLUMN agent_budget REAL;
+ALTER TABLE runs ADD COLUMN timeout_minutes INTEGER;
+";
+
+/// Version 8. One verify run at the head proves the tree is green now. The
+/// same command at the base separates three cases: already broken, broken by
+/// the agent, fixed by the agent. The result is cached because every task of
+/// a project in one batch shares a base. Timeout is part of the key: a pass
+/// under a longer limit says nothing about a shorter one.
+const VERIFY_BASE: &str = "
+CREATE TABLE verify_base (
+    project TEXT NOT NULL,
+    base TEXT NOT NULL,
+    command TEXT NOT NULL,
+    timeout_minutes INTEGER NOT NULL,
+    ok INTEGER,
+    seconds INTEGER NOT NULL,
+    measured_at INTEGER NOT NULL,
+    PRIMARY KEY (project, base, command, timeout_minutes)
+);
+ALTER TABLE runs ADD COLUMN verify_base_ok INTEGER;
+ALTER TABLE runs ADD COLUMN verify_base_seconds INTEGER;
+";
+
+/// Version 9. The paths a run changed, as a JSON array. Stored rather than
+/// the violations derived from them, so a later change to the class rules
+/// re-reads the evidence instead of trusting a verdict recorded under rules
+/// nobody can name any more. Null means the paths could not be enumerated,
+/// which `scope_error` explains; an empty array means the run changed
+/// nothing.
+const CHANGED_PATHS: &str = "
+ALTER TABLE runs ADD COLUMN changed_paths TEXT;
+ALTER TABLE runs ADD COLUMN scope_error TEXT;
+";
+
+/// Version 10. Attempts consumed per task revision, so `--auto` stops
+/// choosing a task an agent cannot close. Keyed by the normalised task text
+/// rather than by the run, because a counter on a run resets when the run
+/// ends, and keyed by text rather than by a permanent id, because a reworded
+/// task is a different specification and a recurring `ci` incident names its
+/// failing workflows.
+const EXHAUSTION: &str = "
+CREATE TABLE exhaustion (
+    project TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    attempts INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (project, revision)
+);
 ";
 
 pub struct Store {
@@ -236,7 +335,18 @@ impl Store {
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         match version {
             0..VERSION => {
-                let steps = [SCHEMA, RUNS, DEPS_AND_NOTES, LEFTOVER, PR_OPEN];
+                let steps = [
+                    SCHEMA,
+                    RUNS,
+                    DEPS_AND_NOTES,
+                    LEFTOVER,
+                    PR_OPEN,
+                    ATTEMPTS,
+                    SNAPSHOT,
+                    VERIFY_BASE,
+                    CHANGED_PATHS,
+                    EXHAUSTION,
+                ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
                     tx.execute_batch(step)?;
@@ -521,11 +631,17 @@ impl Store {
         Ok(self.conn.execute("DELETE FROM notes WHERE id = ?1", [id])? > 0)
     }
 
-    pub fn insert_run(&self, run: &Run) -> Result<i64> {
+    /// Assigns the run's id and stamps `dispatched_at`, in the row and in
+    /// `run`.
+    pub fn insert_run(&self, run: &mut Run) -> Result<i64> {
+        run.dispatched_at = Some(crate::dates::now());
         self.conn.execute(
             "INSERT INTO runs (project, task_key, text, gh, quadrant, agent, branch, worktree,
-                               default_branch, base, prompt, state, repo)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                               default_branch, base, prompt, state, repo, dispatched_at,
+                               class, scope, tier, description, agent_budget, timeout_minutes,
+                               verify, verify_base_ok, verify_base_seconds)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                     ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             params![
                 run.project,
                 run.task_key,
@@ -540,33 +656,54 @@ impl Store {
                 run.prompt,
                 run.state.name(),
                 path_str(&run.repo)?,
+                run.dispatched_at,
+                run.class.map(Class::name),
+                run.scope.join(","),
+                run.tier,
+                run.description,
+                run.agent_budget,
+                run.timeout_minutes,
+                run.verify,
+                run.verify_base_ok,
+                run.verify_base_seconds,
             ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        run.id = self.conn.last_insert_rowid();
+        Ok(run.id)
     }
 
     /// Writes every mutable column of the run with `run.id`.
     pub fn update_run(&self, run: &Run) -> Result<()> {
         self.conn.execute(
-            "UPDATE runs SET state = ?2, feedback = ?3, started_at = ?4, seconds = ?5,
-                cost_usd = ?6, summary = ?7, commits = ?8, diffstat = ?9, verify = ?10,
-                verify_ok = ?11, error = ?12, outcome = ?13, prompt = ?14
+            // `verify` is frozen at dispatch: a command re-detected at rework
+            // could differ from the one the base was checked with.
+            "UPDATE runs SET state = ?2, feedback = ?3, seconds = ?4, cost_usd = ?5,
+                summary = ?6, commits = ?7, diffstat = ?8, verify_ok = ?9,
+                error = ?10, outcome = ?11, prompt = ?12, ready_at = ?13,
+                decided_at = ?14, published_at = ?15, review_seconds = ?16,
+                changed_paths = ?17, scope_error = ?18
              WHERE id = ?1",
             params![
                 run.id,
                 run.state.name(),
                 run.feedback,
-                run.started_at,
                 run.seconds,
                 run.cost_usd,
                 run.summary,
                 run.commits,
                 run.diffstat,
-                run.verify,
                 run.verify_ok,
                 run.error,
                 run.outcome,
                 run.prompt,
+                run.ready_at,
+                run.decided_at,
+                run.published_at,
+                run.review_seconds,
+                run.changed_paths
+                    .as_ref()
+                    .map(|p| serde_json::to_string(p).unwrap_or_default()),
+                run.scope_error,
             ],
         )?;
         Ok(())
@@ -575,8 +712,11 @@ impl Store {
     pub fn runs(&self) -> Result<Vec<Run>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, project, task_key, text, gh, quadrant, agent, branch, worktree,
-                    default_branch, base, prompt, state, feedback, started_at, seconds,
-                    cost_usd, summary, commits, diffstat, verify, verify_ok, error, outcome, repo
+                    default_branch, base, prompt, state, feedback, seconds,
+                    cost_usd, summary, commits, diffstat, verify, verify_ok, error, outcome, repo,
+                    dispatched_at, ready_at, decided_at, published_at, review_seconds,
+                    class, scope, tier, description, agent_budget, timeout_minutes,
+                    verify_base_ok, verify_base_seconds, changed_paths, scope_error
              FROM runs ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -596,17 +736,42 @@ impl Store {
                 prompt: r.get(11)?,
                 state: RunState::parse(&state).unwrap_or(RunState::Failed),
                 feedback: r.get(13)?,
-                started_at: r.get(14)?,
-                seconds: r.get(15)?,
-                cost_usd: r.get(16)?,
-                summary: r.get(17)?,
-                commits: r.get(18)?,
-                diffstat: r.get(19)?,
-                verify: r.get(20)?,
-                verify_ok: r.get(21)?,
-                error: r.get(22)?,
-                outcome: r.get(23)?,
-                repo: PathBuf::from(r.get::<_, String>(24)?),
+                seconds: r.get(14)?,
+                cost_usd: r.get(15)?,
+                summary: r.get(16)?,
+                commits: r.get(17)?,
+                diffstat: r.get(18)?,
+                verify: r.get(19)?,
+                verify_ok: r.get(20)?,
+                error: r.get(21)?,
+                outcome: r.get(22)?,
+                repo: PathBuf::from(r.get::<_, String>(23)?),
+                dispatched_at: r.get(24)?,
+                ready_at: r.get(25)?,
+                decided_at: r.get(26)?,
+                published_at: r.get(27)?,
+                review_seconds: r.get(28)?,
+                class: r
+                    .get::<_, Option<String>>(29)?
+                    .as_deref()
+                    .and_then(Class::parse),
+                scope: r
+                    .get::<_, Option<String>>(30)?
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                tier: r.get(31)?,
+                description: r.get(32)?,
+                agent_budget: r.get(33)?,
+                timeout_minutes: r.get(34)?,
+                verify_base_ok: r.get(35)?,
+                verify_base_seconds: r.get(36)?,
+                changed_paths: r
+                    .get::<_, Option<String>>(37)?
+                    .and_then(|s| serde_json::from_str(&s).ok()),
+                scope_error: r.get(38)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -617,6 +782,137 @@ impl Store {
             .into_iter()
             .find(|r| r.id == id)
             .ok_or_else(|| format!("no run #{id}").into())
+    }
+
+    /// Attempts consumed against a task revision, across every run of it.
+    pub fn consumed_attempts(&self, project: &str, revision: &str) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT attempts FROM exhaustion WHERE project = ?1 AND revision = ?2",
+                params![project, revision],
+                |r| r.get(0),
+            )
+            .unwrap_or(0))
+    }
+
+    /// Records one consumed attempt and returns the new total.
+    pub fn consume_attempt(&self, project: &str, revision: &str) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO exhaustion (project, revision, attempts, updated_at)
+             VALUES (?1, ?2, 1, ?3)
+             ON CONFLICT (project, revision)
+             DO UPDATE SET attempts = attempts + 1, updated_at = ?3",
+            params![project, revision, crate::dates::now()],
+        )?;
+        self.consumed_attempts(project, revision)
+    }
+
+    /// Returns false when the revision had consumed none.
+    pub fn reset_attempts(&self, project: &str, revision: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM exhaustion WHERE project = ?1 AND revision = ?2",
+            params![project, revision],
+        )? > 0)
+    }
+
+    /// A base verification of this exact repository, commit, command and
+    /// timeout, or `None` when it has not been measured.
+    pub fn verify_base(
+        &self,
+        project: &str,
+        base: &str,
+        command: &str,
+        timeout_minutes: i64,
+    ) -> Result<Option<(Option<bool>, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ok, seconds FROM verify_base
+             WHERE project = ?1 AND base = ?2 AND command = ?3 AND timeout_minutes = ?4",
+        )?;
+        let mut rows = stmt.query_map(params![project, base, command, timeout_minutes], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn set_verify_base(
+        &self,
+        project: &str,
+        base: &str,
+        command: &str,
+        timeout_minutes: i64,
+        ok: Option<bool>,
+        seconds: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO verify_base
+                (project, base, command, timeout_minutes, ok, seconds, measured_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                project,
+                base,
+                command,
+                timeout_minutes,
+                ok,
+                seconds,
+                crate::dates::now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Appends an attempt. `n` is assigned here, so two reworks cannot race
+    /// to the same number.
+    pub fn insert_attempt(&self, a: &Attempt) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO attempts (run_id, n, agent, prompt, feedback, started_at, seconds,
+                                   cost_usd, summary, verify, verify_ok, error, outcome)
+             VALUES (?1, (SELECT COALESCE(MAX(n), 0) + 1 FROM attempts WHERE run_id = ?1),
+                     ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                a.run_id,
+                a.agent,
+                a.prompt,
+                a.feedback,
+                a.started_at,
+                a.seconds,
+                a.cost_usd,
+                a.summary,
+                a.verify,
+                a.verify_ok,
+                a.error,
+                a.outcome,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Every attempt, oldest first. `run` limits it to one run.
+    pub fn attempts(&self, run: Option<i64>) -> Result<Vec<Attempt>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, n, agent, prompt, feedback, started_at, seconds, cost_usd,
+                    summary, verify, verify_ok, error, outcome
+             FROM attempts WHERE (?1 IS NULL OR run_id = ?1) ORDER BY run_id, n",
+        )?;
+        let rows = stmt.query_map([run], |r| {
+            Ok(Attempt {
+                id: r.get(0)?,
+                run_id: r.get(1)?,
+                n: r.get(2)?,
+                agent: r.get(3)?,
+                prompt: r.get(4)?,
+                feedback: r.get(5)?,
+                started_at: r.get(6)?,
+                seconds: r.get(7)?,
+                cost_usd: r.get(8)?,
+                summary: r.get(9)?,
+                verify: r.get(10)?,
+                verify_ok: r.get(11)?,
+                error: r.get(12)?,
+                outcome: r.get(13)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Marks runs left queued or running by a session that ended as failed.
@@ -710,7 +1006,6 @@ pub struct Run {
     pub state: RunState,
     /// Reviewer feedback for the latest rework.
     pub feedback: Option<String>,
-    pub started_at: Option<i64>,
     /// Agent and verify time, summed over reworks.
     pub seconds: Option<i64>,
     /// Summed over reworks; `None` when the agent reports no cost.
@@ -724,6 +1019,138 @@ pub struct Run {
     pub verify_ok: Option<bool>,
     pub error: Option<String>,
     /// What shipping did: a pushed commit, or a pull request URL.
+    pub outcome: Option<String>,
+    /// When the run row was created. Never updated, so a per-day count and a
+    /// digest window have a stable date. Per-attempt start times are in
+    /// `attempts`.
+    pub dispatched_at: Option<i64>,
+    /// When the run last became ready. A rework moves it forward.
+    pub ready_at: Option<i64>,
+    /// The first approval or rejection. A pull request closed later does not
+    /// replace the approval that published it.
+    pub decided_at: Option<i64>,
+    /// When `pma` published: the push, or the pull request opening. A merge
+    /// days later does not move it.
+    pub published_at: Option<i64>,
+    /// Review time the user reported with `pma review --minutes`, summed over
+    /// reviews of this run.
+    pub review_seconds: Option<i64>,
+    /// The class predicted at dispatch. `None` for a run dispatched before
+    /// classes existed.
+    pub class: Option<Class>,
+    /// Globs the class allowed, resolved at dispatch. Empty means the class
+    /// stated no bound; the privileged paths still apply.
+    pub scope: Vec<String>,
+    /// The project's tier at dispatch. Tiers change, and routes match on them.
+    pub tier: Option<u8>,
+    /// The item's description lines as dispatched.
+    pub description: Option<String>,
+    /// `agent_budget` at dispatch, so an attempt's cost can be read against
+    /// the limit that applied to it.
+    pub agent_budget: Option<f64>,
+    pub timeout_minutes: Option<i64>,
+    /// `verify` at the base commit, before the agent ran. `None` when there
+    /// is no command, or when the run predates the check; `Some(false)` also
+    /// covers a base run that timed out.
+    pub verify_base_ok: Option<bool>,
+    pub verify_base_seconds: Option<i64>,
+    /// Every path the run changed against its base, both sides of a rename
+    /// included. `None` when they could not be enumerated: an empty list
+    /// would read as a clean run.
+    pub changed_paths: Option<Vec<String>>,
+    /// Why the paths could not be enumerated.
+    pub scope_error: Option<String>,
+}
+
+impl Run {
+    /// A run with every field empty, for tests in this crate to override.
+    #[cfg(test)]
+    pub fn blank() -> Run {
+        Run {
+            id: 0,
+            project: "p".into(),
+            task_key: "fix it".into(),
+            text: "Fix it".into(),
+            gh: None,
+            quadrant: None,
+            agent: "claude".into(),
+            repo: PathBuf::from("/r/p"),
+            branch: "pma/fix-it".into(),
+            worktree: PathBuf::from("/w/p/fix-it"),
+            default_branch: "main".into(),
+            base: "abc".into(),
+            prompt: "do it".into(),
+            state: RunState::Queued,
+            feedback: None,
+            seconds: None,
+            cost_usd: None,
+            summary: None,
+            commits: None,
+            diffstat: None,
+            verify: None,
+            verify_ok: None,
+            error: None,
+            outcome: None,
+            dispatched_at: None,
+            ready_at: None,
+            decided_at: None,
+            published_at: None,
+            review_seconds: None,
+            class: None,
+            scope: Vec::new(),
+            tier: None,
+            description: None,
+            agent_budget: None,
+            timeout_minutes: None,
+            verify_base_ok: None,
+            verify_base_seconds: None,
+            changed_paths: None,
+            scope_error: None,
+        }
+    }
+
+    /// Moves the run to `state` and stamps the transition. Call it instead of
+    /// assigning `state`, so no transition goes unrecorded.
+    pub fn enter(&mut self, state: RunState) {
+        let now = crate::dates::now();
+        match state {
+            RunState::Ready => self.ready_at = Some(now),
+            RunState::Approved | RunState::Rejected => {
+                self.decided_at.get_or_insert(now);
+            }
+            RunState::Shipped | RunState::PrOpen => {
+                self.published_at.get_or_insert(now);
+            }
+            _ => {}
+        }
+        self.state = state;
+    }
+}
+
+/// One agent invocation and the verification that followed it. Rows are
+/// appended and never updated, so a rework cannot overwrite what the previous
+/// attempt did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attempt {
+    pub id: i64,
+    pub run_id: i64,
+    /// 1 for the first attempt, then one per rework.
+    pub n: i64,
+    pub agent: String,
+    pub prompt: String,
+    /// The reviewer feedback this attempt was given, if any.
+    pub feedback: Option<String>,
+    pub started_at: i64,
+    /// Agent and verify time for this attempt alone.
+    pub seconds: Option<i64>,
+    /// `None` when the agent reports no cost. Never zero for unknown.
+    pub cost_usd: Option<f64>,
+    pub summary: Option<String>,
+    pub verify: Option<String>,
+    pub verify_ok: Option<bool>,
+    pub error: Option<String>,
+    /// The state the run reached: `ready` or `failed`. Null for the attempt
+    /// reconstructed from a run that predates this table.
     pub outcome: Option<String>,
 }
 
@@ -849,6 +1276,187 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Migration 6 turns each existing run's single recorded attempt into an
+    /// `attempts` row, so upgrading loses no history, and moves the run's
+    /// start time to `dispatched_at`. Migration 7 adds the decision snapshot,
+    /// which an existing run cannot supply.
+    #[test]
+    fn a_v5_database_gains_an_attempt_per_run() {
+        let dir = scratch("attempts-migrate");
+        let db = dir.join("v5.db");
+        let conn = Connection::open(&db).unwrap();
+        for step in [SCHEMA, RUNS, DEPS_AND_NOTES, LEFTOVER, PR_OPEN] {
+            conn.execute_batch(step).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        conn.execute_batch(
+            "INSERT INTO runs (project, task_key, text, agent, repo, branch, worktree,
+                               default_branch, base, prompt, state, started_at, seconds,
+                               cost_usd, summary, verify, verify_ok)
+             VALUES ('p', 'k', 't', 'claude', '/r', 'pma/t', '/w', 'main', 'b', 'do it',
+                     'ready', 100, 42, 0.5, 'first summary', 'make test', 1);
+             INSERT INTO runs (project, task_key, text, agent, repo, branch, worktree,
+                               default_branch, base, prompt, state)
+             VALUES ('p', 'k2', 't2', 'claude', '/r', 'pma/t2', '/w2', 'main', 'b', 'do it',
+                     'queued');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(&db).unwrap();
+        let runs = store.runs().unwrap();
+        assert_eq!(runs[0].dispatched_at, Some(100));
+        // Never started, so it contributes no attempt and no dispatch time.
+        assert_eq!(runs[1].dispatched_at, None);
+
+        let attempts = store.attempts(None).unwrap();
+        assert_eq!(attempts.len(), 1, "only the run that started");
+        let a = &attempts[0];
+        assert_eq!((a.run_id, a.n, a.started_at), (runs[0].id, 1, 100));
+        assert_eq!(a.summary.as_deref(), Some("first summary"));
+        assert_eq!(
+            (a.seconds, a.cost_usd, a.verify_ok),
+            (Some(42), Some(0.5), Some(true))
+        );
+        assert_eq!(a.outcome, None, "the old row did not record one");
+        // Migration 7 cannot reconstruct a decision that was never recorded.
+        assert_eq!(runs[0].class, None);
+        assert_eq!(runs[0].tier, None);
+        assert!(runs[0].scope.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The counter survives the run that raised it, so rejecting a task and
+    /// dispatching it again does not start from zero. Rewording it does.
+    #[test]
+    fn consumed_attempts_are_kept_per_task_revision() {
+        let dir = scratch("exhaustion");
+        let store = Store::open(&dir.join("p.db")).unwrap();
+        assert_eq!(store.consumed_attempts("p", "fix the parser").unwrap(), 0);
+
+        assert_eq!(store.consume_attempt("p", "fix the parser").unwrap(), 1);
+        assert_eq!(store.consume_attempt("p", "fix the parser").unwrap(), 2);
+        assert_eq!(store.consumed_attempts("p", "fix the parser").unwrap(), 2);
+        // A reworded task, another project, and a `ci` incident naming other
+        // workflows are each their own revision.
+        assert_eq!(
+            store
+                .consumed_attempts("p", "fix the parser on empty input")
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.consumed_attempts("q", "fix the parser").unwrap(), 0);
+
+        assert!(store.reset_attempts("p", "fix the parser").unwrap());
+        assert_eq!(store.consumed_attempts("p", "fix the parser").unwrap(), 0);
+        assert!(!store.reset_attempts("p", "fix the parser").unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The cache answers only for the exact repository, commit, command and
+    /// timeout it measured. A pass under a longer limit says nothing about a
+    /// shorter one, and a changed command says nothing at all.
+    #[test]
+    fn base_verification_is_cached_per_command_and_timeout() {
+        let dir = scratch("verify-base");
+        let store = Store::open(&dir.join("p.db")).unwrap();
+        assert_eq!(
+            store.verify_base("p", "abc", "make test", 30).unwrap(),
+            None
+        );
+
+        store
+            .set_verify_base("p", "abc", "make test", 30, Some(false), 12)
+            .unwrap();
+        assert_eq!(
+            store.verify_base("p", "abc", "make test", 30).unwrap(),
+            Some((Some(false), 12))
+        );
+        for (base, command, timeout) in [
+            ("def", "make test", 30),
+            ("abc", "cargo test", 30),
+            ("abc", "make test", 10),
+        ] {
+            assert_eq!(
+                store.verify_base("p", base, command, timeout).unwrap(),
+                None,
+                "{base} {command} {timeout}"
+            );
+        }
+        // A base that could not be measured is unknown, not failing.
+        store
+            .set_verify_base("p", "def", "make test", 30, None, 0)
+            .unwrap();
+        assert_eq!(
+            store.verify_base("p", "def", "make test", 30).unwrap(),
+            Some((None, 0))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A rework must not overwrite what the previous attempt did.
+    #[test]
+    fn attempts_are_appended_never_replaced() {
+        let dir = scratch("attempts");
+        let store = Store::open(&dir.join("p.db")).unwrap();
+        let mut run = Run::blank();
+        store.insert_run(&mut run).unwrap();
+        assert!(run.dispatched_at.is_some(), "stamped on insert");
+
+        let mut a = Attempt {
+            id: 0,
+            run_id: run.id,
+            n: 0,
+            agent: "claude".into(),
+            prompt: "do it".into(),
+            feedback: None,
+            started_at: 10,
+            seconds: Some(30),
+            cost_usd: Some(0.2),
+            summary: Some("first".into()),
+            verify: Some("make test".into()),
+            verify_ok: Some(false),
+            error: None,
+            outcome: Some("ready".into()),
+        };
+        store.insert_attempt(&a).unwrap();
+        a.feedback = Some("try again".into());
+        a.summary = Some("second".into());
+        a.verify_ok = Some(true);
+        store.insert_attempt(&a).unwrap();
+
+        let rows = store.attempts(Some(run.id)).unwrap();
+        assert_eq!(rows.iter().map(|r| r.n).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(rows[0].summary.as_deref(), Some("first"));
+        assert_eq!(rows[0].verify_ok, Some(false));
+        assert_eq!(rows[1].feedback.as_deref(), Some("try again"));
+        assert!(store.attempts(None).unwrap().len() == 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Each transition stamps its own time, and neither a merge nor a closure
+    /// moves the time the run was published.
+    #[test]
+    fn transitions_are_stamped_once() {
+        let mut run = Run::blank();
+        run.enter(RunState::Ready);
+        let ready = run.ready_at.expect("ready stamped");
+        run.enter(RunState::Approved);
+        let decided = run.decided_at.expect("approval stamped");
+        run.enter(RunState::PrOpen);
+        let published = run.published_at.expect("publication stamped");
+
+        run.enter(RunState::Shipped);
+        assert_eq!(
+            run.published_at,
+            Some(published),
+            "a merge is not a publish"
+        );
+        run.enter(RunState::Rejected);
+        assert_eq!(run.decided_at, Some(decided), "the approval stands");
+        assert_eq!(run.ready_at, Some(ready));
+    }
+
     #[test]
     fn notes_add_edit_and_remove() {
         let dir = scratch("notes");
@@ -897,27 +1505,50 @@ mod tests {
             prompt: "do it".into(),
             state: RunState::Running,
             feedback: None,
-            started_at: None,
             seconds: None,
             cost_usd: None,
             summary: None,
             commits: None,
             diffstat: None,
-            verify: None,
+            verify: Some("make test".into()),
             verify_ok: None,
             error: None,
             outcome: None,
+            dispatched_at: None,
+            ready_at: None,
+            decided_at: None,
+            published_at: None,
+            review_seconds: None,
+            class: Some(Class::Mechanical),
+            scope: vec!["Cargo.lock".into(), "Cargo.toml".into()],
+            tier: Some(2),
+            description: Some("within the constraints\n".into()),
+            agent_budget: Some(1.0),
+            timeout_minutes: Some(30),
+            verify_base_ok: Some(true),
+            verify_base_seconds: Some(12),
+            changed_paths: None,
+            scope_error: None,
         };
-        run.id = store.insert_run(&run).unwrap();
+        store.insert_run(&mut run).unwrap();
         assert_eq!(store.run(run.id).unwrap(), run);
 
         run.state = RunState::Ready;
         run.cost_usd = Some(0.25);
-        run.verify = Some("make test".into());
+        run.changed_paths = Some(vec!["Cargo.lock".into(), "a b/c\nd".into()]);
         run.verify_ok = Some(false);
         run.summary = Some("done".into());
         store.update_run(&run).unwrap();
         assert_eq!(store.run(run.id).unwrap(), run);
+
+        // The command the base was checked with cannot change under the run.
+        run.verify = Some("make something-else".into());
+        store.update_run(&run).unwrap();
+        assert_eq!(
+            store.run(run.id).unwrap().verify.as_deref(),
+            Some("make test")
+        );
+        run.verify = Some("make test".into());
 
         run.state = RunState::PrOpen;
         store.update_run(&run).unwrap();

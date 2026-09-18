@@ -15,16 +15,18 @@ Goal: produce the evidence the rest of the plan depends on. No new features. Man
 | 0.1 | Tier the repositories you know well, plus `pma`. Commit and push every pilot item before dispatch: the dispatcher requires the item to be open in the remote default branch (`dispatch.rs`). |
 | 0.2 | Preselect the cohort and record it before dispatching: 20 tasks, each labelled with specification detail (one-liner or described), class, repository, and an estimate of difficulty. Detail and difficulty confound each other, so record both. |
 | 0.3 | Run each project's `verify` once at HEAD by hand. Record the command, the exact SHA, the result and the duration. Where the dispatch base differs from local HEAD, record that the two differ; a manual run at a different SHA is not that run's baseline. |
-| 0.4 | Sidecar ledger at `$PMA_HOME/pilot.jsonl`, keyed by run id and attempt number, appended by hand. `runs` overwrites `summary`, `verify`, `verify_ok`, `started_at` and `feedback` on every rework (`store.rs::update_run`), so first-attempt failures are otherwise lost. |
-| 0.5 | Dispatch the cohort. Approve, reject or rework each one as you would in normal use. Record review minutes per run, counting only time spent reading the diff and deciding. |
+| 0.4 | Dispatch the cohort. Approve, reject or rework each one as you would in normal use. |
+| 0.5 | Report review time with `pma review <id> --minutes N`, counting only time spent reading the diff and deciding. |
 
-Acceptance: 20 runs in `runs`; a ledger line per attempt carrying verify result, cost, duration and outcome; review minutes per run.
+The sidecar ledger this step originally specified is gone: 1.1 and 1.2 were built first, so `attempts` records every attempt and the run carries a timestamp per transition. Nothing is appended by hand.
+
+Acceptance: 20 runs in `runs`, one `attempts` row per agent invocation carrying verify result, cost, duration and outcome, and review time on each run.
 
 Report three outcomes separately, not one: passed verify on the first attempt, accepted after rework, and merged. A pull request still open counts in no numerator and is named in the report.
 
 Gate: measurements 1 and 2 from the review. Accepted share below roughly 40%, or review above 10 minutes per run, changes the plan: fix specification quality (phase 3) before automation (phases 4 and 5). Both thresholds are provisional decision rules over 20 tasks, not calibrated limits.
 
-Size: 1 session plus agent cost. No code.
+Size: 1 session plus agent cost. No code; 1.1 and 1.2 supply the recording.
 
 ## Phase 1: records, then the gate
 
@@ -36,9 +38,9 @@ Records come first. A gate whose evidence is overwritten on the next rework cann
 
 | Step | Change | Files |
 |-|-|-|
-| 1.1 | `attempts` table, append-only, one row per agent invocation: run id, attempt number, agent, model, prompt, feedback, started, seconds, cost, verify result, error, outcome. `runs` keeps the lifecycle summary and points at its latest attempt. | `store.rs` (schema 6), `dispatch.rs` |
-| 1.2 | Transition timestamps on `runs`: `dispatched_at`, `ready_at`, `decided_at`, `shipped_at`, and `review_seconds`. `started_at` is per attempt and moves to `attempts`. Today `runs` carries no durable dispatch or ship time, so no per-day cap, digest window or time-bucketed report is computable. | `store.rs` (schema 6), `dispatch.rs`, `ship.rs` |
-| 1.3 | Decision snapshot written at dispatch and never updated: task revision hash, task text and description as dispatched, class, tier, raw features, estimator version, policy revision, agent, model, budgets. | `store.rs` (schema 7), `dispatch.rs` |
+| 1.1 | Done. `attempts` table, append-only, one row per agent invocation: run id, attempt number, agent, prompt, feedback, started, seconds, cost, verify result, error, outcome. `runs` keeps the lifecycle summary. `model` arrives with the adapter in 2.2 (schema 11), because until then every attempt runs the same worker at its default model and the column would hold one value. | `store.rs` (schema 6), `dispatch.rs` |
+| 1.2 | Done. Transition timestamps on `runs`: `dispatched_at`, `ready_at`, `decided_at`, `published_at`, and `review_seconds`, set through `Run::enter`. `started_at` moved to `attempts`. Named `published_at` rather than `shipped_at`: a pull request opened on day 1 and merged on day 5 must count against day 1 for the per-repository cap. `pma review --minutes N` reports review time, which nothing else measures. | `store.rs` (schema 6), `dispatch.rs`, `ship.rs`, `main.rs` |
+| 1.3 | Done, with 1.4 and 1.5 in one migration: their fields are one snapshot, and splitting them would have added a `class` column with nothing to write into it. Written at dispatch and never updated: class, scope globs, tier, description, `agent_budget`, `timeout`. The task revision hash is derived from `text` through `todo::normal_text`, so it needs no column. Raw features, estimator version and policy revision arrive with 3.5, 3.6 and 4.1, which produce them. | `store.rs` (schema 7), `dispatch.rs`, `main.rs` |
 
 `runs` is the calibration corpus. Never delete rows; add columns. Features stored only on scanned tasks cannot reconstruct a past decision after a rescan or a rewording, which is why the snapshot lives on the run.
 
@@ -48,17 +50,17 @@ Classes arrive here, not in phase 3. Phase 1's scope check and acceptance table 
 
 | Step | Change | Files |
 |-|-|-|
-| 1.4 | Class per task, with a conservative default: `ci` is B, `deps` is A, `.github/**` work is A-, an item tagged `#manual` is C, an unclassified item is B. `#agent` marks eligibility, not class. Tag precedence and the unknown case are defined in code and tested. Class D is undispatchable, not merely ineligible for unattended shipping. | `todo.rs`, `dispatch.rs` |
-| 1.5 | Allowed globs per class, stored on the run at dispatch. Privileged-path exclusions (`.github/**`, credential and license paths) apply to the actual changed paths, whatever class was predicted, so a misclassified workflow edit cannot pass. | `config.rs`, `dispatch.rs` |
+| 1.4 | Done. `Class::of` in `src/class.rs`: `deps` is A, `ci` is B, an unclassified item is B, and `#manual` is D, refused before the worktree is created. `#agent` marks eligibility, not class. Two deviations, both to avoid a label with no effect: `#manual` is D rather than C, because C's behaviour is the `propose` approval mode that arrives in 4.5, and until then a C task would be dispatched exactly like a B one; and A- is not predicted from the task text, because 1.7 applies the privileged-path rule to the paths a run actually changed, whatever class was predicted, which is the stronger check. | new `src/class.rs`, `dispatch.rs` |
+| 1.5 | Done. `Class::scope` resolves the allowed globs at dispatch and the run stores them. Kept as code constants rather than settings: one manifest list covers every ecosystem, and 4.1 gives each route its own `scope`, which is where per-policy globs belong. The privileged-path list lands with its enforcement in 1.7. | `class.rs`, `dispatch.rs` |
 
 ### 1c. The gate
 
 | Step | Change | Files |
 |-|-|-|
-| 1.6 | Run `verify` at the base commit before the agent starts; store `verify_base`, `verify_base_ok`. Cache keyed by repository, base SHA, the exact verify command and the execution context, not by repository and SHA alone. A configuration change invalidates the cache. Freeze the selected command on the run. | `dispatch.rs`, `store.rs` (schema 6) |
-| 1.7 | Scope check over the complete candidate change: `git add --all --intent-to-add` first, then `git diff -z --name-status` against the base. Handle both sides of a rename, deletions, and a failure to enumerate, which is a refusal rather than an empty set. `dispatch.rs::diffstat` and `dispatch.rs::diff` already stage intent-to-add; plain `git diff --name-only` would miss untracked files. | `dispatch.rs`, `report.rs` |
-| 1.8 | Acceptance table by class and verify status, covering missing verification, timeout and infrastructure failure as distinct from a red result. For a bug fix, the focused regression test must fail against the base implementation and pass against the candidate, or the run keeps human review. A change to the verification command's own implementation forces review. | `dispatch.rs` |
-| 1.9 | Retry exhaustion per task revision or signal incident: a `not-suitable` state after two consumed attempts, retained across runs for that revision, with an explicit reset. Budget refusal, spawn failure and infrastructure timeout do not consume an attempt; red verification and human rejection do. Define whether escalation resumes the failed tree or starts clean, and how the exhausted state releases a retained worktree. Today `main.rs::has_run` ignores final states, so rejecting a task makes it immediately dispatchable again. | `store.rs`, `dispatch.rs`, `main.rs` |
+| 1.6 | Done. `verify` runs in the new worktree before the agent, which is a clean checkout of the base. `verify_base_ok` and `verify_base_seconds` go on the run; the `verify_base` table caches by project, base SHA, command and timeout, so every task of a project in one batch pays for one run and a settings change misses rather than reuses. A base that could not be started is unknown, not failing. The command is frozen at dispatch and dropped from `update_run`: it was re-detected on every rework, so a rework could check the head with a command the base was never checked with. | `dispatch.rs`, `store.rs` (schema 8) |
+| 1.7 | Done. `dispatch::changed_paths` stages intent-to-add, then reads `git diff --name-status -z --find-renames` against the base: NUL-delimited because a path may contain a newline, `--name-status` because a rename names two paths and only the status says so. A failure to enumerate stores null with the reason in `scope_error`, never an empty list. `Class::violations` applies the privileged paths to what the run actually changed, whatever class was predicted. The run stores the paths rather than the verdict, so a later change to the class rules re-reads the evidence instead of trusting a verdict recorded under rules nobody can name. | `dispatch.rs`, `class.rs`, `report.rs`, `store.rs` (schema 9) |
+| 1.8 | Done. `accept::review_reasons` reads the recorded gates and returns why a human is needed; empty means every gate is clean. It approves nothing: `pma review` shows the reasons, and the approval modes of 4b and 4c are what consume an empty list. The verify table is by class: A needs green at the base and the head, B needs a check that fails at the base and passes at the head. Missing, unrun and unknown base results are each distinct from red. A run that edited the files implementing its own verify command is read whatever else passed; the driver files are derived from the frozen command, and test files are not among them, since adding a test is the point of a B task. | new `src/accept.rs`, `report.rs` |
+| 1.9 | Done. The counter is keyed by project and normalised task text, so it survives the run that raised it, a reworded specification starts fresh, and a `ci` incident is identified by the workflows it names rather than by the word `ci`, which recurs. Red verification and rejection each consume one; a budget refusal, a spawn failure and a timeout consume none. At two, `--auto` passes the task over and a named dispatch refuses with `--retry` as the reset. The exhausted state needs no worktree mechanism: a failed run's worktree is still released by `pma review <id> --reject`, which the refusal names. Escalation resuming a failed tree is deferred to 4.3, which is where a second attempt at a different model exists. | `store.rs` (schema 10), `dispatch.rs`, `main.rs` |
 | 1.10 | `pma report`: accepted share, cost, duration, verify outcomes, grouped by project, class, agent and model. Reads `runs` and `attempts`. | new `src/report_runs.rs` |
 
 What this gate establishes: no observed regression, a change inside its declared scope, and for bug fixes a test that discriminates base from candidate. It does not establish arbitrary task correctness, and the worker can edit the tests that implement it. Treat it as bounded evidence.
@@ -75,7 +77,7 @@ Goal: agent-agnostic workers, per-run model selection, and an honest cost contra
 
 | Step | Change | Files |
 |-|-|-|
-| 2.1 | Config schema for structured values. `config` is a flat `(key, value)` scalar table with a closed key list (`config.rs::keys`) and a closed `slot` match; `with_overrides` rejects an unknown stored key with a hard error on every command. An agent record is an open-ended name holding a list, so it needs its own table rather than a dotted key. | `store.rs` (schema 8), `config.rs` |
+| 2.1 | Config schema for structured values (schema 11). `config` is a flat `(key, value)` scalar table with a closed key list (`config.rs::keys`) and a closed `slot` match; `with_overrides` rejects an unknown stored key with a hard error on every command. An agent record is an open-ended name holding a list, so it needs its own table rather than a dotted key. | `store.rs` (schema 11), `config.rs` |
 | 2.2 | `agents.<name>`: command, args template with `{prompt} {dir} {model} {budget}`, allowlist form, output parser, capability flags for sandbox, budget enforcement, cost reporting and session resume. `claude` becomes one seeded entry, not the code path. | `config.rs`, `agent.rs` |
 | 2.3 | Normalized `Report {ok, summary, cost, error}` with parsers `claude-json` and `text-tail`. A worker that reports no cost yields `None` and the run records unknown, never zero. `codex-json` when a second worker is actually used. | `agent.rs` |
 | 2.4 | Budget contract, stated rather than promised. `batch_budget` admits runs; it does not cap spend. `claude` checks its cap between turns and can overshoot, and a worker with no cap overshoots without limit. Reserve retry capacity when escalation is enabled. `agent_budget` applies per attempt; the per-task total is the sum over attempts and is recorded, not bounded. A route may require a worker with an enforceable bound; a timeout is not one. | `config.rs`, `dispatch.rs` |
@@ -97,7 +99,7 @@ Goal: decide what an agent may take, improve what it is told, and produce the co
 | 3.2 | Retired-key policy. A retired key left in a store today aborts every command. Retirement drops the row in the migration and keeps the name in a rejected-key list with the reason, so `pma config` explains it instead of erroring. | `config.rs`, `store.rs` |
 | 3.3 | `default_tier`, so untiered projects appear at all. | `config.rs`, `main.rs` |
 | 3.4 | Urgency becomes sequencing: `due:`, blocking signals, `#urgent`. Drop `stale_after` and its 5 settings. Age moves to tiebreak and to a rotting-backlog report. | `rank.rs`, `config.rs`, `report.rs` |
-| 3.5 | Deterministic complexity features stored per task and snapshotted per run: names a file or symbol, text and description length, repository size, verify duration, prior success in that repository. | `scan.rs`, `store.rs` (schema 9) |
+| 3.5 | Deterministic complexity features stored per task and snapshotted per run (schema 12): names a file or symbol, text and description length, repository size, verify duration, prior success in that repository. | `scan.rs`, `store.rs` (schema 12) |
 | 3.6 | Versioned complexity rule: an explicit, deterministic function from features to 1-5, with its version recorded on every run. This is the producer phase 4 matches on, and it exists whether or not 3.7 is built. | `rank.rs` or new `src/complexity.rs` |
 | 3.7 | Optional: one LLM step, classify-and-specify, schema-checked and cached per item revision, producing `{class, complexity, acceptance, expected_paths}`. It proposes; 3.6 remains the applied rule unless a route says otherwise. | new `src/judge.rs` |
 
@@ -151,7 +153,7 @@ Unattended means opening a pull request and completing its merge. Restricted to 
 | Step | Change | Files |
 |-|-|-|
 | 4.8 | CI gate: require positive success for the exact head revision, over a named set of required checks. Pending, missing, cancelled, skipped, unreadable and API failure all leave the pull request pending, not merged. A head change re-arms the gate. A pull request closed unmerged ends the run. Restart resumes from recorded state. `ship.rs::settle` currently only observes what a person did; this adds the merge lifecycle. | `ship.rs` |
-| 4.9 | Code-level limits no matrix may raise: never unattended for class C, D or A-; merge only on positive green CI for the current head; at most N unattended changes per repository per day, counted from `shipped_at`; stop after K consecutive failures. | `dispatch.rs`, `ship.rs` |
+| 4.9 | Code-level limits no matrix may raise: never unattended for class C, D or A-; merge only on positive green CI for the current head; at most N unattended changes per repository per day, counted from `published_at`; stop after K consecutive failures. | `dispatch.rs`, `ship.rs` |
 | 4.10 | Digest after an unattended pass: what shipped, what was refused and why, and what it cost. Bounded by the pass window from the transition timestamps. | `report.rs` |
 | 4.11 | The trigger for an unattended pass. `pma dispatch` blocks until every run finishes and holds an exclusive `flock` for its whole run, so a scheduled pass and an interactive session cannot overlap. Specify the command, its schedule, and what it does when the lock is held. | `main.rs` |
 
@@ -187,11 +189,14 @@ Current `user_version` is 5. `runs` already carries `agent`; only `model` is new
 
 | Version | Contents | Phase |
 |-|-|-|
-| 6 | `attempts` table; transition timestamps and `review_seconds` on `runs`; `verify_base`, `verify_base_ok`; `started_at` moves to `attempts` | 1 |
-| 7 | Decision snapshot on `runs`: task revision, class, scope globs, feature blob, estimator and policy versions | 1 |
-| 8 | `agents` table and `model` on `attempts`; retired-key drops | 2 |
-| 9 | Complexity features on `tasks` | 3 |
-| 10 | Routing revisions, activations and approval evidence | 4a |
+| 6 | `attempts` table; transition timestamps and `review_seconds` on `runs`; `started_at` moves to `attempts`. Applied | 1 |
+| 7 | Decision snapshot on `runs`: class, scope globs, tier, description, `agent_budget`, `timeout`. Applied | 1 |
+| 8 | `verify_base` cache table; `verify_base_ok` and `verify_base_seconds` on `runs`. Applied | 1 |
+| 9 | `changed_paths` and `scope_error` on `runs`. Applied | 1 |
+| 10 | `exhaustion` counter per project and task revision. Applied | 1 |
+| 11 | `agents` table and `model` on `attempts`; retired-key drops | 2 |
+| 12 | Complexity features on `tasks` | 3 |
+| 13 | Routing revisions, activations and approval evidence | 4a |
 
 Each migration is additive to existing tables, applied on open in one transaction, and raises `user_version` so an older binary refuses the file rather than misreading it.
 

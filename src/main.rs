@@ -2,7 +2,9 @@
 //!
 //! Design: `docs/dev/design.md`.
 
+mod accept;
 mod agent;
+mod class;
 mod config;
 mod dates;
 mod deps;
@@ -125,6 +127,9 @@ enum Command {
         /// With --auto, how many tasks; defaults to `max_parallel`.
         #[arg(short = 'n', long, requires = "auto")]
         count: Option<usize>,
+        /// Clear the named target's consumed attempts and dispatch it again.
+        #[arg(long, conflicts_with = "auto")]
+        retry: bool,
     },
     /// List runs that are not shipped or rejected, show one, or act on it.
     Review {
@@ -139,6 +144,9 @@ enum Command {
         /// Run the agent again in the same worktree with this feedback.
         #[arg(long, requires = "id", value_name = "FEEDBACK")]
         rework: Option<String>,
+        /// Minutes spent reviewing this run, added to the run's total.
+        #[arg(long, requires = "id", value_name = "N")]
+        minutes: Option<u32>,
     },
     /// Commit and publish approved runs, then remove their worktrees.
     Ship {
@@ -222,13 +230,15 @@ fn main() -> ExitCode {
             targets,
             auto,
             count,
-        } => run_dispatch(&targets, auto, count),
+            retry,
+        } => run_dispatch(&targets, auto, count, retry),
         Command::Review {
             id,
             approve,
             reject,
             rework,
-        } => run_review(id, approve, reject, rework.as_deref()),
+            minutes,
+        } => run_review(id, approve, reject, rework.as_deref(), minutes),
         Command::Ship { projects } => run_ship(&projects),
         Command::Sync { projects, apply } => run_sync(&projects, apply),
         Command::Note { action } => note(action),
@@ -677,7 +687,7 @@ fn has_run(runs: &[store::Run], project: &str, key: &str, text: &str) -> bool {
     })
 }
 
-fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>) -> Result<()> {
+fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>, retry: bool) -> Result<()> {
     let store = Store::open_default()?;
     let home = store::home()?;
     let session = Session::acquire(&home)?;
@@ -693,13 +703,11 @@ fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>) -> Result<
             .find(|x| x.task.project == project && x.task.key.as_deref() == Some(key))
             .map(|x| format!("{:?}", x.quadrant))
     };
-    let repo = |project: &str| -> Result<PathBuf> {
-        Ok(rows
-            .iter()
+    let row = |project: &str| {
+        rows.iter()
             .find(|r| r.name == project)
-            .ok_or_else(|| format!("unknown project `{project}`"))?
-            .path
-            .clone())
+            .ok_or_else(|| format!("unknown project `{project}`").into())
+            .map_err(|e: Box<dyn std::error::Error>| e)
     };
 
     // With --auto, every candidate in matrix order; `wanted` of them are
@@ -720,12 +728,19 @@ fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>) -> Result<
                 if taken || has_run(&active, &x.task.project, key, &x.task.text) {
                     continue;
                 }
+                let spent =
+                    store.consumed_attempts(&x.task.project, &dispatch::revision(&x.task.text))?;
+                if spent >= dispatch::ATTEMPT_LIMIT {
+                    continue;
+                }
+                let r = row(&x.task.project)?;
                 picks.push(dispatch::Pick {
                     project: x.task.project.clone(),
-                    repo: repo(&x.task.project)?,
+                    repo: r.path.clone(),
                     key: key.clone(),
                     text: x.task.text.clone(),
                     gh: None,
+                    tier: r.tier,
                     quadrant: Some(format!("{:?}", x.quadrant)),
                 });
             }
@@ -790,9 +805,23 @@ fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>) -> Result<
             if has_run(&active, project, &key, &text) {
                 return Err(format!("{target} already has a run; see `pma review`").into());
             }
+            let rev = dispatch::revision(&text);
+            if retry {
+                store.reset_attempts(project, &rev)?;
+            }
+            let spent = store.consumed_attempts(project, &rev)?;
+            if spent >= dispatch::ATTEMPT_LIMIT {
+                return Err(format!(
+                    "{target}: {spent} attempts on `{text}` were used without an accepted \
+                     result; reword the task, or `pma dispatch {target} --retry`. \
+                     Any worktree it left is removed by `pma review <id> --reject`"
+                )
+                .into());
+            }
             picks.push(dispatch::Pick {
                 project: project.into(),
                 repo: row.path.clone(),
+                tier: row.tier,
                 quadrant: quadrant(project, &key),
                 key,
                 text,
@@ -859,7 +888,13 @@ fn settle_prs(store: &Store) -> Result<()> {
     })
 }
 
-fn run_review(id: Option<i64>, approve: bool, reject: bool, rework: Option<&str>) -> Result<()> {
+fn run_review(
+    id: Option<i64>,
+    approve: bool,
+    reject: bool,
+    rework: Option<&str>,
+    minutes: Option<u32>,
+) -> Result<()> {
     let store = Store::open_default()?;
     let home = store::home()?;
     // Free, the lock proves that no session is running agents.
@@ -889,6 +924,12 @@ fn run_review(id: Option<i64>, approve: bool, reject: bool, rework: Option<&str>
         return Ok(());
     };
     let mut run = store.run(id)?;
+    // Added before the action, so a rework's own review time is not lost when
+    // the run is reviewed again.
+    if let Some(m) = minutes {
+        run.review_seconds = Some(run.review_seconds.unwrap_or(0) + i64::from(m) * 60);
+        store.update_run(&run)?;
+    }
     if approve {
         dispatch::approve(&store, &mut run)?;
     } else if reject {
@@ -899,7 +940,10 @@ fn run_review(id: Option<i64>, approve: bool, reject: bool, rework: Option<&str>
         println!("{}", report::run_line(&run));
     } else {
         let diff = dispatch::diff(&run).unwrap_or_else(|e| format!("(no diff: {e})"));
-        print!("{}", report::run_detail(&run, &diff));
+        print!(
+            "{}",
+            report::run_detail(&run, &store.attempts(Some(run.id))?, &diff)
+        );
     }
     drop(session);
     Ok(())

@@ -29,10 +29,10 @@ pub fn ship(
         }
         match ship_one(cfg, &run) {
             Ok(outcome) => {
-                run.state = match cfg.publish_for(&run.project) {
+                run.enter(match cfg.publish_for(&run.project) {
                     Publish::Push => RunState::Shipped,
                     Publish::Pr => RunState::PrOpen,
-                };
+                });
                 run.outcome = Some(outcome.clone());
                 run.error = None;
                 // Saved before cleanup, so a cleanup failure cannot hide
@@ -196,11 +196,12 @@ pub fn settle(
             };
         let outcome = match state.trim() {
             "MERGED" => {
-                run.state = RunState::Shipped;
+                // `published_at` keeps the time the pull request was opened.
+                run.enter(RunState::Shipped);
                 format!("pull request merged: {url}")
             }
             "CLOSED" => {
-                run.state = RunState::Rejected;
+                run.enter(RunState::Rejected);
                 run.error = Some("pull request closed without merging".into());
                 format!("pull request closed without merging: {url}")
             }

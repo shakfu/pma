@@ -1,9 +1,11 @@
 //! Text output for `pma matrix` and `pma status`.
 
+use crate::accept;
+use crate::class::Class;
 use crate::config::Config;
 use crate::rank::{self, Placed, Project, Quadrant, Urgency};
 use crate::scan::Ci;
-use crate::store::{Run, RunState};
+use crate::store::{Attempt, Run, RunState};
 
 /// Lays out rows as left-aligned columns separated by two spaces. The last
 /// column is not padded.
@@ -220,6 +222,34 @@ fn verify_cell(run: &Run) -> String {
     }
 }
 
+/// What the scope check made of the paths the run changed. An enumeration
+/// failure is reported as such: it is not a clean run.
+fn scope_cell(run: &Run, class: Class) -> String {
+    let Some(paths) = &run.changed_paths else {
+        return format!(
+            "NOT CHECKED: {}",
+            run.scope_error.as_deref().unwrap_or("paths not enumerated")
+        );
+    };
+    match class.violations(&run.scope, paths) {
+        v if v.is_empty() => format!("{} files, all permitted", paths.len()),
+        v => format!(
+            "{} of {} files OUTSIDE: {}",
+            v.len(),
+            paths.len(),
+            v.join(" ")
+        ),
+    }
+}
+
+fn verify_state(ok: Option<bool>) -> &'static str {
+    match ok {
+        Some(true) => "passed",
+        Some(false) => "FAILED",
+        None => "not run",
+    }
+}
+
 fn duration(seconds: Option<i64>) -> String {
     match seconds {
         None => "-".into(),
@@ -236,6 +266,10 @@ fn run_cells(run: &Run) -> Vec<String> {
         verify_cell(run),
         run.cost_usd.map_or("-".into(), |c| format!("${c:.2}")),
         duration(run.seconds),
+        match accept::review_reasons(run).len() {
+            0 => "clean".into(),
+            n => format!("{n} to read"),
+        },
         truncate(&run.text, 60),
     ]
 }
@@ -254,7 +288,33 @@ pub fn runs(runs: &[Run]) -> String {
     table(&rows, "")
 }
 
-pub fn run_detail(run: &Run, diff: &str) -> String {
+/// One line per attempt, oldest first. A run with a single attempt says
+/// nothing the rows above it do not, so it is left out.
+fn attempt_lines(attempts: &[Attempt]) -> String {
+    if attempts.len() < 2 {
+        return String::new();
+    }
+    let rows: Vec<Vec<String>> = attempts
+        .iter()
+        .map(|a| {
+            vec![
+                format!("  {}", a.n),
+                a.outcome.clone().unwrap_or_else(|| "?".into()),
+                match a.verify_ok {
+                    Some(true) => "verify passed".into(),
+                    Some(false) => "verify FAILED".into(),
+                    None => "verify not run".into(),
+                },
+                a.cost_usd
+                    .map_or("cost not reported".into(), |c| format!("${c:.2}")),
+                duration(a.seconds),
+            ]
+        })
+        .collect();
+    format!("\nattempts:\n{}", table(&rows, ""))
+}
+
+pub fn run_detail(run: &Run, attempts: &[Attempt], diff: &str) -> String {
     let mut rows = vec![
         vec!["task".into(), run.text.clone()],
         vec![
@@ -273,14 +333,28 @@ pub fn run_detail(run: &Run, diff: &str) -> String {
         ],
         vec![
             "verify".into(),
-            match (&run.verify, run.verify_ok) {
-                (Some(v), Some(true)) => format!("`{v}` passed"),
-                (Some(v), Some(false)) => format!("`{v}` FAILED"),
-                (Some(v), None) => format!("`{v}` not run"),
-                (None, _) => "none detected; set projects.<name>.verify".into(),
+            match &run.verify {
+                // Base and head together separate a regression from a
+                // repository that was already failing.
+                Some(v) => format!(
+                    "`{v}`: base {}, head {}",
+                    verify_state(run.verify_base_ok),
+                    verify_state(run.verify_ok)
+                ),
+                None => "none detected; set projects.<name>.verify".into(),
             },
         ],
     ];
+    if let Some(c) = run.class {
+        rows.push(vec![
+            "class".into(),
+            match run.scope.as_slice() {
+                [] => format!("{}, any path", c.name()),
+                globs => format!("{}, within {}", c.name(), globs.join(" ")),
+            },
+        ]);
+        rows.push(vec!["scope".into(), scope_cell(run, c)]);
+    }
     if let Some(stat) = &run.diffstat {
         rows.push(vec!["changes".into(), stat.clone()]);
     }
@@ -289,6 +363,9 @@ pub fn run_detail(run: &Run, diff: &str) -> String {
             "commits".into(),
             format!("{n} beyond the base; the agent was told not to commit"),
         ]);
+    }
+    if let Some(s) = run.review_seconds {
+        rows.push(vec!["reviewed".into(), duration(Some(s))]);
     }
     for (label, value) in [
         ("feedback", &run.feedback),
@@ -315,6 +392,16 @@ pub fn run_detail(run: &Run, diff: &str) -> String {
             out.push_str(&format!("  {line}\n").replace("  \n", "\n"));
         }
     }
+    let reasons = accept::review_reasons(run);
+    if reasons.is_empty() {
+        out.push_str("\naccept: every recorded gate is clean\n");
+    } else {
+        out.push_str("\nread this run because:\n");
+        for r in &reasons {
+            out.push_str(&format!("  - {r}\n"));
+        }
+    }
+    out.push_str(&attempt_lines(attempts));
     out.push_str("\ndiff:\n");
     out.push_str(diff);
     if !diff.ends_with('\n') {

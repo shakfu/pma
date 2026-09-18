@@ -311,6 +311,17 @@ if git push -q origin HEAD:refs/heads/agent 2>/dev/null; then echo pushed; else 
 echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","total_cost_usd":0.1}'
 "#;
 
+/// A stand-in that strays: an untracked workflow, a rename out of scope, and
+/// a deletion. Its own summary claims it only touched the manifest.
+const STRAYING_CLAUDE: &str = r#"#!/bin/sh
+mkdir -p .github/workflows
+echo "on: push" > .github/workflows/ci.yml
+echo bump >> Cargo.lock
+git mv Makefile build.mk
+git rm -q notes.txt
+echo '{"type":"result","subtype":"success","is_error":false,"result":"updated Cargo.lock","total_cost_usd":0.1}'
+"#;
+
 struct Env {
     home: PathBuf,
     bin: PathBuf,
@@ -389,7 +400,7 @@ fn dispatch_env(s: &Scratch, scripts: &[(&str, &str)]) -> (Env, PathBuf, PathBuf
     git(&seed, &["init", "-q", "-b", "main"], None);
     fs::write(
         seed.join("TODO.md"),
-        "# TODO\n\n## High\n\n- [ ] add greeting\n  say hello in hello.txt\n- [ ] second task gh:7\n- [ ] third task\n",
+        "# TODO\n\n## High\n\n- [ ] add greeting\n  say hello in hello.txt\n- [ ] second task gh:7\n- [ ] third task\n\n## Low\n\n- [ ] guarded task #manual\n",
     )
     .unwrap();
     fs::write(seed.join("Makefile"), "test:\n\ttest -f hello.txt\n").unwrap();
@@ -442,7 +453,25 @@ fn dispatch_review_rework_and_ship() {
     );
     let detail = env.ok(&["review", "1"]);
     assert!(detail.starts_with("#1 ready  alpha  Q2\n"), "{detail}");
-    assert!(detail.contains("`make test` passed"), "{detail}");
+    // Class B, a base that failed and a head that passes: the check
+    // discriminates, so nothing objects.
+    assert!(
+        detail.contains("accept: every recorded gate is clean"),
+        "{detail}"
+    );
+    assert!(list.contains("clean"), "{list}");
+    // #2 failed its verify, so it is not.
+    let failed = env.ok(&["review", "2"]);
+    assert!(
+        failed.contains("read this run because:\n  - verify failed at the head"),
+        "{failed}"
+    );
+    // The test needs hello.txt, which the base does not have: the agent
+    // fixed a failing tree rather than leaving a green one green.
+    assert!(
+        detail.contains("`make test`: base FAILED, head passed"),
+        "{detail}"
+    );
     assert!(detail.contains("+hi"), "{detail}");
     let (out, _, _) = env.run(&["review", "2", "--approve"]);
     assert_eq!(out, "");
@@ -450,6 +479,25 @@ fn dispatch_review_rework_and_ship() {
     // Rework keeps the worktree and adds the reviewer's fix.
     let out = env.ok(&["review", "2", "--rework", "tests need hello.txt"]);
     assert!(out.contains("verify ok  $0.20"), "{out}");
+
+    // The rework does not overwrite the failed attempt that preceded it.
+    let detail = env.ok(&["review", "2", "--minutes", "7"]);
+    let attempts = detail
+        .split_once("attempts:\n")
+        .unwrap_or_default()
+        .1
+        .lines()
+        .take(2)
+        .collect::<Vec<_>>();
+    assert!(attempts[0].contains("verify FAILED"), "{detail}");
+    assert!(attempts[1].contains("verify passed"), "{detail}");
+    assert!(detail.contains("reviewed  7m00s"), "{detail}");
+    // A run seen twice sums its review time.
+    let detail = env.ok(&["review", "2", "--minutes", "3"]);
+    assert!(detail.contains("reviewed  10m00s"), "{detail}");
+    // One attempt says nothing the rows above it do not.
+    assert!(!env.ok(&["review", "1"]).contains("attempts:"));
+
     env.ok(&["review", "1", "--approve"]);
     env.ok(&["review", "2", "--approve"]);
     let (_, err, success) = env.run(&["review", "2", "--approve"]);
@@ -484,7 +532,7 @@ fn dispatch_review_rework_and_ship() {
     );
     assert_eq!(
         git_out(&origin, &["show", "main:TODO.md"]),
-        "# TODO\n\n## High\n\n- [x] add greeting\n  say hello in hello.txt\n- [x] second task gh:7\n- [ ] third task\n"
+        "# TODO\n\n## High\n\n- [x] add greeting\n  say hello in hello.txt\n- [x] second task gh:7\n- [ ] third task\n\n## Low\n\n- [ ] guarded task #manual\n"
     );
     assert_eq!(git_out(&origin, &["show", "main:second.txt"]), "two\n");
     assert_eq!(git_out(&origin, &["branch", "--list", "agent"]), "");
@@ -493,9 +541,18 @@ fn dispatch_review_rework_and_ship() {
     assert_eq!(env.ok(&["review"]), "no runs to review\n");
     assert_eq!(env.ok(&["ship"]), "nothing approved\n");
 
-    // A run whose budget would exceed the batch's does not start.
+    // `third task` failed its verify and was then rejected, so it is not
+    // dispatched again without an explicit reset.
+    let (_, err, success) = env.run(&["dispatch", "alpha:8"]);
+    assert!(
+        !success && err.contains("2 attempts on `third task` were used without an accepted result"),
+        "{err}"
+    );
+
+    // A run whose budget would exceed the batch's does not start, and a run
+    // that never reached the agent consumes no attempt.
     env.ok(&["config", "batch_budget", "0.05"]);
-    let out = env.ok(&["dispatch", "alpha:8"]);
+    let out = env.ok(&["dispatch", "alpha:8", "--retry"]);
     assert!(
         out.contains("not started: batch budget $0.05 reached"),
         "{out}"
@@ -504,7 +561,13 @@ fn dispatch_review_rework_and_ship() {
         out.ends_with("0 ready, 1 failed, $0.00 spent; see `pma review`\n"),
         "{out}"
     );
+    // The budget refusal never reached the agent, so it consumed nothing:
+    // rejecting it leaves one attempt against the task, not two, and no
+    // second reset is needed.
+    env.ok(&["config", "batch_budget", "5.0"]);
     env.ok(&["review", "4", "--reject"]);
+    env.ok(&["dispatch", "alpha:8"]);
+    env.ok(&["review", "5", "--reject"]);
 }
 
 /// A stand-in for `gh pr`, driven by files in `$PMA_HOME`: `pr-state` for
@@ -675,6 +738,55 @@ fn auto_dispatch_passes_over_refused_tasks_and_names_the_cause() {
         !success && err.contains("`third task` is already done on origin/main; pull the clone"),
         "{err}"
     );
+
+    // Class D: refused before any worktree exists.
+    let (_, err, success) = env.run(&["dispatch", "alpha:13"]);
+    assert!(
+        !success && err.contains("`guarded task` is class D and is not dispatched"),
+        "{err}"
+    );
+    assert!(!env.home.join("worktrees/alpha/guarded-task").exists());
+    assert_eq!(
+        git_out(&alpha, &["branch", "--list", "pma/guarded-task"]),
+        ""
+    );
+}
+
+/// Every path a run changed is checked, whatever the agent says it did and
+/// whatever class the task was predicted to be. A deps task is class A, whose
+/// scope is manifests alone.
+#[test]
+fn the_scope_check_reads_the_whole_change_not_the_agents_report() {
+    let s = Scratch::new("scope");
+    let (env, _, alpha) = dispatch_env(&s, &[("claude", STRAYING_CLAUDE)]);
+    // The moved Makefile takes the test target with it; the scope check is
+    // what this test is about.
+    env.ok(&["config", "projects.alpha.verify", "none"]);
+    fs::write(alpha.join("Cargo.lock"), "lock\n").unwrap();
+    fs::write(alpha.join("notes.txt"), "notes\n").unwrap();
+    git(&alpha, &["add", "Cargo.lock", "notes.txt"], None);
+    git(&alpha, &["commit", "-qm", "lock"], None);
+    git(&alpha, &["push", "-q"], None);
+    env.ok(&["scan", "--offline"]);
+    env.ok(&["dispatch", "alpha:5"]);
+
+    // Five paths from four edits: the untracked workflow, the edited lock
+    // file, both sides of the rename, and the deletion. The agent reported
+    // only the lock file.
+    let detail = env.ok(&["review", "1"]);
+    assert!(detail.contains("class    B, any path"), "{detail}");
+    assert!(
+        detail.contains("scope    1 of 5 files OUTSIDE: .github/workflows/ci.yml"),
+        "{detail}"
+    );
+    assert!(detail.contains("updated Cargo.lock"), "{detail}");
+    // Without a verify command there is no acceptance, whatever the scope.
+    assert!(
+        detail.contains("  - outside class B: .github/workflows/ci.yml"),
+        "{detail}"
+    );
+    assert!(detail.contains("  - no verify command"), "{detail}");
+    assert!(env.ok(&["review"]).contains("2 to read"), "{detail}");
 }
 
 /// A stand-in for `claude -p` that finishes once `$PMA_HOME/release` exists,

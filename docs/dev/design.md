@@ -2,6 +2,8 @@
 
 Status: stages 1, 2, 4 and 5 are built. Stage 3 is built for `claude` only.
 
+This document describes what `pma` does today. `implementation-plan.md` changes several of these decisions. Sections it supersedes carry a **Superseded** note naming the phase; the text below them remains the current behaviour until that phase lands.
+
 ## Problem
 
 94 repositories under `~/projects/personal`, all on GitHub. 64 keep a root `TODO.md`. Checking what needs attention means opening each one.
@@ -70,6 +72,8 @@ Values at or above 0.4 are important: `Critical` in tiers 1-4, `High` in tiers 1
 
 ### Urgency
 
+**Superseded by implementation plan 3.4.** The `stale_after` rule is replaced by sequencing: `due:`, a blocking signal, and `#urgent`. With no due dates in the portfolio, "older than 30 days" admits most tier-1 tasks within a month, and the queue already sorts by age. Age becomes a tiebreak and a rotting-backlog report. The five `stale_after` settings are retired.
+
 A task is urgent when any of these hold:
 
 - `due:` is past or within `urgent_within` days (default 7).
@@ -95,6 +99,8 @@ The rule also applies to tasks that are not important. An old `Low` item in a ti
 Within a quadrant: importance, then days to due (dated tasks first), then age. The matrix view shows the top `quadrant_limit` tasks (default 10, as the source advises) and a count of the rest.
 
 ### Quadrant actions
+
+**Superseded by implementation plan 3.1.** Eligibility replaces quadrant gating. An agent may take the `ci` and `deps` signals at any tier, plus items tagged `#agent`; `activity` and `hygiene` stay undispatchable. Importance orders the queue, eligibility decides what may be dispatched. `dispatch_quadrants` and `overflow_quadrants` are retired. The 2x2 remains a view.
 
 | Quadrant | `pma` action |
 |-|-|
@@ -207,6 +213,8 @@ The counts are not comparable across ecosystems: cargo's includes transitive cra
 Measuring takes 0.6s (uv) to 10s (go) per project, and 44s for the 52 repos. It runs only with `pma scan --deps`. Other scans keep the last measurement and its date, which `status --explain` shows. A project with none of the three files, or whose tools all fail, is unmeasured. A tool's failure is kept in the detail. A deps task is dispatched with that detail as the list to update.
 
 ### Project health
+
+**Under review; see the cut list in `implementation-plan.md`.** Five weights and a saturation curve yield a number with no action attached. Removal waits on a replacement for what it alone covers: `pma report` (plan 1.10) describes runs that were attempted, whereas this view also describes repositories where nothing was ever dispatched.
 
 A separate per-project view ranks projects rather than tasks:
 
@@ -361,6 +369,8 @@ States: `queued -> running -> ready | failed`, then `approved -> shipped`, or `r
 
 ## Ship
 
+**Superseded by implementation plan 4.7 and 4.8.** Ship publishes without rerunning verification after approval, so an edited worktree, or a clean but semantically incompatible rebase, can publish content no verify run ever saw. Approval will carry evidence (verified tree, base SHA, verify command, scope revision, approver) that the integrated tree is rechecked against after the rebase. With `publish = "pr"`, the run will also gain a merge lifecycle gated on positive green CI for the current head, rather than only observing whether a person merged it.
+
 `pma ship` processes approved tasks, per project:
 
 1. `git add -A`, then commit with the task text as the subject. Add `Closes #N` when `gh:N` is set. Author is the user. With `attribution = "co-author"`, a trailer names the agent.
@@ -433,4 +443,4 @@ Each stage is used before the next one is built.
 
 ## Open questions
 
-Open questions, what to cut, and the sequencing model for urgency: `design-review.md`.
+Open questions, what to cut, and the sequencing model for urgency: `design-review.md`. Sequenced work, with the phase that supersedes each decision above: `implementation-plan.md`. Review of that plan against this code: `plan-review.md`.

@@ -17,7 +17,6 @@ include = [
     "/README.md",
     "/CHANGELOG.md",
     "/LICENSE",
-    "/docs/dev/design.md",
 ]
 
 [dependencies]

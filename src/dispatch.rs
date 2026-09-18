@@ -10,10 +10,13 @@ use std::time::Duration;
 
 use crate::agent;
 use crate::class::Class;
+use crate::complexity::{self, Features};
 use crate::config::Config;
+use crate::route::{Policy, Subject};
 use crate::scan;
 use crate::store::{Attempt, Result, Run, RunState, Store};
 use crate::todo;
+use crate::worker::Worker;
 
 /// A task chosen for dispatch.
 #[derive(Debug, Clone)]
@@ -26,12 +29,23 @@ pub struct Pick {
     pub gh: Option<i64>,
     /// The project's tier, recorded on the run because tiers change.
     pub tier: Option<u8>,
+    /// Stated by a campaign, which has no item to read tags from.
+    pub class: Option<Class>,
+    /// Extra prompt lines a campaign carries.
+    pub details: Option<String>,
     pub quadrant: Option<String>,
 }
 
 /// Whether a task key names a signal rather than a TODO.md item.
 pub fn is_signal(key: &str) -> bool {
     matches!(key, "ci" | "deps")
+}
+
+/// A task with no line in any `TODO.md`: a signal, or a campaign applying one
+/// definition across repositories. There is nothing to check on origin before
+/// dispatch and nothing to tick at ship.
+pub fn without_item(key: &str) -> bool {
+    is_signal(key) || key.starts_with("campaign:")
 }
 
 /// Consumed attempts after which a task revision is not dispatched again.
@@ -145,6 +159,9 @@ pub fn prepare(store: &Store, home: &Path, cfg: &Config, pick: &Pick) -> Result<
                 Vec::new(),
             )
         }
+        key if key.starts_with("campaign:") => {
+            (pick.details.clone().unwrap_or_default(), Vec::new())
+        }
         _ => {
             let file = git(repo, &["show", &format!("{base}:TODO.md")]).ok();
             match on_origin(file.as_deref(), &pick.key, &pick.text) {
@@ -166,7 +183,8 @@ pub fn prepare(store: &Store, home: &Path, cfg: &Config, pick: &Pick) -> Result<
     };
 
     // Before the worktree, so a task the user marked leaves nothing behind.
-    let class = Class::of(&pick.key, &tags);
+    // A campaign states its class: it has no item to read tags from.
+    let class = pick.class.unwrap_or_else(|| Class::of(&pick.key, &tags));
     if !class.dispatchable() {
         return refuse(format!(
             "`{}` is class {} and is not dispatched; remove `#manual` to change that",
@@ -218,6 +236,47 @@ pub fn prepare(store: &Store, home: &Path, cfg: &Config, pick: &Pick) -> Result<
         Some(v) => base_verify(store, home, cfg, &pick.project, &base, v, &worktree)?,
         None => (None, None),
     };
+    let mut features = Features::of(&pick.text, &details);
+    features.repo_files = tracked_files(&worktree);
+    features.verify_seconds = verify_base_seconds.filter(|_| verify.is_some());
+    (features.prior_decided, features.prior_accepted) = store.decided_runs(&pick.project)?;
+    let complexity = complexity::estimate(class, &features);
+
+    // A policy applies only once someone activates it; in shadow it is
+    // computed and recorded but the settings still decide.
+    let subject = Subject {
+        class,
+        complexity,
+        tier: pick.tier,
+    };
+    let active = store.active_route()?;
+    let mut routed = (None, None, None, None, class.scope());
+    if let Some(rev) = &active {
+        let policy = rev.policy()?;
+        let Some(route) = policy.route(&subject) else {
+            return refuse(format!(
+                "`{}` matches no route in policy revision {}; add one or widen the last",
+                pick.text, rev.revision
+            ));
+        };
+        let scope = route.scope.clone().unwrap_or_else(|| class.scope());
+        routed = (
+            Some(rev.revision),
+            Some(route.name.clone()),
+            Some(route.approval),
+            (!rev.shadow).then(|| (route.agent.clone(), route.model.clone())),
+            scope,
+        );
+    }
+    let (route_revision, route_name, approval, applied, scope) = routed;
+    let (agent, model) = match applied {
+        Some((a, m)) => (
+            a.unwrap_or_else(|| cfg.agent.clone()),
+            m.or_else(|| cfg.model.clone()),
+        ),
+        None => (cfg.agent.clone(), cfg.model.clone()),
+    };
+
     let mut run = Run {
         id: 0,
         project: pick.project.clone(),
@@ -225,7 +284,7 @@ pub fn prepare(store: &Store, home: &Path, cfg: &Config, pick: &Pick) -> Result<
         text: pick.text.clone(),
         gh: pick.gh,
         quadrant: pick.quadrant.clone(),
-        agent: agent::AGENT.into(),
+        agent,
         repo: repo.clone(),
         branch,
         worktree,
@@ -249,7 +308,7 @@ pub fn prepare(store: &Store, home: &Path, cfg: &Config, pick: &Pick) -> Result<
         published_at: None,
         review_seconds: None,
         class: Some(class),
-        scope: class.scope(),
+        scope,
         tier: pick.tier,
         description: (!details.trim().is_empty()).then(|| details.clone()),
         agent_budget: Some(cfg.agent_budget),
@@ -258,6 +317,16 @@ pub fn prepare(store: &Store, home: &Path, cfg: &Config, pick: &Pick) -> Result<
         verify_base_seconds,
         changed_paths: None,
         scope_error: None,
+        model,
+        complexity: Some(complexity),
+        features: Some(features),
+        estimator: Some(complexity::ESTIMATOR.into()),
+        route_revision,
+        route: route_name,
+        approval,
+        approved_tree: None,
+        approved_head: None,
+        approved_by: None,
     };
     run.prompt = prompt(&run, &details, verify.as_deref());
     store.insert_run(&mut run)?;
@@ -382,6 +451,13 @@ pub fn execute(
     runs: Vec<Run>,
     mut done: impl FnMut(&Run),
 ) -> Result<Vec<Run>> {
+    let workers = store.agents()?;
+    // Escalation follows the policy only when it is applied. A shadow
+    // revision is recorded and not acted on, here as everywhere.
+    let policy = match store.active_route()? {
+        Some(rev) if !rev.shadow => Some(rev.policy()?),
+        _ => None,
+    };
     struct Queue {
         waiting: VecDeque<Run>,
         spent: f64,
@@ -392,18 +468,20 @@ pub fn execute(
         spent: 0.0,
         running: 0,
     });
-    let workers = (cfg.max_parallel as usize).max(1);
+    let threads = (cfg.max_parallel as usize).max(1);
     // An attempt rides with the run it belongs to: only this thread has the
     // store, and a row appended after the run's update would be lost on a
     // save error.
-    let (tx, rx) = mpsc::channel::<(Run, Option<Attempt>)>();
+    let (tx, rx) = mpsc::channel::<(Run, Vec<Attempt>)>();
     let mut finished = Vec::new();
     let mut save_error = None;
 
     std::thread::scope(|s| {
-        for _ in 0..workers {
+        for _ in 0..threads {
             let tx = tx.clone();
             let queue = &queue;
+            let workers = &workers;
+            let policy = policy.as_ref();
             s.spawn(move || {
                 loop {
                     let mut run = {
@@ -411,7 +489,13 @@ pub fn execute(
                         let Some(mut run) = q.waiting.pop_front() else {
                             break;
                         };
-                        let committed = q.spent + (q.running + 1) as f64 * cfg.agent_budget;
+                        // A route that may escalate reserves both attempts,
+                        // so the second is not refused after the first spent
+                        // the batch's room.
+                        let tries = 1 + i64::from(escalation(policy, &run).is_some());
+                        let committed = q.spent
+                            + q.running as f64 * cfg.agent_budget
+                            + tries as f64 * cfg.agent_budget;
                         if committed > cfg.batch_budget + 1e-9 {
                             run.state = RunState::Failed;
                             run.error = Some(format!(
@@ -420,34 +504,44 @@ pub fn execute(
                             ));
                             // Refused before the agent ran, so it consumes
                             // no attempt.
-                            let _ = tx.send((run, None));
+                            let _ = tx.send((run, Vec::new()));
                             continue;
                         }
                         q.running += 1;
                         run
                     };
                     run.state = RunState::Running;
-                    let _ = tx.send((run.clone(), None));
-                    let a = attempt(home, cfg, &mut run, None);
+                    let _ = tx.send((run.clone(), Vec::new()));
+                    let mut made = vec![attempt(home, cfg, workers, &mut run, None)];
+                    // One retry at a stronger model, only where the check
+                    // itself refused the work.
+                    if consumes(&run)
+                        && let Some(model) = escalation(policy, &run)
+                    {
+                        run.model = Some(model);
+                        made.push(attempt(home, cfg, workers, &mut run, Some(ESCALATION)));
+                    }
                     {
                         let mut q = queue.lock().unwrap();
                         q.running -= 1;
                         q.spent += run.cost_usd.unwrap_or(0.0);
                     }
-                    let _ = tx.send((run, Some(a)));
+                    let _ = tx.send((run, made));
                 }
             });
         }
         drop(tx);
-        for (run, attempt) in rx {
+        for (run, attempts) in rx {
             if let Err(e) = store.update_run(&run) {
                 save_error.get_or_insert(e.to_string());
             }
-            if let Some(a) = attempt {
-                if let Err(e) = store.insert_attempt(&a) {
+            for a in &attempts {
+                if let Err(e) = store.insert_attempt(a) {
                     save_error.get_or_insert(e.to_string());
                 }
-                if consumes(&run)
+                // Escalation counts like any other attempt: each refused
+                // check is one negative signal about the task.
+                if a.verify_ok == Some(false)
                     && let Err(e) = store.consume_attempt(&run.project, &revision(&run.text))
                 {
                     save_error.get_or_insert(e.to_string());
@@ -473,12 +567,19 @@ pub fn execute(
 /// attempt's own values; the caller appends it, because the worker threads
 /// have no store.
 #[must_use]
-fn attempt(home: &Path, cfg: &Config, run: &mut Run, feedback: Option<&str>) -> Attempt {
+fn attempt(
+    home: &Path,
+    cfg: &Config,
+    workers: &[Worker],
+    run: &mut Run,
+    feedback: Option<&str>,
+) -> Attempt {
     let mut a = Attempt {
         id: 0,
         run_id: run.id,
         n: 0,
         agent: run.agent.clone(),
+        model: run.model.clone(),
         prompt: String::new(),
         feedback: feedback.map(str::to_string),
         started_at: crate::dates::now(),
@@ -489,6 +590,14 @@ fn attempt(home: &Path, cfg: &Config, run: &mut Run, feedback: Option<&str>) -> 
         verify_ok: None,
         error: None,
         outcome: None,
+    };
+    let Some(worker) = workers.iter().find(|w| w.name == run.agent) else {
+        fail(
+            run,
+            &mut a,
+            format!("unknown agent `{}`; see `pma agent`", run.agent),
+        );
+        return a;
     };
     let logs = home.join("runs").join(run.id.to_string());
     let empty = home.join("empty");
@@ -509,7 +618,13 @@ fn attempt(home: &Path, cfg: &Config, run: &mut Run, feedback: Option<&str>) -> 
         None => run.prompt.clone(),
     };
     a.verify = run.verify.clone();
-    let mut cmd = agent::claude(&a.prompt, cfg.agent_budget, run.verify.as_deref());
+    let mut cmd = worker.build(
+        &a.prompt,
+        &run.worktree,
+        run.model.as_deref(),
+        cfg.agent_budget,
+    );
+    worker.allow_verify(&mut cmd, run.verify.as_deref());
     cmd.current_dir(&run.worktree);
     agent::restrict(&mut cmd, &empty);
     a.started_at = crate::dates::now();
@@ -518,11 +633,14 @@ fn attempt(home: &Path, cfg: &Config, run: &mut Run, feedback: Option<&str>) -> 
     let finished = match agent::run_limited(cmd, &log, timeout) {
         Ok(f) => f,
         Err(e) => {
-            fail(run, &mut a, format!("{}: {e}", agent::AGENT));
+            fail(run, &mut a, format!("{}: {e}", worker.command));
             return a;
         }
     };
-    let report = agent::parse_claude(&std::fs::read_to_string(&log).unwrap_or_default());
+    let report = worker.parse.report(
+        &std::fs::read_to_string(&log).unwrap_or_default(),
+        finished.success == Some(true),
+    );
     a.seconds = Some(finished.seconds);
     run.seconds = Some(run.seconds.unwrap_or(0) + finished.seconds);
     // An agent that reports no cost leaves both null. Zero would read as free.
@@ -584,10 +702,19 @@ fn attempt(home: &Path, cfg: &Config, run: &mut Run, feedback: Option<&str>) -> 
     a
 }
 
+/// Files git tracks in the worktree, as a proxy for how far a change can
+/// reach. Zero when it cannot be counted, which reads as a small repository
+/// rather than refusing the dispatch.
+fn tracked_files(worktree: &Path) -> i64 {
+    git(worktree, &["ls-files"])
+        .map(|out| out.lines().filter(|l| !l.is_empty()).count() as i64)
+        .unwrap_or(0)
+}
+
 /// Runs `command` in `worktree` under the agent's stripped environment, the
 /// same way the head check runs it. `Ok(None)` means it was killed at the
 /// timeout.
-fn verify_once(
+pub fn verify_once(
     command: &str,
     worktree: &Path,
     empty: &Path,
@@ -629,6 +756,24 @@ fn base_verify(
     };
     store.set_verify_base(project, base, command, cfg.timeout, ok, seconds)?;
     Ok((ok, Some(seconds)))
+}
+
+/// Added after the original prompt when a run is retried at a stronger
+/// model. The worktree still holds the first attempt's work.
+const ESCALATION: &str = "The project's check refused your previous attempt, which is still in \
+                          the working tree. Reproduce the failure, then fix it.";
+
+/// The model a failed run retries at, or `None` when its route says nothing,
+/// when the policy is not applied, or when it has already escalated.
+fn escalation(policy: Option<&Policy>, run: &Run) -> Option<String> {
+    let name = run.route.as_deref()?;
+    let route = policy?.routes.iter().find(|r| r.name == name)?;
+    let escalate = route.escalate.as_ref()?;
+    // `attempts` is the number beyond the first, and only one is honoured.
+    if escalate.attempts < 1 || run.model.as_deref() == Some(escalate.model.as_str()) {
+        return None;
+    }
+    Some(escalate.model.clone())
 }
 
 /// Fails the run and the attempt with one error, so neither records an
@@ -689,15 +834,38 @@ pub fn diff(run: &Run) -> Result<String> {
     git(&run.worktree, &["diff", &run.base])
 }
 
-pub fn approve(store: &Store, run: &mut Run) -> Result<()> {
-    if run.state != RunState::Ready {
+/// The worktree's content as one object id: `git add --all`, which stages
+/// without committing, then `git write-tree`. The same call at ship time
+/// says whether anything changed since.
+pub fn tree(run: &Run) -> Result<String> {
+    git(&run.worktree, &["add", "--all"])?;
+    git(&run.worktree, &["write-tree"])
+}
+
+pub fn approve(store: &Store, run: &mut Run, by: &str) -> Result<()> {
+    // Approving an already approved run re-takes the evidence, which is how
+    // a reviewer says the tree is fine after ship refused a stale one.
+    if !matches!(run.state, RunState::Ready | RunState::Approved) {
         return Err(format!(
-            "run #{} is {}; only a ready run can be approved",
+            "run #{} is {}; only a ready or approved run can be approved",
             run.id,
             run.state.name()
         )
         .into());
     }
+    if run.approval == Some(crate::route::Approval::Propose) {
+        return Err(format!(
+            "run #{} took route `{}`, which is `propose`: it produces a patch and a \
+             summary, and nothing is published. Change the route to publish it.",
+            run.id,
+            run.route.as_deref().unwrap_or("-")
+        )
+        .into());
+    }
+    // Recorded now, so ship can say whether it is publishing what was read.
+    run.approved_tree = Some(tree(run)?);
+    run.approved_head = git(&run.worktree, &["rev-parse", "HEAD"]).ok();
+    run.approved_by = Some(by.to_string());
     run.enter(RunState::Approved);
     store.update_run(run)
 }
@@ -755,9 +923,13 @@ pub fn rework(
         .into());
     }
     run.feedback = Some(feedback.to_string());
+    // The approver read a tree that is about to change.
+    run.approved_tree = None;
+    run.approved_head = None;
+    run.approved_by = None;
     run.state = RunState::Running;
     store.update_run(run)?;
-    let a = attempt(home, cfg, run, Some(feedback));
+    let a = attempt(home, cfg, &store.agents()?, run, Some(feedback));
     store.update_run(run)?;
     store.insert_attempt(&a)?;
     if consumes(run) {
@@ -851,6 +1023,16 @@ mod tests {
             verify_base_seconds: None,
             changed_paths: None,
             scope_error: None,
+            model: None,
+            complexity: None,
+            features: None,
+            estimator: None,
+            route_revision: None,
+            route: None,
+            approval: None,
+            approved_tree: None,
+            approved_head: None,
+            approved_by: None,
         };
         let p = prompt(&run, "for all classes\n", Some("make test"));
         assert!(p.contains("`cynn`"));

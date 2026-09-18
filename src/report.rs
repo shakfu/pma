@@ -42,7 +42,7 @@ const TEXT_WIDTH: usize = 100;
 /// Longest group shown in the matrix, in characters.
 const GROUP_WIDTH: usize = 24;
 
-fn truncate(s: &str, max: usize) -> String {
+pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
@@ -59,10 +59,42 @@ pub fn when(p: &Placed, today: i64) -> String {
         (Some(Urgency::Due(d)), _) => format!("due in {d}d"),
         (Some(Urgency::Tagged), _) => "#urgent".into(),
         (Some(Urgency::Signal), _) => "signal".into(),
-        (Some(Urgency::Stale(a)), _) => format!("open {a}d"),
         (None, Some(due)) => format!("due in {}d", due - today),
         (None, None) => format!("open {}d", p.task.age_days),
     }
+}
+
+/// Open tasks by age, oldest first. Age used to make a task urgent, which in
+/// a portfolio with no due dates meant "older than 30 days" and told the
+/// queue nothing. It is a list to prune, not a reason to work.
+pub fn stale(placed: &[Placed], limit: usize) -> String {
+    let mut rows: Vec<&Placed> = placed.iter().filter(|p| p.task.line.is_some()).collect();
+    if rows.is_empty() {
+        return "no open items\n".into();
+    }
+    rows.sort_by_key(|p| std::cmp::Reverse(p.task.age_days));
+    let shown = rows.len().min(limit);
+    let cells: Vec<Vec<String>> = rows[..shown]
+        .iter()
+        .map(|p| {
+            vec![
+                format!("{}:{}", p.task.project, p.task.line.unwrap_or(0)),
+                format!("T{}", p.task.tier),
+                p.task.priority.name().into(),
+                format!("open {}d", p.task.age_days),
+                truncate(&p.task.text, TEXT_WIDTH),
+            ]
+        })
+        .collect();
+    let rest = rows.len() - shown;
+    format!(
+        "{}{}",
+        table(&cells, "  "),
+        match rest {
+            0 => String::new(),
+            n => format!("  and {n} more\n"),
+        }
+    )
 }
 
 /// `limit` caps the rows shown per quadrant; the count shows the rest.
@@ -250,7 +282,7 @@ fn verify_state(ok: Option<bool>) -> &'static str {
     }
 }
 
-fn duration(seconds: Option<i64>) -> String {
+pub fn duration(seconds: Option<i64>) -> String {
     match seconds {
         None => "-".into(),
         Some(s) if s < 60 => format!("{s}s"),
@@ -305,6 +337,7 @@ fn attempt_lines(attempts: &[Attempt]) -> String {
                     Some(false) => "verify FAILED".into(),
                     None => "verify not run".into(),
                 },
+                a.model.clone().unwrap_or_else(|| a.agent.clone()),
                 a.cost_usd
                     .map_or("cost not reported".into(), |c| format!("${c:.2}")),
                 duration(a.seconds),
@@ -320,8 +353,11 @@ pub fn run_detail(run: &Run, attempts: &[Attempt], diff: &str) -> String {
         vec![
             "agent".into(),
             format!(
-                "{}, {}, {}",
+                "{}{}, {}, {}",
                 run.agent,
+                run.model
+                    .as_deref()
+                    .map_or(String::new(), |m| format!(" {m}")),
                 run.cost_usd
                     .map_or("cost not reported".into(), |c| format!("${c:.2}")),
                 duration(run.seconds)
@@ -354,6 +390,21 @@ pub fn run_detail(run: &Run, attempts: &[Attempt], diff: &str) -> String {
             },
         ]);
         rows.push(vec!["scope".into(), scope_cell(run, c)]);
+        if let (Some(rev), Some(name)) = (run.route_revision, run.route.as_deref()) {
+            rows.push(vec![
+                "route".into(),
+                format!(
+                    "{name} in revision {rev}, approval {}",
+                    run.approval.map_or("-", |a| a.name())
+                ),
+            ]);
+        }
+        if let Some(n) = run.complexity {
+            rows.push(vec![
+                "complexity".into(),
+                format!("{n} of 5 ({})", run.estimator.as_deref().unwrap_or("?")),
+            ]);
+        }
     }
     if let Some(stat) = &run.diffstat {
         rows.push(vec!["changes".into(), stat.clone()]);
@@ -362,6 +413,17 @@ pub fn run_detail(run: &Run, attempts: &[Attempt], diff: &str) -> String {
         rows.push(vec![
             "commits".into(),
             format!("{n} beyond the base; the agent was told not to commit"),
+        ]);
+    }
+    if let Some(by) = &run.approved_by {
+        rows.push(vec![
+            "approved".into(),
+            format!(
+                "by {by}, tree {}",
+                run.approved_tree
+                    .as_deref()
+                    .map_or("?", |t| &t[..t.len().min(12)])
+            ),
         ]);
     }
     if let Some(s) = run.review_seconds {
@@ -444,6 +506,7 @@ mod tests {
                 due,
                 tagged_urgent: false,
                 signal_urgent: false,
+                eligible: false,
                 age_days: 12,
             },
             importance: 0.5,

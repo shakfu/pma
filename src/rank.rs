@@ -1,8 +1,9 @@
 //! Places tasks in the Eisenhower matrix and scores project health.
 //!
 //! Importance is `tier multiplier * priority weight` against a threshold.
-//! Urgency is computed from due dates, tags, signals and age, so a quadrant
-//! is never stored. Formulas are described in `docs/dev/design.md`.
+//! Urgency is sequencing, not decay: a deadline, a signal that blocks other
+//! work, or an explicit mark. Age orders the queue and fills `pma stale`; it
+//! does not make a task urgent. Formulas are in `docs/dev/design.md`.
 
 use std::cmp::Ordering;
 
@@ -39,9 +40,8 @@ pub enum Urgency {
     /// Days until due; negative when overdue.
     Due(i64),
     Tagged,
+    /// A failing check blocks everything else in that repository.
     Signal,
-    /// Days open, beyond the tier's `stale_after`.
-    Stale(i64),
 }
 
 /// A project as ranking sees it: what the last scan recorded, plus its tier.
@@ -80,6 +80,10 @@ pub struct Task {
     pub tagged_urgent: bool,
     pub signal_urgent: bool,
     pub age_days: i64,
+    /// Whether an agent may take it: the `ci` and `deps` signals at any tier,
+    /// and items tagged `#agent`. Importance orders the queue; this decides
+    /// what is dispatched from it.
+    pub eligible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -99,13 +103,7 @@ pub fn urgency(cfg: &Config, t: &Task, today: i64) -> Option<Urgency> {
     if t.tagged_urgent {
         return Some(Urgency::Tagged);
     }
-    if t.signal_urgent {
-        return Some(Urgency::Signal);
-    }
-    match cfg.stale_after[usize::from(t.tier) - 1] {
-        Some(days) if t.due.is_none() && t.age_days > days => Some(Urgency::Stale(t.age_days)),
-        _ => None,
-    }
+    t.signal_urgent.then_some(Urgency::Signal)
 }
 
 /// Places every task, ordered by quadrant, then importance, then days to due
@@ -168,11 +166,13 @@ pub fn signal_tasks(cfg: &Config, p: &Project) -> Vec<Task> {
         tagged_urgent: false,
         signal_urgent: urgent,
         age_days,
+        eligible: false,
     };
     let mut tasks = Vec::new();
     if let Ci::Failing(workflows) = &p.ci {
         tasks.push(Task {
             key: Some("ci".into()),
+            eligible: true,
             ..task(
                 cfg.signals.ci,
                 format!("fix CI: {}", workflows.join(", ")),
@@ -184,6 +184,7 @@ pub fn signal_tasks(cfg: &Config, p: &Project) -> Vec<Task> {
     if let Some((n, _)) = p.deps.filter(|(n, _)| *n > 0) {
         tasks.push(Task {
             key: Some("deps".into()),
+            eligible: true,
             ..task(
                 cfg.signals.deps,
                 format!("update dependencies: {n} outdated"),
@@ -383,6 +384,7 @@ mod tests {
             tagged_urgent: false,
             signal_urgent: false,
             age_days: 0,
+            eligible: false,
         }
     }
 
@@ -441,36 +443,25 @@ mod tests {
         assert_eq!(urgency(&cfg, &t, TODAY), Some(Urgency::Signal));
     }
 
+    /// Age no longer makes a task urgent. With no due dates in a portfolio,
+    /// the old rule reduced to "older than 30 days", which within a month
+    /// admitted most tier-1 tasks and carried no ordering information the
+    /// queue did not already have.
     #[test]
-    fn age_makes_undated_tasks_urgent_per_tier() {
+    fn age_alone_is_not_urgency() {
         let cfg = Config::default();
-        let aged = |tier, age_days, due| Task {
+        let aged = |tier, age_days| Task {
             age_days,
-            due,
             ..task(tier, Priority::Low)
         };
+        for (tier, age) in [(1, 31), (1, 400), (3, 91), (4, 5000)] {
+            assert_eq!(urgency(&cfg, &aged(tier, age), TODAY), None, "{tier} {age}");
+        }
+        // It still orders the queue, oldest first among equals.
+        let placed = place(&cfg, vec![aged(1, 10), aged(1, 90)], TODAY);
         assert_eq!(
-            urgency(&cfg, &aged(1, 30, None), TODAY),
-            None,
-            "30 days is not beyond 30"
-        );
-        assert_eq!(
-            urgency(&cfg, &aged(1, 31, None), TODAY),
-            Some(Urgency::Stale(31))
-        );
-        assert_eq!(
-            urgency(&cfg, &aged(3, 91, None), TODAY),
-            Some(Urgency::Stale(91))
-        );
-        assert_eq!(
-            urgency(&cfg, &aged(4, 5000, None), TODAY),
-            None,
-            "tier 4 never ages"
-        );
-        assert_eq!(
-            urgency(&cfg, &aged(1, 400, Some(TODAY + 30)), TODAY),
-            None,
-            "a due date overrides age"
+            placed.iter().map(|p| p.task.age_days).collect::<Vec<_>>(),
+            [90, 10]
         );
     }
 

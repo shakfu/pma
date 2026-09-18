@@ -27,6 +27,12 @@ pub enum Class {
 /// change is most dangerous.
 pub const PRIVILEGED: [&str; 4] = [".github/**", "LICENSE", "COPYING", "**/.netrc"];
 
+/// Files `pma` writes itself. No class may change one: an agent is told not
+/// to, and ship marks the item done after the rebase. Keeping the file out of
+/// every scope is what lets that edit be admitted without granting an agent
+/// access to it.
+pub const OWNED: [&str; 1] = ["TODO.md"];
+
 /// Manifests and lock files a dependency update may touch. One list covers
 /// every ecosystem, so a project needs no per-class setting.
 const MANIFESTS: [&str; 10] = [
@@ -96,6 +102,9 @@ impl Class {
         paths
             .iter()
             .filter(|p| {
+                if OWNED.iter().any(|g| crate::scan::glob_match(g, p.as_str())) {
+                    return true;
+                }
                 let privileged = PRIVILEGED
                     .iter()
                     .any(|g| crate::scan::glob_match(g, p.as_str()));
@@ -214,6 +223,19 @@ mod tests {
             p.violations(&p.scope(), &paths(&["src/main.rs"])),
             ["src/main.rs"]
         );
+    }
+
+    /// `pma` marks the item done itself, after the rebase. An agent that
+    /// edits the file is caught at review, whatever its class.
+    #[test]
+    fn no_class_may_change_a_file_pma_writes() {
+        for class in [Class::Mechanical, Class::Privileged, Class::Specified] {
+            assert_eq!(
+                class.violations(&class.scope(), &paths(&["TODO.md"])),
+                ["TODO.md"],
+                "{class:?}"
+            );
+        }
     }
 
     #[test]

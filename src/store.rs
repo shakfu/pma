@@ -15,12 +15,15 @@ use std::time::Duration;
 use rusqlite::{Connection, params};
 
 use crate::class::Class;
+use crate::complexity::Features;
+use crate::route::{Approval, Policy};
 use crate::scan::{Ci, Facts};
 use crate::todo::Priority;
+use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 10;
+const VERSION: i64 = 16;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -211,6 +214,99 @@ CREATE TABLE exhaustion (
 );
 ";
 
+/// Version 11. A worker is a record, not a code path. `config` is a flat
+/// table of scalars with a closed key list, and an agent record is an
+/// open-ended name holding a list, so it gets its own table rather than a
+/// dotted key. `claude` is seeded as one entry with exactly the behaviour it
+/// had when it was compiled in.
+const AGENTS: &str = "
+CREATE TABLE agents (
+    name TEXT PRIMARY KEY,
+    command TEXT NOT NULL,
+    args TEXT NOT NULL,
+    allow TEXT,
+    parse TEXT NOT NULL,
+    reports_cost INTEGER NOT NULL,
+    enforces_budget INTEGER NOT NULL,
+    sandbox INTEGER NOT NULL,
+    resumes INTEGER NOT NULL
+);
+ALTER TABLE runs ADD COLUMN model TEXT;
+ALTER TABLE attempts ADD COLUMN model TEXT;
+";
+
+/// Version 12. Drops the settings phase 3 retired. A stored row for an
+/// unknown key makes every command fail, so retiring one is a migration, not
+/// only a code change. The names stay in `config::RETIRED`, which explains
+/// them to `pma config`.
+const RETIRE_KEYS: &str = "
+DELETE FROM config WHERE key IN (
+    'dispatch_quadrants', 'overflow_quadrants',
+    'stale_after.1', 'stale_after.2', 'stale_after.3', 'stale_after.4', 'stale_after.5'
+);
+";
+
+/// Version 13. The complexity estimate and the features it read, on the run
+/// that used them, with the version of the rule that produced it. Routing
+/// matches on the value, so replaying a decision means re-running the rule
+/// named here rather than today's.
+const COMPLEXITY: &str = "
+ALTER TABLE runs ADD COLUMN complexity INTEGER;
+ALTER TABLE runs ADD COLUMN features TEXT;
+ALTER TABLE runs ADD COLUMN estimator TEXT;
+";
+
+/// Version 14. Routing policy as a versioned artifact with provenance.
+/// Editing a revision and putting it into effect are separate acts: a
+/// revision is a draft until someone activates it, and the run records the
+/// revision it was dispatched under, so a later activation does not rewrite
+/// what a past dispatch decided.
+const ROUTES: &str = "
+CREATE TABLE routes (
+    revision INTEGER PRIMARY KEY,
+    document TEXT NOT NULL,
+    proposed_by TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    activated_at INTEGER,
+    activated_by TEXT,
+    shadow INTEGER NOT NULL DEFAULT 0
+);
+ALTER TABLE runs ADD COLUMN route_revision INTEGER;
+ALTER TABLE runs ADD COLUMN route TEXT;
+ALTER TABLE runs ADD COLUMN approval TEXT;
+";
+
+/// Version 15. What an approval was given for. Ship rebases, edits
+/// `TODO.md`, amends and publishes without rerunning anything, so an
+/// approval that names no tree can publish content no check ever saw. The
+/// base, the verify command and the scope are already immutable on the run;
+/// the tree and the approver are what was missing.
+const APPROVAL_EVIDENCE: &str = "
+ALTER TABLE runs ADD COLUMN approved_tree TEXT;
+ALTER TABLE runs ADD COLUMN approved_head TEXT;
+ALTER TABLE runs ADD COLUMN approved_by TEXT;
+";
+
+/// Version 16. One task definition across many repositories. Membership is
+/// stored rather than recomputed, so a rescan cannot change the set under a
+/// campaign that is already running, and a restart can tell which members
+/// already have a run instead of opening a second pull request for them.
+const CAMPAIGNS: &str = "
+CREATE TABLE campaigns (
+    name TEXT PRIMARY KEY,
+    text TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    class TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE campaign_members (
+    campaign TEXT NOT NULL REFERENCES campaigns(name) ON DELETE CASCADE,
+    project TEXT NOT NULL,
+    run_id INTEGER,
+    PRIMARY KEY (campaign, project)
+);
+";
+
 pub struct Store {
     conn: Connection,
 }
@@ -346,10 +442,19 @@ impl Store {
                     VERIFY_BASE,
                     CHANGED_PATHS,
                     EXHAUSTION,
+                    AGENTS,
+                    RETIRE_KEYS,
+                    COMPLEXITY,
+                    ROUTES,
+                    APPROVAL_EVIDENCE,
+                    CAMPAIGNS,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
                     tx.execute_batch(step)?;
+                }
+                if version < 11 {
+                    seed_agent(&tx, &crate::worker::Worker::claude())?;
                 }
                 tx.pragma_update(None, "user_version", VERSION)?;
                 tx.commit()?;
@@ -639,9 +744,11 @@ impl Store {
             "INSERT INTO runs (project, task_key, text, gh, quadrant, agent, branch, worktree,
                                default_branch, base, prompt, state, repo, dispatched_at,
                                class, scope, tier, description, agent_budget, timeout_minutes,
-                               verify, verify_base_ok, verify_base_seconds)
+                               verify, verify_base_ok, verify_base_seconds, model,
+                               complexity, features, estimator,
+                               route_revision, route, approval)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                     ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                     ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
             params![
                 run.project,
                 run.task_key,
@@ -666,6 +773,13 @@ impl Store {
                 run.verify,
                 run.verify_base_ok,
                 run.verify_base_seconds,
+                run.model,
+                run.complexity,
+                run.features.map(Features::to_json),
+                run.complexity.map(|_| crate::complexity::ESTIMATOR),
+                run.route_revision,
+                run.route,
+                run.approval.map(Approval::name),
             ],
         )?;
         run.id = self.conn.last_insert_rowid();
@@ -681,7 +795,8 @@ impl Store {
                 summary = ?6, commits = ?7, diffstat = ?8, verify_ok = ?9,
                 error = ?10, outcome = ?11, prompt = ?12, ready_at = ?13,
                 decided_at = ?14, published_at = ?15, review_seconds = ?16,
-                changed_paths = ?17, scope_error = ?18
+                changed_paths = ?17, scope_error = ?18, approved_tree = ?19,
+                approved_head = ?20, approved_by = ?21
              WHERE id = ?1",
             params![
                 run.id,
@@ -704,6 +819,9 @@ impl Store {
                     .as_ref()
                     .map(|p| serde_json::to_string(p).unwrap_or_default()),
                 run.scope_error,
+                run.approved_tree,
+                run.approved_head,
+                run.approved_by,
             ],
         )?;
         Ok(())
@@ -716,7 +834,9 @@ impl Store {
                     cost_usd, summary, commits, diffstat, verify, verify_ok, error, outcome, repo,
                     dispatched_at, ready_at, decided_at, published_at, review_seconds,
                     class, scope, tier, description, agent_budget, timeout_minutes,
-                    verify_base_ok, verify_base_seconds, changed_paths, scope_error
+                    verify_base_ok, verify_base_seconds, changed_paths, scope_error, model,
+                    complexity, features, estimator, route_revision, route, approval,
+                    approved_tree, approved_head, approved_by
              FROM runs ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -772,6 +892,22 @@ impl Store {
                     .get::<_, Option<String>>(37)?
                     .and_then(|s| serde_json::from_str(&s).ok()),
                 scope_error: r.get(38)?,
+                model: r.get(39)?,
+                complexity: r.get(40)?,
+                features: r
+                    .get::<_, Option<String>>(41)?
+                    .as_deref()
+                    .and_then(Features::from_json),
+                estimator: r.get(42)?,
+                route_revision: r.get(43)?,
+                route: r.get(44)?,
+                approval: r
+                    .get::<_, Option<String>>(45)?
+                    .as_deref()
+                    .and_then(Approval::parse),
+                approved_tree: r.get(46)?,
+                approved_head: r.get(47)?,
+                approved_by: r.get(48)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -782,6 +918,225 @@ impl Store {
             .into_iter()
             .find(|r| r.id == id)
             .ok_or_else(|| format!("no run #{id}").into())
+    }
+
+    /// Creates a campaign with a fixed membership. The set does not change
+    /// afterwards: a rescan must not move work under a campaign in flight.
+    pub fn add_campaign(&self, c: &Campaign) -> Result<()> {
+        if c.members.is_empty() {
+            return Err(format!("campaign `{}` selects no project", c.name).into());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO campaigns (name, text, description, class, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![c.name, c.text, c.description, c.class.name(), c.created_at],
+        )
+        .map_err(|e| format!("campaign `{}`: {e}", c.name))?;
+        for (project, _) in &c.members {
+            tx.execute(
+                "INSERT INTO campaign_members (campaign, project) VALUES (?1, ?2)",
+                params![c.name, project],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn campaigns(&self) -> Result<Vec<Campaign>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, text, description, class, created_at FROM campaigns ORDER BY name",
+        )?;
+        let rows: Vec<Campaign> = stmt
+            .query_map([], |r| {
+                let class: String = r.get(3)?;
+                Ok(Campaign {
+                    name: r.get(0)?,
+                    text: r.get(1)?,
+                    description: r.get(2)?,
+                    class: Class::parse(&class).unwrap_or(Class::Specified),
+                    created_at: r.get(4)?,
+                    members: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT campaign, project, run_id FROM campaign_members ORDER BY project")?;
+        let members: Vec<(String, String, Option<i64>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|mut c| {
+                c.members = members
+                    .iter()
+                    .filter(|(name, ..)| *name == c.name)
+                    .map(|(_, p, run)| (p.clone(), *run))
+                    .collect();
+                c
+            })
+            .collect())
+    }
+
+    pub fn campaign(&self, name: &str) -> Result<Campaign> {
+        self.campaigns()?
+            .into_iter()
+            .find(|c| c.name == name)
+            .ok_or_else(|| format!("unknown campaign `{name}`; see `pma campaign`").into())
+    }
+
+    /// Records which run took a member, so a restart does not dispatch it
+    /// again and open a second pull request.
+    pub fn set_campaign_run(&self, campaign: &str, project: &str, run: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE campaign_members SET run_id = ?3 WHERE campaign = ?1 AND project = ?2",
+            params![campaign, project, run],
+        )?;
+        Ok(())
+    }
+
+    /// Returns false when no campaign has the name.
+    pub fn remove_campaign(&self, name: &str) -> Result<bool> {
+        self.conn
+            .execute("DELETE FROM campaign_members WHERE campaign = ?1", [name])?;
+        Ok(self
+            .conn
+            .execute("DELETE FROM campaigns WHERE name = ?1", [name])?
+            > 0)
+    }
+
+    /// Stores a policy revision as a draft and returns its number. Storing
+    /// is not activating: nothing routes by it until someone says so.
+    pub fn add_route_revision(&self, document: &str, by: &str) -> Result<i64> {
+        // Refused here, so an unreadable document never reaches the table.
+        // Stored as `pma` read it, with every default written out, so two
+        // revisions diff by what they mean rather than by how they were
+        // typed, and `pma route show` states the route names a reader will
+        // see in a replay.
+        let document = Policy::parse(document)?.to_json();
+        let next: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(revision), 0) + 1 FROM routes",
+            [],
+            |r| r.get(0),
+        )?;
+        self.conn.execute(
+            "INSERT INTO routes (revision, document, proposed_by, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![next, document, by, crate::dates::now()],
+        )?;
+        Ok(next)
+    }
+
+    /// Puts a revision into effect, in shadow or for real, and retires any
+    /// other. `by` is recorded: raising autonomy is somebody's decision.
+    pub fn activate_route(&self, revision: i64, by: &str, shadow: bool) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let found = tx.execute(
+            "UPDATE routes SET activated_at = ?2, activated_by = ?3, shadow = ?4
+             WHERE revision = ?1",
+            params![revision, crate::dates::now(), by, shadow],
+        )?;
+        if found == 0 {
+            return Err(format!("no policy revision {revision}").into());
+        }
+        tx.execute(
+            "UPDATE routes SET activated_at = NULL, activated_by = NULL WHERE revision <> ?1",
+            [revision],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every revision, oldest first.
+    pub fn route_revisions(&self) -> Result<Vec<RouteRevision>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT revision, document, proposed_by, created_at, activated_at, activated_by,
+                    shadow
+             FROM routes ORDER BY revision",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(RouteRevision {
+                revision: r.get(0)?,
+                document: r.get(1)?,
+                proposed_by: r.get(2)?,
+                created_at: r.get(3)?,
+                activated_at: r.get(4)?,
+                activated_by: r.get(5)?,
+                shadow: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The revision in effect, if any.
+    pub fn active_route(&self) -> Result<Option<RouteRevision>> {
+        Ok(self
+            .route_revisions()?
+            .into_iter()
+            .find(|r| r.activated_at.is_some()))
+    }
+
+    /// Every worker, by name.
+    pub fn agents(&self) -> Result<Vec<Worker>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, command, args, allow, parse, reports_cost, enforces_budget,
+                    sandbox, resumes
+             FROM agents ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let args: String = r.get(2)?;
+            let parse: String = r.get(4)?;
+            Ok(Worker {
+                name: r.get(0)?,
+                command: r.get(1)?,
+                args: serde_json::from_str(&args).unwrap_or_default(),
+                allow: r.get::<_, Option<String>>(3)?.filter(|a| !a.is_empty()),
+                parse: Parser::parse(&parse).unwrap_or(Parser::TextTail),
+                reports_cost: r.get(5)?,
+                enforces_budget: r.get(6)?,
+                sandbox: r.get(7)?,
+                resumes: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn agent(&self, name: &str) -> Result<Worker> {
+        self.agents()?
+            .into_iter()
+            .find(|w| w.name == name)
+            .ok_or_else(|| format!("unknown agent `{name}`; see `pma agent`").into())
+    }
+
+    pub fn set_agent(&self, w: &Worker) -> Result<()> {
+        seed_agent(&self.conn, w)
+    }
+
+    /// Returns false when no agent has the name.
+    pub fn remove_agent(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM agents WHERE name = ?1", [name])?
+            > 0)
+    }
+
+    /// Decided runs in a project and how many were accepted. An open pull
+    /// request is in neither: no one has judged it.
+    pub fn decided_runs(&self, project: &str) -> Result<(i64, i64)> {
+        let mut decided = 0;
+        let mut accepted = 0;
+        for run in self.runs()?.iter().filter(|r| r.project == project) {
+            match run.state {
+                RunState::Approved | RunState::Shipped => {
+                    decided += 1;
+                    accepted += 1;
+                }
+                RunState::Rejected => decided += 1,
+                _ => {}
+            }
+        }
+        Ok((decided, accepted))
     }
 
     /// Attempts consumed against a task revision, across every run of it.
@@ -866,9 +1221,9 @@ impl Store {
     pub fn insert_attempt(&self, a: &Attempt) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO attempts (run_id, n, agent, prompt, feedback, started_at, seconds,
-                                   cost_usd, summary, verify, verify_ok, error, outcome)
+                                   cost_usd, summary, verify, verify_ok, error, outcome, model)
              VALUES (?1, (SELECT COALESCE(MAX(n), 0) + 1 FROM attempts WHERE run_id = ?1),
-                     ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                     ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 a.run_id,
                 a.agent,
@@ -882,6 +1237,7 @@ impl Store {
                 a.verify_ok,
                 a.error,
                 a.outcome,
+                a.model,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -891,7 +1247,7 @@ impl Store {
     pub fn attempts(&self, run: Option<i64>) -> Result<Vec<Attempt>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, run_id, n, agent, prompt, feedback, started_at, seconds, cost_usd,
-                    summary, verify, verify_ok, error, outcome
+                    summary, verify, verify_ok, error, outcome, model
              FROM attempts WHERE (?1 IS NULL OR run_id = ?1) ORDER BY run_id, n",
         )?;
         let rows = stmt.query_map([run], |r| {
@@ -910,6 +1266,7 @@ impl Store {
                 verify_ok: r.get(11)?,
                 error: r.get(12)?,
                 outcome: r.get(13)?,
+                model: r.get(14)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1060,6 +1417,26 @@ pub struct Run {
     pub changed_paths: Option<Vec<String>>,
     /// Why the paths could not be enumerated.
     pub scope_error: Option<String>,
+    /// The model chosen at dispatch, or `None` for the worker's own default.
+    pub model: Option<String>,
+    /// 1 to 5, from the rule named in `estimator`.
+    pub complexity: Option<i64>,
+    /// What that rule read.
+    pub features: Option<Features>,
+    pub estimator: Option<String>,
+    /// The policy revision in effect at dispatch, and the route it matched.
+    /// A later activation does not change either.
+    pub route_revision: Option<i64>,
+    pub route: Option<String>,
+    pub approval: Option<Approval>,
+    /// The tree the approver saw, as `git write-tree` names it. Ship refuses
+    /// to publish a worktree that no longer matches.
+    pub approved_tree: Option<String>,
+    /// The commit the worktree was on. Ship commits before it publishes, so
+    /// the tree check applies only while the head is still this one; past
+    /// that, a resumed ship is recognised by its own pushed commits.
+    pub approved_head: Option<String>,
+    pub approved_by: Option<String>,
 }
 
 impl Run {
@@ -1106,6 +1483,16 @@ impl Run {
             verify_base_seconds: None,
             changed_paths: None,
             scope_error: None,
+            model: None,
+            complexity: None,
+            features: None,
+            estimator: None,
+            route_revision: None,
+            route: None,
+            approval: None,
+            approved_tree: None,
+            approved_head: None,
+            approved_by: None,
         }
     }
 
@@ -1152,6 +1539,59 @@ pub struct Attempt {
     /// The state the run reached: `ready` or `failed`. Null for the attempt
     /// reconstructed from a run that predates this table.
     pub outcome: Option<String>,
+    /// The model this attempt ran, or `None` for the worker's own default.
+    pub model: Option<String>,
+}
+
+/// One task definition applied across a fixed set of repositories.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Campaign {
+    pub name: String,
+    pub text: String,
+    pub description: String,
+    pub class: Class,
+    pub created_at: i64,
+    /// Project, and the run that took it, if any.
+    pub members: Vec<(String, Option<i64>)>,
+}
+
+/// One stored policy document and who put it where it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteRevision {
+    pub revision: i64,
+    pub document: String,
+    pub proposed_by: String,
+    pub created_at: i64,
+    pub activated_at: Option<i64>,
+    pub activated_by: Option<String>,
+    /// Computed and recorded on each run, but not applied.
+    pub shadow: bool,
+}
+
+impl RouteRevision {
+    pub fn policy(&self) -> Result<Policy> {
+        Ok(Policy::parse(&self.document)?)
+    }
+}
+
+fn seed_agent(conn: &Connection, w: &Worker) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO agents
+            (name, command, args, allow, parse, reports_cost, enforces_budget, sandbox, resumes)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            w.name,
+            w.command,
+            serde_json::to_string(&w.args).unwrap_or_default(),
+            w.allow,
+            w.parse.name(),
+            w.reports_cost,
+            w.enforces_budget,
+            w.sandbox,
+            w.resumes,
+        ],
+    )?;
+    Ok(())
 }
 
 fn path_str(path: &Path) -> Result<&str> {
@@ -1326,6 +1766,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Upgrading seeds `claude` with exactly the behaviour it had when it
+    /// was compiled in, so a database made before the adapter keeps working.
+    #[test]
+    fn upgrading_seeds_the_worker_that_was_compiled_in() {
+        let dir = scratch("agents");
+        let store = Store::open(&dir.join("p.db")).unwrap();
+        assert_eq!(store.agents().unwrap(), [Worker::claude()]);
+
+        let mut w = Worker::claude();
+        w.name = "codex".into();
+        w.command = "codex".into();
+        w.args = vec![
+            "exec".into(),
+            "-C".into(),
+            "{dir}".into(),
+            "{prompt}".into(),
+        ];
+        w.allow = None;
+        w.parse = Parser::TextTail;
+        w.reports_cost = false;
+        w.sandbox = true;
+        store.set_agent(&w).unwrap();
+        assert_eq!(store.agents().unwrap(), [Worker::claude(), w.clone()]);
+        assert_eq!(store.agent("codex").unwrap(), w);
+        assert!(store.agent("cursor").is_err());
+
+        assert!(store.remove_agent("codex").unwrap());
+        assert!(!store.remove_agent("codex").unwrap());
+        assert_eq!(store.agents().unwrap(), [Worker::claude()]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The counter survives the run that raised it, so rejecting a task and
     /// dispatching it again does not start from zero. Rewording it does.
     #[test]
@@ -1418,6 +1890,7 @@ mod tests {
             verify_ok: Some(false),
             error: None,
             outcome: Some("ready".into()),
+            model: Some("haiku".into()),
         };
         store.insert_attempt(&a).unwrap();
         a.feedback = Some("try again".into());
@@ -1529,6 +2002,19 @@ mod tests {
             verify_base_seconds: Some(12),
             changed_paths: None,
             scope_error: None,
+            model: Some("sonnet".into()),
+            complexity: Some(2),
+            features: Some(Features {
+                text_words: 3,
+                ..Features::default()
+            }),
+            estimator: Some(crate::complexity::ESTIMATOR.into()),
+            route_revision: Some(2),
+            route: Some("chores".into()),
+            approval: Some(Approval::Batch),
+            approved_tree: None,
+            approved_head: None,
+            approved_by: None,
         };
         store.insert_run(&mut run).unwrap();
         assert_eq!(store.run(run.id).unwrap(), run);

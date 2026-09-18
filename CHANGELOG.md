@@ -6,15 +6,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-**Per-attempt records.** Each agent invocation and the verification after it is now an append-only `attempts` row, carrying its own summary, cost, duration, verify result and error. `runs` keeps the lifecycle summary, so its cost and duration still sum across reworks. `pma review <id>` lists the attempts when there is more than one.
+Everything below turns the agent loop from one prompt per task into a measured, gated pipeline. `docs/dev/implementation-plan.md` sequences it; `docs/dev/plan-review.md` is the review it answers.
 
-A run was one mutable row, so a rework overwrote the previous attempt's summary, verify result and start time. A task that failed twice and then succeeded recorded only the success, which is the case the calibration data most needs. The database schema moves to version 6; existing runs contribute their last attempt, whose outcome was never recorded and stays null.
+**Per-attempt records.** Each agent invocation and the verification after it is an append-only `attempts` row with its own summary, cost, duration, verify result and model. `runs` kept one mutable row per task, so a rework overwrote the previous attempt and a task that failed twice before succeeding recorded only the success -- the case calibration most needs. `pma review <id>` lists the attempts when there is more than one. Schema 6.
 
-**A task an agent cannot close is not chosen again.** Attempts are counted per project and task revision, and at two, `pma dispatch --auto` passes the task over and a named dispatch refuses. `pma dispatch <target> --retry` clears the count. The count survives the run that raised it, so rejecting a task and dispatching it again no longer starts from zero; it was keyed to nothing durable before, and `--auto` could pick the same task forever.
+**A timestamp per run transition:** `dispatched_at`, `ready_at`, `decided_at`, `published_at`, and reported review time from `pma review <id> --minutes N`. `runs` held only the current attempt's start time, which a rework moved, so nothing could count changes published per day or bound a report to one pass. `published_at` is when `pma` pushed or opened the pull request; a merge days later does not move it.
 
-The revision is the task's normalised text. Rewording a task starts a fresh count, which is right: a materially revised specification has not been tried. It also separates recurring signals, since `fix CI: build` and `fix CI: build, test` are different incidents while the word `ci` is not.
+**Task class and the decision behind a dispatch.** `deps` is class A, `ci` and any unclassified item are B, and an item tagged `#manual` is D and is refused before a worktree exists. The run records the class, its allowed globs, the tier, the description, `agent_budget` and `timeout` as they were at dispatch, and never updates them: a rescan, a reworded item or `pma config` would otherwise leave no way to say what a past dispatch decided. Schema 7.
 
-A red verification and a rejection each consume one attempt. A run refused at the batch budget, an agent that could not start, and a run killed at the timeout consume none: none of them says anything about whether the task suits an agent. The database schema moves to version 10.
+**Verification at the base commit**, in the fresh worktree before the agent starts. `pma review <id>` reports both ends: ``make test`: base FAILED, head passed`. One run at the head proves the tree is green now; it cannot tell a regression from a repository that was already broken, which is what class A auto-approval requires. Results are cached per project, base commit, command and timeout, so a batch pays once and changing the command or the timeout misses rather than reuses. A base check that could not start is unknown, not failing. The verify command is now chosen once, at dispatch: it was re-detected on every attempt, so a rework could check the head with a command the base was never checked with. Schema 8.
+
+**Path scope, checked against the whole change.** Every path a run touched is enumerated against its base and recorded, and `pma review <id>` reports what its class does not permit: `scope  1 of 5 files OUTSIDE: .github/workflows/ci.yml`. Untracked files are staged with `--intent-to-add` so a new file counts, the listing is NUL-delimited because a path may contain a newline, and `--name-status` names both sides of a rename. Paths that could not be enumerated are unknown with the reason, never an empty list, which would read as a run that changed nothing. Schema 9.
+
+`.github/**`, `LICENSE`, `COPYING` and `.netrc` are refused to every class but A-, and `TODO.md` to all of them, judged on the paths actually changed rather than the class predicted at dispatch. A workflow runs with repository tokens and CI validates the changed workflow rather than checking it, so a task misread as a dependency bump must not reach one.
 
 **Review by exception.** `pma review` marks each run `clean` or `N to read`, and `pma review <id>` lists why:
 
@@ -24,25 +28,59 @@ read this run because:
   - the base already passed, so no check discriminates this change
 ```
 
-What the two verify results must show depends on the class. Class A must leave a green tree green, so a base that was already failing blocks. Class B is accepted by a check that fails at the base and passes at the head; green to green demonstrates no regression but does not demonstrate a fix. A missing command, a check that did not run, and a base that could not be measured are each distinct from a red result. A run that edited the files implementing its own verify command is read whatever else passed, since a worker that changes its own check can turn any tree green; the files are derived from the command, and test files are not among them.
+What the two verify results must show depends on the class. A must leave a green tree green. B is accepted by a check that fails at the base and passes at the head; green to green shows no regression but no fix either. A missing command, a check that did not run and an unknown base are each distinct reasons. So is a run that cost more than `agent_budget`, which admits runs rather than capping spend: `claude` checks its own cap between turns and has exceeded it, and a worker with no cap overshoots without limit. A run that edited the files implementing its own verify command is read whatever else passed. The reasons are computed from the run, so changing a rule re-reads the evidence.
 
-Nothing is approved or shipped by this. Review time is the throughput limit, and reading the reasons is faster than reading the diff. The reasons are computed from the run rather than stored, so changing a rule re-reads the evidence.
+**A task an agent cannot close is not chosen again.** Attempts are counted per project and task revision; at two, `--auto` passes the task over and a named dispatch refuses, until `pma dispatch <target> --retry`. The count survives the run that raised it, so rejecting a task and dispatching it again no longer starts from zero. The revision is the task's normalised text, so rewording starts fresh -- a revised specification has not been tried -- and `fix CI: build` and `fix CI: build, test` are different incidents. A red check and a rejection each consume one; a budget refusal, a failed spawn and a timeout consume none. Schema 10.
 
-**Path scope, checked against the whole change.** Every path a run touched is enumerated against its base and recorded, and `pma review <id>` reports what the task's class does not permit: `scope  1 of 5 files OUTSIDE: .github/workflows/ci.yml`. Untracked files are staged with `--intent-to-add` first, so a new file counts; the listing is NUL-delimited because a path may contain a newline, and `--name-status` names both sides of a rename. Paths that could not be enumerated are recorded as unknown with the reason, never as an empty list, which would read as a run that changed nothing.
+**`pma report`** shows what dispatching produced, grouped by class, project or agent:
 
-`.github/**`, `LICENSE`, `COPYING` and `.netrc` are refused to every class but A-, judged on the paths actually changed rather than the class predicted at dispatch. A workflow runs with repository tokens and CI validates the changed workflow rather than checking it, so a task misread as a dependency bump must not be able to edit one. The run stores the paths, not the verdict, so changing the rules re-reads the evidence. The database schema moves to version 9.
+```
+67% of 3 decided runs accepted
 
-**Verification at the base commit.** `pma` now runs the project's `verify` in the fresh worktree before the agent starts, and `pma review <id>` reports both results: ``make test`: base FAILED, head passed`. One run at the head proves only that the tree is green now; it cannot tell a regression from a repository that was already broken, which is what class A auto-approval will rest on. Results are cached per project, base commit, command and timeout, so every task of a project in one batch pays for one run, and changing the command or the timeout misses the cache rather than reusing it. A base check that could not be started is recorded as unknown, not as failing.
+by class  runs  1st pass  accepted  merged  open  attempts  cost      agent  review
+B         4     1         2         2       0     4         $0.40+1?  0s     10m00s
+```
 
-The verify command is chosen once, at dispatch, and no longer changes. It was re-detected on every attempt, so a rework could check the head with a command the base was never checked with. The database schema moves to version 8.
+First-attempt passes, acceptances and merges are three columns rather than one number. A queued or running run is left out rather than counted against the share, an open pull request is in no share, and a worker that reported no cost appears as `+1?` rather than summed as free.
 
-**Task class, and the decision behind a dispatch.** Each task gets a maintenance class from `docs/dev/design-review.md`: `deps` is A (mechanical), `ci` and any unclassified item are B (specified), and an item tagged `#manual` is D and is refused before a worktree is created. The run records the class, the globs that class allows, the project's tier, the item's description, `agent_budget` and `timeout` as they were at dispatch, and none of them is updated afterwards. A rescan, a reworded item or `pma config` would otherwise leave no way to say what a past dispatch decided. The database schema moves to version 7; runs dispatched before it have no snapshot.
+**Agents are records, not a code path.** `pma agent set <name> <field> <value>` defines a worker: how the prompt and directory are passed, how a model is named, whether a budget argument exists, how success and cost are read back, and whether there is a sandbox or an allowlist. `{prompt}`, `{dir}`, `{model}` and `{budget}` are filled in at dispatch, and an argument whose placeholder has no value is dropped with the flag before it, so `--model {model}` disappears whole. `claude` is seeded with the behaviour it had compiled in. Two parsers: `claude-json`, and `text-tail` for a worker with no structured output, which leaves cost unknown rather than zero. New settings `agent` and `model`. Schema 11.
 
-The globs are recorded but not yet enforced.
+What a record cannot carry, the pipeline carries: the worktree, the stripped push credentials, `pma` running `verify` itself and the scope check do not depend on the worker.
 
-**A timestamp per run transition:** `dispatched_at`, `ready_at`, `decided_at` and `published_at`. `runs` previously held only the current attempt's start time, which a rework moved, so no query could count changes published per day or bound a digest to one pass. `published_at` is when `pma` pushed or opened the pull request; a merge days later does not move it, and a pull request closed unmerged does not replace the approval in `decided_at`.
+**A complexity estimate per run**, 1 to 5, from features measured at dispatch: whether the task names a path or a symbol, its words, its description lines, the repository's tracked files, the base verify duration, and the project's accepted share. `pma review <id>` shows `complexity  2 of 5 (v1)`. The rule is a sum of named adjustments, and both it and the features are stored with the rule's version, so replaying a past decision re-runs the rule named on the run. No model is called. Schema 13.
 
-**`pma review <id> --minutes N`** adds reported review time to the run, summed over repeated reviews. Review time is the throughput limit this design assumes, and nothing measured it.
+**Routing policy as a versioned artifact.**
+
+```json
+{"route": [
+  {"name": "chores", "match": {"class": "A", "complexity": "1-2"},
+   "model": "haiku", "escalate": {"model": "sonnet", "attempts": 1},
+   "approval": "batch"},
+  {"name": "rest", "match": {}, "approval": "each"}
+]}
+```
+
+First match wins; a task matching no route refuses the dispatch by name rather than falling through to a default nobody wrote. One judgment per revision, not one per task. `pma route propose` stores a draft that routes nothing; `pma route activate <rev>` puts it in effect and records who did it, and `--shadow` records the computed route without applying it. Each run keeps the revision it was dispatched under, so a later activation cannot rewrite a past decision. `unattended` is refused where the document is read if it covers class A-, C or D, or names no class at all. Schema 14.
+
+The document is JSON, not the TOML the design named: this crate parses JSON already, and adding a TOML parser and `serde` derive for one file is the larger change.
+
+**`pma route replay <file>`** applies a candidate to the recorded runs and reports what it would route differently, reading each run's own snapshot so a task edited, retiered, rescanned or reworked since cannot change the answer. No cost is projected: what a different model would spend, or whether it would succeed, is not in this data, and the report says so instead of printing a number.
+
+**Escalation.** A route may retry once at a stronger model where the check refused the work, with the first attempt still in the worktree. Both attempts are reserved against `batch_budget` before the first starts, so the second is not refused after the first spent the room, and each is recorded with the model it ran.
+
+**An approval is evidence about a tree, not a state.** Approving records the tree it was given for, the commit it was taken at, and who gave it; ship publishes that tree or nothing. Ship rebased, ticked the item, amended and pushed without rerunning anything, so an edited worktree could publish content no check had seen. `verify` now runs again on the integrated tree after the rebase and the tick: two changes that each pass against the same base can fail together, and a clean rebase is not a semantic one. A rework withdraws the approval, and approving an approved run re-takes the evidence, which is how a reviewer says a refused tree is fine after looking again. Schema 15.
+
+**Approval modes are acted on.** A route with `propose` refuses approval by name. `pma review --approve 1 2 3` approves a batch, checking every named run first, so a list with one run to read in it approves nothing.
+
+**Campaigns: one task definition across many repositories.**
+
+```
+pma campaign add workflows "add a workflow" --projects a,b,c --class A- \
+  --describe "Create .github/workflows/ci.yml that runs on push."
+pma campaign run workflows
+```
+
+Each repository gets its own worktree, its own base and head verification and its own pull request, and the reviewer holds one context across them. Membership is fixed when the campaign is defined, so a rescan cannot move work under one in flight. A member whose run is not final is named -- `beta: #2 is failed; reject or rework it to dispatch again` -- rather than dispatched over, which would leave its worktree behind and could open a second pull request for the same work. Schema 16.
 
 **Deps signal.** `pma scan --deps` counts outdated dependencies with `cargo update --dry-run`, `uv tree --outdated` and `go list -u -m all`, adds an "update dependencies" task, and scores deps in health. It is opt-in because it took 44s for 52 repos against 1s for a plain scan. Plain scans keep the last measurement. Counts differ in kind between tools: cargo's include transitive crates.
 
@@ -58,13 +96,21 @@ The globs are recorded but not yet enforced.
 
 Each `gh:N` is saved as soon as its issue exists, and an open labelled issue with an unlinked item's title is linked rather than duplicated, so an interrupted sync does not open a second issue. Adding `gh:N` changes an item's key, so dispatch and ship now match a task by key or by text.
 
-**`pma dispatch`, `pma review`, `pma ship`.** Run `claude` on tasks in worktrees of the remote default branch, verify the result with the project's own tests, review the diff, then commit, push or open a PR, and mark the item done. Settings: `max_parallel`, `batch_budget`, `agent_budget`, `timeout`, `publish`, `attribution`, `dispatch_quadrants`, `overflow_quadrants`, and per project `projects.<name>.verify` and `projects.<name>.publish`. The database schema moves to version 2; version 1 databases are upgraded on open.
+**`pma dispatch`, `pma review`, `pma ship`.** Run `claude` on tasks in worktrees of the remote default branch, verify the result with the project's own tests, review the diff, then commit, push or open a PR, and mark the item done. Settings: `max_parallel`, `batch_budget`, `agent_budget`, `timeout`, `publish`, `attribution`, and per project `projects.<name>.verify` and `projects.<name>.publish`. The database schema moves to version 2; version 1 databases are upgraded on open.
 
 The item is marked done after the rebase, not before. Git treats changes to adjacent lines as a conflict, so ticking first could conflict for two tasks from one project. An item must be open in the remote `TODO.md` to be dispatched; otherwise ship would have no line to mark.
 
 `claude --max-budget-usd` is checked between turns and was exceeded in use ($0.09 under a $0.05 cap). `batch_budget` limits which runs start, not their total spend.
 
 ### Changed
+
+**Eligibility replaces quadrant gating.** `pma dispatch --auto` draws from the tasks an agent may take -- the `ci` and `deps` signals at any tier, and items tagged `#agent` -- in matrix order. Importance orders the queue; eligibility decides what is taken from it. `Medium` and `Low` are never important at any tier, so quadrant gating hid exactly the mechanical maintenance agents are best at, and a `deps` task landed in Q4 where `--auto` never reached it. `dispatch_quadrants` and `overflow_quadrants` are retired; the 2x2 remains a view.
+
+**Urgency is sequencing, not decay.** A task is urgent for a deadline within `urgent_within`, a signal that blocks other work in its repository, or `#urgent`. `stale_after` and its five settings are retired: with no due dates in a portfolio the rule reduced to "older than 30 days", which within a month admitted most tier-1 tasks and told the queue nothing it did not already know from sorting by age. Age now breaks ties and fills `pma stale`.
+
+**`default_tier`** ranks projects that have no tier of their own instead of leaving them out of the matrix. Unset by default.
+
+**Retiring a setting is a migration, not only a code change.** A stored row for an unknown key made every command fail. The upgrade deletes the rows, `pma config` explains a retired name and what replaced it, and a row written by another binary is skipped rather than fatal. Schema 12.
 
 **The agent may run the verify command.** `claude` got `acceptEdits` only, so in `-p` mode it could not run the project's tests, while `pma` ran code the agent had edited anyway. It now gets one exact `Bash(...)` rule per subcommand of verify. Other shell commands stay denied. The design states that the permission mode is not an isolation boundary.
 

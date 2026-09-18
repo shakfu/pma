@@ -252,18 +252,18 @@ fn scan_rank_and_explain_a_real_repo() {
 
     let matrix = ok(&home, &["matrix", "--all"]);
     let expected = "\
-Q1 Do right away: 1
+Q1 Do right away: 0
+
+Q2 Schedule for later: 2
   alpha:7  T1  high  open 100d  core  old high
+  alpha:8  T1  high  open 0d    core  new high
 
-Q2 Schedule for later: 1
-  alpha:8  T1  high  open 0d  core  new high
+Q3 Delegate or avoid: 0
 
-Q3 Delegate or avoid: 2
-  alpha:12  T1  low  open 100d  old low
-  alpha     T1  low  open 70d   review project: no code commits in 100 days
-
-Q4 Remove: 1
-  alpha  T1  medium  open 0d  resolve local changes: 1 changed file, 1 leftover pma branch
+Q4 Remove: 3
+  alpha     T1  medium  open 0d    resolve local changes: 1 changed file, 1 leftover pma branch
+  alpha:12  T1  low     open 100d  old low
+  alpha     T1  low     open 70d   review project: no code commits in 100 days
 ";
     let (head, body) = matrix.split_once("\n\n").unwrap();
     assert_eq!(
@@ -291,7 +291,22 @@ Q4 Remove: 1
         "{err}"
     );
     ok(&home, &["config", "tiers.1", "--reset"]);
-    assert!(ok(&home, &["matrix", "-q", "q1"]).contains("Q1 Do right away: 1\n"));
+    assert!(ok(&home, &["matrix", "-q", "q2"]).contains("Q2 Schedule for later: 2\n"));
+
+    // An untiered project joins the matrix once there is a tier for it.
+    assert!(ok(&home, &["matrix"]).contains("1 untiered"));
+    ok(&home, &["config", "default_tier", "5"]);
+    let matrix = ok(&home, &["matrix"]);
+    assert!(matrix.contains("2 tiered projects, 0 untiered"), "{matrix}");
+    ok(&home, &["config", "default_tier", "--reset"]);
+
+    // Age orders `pma stale`; it no longer moves anything into Q1.
+    let stale = ok(&home, &["stale", "-n", "2"]);
+    assert!(
+        stale.contains("alpha:7   T1  high  open 100d  old high"),
+        "{stale}"
+    );
+    assert!(stale.trim_end().ends_with("and 1 more"), "{stale}");
 
     // A rescan keeps the tier and each task's first sighting.
     ok(&home, &["scan", "--offline", "alpha"]);
@@ -309,6 +324,15 @@ case "$2" in
 esac
 if git push -q origin HEAD:refs/heads/agent 2>/dev/null; then echo pushed; else echo blocked; fi >> "$PUSH_LOG"
 echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","total_cost_usd":0.1}'
+"#;
+
+/// A worker with no structured output and no allowlist: the exit status is
+/// its only verdict and its cost is unknown. It also proves `{dir}` reaches a
+/// worker that takes its directory as an argument.
+const PLAIN_WORKER: &str = r#"#!/bin/sh
+cd "$3" || exit 1
+echo hi > hello.txt
+echo "wrote hello.txt in $3"
 "#;
 
 /// A stand-in that strays: an untracked workflow, a rename out of scope, and
@@ -400,7 +424,7 @@ fn dispatch_env(s: &Scratch, scripts: &[(&str, &str)]) -> (Env, PathBuf, PathBuf
     git(&seed, &["init", "-q", "-b", "main"], None);
     fs::write(
         seed.join("TODO.md"),
-        "# TODO\n\n## High\n\n- [ ] add greeting\n  say hello in hello.txt\n- [ ] second task gh:7\n- [ ] third task\n\n## Low\n\n- [ ] guarded task #manual\n",
+        "# TODO\n\n## High\n\n- [ ] add greeting #agent\n  say hello in hello.txt\n- [ ] second task #agent gh:7\n- [ ] third task #agent\n\n## Low\n\n- [ ] guarded task #manual\n",
     )
     .unwrap();
     fs::write(seed.join("Makefile"), "test:\n\ttest -f hello.txt\n").unwrap();
@@ -473,6 +497,10 @@ fn dispatch_review_rework_and_ship() {
         "{detail}"
     );
     assert!(detail.contains("+hi"), "{detail}");
+    // #1 names hello.txt and carries a description, in a small repository
+    // with a working check. #2 is two words with neither.
+    assert!(detail.contains("2 of 5 (v1)"), "{detail}");
+    assert!(failed.contains("4 of 5 (v1)"), "{failed}");
     let (out, _, _) = env.run(&["review", "2", "--approve"]);
     assert_eq!(out, "");
 
@@ -491,22 +519,28 @@ fn dispatch_review_rework_and_ship() {
         .collect::<Vec<_>>();
     assert!(attempts[0].contains("verify FAILED"), "{detail}");
     assert!(attempts[1].contains("verify passed"), "{detail}");
-    assert!(detail.contains("reviewed  7m00s"), "{detail}");
+    assert!(
+        detail.contains("reviewed") && detail.contains("7m00s"),
+        "{detail}"
+    );
     // A run seen twice sums its review time.
     let detail = env.ok(&["review", "2", "--minutes", "3"]);
-    assert!(detail.contains("reviewed  10m00s"), "{detail}");
+    assert!(detail.contains("10m00s"), "{detail}");
     // One attempt says nothing the rows above it do not.
     assert!(!env.ok(&["review", "1"]).contains("attempts:"));
 
     env.ok(&["review", "1", "--approve"]);
+    // Approving an approved run re-takes its evidence rather than refusing.
     env.ok(&["review", "2", "--approve"]);
-    let (_, err, success) = env.run(&["review", "2", "--approve"]);
-    assert!(!success && err.contains("only a ready run"), "{err}");
+    env.ok(&["review", "2", "--approve"]);
+    let (_, err, success) = env.run(&["review", "9", "--approve"]);
+    assert!(!success && err.contains("no run #9"), "{err}");
 
     // An item that exists only in the local file cannot be dispatched.
-    let local = fs::read_to_string(alpha.join("TODO.md"))
-        .unwrap()
-        .replace("- [ ] third task\n", "- [ ] third task\n- [ ] local only\n");
+    let local = fs::read_to_string(alpha.join("TODO.md")).unwrap().replace(
+        "- [ ] third task #agent\n",
+        "- [ ] third task #agent\n- [ ] local only #agent\n",
+    );
     fs::write(alpha.join("TODO.md"), local).unwrap();
     env.ok(&["scan", "--offline"]);
     let (_, err, success) = env.run(&["dispatch", "alpha:9"]);
@@ -532,7 +566,7 @@ fn dispatch_review_rework_and_ship() {
     );
     assert_eq!(
         git_out(&origin, &["show", "main:TODO.md"]),
-        "# TODO\n\n## High\n\n- [x] add greeting\n  say hello in hello.txt\n- [x] second task gh:7\n- [ ] third task\n\n## Low\n\n- [ ] guarded task #manual\n"
+        "# TODO\n\n## High\n\n- [x] add greeting #agent\n  say hello in hello.txt\n- [x] second task #agent gh:7\n- [ ] third task #agent\n\n## Low\n\n- [ ] guarded task #manual\n"
     );
     assert_eq!(git_out(&origin, &["show", "main:second.txt"]), "two\n");
     assert_eq!(git_out(&origin, &["branch", "--list", "agent"]), "");
@@ -561,6 +595,35 @@ fn dispatch_review_rework_and_ship() {
         out.ends_with("0 ready, 1 failed, $0.00 spent; see `pma review`\n"),
         "{out}"
     );
+    // Four runs: two shipped, `third task` rejected, and one refused at the
+    // batch budget, which is not decided because no one judged it. One passed
+    // on its first attempt and one after a rework, so four attempts in all,
+    // and the refused run reported no cost.
+    let report = env.ok(&["report"]);
+    assert!(
+        report.contains("67% of 3 decided runs accepted"),
+        "{report}"
+    );
+    let b: Vec<&str> = report
+        .lines()
+        .find(|l| l.starts_with("B "))
+        .unwrap()
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        &b[..8],
+        ["B", "4", "1", "2", "2", "0", "4", "$0.40+1?"],
+        "{report}"
+    );
+    assert!(report.contains("10m00s"), "review time: {report}");
+    assert!(
+        env.ok(&["report", "--by", "project"])
+            .contains("by project"),
+        "{report}"
+    );
+    let (_, err, ok) = env.run(&["report", "--by", "model"]);
+    assert!(!ok && err.contains("unknown dimension `model`"), "{err}");
+
     // The budget refusal never reached the agent, so it consumed nothing:
     // rejecting it leaves one attempt against the task, not two, and no
     // second reset is needed.
@@ -708,7 +771,10 @@ fn auto_dispatch_passes_over_refused_tasks_and_names_the_cause() {
     let todo = fs::read_to_string(alpha.join("TODO.md")).unwrap();
     fs::write(
         alpha.join("TODO.md"),
-        todo.replace("- [ ] add greeting", "- [ ] local only\n- [ ] add greeting"),
+        todo.replace(
+            "- [ ] add greeting",
+            "- [ ] local only #agent\n- [ ] add greeting",
+        ),
     )
     .unwrap();
     let other = s.0.join("other");
@@ -774,9 +840,9 @@ fn the_scope_check_reads_the_whole_change_not_the_agents_report() {
     // file, both sides of the rename, and the deletion. The agent reported
     // only the lock file.
     let detail = env.ok(&["review", "1"]);
-    assert!(detail.contains("class    B, any path"), "{detail}");
+    assert!(detail.contains("B, any path"), "{detail}");
     assert!(
-        detail.contains("scope    1 of 5 files OUTSIDE: .github/workflows/ci.yml"),
+        detail.contains("1 of 5 files OUTSIDE: .github/workflows/ci.yml"),
         "{detail}"
     );
     assert!(detail.contains("updated Cargo.lock"), "{detail}");
@@ -787,6 +853,448 @@ fn the_scope_check_reads_the_whole_change_not_the_agents_report() {
     );
     assert!(detail.contains("  - no verify command"), "{detail}");
     assert!(env.ok(&["review"]).contains("2 to read"), "{detail}");
+}
+
+/// A second worker runs through the same dispatch, review and ship path as
+/// `claude`, with no code that knows its name.
+#[test]
+fn a_worker_without_json_output_or_an_allowlist_runs_the_same_path() {
+    let s = Scratch::new("adapter");
+    let (env, origin, _) = dispatch_env(&s, &[("plain", PLAIN_WORKER)]);
+    env.ok(&["config", "publish", "push"]);
+
+    let listed = env.ok(&["agent"]);
+    assert!(listed.contains("* claude"), "{listed}");
+    assert!(listed.contains("cost,allowlist"), "{listed}");
+
+    env.ok(&["agent", "set", "plain", "command", "plain"]);
+    env.ok(&[
+        "agent",
+        "set",
+        "plain",
+        "args",
+        r#"["--task","{prompt}","{dir}"]"#,
+    ]);
+    env.ok(&["config", "agent", "plain"]);
+    let listed = env.ok(&["agent"]);
+    assert!(listed.contains("* plain"), "{listed}");
+    assert!(listed.contains("text-tail"), "{listed}");
+
+    env.ok(&["dispatch", "alpha:5"]);
+    let detail = env.ok(&["review", "1"]);
+    // The exit status decided, the tail is the summary, and the cost is
+    // unknown rather than zero.
+    assert!(detail.contains("plain, cost not reported"), "{detail}");
+    assert!(detail.contains("wrote hello.txt in"), "{detail}");
+    assert!(
+        detail.contains("`make test`: base FAILED, head passed"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("accept: every recorded gate is clean"),
+        "{detail}"
+    );
+
+    env.ok(&["review", "1", "--approve"]);
+    assert!(env.ok(&["ship"]).contains("#1 alpha: pushed "), "shipped");
+    assert_eq!(git_out(&origin, &["show", "main:hello.txt"]), "hi\n");
+    // No cost to sum, and `--by agent` names the worker that did the work.
+    let report = env.ok(&["report", "--by", "agent"]);
+    assert!(report.contains("plain"), "{report}");
+    assert!(report.contains("$0.00+1?"), "{report}");
+
+    // A run whose worker was removed says so rather than running nothing.
+    env.ok(&["agent", "rm", "plain"]);
+    env.ok(&["dispatch", "alpha:7"]);
+    let detail = env.ok(&["review", "2"]);
+    assert!(detail.contains("unknown agent `plain`"), "{detail}");
+
+    let (_, err, ok) = env.run(&["agent", "set", "x", "parse", "codex-json"]);
+    assert!(!ok && err.contains("unknown parser `codex-json`"), "{err}");
+    let (_, err, ok) = env.run(&["agent", "set", "x", "args", "not json"]);
+    assert!(!ok && err.contains("JSON array"), "{err}");
+}
+
+/// A worker that reports which model it was given, so a route's choice can
+/// be seen from outside.
+const MODEL_CLAUDE: &str = r#"#!/bin/sh
+model=unset
+while [ $# -gt 0 ]; do
+  case "$1" in --model) model="$2" ;; esac
+  shift
+done
+echo hi > hello.txt
+printf '{"type":"result","subtype":"success","is_error":false,"result":"ran as %s","total_cost_usd":0.1}\n' "$model"
+"#;
+
+/// A worker that adds the file a campaign asks for, and fails in one named
+/// repository so a partial campaign can be restarted.
+const CAMPAIGN_WORKER: &str = r#"#!/bin/sh
+if [ "$(basename "$(dirname "$PWD")")" = "beta" ] && [ ! -e "$PMA_HOME/fixed" ]; then
+  printf '{"type":"result","subtype":"error","is_error":true,"result":"gave up","total_cost_usd":0.1}
+'
+  exit 0
+fi
+mkdir -p .github/workflows
+echo "on: push" > .github/workflows/ci.yml
+printf '{"type":"result","subtype":"success","is_error":false,"result":"added the workflow","total_cost_usd":0.1}
+'
+"#;
+
+/// One definition, three independent repositories, one worktree each,
+/// verified separately, reviewed as a batch. A restart dispatches only the
+/// members that have no live run.
+#[test]
+fn a_campaign_applies_one_definition_across_repositories() {
+    let s = Scratch::new("campaign");
+    let (env, _, _) = dispatch_env(&s, &[("claude", CAMPAIGN_WORKER)]);
+    // Two more repositories from the same seed, independent of each other.
+    let root = s.0.join("root");
+    for name in ["beta", "gamma"] {
+        git(&root, &["clone", "-q", "../origin.git", name], None);
+        env.ok(&["tier", name, "3"]);
+    }
+    env.ok(&["scan", "--offline"]);
+    // The seed's `make test` needs hello.txt, which a workflow campaign has
+    // no business creating; a check that passes at both ends is what class
+    // A- work is accepted against.
+    for name in ["alpha", "beta", "gamma"] {
+        env.ok(&["config", &format!("projects.{name}.verify"), "true"]);
+    }
+
+    assert!(env.ok(&["campaign"]).contains("no campaigns"), "empty");
+    env.ok(&[
+        "campaign",
+        "add",
+        "workflows",
+        "add a workflow",
+        "--projects",
+        "alpha,beta,gamma",
+        "--class",
+        "A-",
+        "--describe",
+        "Create .github/workflows/ci.yml that runs on push.",
+    ]);
+    let listed = env.ok(&["campaign"]);
+    assert!(
+        listed.contains("class A-") && listed.contains("0/3 dispatched"),
+        "{listed}"
+    );
+
+    // beta's agent gives up, so two of three produce a run to review.
+    let out = env.ok(&["campaign", "run", "workflows"]);
+    assert!(out.contains("2 ready, 1 failed"), "{out}");
+    let show = env.ok(&["campaign", "show", "workflows"]);
+    assert!(
+        show.starts_with(
+            "workflows: add a workflow
+"
+        ),
+        "{show}"
+    );
+    assert!(show.contains("failed"), "{show}");
+
+    // A- may edit `.github/**` and nothing else, so both are clean.
+    let detail = env.ok(&["review", "1"]);
+    assert!(detail.contains("A-, within .github/**"), "{detail}");
+    assert!(detail.contains("1 files, all permitted"), "{detail}");
+    assert!(detail.contains("base passed, head passed"), "{detail}");
+    assert!(detail.contains("every recorded gate is clean"), "{detail}");
+
+    // Batched review: one context across the repositories.
+    let ready: Vec<String> = env
+        .ok(&["review"])
+        .lines()
+        .filter(|l| l.contains(" ready "))
+        .map(|l| l.split_whitespace().next().unwrap()[1..].to_string())
+        .collect();
+    assert_eq!(ready.len(), 2, "two runs to approve");
+    let mut args = vec!["review"];
+    args.extend(ready.iter().map(String::as_str));
+    args.push("--approve");
+    let approved = env.ok(&args);
+    assert_eq!(approved.lines().count(), 2, "{approved}");
+
+    // A member whose run failed is named, not dispatched over: its worktree
+    // is still there and the reviewer decides what happens to it.
+    let out = env.ok(&["campaign", "run", "workflows"]);
+    assert!(
+        out.contains("beta: #2 is failed; reject or rework it"),
+        "{out}"
+    );
+    assert!(
+        out.contains("every member of `workflows` has a run"),
+        "{out}"
+    );
+
+    // Once it is rejected, a restart dispatches that member and no other.
+    fs::write(env.home.join("fixed"), "").unwrap();
+    env.ok(&["review", "2", "--reject"]);
+    let out = env.ok(&["campaign", "run", "workflows"]);
+    assert!(out.contains("1 ready, 0 failed"), "{out}");
+    assert_eq!(out.matches(": add a workflow").count(), 1, "{out}");
+    let show = env.ok(&["campaign", "show", "workflows"]);
+    assert_eq!(show.matches("approved").count(), 2, "{show}");
+    assert_eq!(show.matches("ready").count(), 1, "{show}");
+
+    // Every member has a run, so there is nothing left to start.
+    env.ok(&["review", "3", "--approve"]);
+    let out = env.ok(&["campaign", "run", "workflows"]);
+    assert!(
+        out.contains("every member of `workflows` has a run"),
+        "{out}"
+    );
+}
+
+/// Approval names a tree. Ship publishes that tree or nothing, and rechecks
+/// what the rebase produced rather than what was approved in isolation.
+#[test]
+fn an_approval_is_evidence_about_a_tree_not_a_state() {
+    let s = Scratch::new("evidence");
+    let (env, origin, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    env.ok(&["config", "publish", "push"]);
+
+    // A worktree edited after approval is not published.
+    env.ok(&["dispatch", "alpha:5"]);
+    env.ok(&["review", "1", "--approve"]);
+    let worktree = env.home.join("worktrees/alpha/add-greeting");
+    fs::write(worktree.join("sneaked.txt"), "later\n").unwrap();
+    let (out, err, success) = env.run(&["ship"]);
+    assert!(!success, "{out}{err}");
+    assert!(
+        out.contains("the worktree changed after it was approved"),
+        "{out}"
+    );
+    assert_eq!(git_out(&origin, &["log", "--format=%s", "main"]), "init\n");
+
+    // Reviewing it again approves the tree that is actually there.
+    fs::remove_file(worktree.join("sneaked.txt")).unwrap();
+    env.ok(&["review", "1", "--approve"]);
+    assert!(env.ok(&["ship"]).contains("#1 alpha: pushed "), "shipped");
+
+    // A rework withdraws an approval: the approver read another tree.
+    env.ok(&["dispatch", "alpha:7"]);
+    env.ok(&["review", "2", "--approve"]);
+    env.ok(&["review", "2", "--rework", "add hello.txt too"]);
+    let detail = env.ok(&["review", "2"]);
+    assert!(!detail.contains("approved by"), "{detail}");
+
+    // The integrated tree is checked, not the approved one in isolation:
+    // another commit lands upstream that the approved change breaks.
+    env.ok(&["review", "2", "--approve"]);
+    let other = s.0.join("other");
+    git(
+        &s.0,
+        &["clone", "-q", origin.to_str().unwrap(), "other"],
+        None,
+    );
+    fs::write(other.join("Makefile"), "test:\n\ttest -f never.txt\n").unwrap();
+    git(&other, &["commit", "-qam", "stricter test"], None);
+    git(&other, &["push", "-q"], None);
+    let (out, err, success) = env.run(&["ship"]);
+    assert!(!success, "{out}{err}");
+    assert!(
+        out.contains("`make test` failed on the integrated tree"),
+        "{out}"
+    );
+    assert_eq!(
+        git_out(&origin, &["log", "--format=%s", "main"]),
+        "stricter test\nadd greeting\ninit\n",
+        "nothing of the run reached the branch"
+    );
+    let _ = alpha;
+}
+
+/// A batch approval is all or nothing, and only for runs nothing objects to.
+#[test]
+fn a_batch_approval_refuses_a_list_with_anything_to_read_in_it() {
+    let s = Scratch::new("batch");
+    let (env, _, _) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    env.ok(&["dispatch", "--auto", "-n", "3"]);
+    let list = env.ok(&["review"]);
+    assert!(list.contains("clean"), "{list}");
+
+    // #2 and #3 fail their checks, so the list is refused whole.
+    let (_, err, success) = env.run(&["review", "1", "2", "--approve"]);
+    assert!(!success && err.contains("#2 is not clean"), "{err}");
+    assert!(err.contains("verify failed at the head"), "{err}");
+    assert_eq!(
+        env.ok(&["review"]).matches("ready").count(),
+        3,
+        "nothing was approved"
+    );
+
+    // A propose route publishes nothing, whatever the gates say.
+    let doc = s.0.join("policy.json");
+    fs::write(
+        &doc,
+        r#"{"route":[{"name":"draft-only","match":{},"approval":"propose"}]}"#,
+    )
+    .unwrap();
+    env.ok(&["route", "propose", doc.to_str().unwrap()]);
+    env.ok(&["route", "activate", "1"]);
+    env.ok(&["review", "1", "--reject"]);
+    env.ok(&["dispatch", "alpha:5", "--retry"]);
+    let (_, err, success) = env.run(&["review", "4", "--approve"]);
+    assert!(!success && err.contains("which is `propose`"), "{err}");
+}
+
+/// Fails its check at the first model and passes at the second, so a route's
+/// escalation can be seen end to end.
+const ESCALATING_CLAUDE: &str = r#"#!/bin/sh
+model=unset
+while [ $# -gt 0 ]; do
+  case "$1" in --model) model="$2" ;; esac
+  shift
+done
+if [ "$model" = "opus" ]; then echo hi > hello.txt; fi
+printf '{"type":"result","subtype":"success","is_error":false,"result":"ran as %s","total_cost_usd":0.1}
+' "$model"
+"#;
+
+/// A route may retry once at a stronger model where the check itself refused
+/// the work. Each attempt is recorded with the model it ran.
+#[test]
+fn a_failed_check_escalates_once_and_records_both_attempts() {
+    let s = Scratch::new("escalate");
+    let (env, _, _) = dispatch_env(&s, &[("claude", ESCALATING_CLAUDE)]);
+    let doc = s.0.join("policy.json");
+    fs::write(
+        &doc,
+        r#"{"route":[{"name":"try-twice","match":{},"model":"haiku",
+             "escalate":{"model":"opus","attempts":1},"approval":"each"}]}"#,
+    )
+    .unwrap();
+    env.ok(&["route", "propose", doc.to_str().unwrap()]);
+    env.ok(&["route", "activate", "1"]);
+
+    env.ok(&["dispatch", "alpha:5"]);
+    let detail = env.ok(&["review", "1"]);
+    assert!(detail.contains("base FAILED, head passed"), "{detail}");
+    let attempts = detail.split_once("attempts:\n").expect("two attempts").1;
+    let lines: Vec<&str> = attempts.lines().take(2).collect();
+    assert!(
+        lines[0].contains("haiku") && lines[0].contains("verify FAILED"),
+        "{detail}"
+    );
+    assert!(
+        lines[1].contains("opus") && lines[1].contains("verify passed"),
+        "{detail}"
+    );
+    // The refused check consumed one attempt; the one that passed did not.
+    let (_, err, success) = env.run(&["dispatch", "alpha:5"]);
+    assert!(!success && err.contains("already has a run"), "{err}");
+
+    // The run's cost is both attempts. Its `model` stays what the route
+    // chose at dispatch: the snapshot records the decision, and the attempt
+    // records what actually ran.
+    assert!(detail.contains("claude haiku, $0.20"), "{detail}");
+}
+
+/// A policy is an artifact: proposed, reviewed, activated, and applied
+/// deterministically. Replaying it over recorded runs must reproduce what
+/// they were routed to.
+#[test]
+fn a_policy_is_a_draft_until_activated_and_replays_exactly() {
+    let s = Scratch::new("route");
+    let (env, _, _) = dispatch_env(&s, &[("claude", MODEL_CLAUDE)]);
+    assert!(env.ok(&["route"]).contains("no routing policy"), "empty");
+
+    let doc = s.0.join("policy.json");
+    fs::write(
+        &doc,
+        r#"{"route":[
+             {"name":"specified","match":{"class":"B","complexity":"1-3"},
+              "model":"haiku","approval":"batch"},
+             {"name":"rest","match":{},"model":"opus","approval":"each"}
+           ]}"#,
+    )
+    .unwrap();
+    let out = env.ok(&["route", "propose", doc.to_str().unwrap(), "--by", "me"]);
+    assert!(out.contains("revision 1 stored as a draft"), "{out}");
+    assert!(env.ok(&["route"]).contains("draft"), "still a draft");
+
+    // One task throughout: `add greeting` names hello.txt and carries a
+    // description, so it estimates 2 and matches the first route.
+    // A draft does not route: the run takes the settings, as before.
+    env.ok(&["dispatch", "alpha:5"]);
+    let detail = env.ok(&["review", "1"]);
+    assert!(detail.contains("ran as unset"), "{detail}");
+    assert!(!detail.contains("revision 1"), "{detail}");
+    env.ok(&["review", "1", "--reject"]);
+
+    // Shadow records the route without applying it.
+    env.ok(&["route", "activate", "1", "--shadow", "--by", "me"]);
+    env.ok(&["dispatch", "alpha:5", "--retry"]);
+    let detail = env.ok(&["review", "2"]);
+    assert!(detail.contains("specified in revision 1"), "{detail}");
+    assert!(detail.contains("approval batch"), "{detail}");
+    assert!(detail.contains("ran as unset"), "shadow applies nothing");
+    env.ok(&["review", "2", "--reject"]);
+
+    // Activated, the same task takes the route's model.
+    env.ok(&["route", "activate", "1", "--by", "me"]);
+    assert!(env.ok(&["route"]).contains("active, by me"), "activated");
+    env.ok(&["dispatch", "alpha:5", "--retry"]);
+    let detail = env.ok(&["review", "3"]);
+    assert!(detail.contains("ran as haiku"), "{detail}");
+
+    // The gate: replaying the active policy changes nothing it decided.
+    // #1 predates it and #2 was shadowed, so neither took the route's model;
+    // both are differences worth seeing rather than matches.
+    let replay = env.ok(&["route", "replay", "1"]);
+    assert!(
+        replay.contains("3 runs replayed, 2 routed differently"),
+        "{replay}"
+    );
+    assert!(replay.contains("#1"), "dispatched before it: {replay}");
+    assert!(replay.contains("#2"), "shadowed, so not applied: {replay}");
+    assert!(!replay.contains("#3"), "applied, so unchanged: {replay}");
+    assert!(replay.contains("Cost is not projected"), "{replay}");
+
+    // A candidate that narrows the first route moves runs onto the second.
+    let other = s.0.join("other.json");
+    fs::write(
+        &other,
+        r#"{"route":[
+             {"name":"specified","match":{"class":"B","complexity":"1-1"},
+              "model":"haiku","approval":"batch"},
+             {"name":"rest","match":{},"model":"opus","approval":"each"}
+           ]}"#,
+    )
+    .unwrap();
+    let replay = env.ok(&["route", "replay", other.to_str().unwrap()]);
+    assert!(
+        replay.contains("3 runs replayed, 3 routed differently"),
+        "{replay}"
+    );
+    assert!(replay.contains("rest claude/opus"), "{replay}");
+
+    // A policy that matches nothing refuses the dispatch by name.
+    let narrow = s.0.join("narrow.json");
+    fs::write(
+        &narrow,
+        r#"{"route":[{"name":"only-a","match":{"class":"A"},"approval":"each"}]}"#,
+    )
+    .unwrap();
+    env.ok(&["route", "propose", narrow.to_str().unwrap()]);
+    env.ok(&["route", "activate", "2"]);
+    env.ok(&["review", "3", "--reject"]);
+    let (_, err, success) = env.run(&["dispatch", "alpha:5", "--retry"]);
+    assert!(
+        !success && err.contains("matches no route in policy revision 2"),
+        "{err}"
+    );
+
+    // An unreadable document never becomes a revision.
+    let bad = s.0.join("bad.json");
+    fs::write(&bad, r#"{"route":[{"match":{},"approval":"whenever"}]}"#).unwrap();
+    let (_, err, success) = env.run(&["route", "propose", bad.to_str().unwrap()]);
+    assert!(
+        !success && err.contains("unknown approval `whenever`"),
+        "{err}"
+    );
+    assert_eq!(env.ok(&["route"]).lines().count(), 2, "still two revisions");
 }
 
 /// A stand-in for `claude -p` that finishes once `$PMA_HOME/release` exists,

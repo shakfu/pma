@@ -44,11 +44,10 @@ enum Command {
         /// Files or directories; defaults to the current directory.
         paths: Vec<PathBuf>,
     },
-    /// Remove finished items and `## Done` sections from TODO.md files. Dry
-    /// run unless --apply.
+    /// Remove finished items and `Done` sections from TODO.md files.
     ///
     /// Each path is a TODO.md file or a directory containing one. A file with
-    /// lint errors is skipped. Edits stay uncommitted.
+    /// lint errors is skipped. Edits stay uncommitted. Dry run unless --apply.
     Prune {
         /// Files or directories; defaults to the current directory.
         paths: Vec<PathBuf>,
@@ -111,8 +110,7 @@ enum Command {
         #[arg(long)]
         explain: bool,
     },
-    /// Run an agent on tasks, each in its own worktree of the remote default
-    /// branch.
+    /// Run an agent on tasks, each in its own worktree of the remote branch.
     ///
     /// A target is `project:line`, a TODO.md line from the last scan,
     /// `project:ci` for failing CI, or `project:deps` for outdated

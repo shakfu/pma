@@ -5,18 +5,22 @@
 mod accept;
 mod agent;
 mod class;
+mod complexity;
 mod config;
 mod dates;
 mod deps;
 mod dispatch;
 mod rank;
 mod report;
+mod report_runs;
+mod route;
 mod scan;
 mod ship;
 mod store;
 mod sync;
 mod todo;
 mod tui;
+mod worker;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -131,20 +135,50 @@ enum Command {
     },
     /// List runs that are not shipped or rejected, show one, or act on it.
     Review {
-        /// A run id; omit to list runs.
-        id: Option<i64>,
-        /// Mark a ready run for `pma ship`.
-        #[arg(long, requires = "id", conflicts_with_all = ["reject", "rework"])]
+        /// Run ids; omit to list runs. Several are allowed with --approve.
+        ids: Vec<i64>,
+        /// Mark ready runs for `pma ship`.
+        #[arg(long, requires = "ids", conflicts_with_all = ["reject", "rework"])]
         approve: bool,
         /// Remove the run's worktree and branch.
-        #[arg(long, requires = "id", conflicts_with = "rework")]
+        #[arg(long, requires = "ids", conflicts_with = "rework")]
         reject: bool,
         /// Run the agent again in the same worktree with this feedback.
-        #[arg(long, requires = "id", value_name = "FEEDBACK")]
+        #[arg(long, requires = "ids", value_name = "FEEDBACK")]
         rework: Option<String>,
         /// Minutes spent reviewing this run, added to the run's total.
-        #[arg(long, requires = "id", value_name = "N")]
+        #[arg(long, requires = "ids", value_name = "N")]
         minutes: Option<u32>,
+    },
+    /// Open items by age, oldest first: a list to prune.
+    Stale {
+        /// Limit to these projects.
+        projects: Vec<String>,
+        /// How many to show; defaults to `quadrant_limit`.
+        #[arg(short = 'n', long)]
+        count: Option<usize>,
+    },
+    /// One task definition across many repositories.
+    Campaign {
+        #[command(subcommand)]
+        action: Option<CampaignAction>,
+    },
+    /// Routing policy: propose a revision, put one into effect, or replay
+    /// a candidate over the runs already recorded.
+    Route {
+        #[command(subcommand)]
+        action: Option<RouteAction>,
+    },
+    /// List the workers `pma dispatch` can run, or change one.
+    Agent {
+        #[command(subcommand)]
+        action: Option<AgentAction>,
+    },
+    /// What dispatching has produced: outcomes, attempts, cost and time.
+    Report {
+        /// Group by `project`, `class` or `agent`. Default: class.
+        #[arg(long, value_name = "DIMENSION")]
+        by: Option<String>,
     },
     /// Commit and publish approved runs, then remove their worktrees.
     Ship {
@@ -206,6 +240,80 @@ fn parse_quadrant(s: &str) -> std::result::Result<rank::Quadrant, String> {
         .ok_or_else(|| "expected q1, q2, q3 or q4".into())
 }
 
+#[derive(Subcommand)]
+enum CampaignAction {
+    /// Define a campaign over a fixed set of projects.
+    Add {
+        name: String,
+        /// The task, as every repository's agent will read it.
+        text: String,
+        /// The projects to apply it to.
+        #[arg(long, value_delimiter = ',', required = true)]
+        projects: Vec<String>,
+        /// Extra prompt lines: acceptance, constraints, an example.
+        #[arg(long, value_name = "TEXT")]
+        describe: Option<String>,
+        /// Maintenance class; default B. A- for `.github/**` work.
+        #[arg(long)]
+        class: Option<String>,
+    },
+    /// Show a campaign's members and what took them.
+    Show { name: String },
+    /// Dispatch the members that have no run.
+    Run {
+        name: String,
+        /// How many to start; defaults to every remaining member.
+        #[arg(short = 'n', long)]
+        count: Option<usize>,
+    },
+    /// Remove a campaign. Its runs are untouched.
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
+enum RouteAction {
+    /// Store a policy document as a draft revision.
+    Propose {
+        /// A JSON policy file, or `-` for stdin.
+        file: String,
+        /// Who proposed it; defaults to the local user.
+        #[arg(long)]
+        by: Option<String>,
+    },
+    /// Put a revision into effect.
+    Activate {
+        revision: i64,
+        /// Compute and record the route without applying it.
+        #[arg(long)]
+        shadow: bool,
+        /// Who approved it; defaults to the local user.
+        #[arg(long)]
+        by: Option<String>,
+    },
+    /// Show what a candidate would have routed differently.
+    Replay {
+        /// A JSON policy file, `-` for stdin, or a stored revision number.
+        file: String,
+    },
+    /// Print a revision's document.
+    Show { revision: Option<i64> },
+}
+
+#[derive(Subcommand)]
+enum AgentAction {
+    /// Set one field, creating the worker when `command` is set first.
+    Set {
+        name: String,
+        /// One of: command, args, allow, parse, reports-cost,
+        /// enforces-budget, sandbox, resumes.
+        field: String,
+        /// The value; for `args`, a JSON array such as `["-p","{prompt}"]`.
+        value: String,
+    },
+    /// Remove a worker.
+    Rm { name: String },
+}
+
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Lint { paths } => return lint(&paths),
@@ -231,12 +339,17 @@ fn main() -> ExitCode {
             retry,
         } => run_dispatch(&targets, auto, count, retry),
         Command::Review {
-            id,
+            ids,
             approve,
             reject,
             rework,
             minutes,
-        } => run_review(id, approve, reject, rework.as_deref(), minutes),
+        } => run_review(&ids, approve, reject, rework.as_deref(), minutes),
+        Command::Stale { projects, count } => show_stale(&projects, count),
+        Command::Campaign { action } => campaign_command(action),
+        Command::Route { action } => route_command(action),
+        Command::Agent { action } => agent_command(action),
+        Command::Report { by } => run_report(by.as_deref()),
         Command::Ship { projects } => run_ship(&projects),
         Command::Sync { projects, apply } => run_sync(&projects, apply),
         Command::Note { action } => note(action),
@@ -587,13 +700,19 @@ fn portfolio(names: &[String]) -> Result<Portfolio> {
         .into_iter()
         .filter(|r| names.is_empty() || names.contains(&r.name))
         .collect();
-    let untiered = rows.iter().filter(|r| r.tier.is_none()).count();
+    let fallback = cfg.default_tier.and_then(|t| u8::try_from(t).ok());
+    let untiered = rows
+        .iter()
+        .filter(|r| r.tier.is_none() && fallback.is_none())
+        .count();
     let task_rows = store.tasks()?;
 
     let mut projects = Vec::new();
     let mut tasks = Vec::new();
     for row in rows {
-        let Some(tier) = row.tier else { continue };
+        let Some(tier) = row.tier.or(fallback) else {
+            continue;
+        };
         let own: Vec<&store::TaskRow> =
             task_rows.iter().filter(|t| t.project == row.name).collect();
         let project = rank::Project {
@@ -620,6 +739,7 @@ fn portfolio(names: &[String]) -> Result<Portfolio> {
             due: t.due.as_deref().and_then(dates::parse),
             tagged_urgent: t.tags.iter().any(|g| g == "urgent"),
             signal_urgent: false,
+            eligible: t.tags.iter().any(|g| g == "agent"),
             age_days:
                 (today - dates::day(t.added_at.unwrap_or(t.first_seen).min(t.first_seen))).max(0),
         }));
@@ -716,32 +836,35 @@ fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>, retry: boo
         false => targets.len(),
     };
     if auto {
-        let lists = [&p.cfg.dispatch_quadrants, &p.cfg.overflow_quadrants];
-        for list in lists {
-            for x in placed.iter().filter(|x| list.contains(&x.quadrant)) {
-                let Some(key) = &x.task.key else { continue };
-                let taken = picks
-                    .iter()
-                    .any(|q: &dispatch::Pick| q.project == x.task.project && &q.key == key);
-                if taken || has_run(&active, &x.task.project, key, &x.task.text) {
-                    continue;
-                }
-                let spent =
-                    store.consumed_attempts(&x.task.project, &dispatch::revision(&x.task.text))?;
-                if spent >= dispatch::ATTEMPT_LIMIT {
-                    continue;
-                }
-                let r = row(&x.task.project)?;
-                picks.push(dispatch::Pick {
-                    project: x.task.project.clone(),
-                    repo: r.path.clone(),
-                    key: key.clone(),
-                    text: x.task.text.clone(),
-                    gh: None,
-                    tier: r.tier,
-                    quadrant: Some(format!("{:?}", x.quadrant)),
-                });
+        // Importance orders the queue; eligibility decides what is taken from
+        // it. A quadrant is a view, not a dispatch policy: `Medium` and `Low`
+        // are never important at any tier, so quadrant gating hid the
+        // maintenance work agents are best at.
+        for x in placed.iter().filter(|x| x.task.eligible) {
+            let Some(key) = &x.task.key else { continue };
+            let taken = picks
+                .iter()
+                .any(|q: &dispatch::Pick| q.project == x.task.project && &q.key == key);
+            if taken || has_run(&active, &x.task.project, key, &x.task.text) {
+                continue;
             }
+            let spent =
+                store.consumed_attempts(&x.task.project, &dispatch::revision(&x.task.text))?;
+            if spent >= dispatch::ATTEMPT_LIMIT {
+                continue;
+            }
+            let r = row(&x.task.project)?;
+            picks.push(dispatch::Pick {
+                project: x.task.project.clone(),
+                repo: r.path.clone(),
+                key: key.clone(),
+                text: x.task.text.clone(),
+                gh: None,
+                tier: r.tier,
+                class: None,
+                details: None,
+                quadrant: Some(format!("{:?}", x.quadrant)),
+            });
         }
         let tasks = store.tasks()?;
         for pick in &mut picks {
@@ -820,6 +943,8 @@ fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>, retry: boo
                 project: project.into(),
                 repo: row.path.clone(),
                 tier: row.tier,
+                class: None,
+                details: None,
                 quadrant: quadrant(project, &key),
                 key,
                 text,
@@ -831,18 +956,29 @@ fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>, retry: boo
         println!("nothing to dispatch");
         return Ok(());
     }
+    run_picks(&store, &home, &p.cfg, &picks, wanted).map(|_| ())
+}
 
+/// Prepares up to `wanted` picks and runs them, reporting each. Returns the
+/// finished runs, so a caller that owns a set of tasks can record them.
+fn run_picks(
+    store: &Store,
+    home: &std::path::Path,
+    cfg: &config::Config,
+    picks: &[dispatch::Pick],
+    wanted: usize,
+) -> Result<Vec<store::Run>> {
     let mut queued = Vec::new();
     // A project-level failure, such as a failed fetch, skips the project.
     let mut unreachable: Vec<&str> = Vec::new();
-    for pick in &picks {
+    for pick in picks {
         if queued.len() == wanted {
             break;
         }
         if unreachable.contains(&pick.project.as_str()) {
             continue;
         }
-        match dispatch::prepare(&store, &home, &p.cfg, pick) {
+        match dispatch::prepare(store, home, cfg, pick) {
             Ok(dispatch::Prepared::Queued(run)) => {
                 println!("#{} {}: {}", run.id, run.project, run.text);
                 queued.push(*run);
@@ -857,7 +993,7 @@ fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>, retry: boo
     if queued.is_empty() {
         return Err("no run started".into());
     }
-    let finished = dispatch::execute(&store, &home, &p.cfg, queued, |run| {
+    let finished = dispatch::execute(store, home, cfg, queued, |run| {
         println!("{}", report::run_line(run));
     })?;
     let ready = finished
@@ -872,7 +1008,7 @@ fn run_dispatch(targets: &[String], auto: bool, count: Option<usize>, retry: boo
         "{ready} ready, {} failed, ${spent:.2} spent; see `pma review`",
         finished.len() - ready
     );
-    Ok(())
+    Ok(finished)
 }
 
 /// Reports runs whose pull request was merged or closed since the last check.
@@ -887,7 +1023,7 @@ fn settle_prs(store: &Store) -> Result<()> {
 }
 
 fn run_review(
-    id: Option<i64>,
+    ids: &[i64],
     approve: bool,
     reject: bool,
     rework: Option<&str>,
@@ -907,7 +1043,7 @@ fn run_review(
         (None, true) => Some(Session::acquire(&home)?),
         (_, false) => None,
     };
-    let Some(id) = id else {
+    if ids.is_empty() {
         settle_prs(&store)?;
         let runs: Vec<_> = store
             .runs()?
@@ -920,7 +1056,14 @@ fn run_review(
             print!("{}", report::runs(&runs));
         }
         return Ok(());
-    };
+    }
+    if ids.len() > 1 {
+        if !approve {
+            return Err("name one run, or several ids with --approve".into());
+        }
+        return approve_many(&store, ids);
+    }
+    let id = ids[0];
     let mut run = store.run(id)?;
     // Added before the action, so a rework's own review time is not lost when
     // the run is reviewed again.
@@ -929,7 +1072,7 @@ fn run_review(
         store.update_run(&run)?;
     }
     if approve {
-        dispatch::approve(&store, &mut run)?;
+        dispatch::approve(&store, &mut run, &whoami())?;
     } else if reject {
         dispatch::reject(&store, &mut run)?;
     } else if let Some(feedback) = rework {
@@ -944,6 +1087,447 @@ fn run_review(
         );
     }
     drop(session);
+    Ok(())
+}
+
+fn show_stale(names: &[String], count: Option<usize>) -> Result<()> {
+    let p = portfolio(names)?;
+    header(&p);
+    let limit = count.unwrap_or(p.cfg.quadrant_limit as usize);
+    let placed = rank::place(&p.cfg, p.tasks, p.today);
+    print!("{}", report::stale(&placed, limit));
+    Ok(())
+}
+
+fn campaign_command(action: Option<CampaignAction>) -> Result<()> {
+    let store = Store::open_default()?;
+    let Some(action) = action else {
+        let all = store.campaigns()?;
+        if all.is_empty() {
+            println!("no campaigns; `pma campaign add <name> <text> --projects a,b` defines one");
+            return Ok(());
+        }
+        let rows: Vec<Vec<String>> = all
+            .iter()
+            .map(|c| {
+                let taken = c.members.iter().filter(|(_, r)| r.is_some()).count();
+                vec![
+                    c.name.clone(),
+                    format!("class {}", c.class.name()),
+                    format!("{taken}/{} dispatched", c.members.len()),
+                    report::truncate(&c.text, 50),
+                ]
+            })
+            .collect();
+        print!("{}", report::table(&rows, ""));
+        return Ok(());
+    };
+    match action {
+        CampaignAction::Add {
+            name,
+            text,
+            projects,
+            describe,
+            class,
+        } => {
+            let known = store.projects()?;
+            for p in &projects {
+                if !known.iter().any(|r| &r.name == p) {
+                    return Err(format!("unknown project `{p}`; run `pma scan`").into());
+                }
+            }
+            let class = match class.as_deref() {
+                None => class::Class::Specified,
+                Some(c) => class::Class::parse(c)
+                    .ok_or_else(|| format!("unknown class `{c}`; expected A, A-, B, C or D"))?,
+            };
+            if !class.dispatchable() {
+                return Err(format!("class {} is never dispatched", class.name()).into());
+            }
+            let mut members: Vec<(String, Option<i64>)> =
+                projects.iter().map(|p| (p.clone(), None)).collect();
+            members.sort();
+            members.dedup();
+            store.add_campaign(&store::Campaign {
+                name: name.clone(),
+                text,
+                description: describe.unwrap_or_default(),
+                class,
+                created_at: dates::now(),
+                members,
+            })?;
+            println!("campaign `{name}` defined; `pma campaign run {name}` starts it");
+        }
+        CampaignAction::Rm { name } => {
+            if !store.remove_campaign(&name)? {
+                return Err(format!("unknown campaign `{name}`").into());
+            }
+        }
+        CampaignAction::Show { name } => {
+            let c = store.campaign(&name)?;
+            let runs = store.runs()?;
+            println!("{}: {}", c.name, c.text);
+            let rows: Vec<Vec<String>> = c
+                .members
+                .iter()
+                .map(|(project, run)| {
+                    let state = match run.and_then(|id| runs.iter().find(|r| r.id == id)) {
+                        None => "not dispatched".to_string(),
+                        Some(r) => format!(
+                            "#{} {}{}",
+                            r.id,
+                            r.state.name(),
+                            r.outcome
+                                .as_deref()
+                                .map_or(String::new(), |o| format!("  {o}"))
+                        ),
+                    };
+                    vec![format!("  {project}"), state]
+                })
+                .collect();
+            print!("{}", report::table(&rows, ""));
+        }
+        CampaignAction::Run { name, count } => return run_campaign(&name, count),
+    }
+    Ok(())
+}
+
+/// Dispatches the members that have no live run. Repeating it is safe: a
+/// member whose run is still open is passed over, so a restart after a
+/// failure does not open a second pull request for it.
+fn run_campaign(name: &str, count: Option<usize>) -> Result<()> {
+    let store = Store::open_default()?;
+    let home = store::home()?;
+    let session = Session::acquire(&home)?;
+    store.fail_interrupted_runs(&session)?;
+    let cfg = load_config(&store)?;
+    let campaign = store.campaign(name)?;
+    let rows = store.projects()?;
+    let active = store.runs()?;
+
+    let mut picks = Vec::new();
+    for (project, run) in &campaign.members {
+        // A member with a run that is not final is left alone, whatever its
+        // state. Dispatching over a failed run would leave its worktree
+        // behind and could open a second pull request for the same work;
+        // rejecting or reworking it is the reviewer's call, not this one.
+        if let Some(open) = run
+            .and_then(|id| active.iter().find(|r| r.id == id))
+            .filter(|r| !r.state.is_final())
+        {
+            println!(
+                "{project}: #{} is {}; reject or rework it to dispatch again",
+                open.id,
+                open.state.name()
+            );
+            continue;
+        }
+        let Some(row) = rows.iter().find(|r| &r.name == project) else {
+            eprintln!("warning: {project} is no longer scanned; skipped");
+            continue;
+        };
+        picks.push(dispatch::Pick {
+            project: project.clone(),
+            repo: row.path.clone(),
+            key: format!("campaign:{name}"),
+            text: campaign.text.clone(),
+            gh: None,
+            tier: row.tier,
+            class: Some(campaign.class),
+            details: (!campaign.description.trim().is_empty())
+                .then(|| format!("{}\n", campaign.description.trim_end())),
+            quadrant: None,
+        });
+    }
+    if picks.is_empty() {
+        println!("every member of `{name}` has a run; see `pma campaign show {name}`");
+        return Ok(());
+    }
+    let wanted = count.unwrap_or(picks.len());
+    let finished = run_picks(&store, &home, &cfg, &picks, wanted)?;
+    for run in &finished {
+        store.set_campaign_run(name, &run.project, run.id)?;
+    }
+    println!("`pma campaign show {name}` lists what each repository did");
+    Ok(())
+}
+
+/// A policy document from a file, stdin, or a stored revision number.
+fn policy_text(store: &Store, from: &str) -> Result<String> {
+    if from == "-" {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+        return Ok(text);
+    }
+    if let Ok(n) = from.parse::<i64>() {
+        return store
+            .route_revisions()?
+            .into_iter()
+            .find(|r| r.revision == n)
+            .map(|r| r.document)
+            .ok_or_else(|| format!("no policy revision {n}").into());
+    }
+    std::fs::read_to_string(from).map_err(|e| format!("{from}: {e}").into())
+}
+
+fn whoami() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "unknown".into())
+}
+
+fn route_command(action: Option<RouteAction>) -> Result<()> {
+    let store = Store::open_default()?;
+    let Some(action) = action else {
+        let revisions = store.route_revisions()?;
+        if revisions.is_empty() {
+            println!(
+                "no routing policy; dispatch uses `pma config agent` and each task's class.\n\
+                 `pma route propose <file>` stores one."
+            );
+            return Ok(());
+        }
+        let rows: Vec<Vec<String>> = revisions
+            .iter()
+            .map(|r| {
+                let state = match (r.activated_at, r.shadow) {
+                    (None, _) => "draft".to_string(),
+                    (Some(_), true) => {
+                        format!("shadow, by {}", r.activated_by.as_deref().unwrap_or("?"))
+                    }
+                    (Some(_), false) => {
+                        format!("active, by {}", r.activated_by.as_deref().unwrap_or("?"))
+                    }
+                };
+                let routes = r.policy().map(|p| p.routes.len()).unwrap_or(0);
+                vec![
+                    format!("{}", r.revision),
+                    state,
+                    format!("{routes} routes"),
+                    format!("proposed by {}", r.proposed_by),
+                    report::ago(dates::now() - r.created_at),
+                ]
+            })
+            .collect();
+        print!("{}", report::table(&rows, ""));
+        return Ok(());
+    };
+    match action {
+        RouteAction::Propose { file, by } => {
+            let text = policy_text(&store, &file)?;
+            let n = store.add_route_revision(&text, &by.unwrap_or_else(whoami))?;
+            println!("revision {n} stored as a draft; `pma route activate {n}` puts it in effect");
+        }
+        RouteAction::Activate {
+            revision,
+            shadow,
+            by,
+        } => {
+            store.activate_route(revision, &by.unwrap_or_else(whoami), shadow)?;
+            println!(
+                "revision {revision} is {}",
+                if shadow {
+                    "in shadow: routes are recorded, not applied"
+                } else {
+                    "in effect"
+                }
+            );
+        }
+        RouteAction::Show { revision } => {
+            let doc = match revision {
+                Some(n) => policy_text(&store, &n.to_string())?,
+                None => {
+                    store
+                        .active_route()?
+                        .ok_or("no revision is in effect; name one")?
+                        .document
+                }
+            };
+            print!("{doc}");
+            if !doc.ends_with('\n') {
+                println!();
+            }
+        }
+        RouteAction::Replay { file } => {
+            let policy = route::Policy::parse(&policy_text(&store, &file)?)?;
+            let runs = store.runs()?;
+            let (differences, compared) = route::replay(&policy, &runs);
+            if compared == 0 {
+                println!("no run carries a class and a complexity to replay against");
+                return Ok(());
+            }
+            println!(
+                "{compared} runs replayed, {} routed differently",
+                differences.len()
+            );
+            if !differences.is_empty() {
+                let rows: Vec<Vec<String>> = differences
+                    .iter()
+                    .map(|d| {
+                        vec![
+                            format!("  #{}", d.run),
+                            d.was.clone(),
+                            "->".into(),
+                            d.would_be.clone(),
+                        ]
+                    })
+                    .collect();
+                print!("{}", report::table(&rows, ""));
+            }
+            println!(
+                "\nCost is not projected. What a different model would spend, or whether it \n\
+                 would succeed, is not in this data; only a canary settles that."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn agent_command(action: Option<AgentAction>) -> Result<()> {
+    let store = Store::open_default()?;
+    let Some(action) = action else {
+        let cfg = load_config(&store)?;
+        let rows: Vec<Vec<String>> = store
+            .agents()?
+            .iter()
+            .map(|w| {
+                let mut flags: Vec<&str> = Vec::new();
+                if w.reports_cost {
+                    flags.push("cost");
+                }
+                if w.enforces_budget {
+                    flags.push("budget");
+                }
+                if w.sandbox {
+                    flags.push("sandbox");
+                }
+                if w.allow.is_some() {
+                    flags.push("allowlist");
+                }
+                if w.resumes {
+                    flags.push("resumes");
+                }
+                vec![
+                    if w.name == cfg.agent {
+                        format!("* {}", w.name)
+                    } else {
+                        format!("  {}", w.name)
+                    },
+                    w.command.clone(),
+                    w.parse.name().into(),
+                    if flags.is_empty() {
+                        "-".into()
+                    } else {
+                        flags.join(",")
+                    },
+                    serde_json::to_string(&w.args).unwrap_or_default(),
+                ]
+            })
+            .collect();
+        if rows.is_empty() {
+            println!("no agents; `pma agent set <name> command <program>` adds one");
+        } else {
+            print!("{}", report::table(&rows, ""));
+            println!("\n* is `pma config agent`; reports cost, enforces budget, has a sandbox");
+        }
+        return Ok(());
+    };
+    match action {
+        AgentAction::Rm { name } => {
+            if !store.remove_agent(&name)? {
+                return Err(format!("unknown agent `{name}`").into());
+            }
+        }
+        AgentAction::Set { name, field, value } => {
+            let mut w = store.agent(&name).unwrap_or_else(|_| worker::Worker {
+                name: name.clone(),
+                command: String::new(),
+                args: Vec::new(),
+                allow: None,
+                parse: worker::Parser::TextTail,
+                reports_cost: false,
+                enforces_budget: false,
+                sandbox: false,
+                resumes: false,
+            });
+            let flag = |v: &str| match v {
+                "true" | "yes" => Ok(true),
+                "false" | "no" => Ok(false),
+                _ => Err(format!("expected true or false, not `{v}`")),
+            };
+            match field.as_str() {
+                "command" => w.command = value,
+                "args" => {
+                    w.args = serde_json::from_str(&value)
+                        .map_err(|e| format!("args must be a JSON array of strings: {e}"))?;
+                }
+                "allow" => w.allow = (!value.is_empty()).then_some(value),
+                "parse" => {
+                    w.parse = worker::Parser::parse(&value).ok_or_else(|| {
+                        format!(
+                            "unknown parser `{value}`; expected {}",
+                            worker::Parser::names()
+                        )
+                    })?;
+                }
+                "reports-cost" => w.reports_cost = flag(&value)?,
+                "enforces-budget" => w.enforces_budget = flag(&value)?,
+                "sandbox" => w.sandbox = flag(&value)?,
+                "resumes" => w.resumes = flag(&value)?,
+                _ => {
+                    let names: Vec<&str> = worker::FIELDS.iter().map(|(n, _)| *n).collect();
+                    return Err(
+                        format!("unknown field `{field}`; expected {}", names.join(", ")).into(),
+                    );
+                }
+            }
+            if w.command.is_empty() {
+                return Err(format!("set `command` for `{name}` first").into());
+            }
+            store.set_agent(&w)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_report(by: Option<&str>) -> Result<()> {
+    let store = Store::open_default()?;
+    let by = match by {
+        None => report_runs::By::Class,
+        Some(s) => report_runs::By::parse(s).ok_or_else(|| {
+            let names: Vec<&str> = report_runs::By::ALL.iter().map(|(n, _)| *n).collect();
+            format!("unknown dimension `{s}`; expected {}", names.join(", "))
+        })?,
+    };
+    print!(
+        "{}",
+        report_runs::report(&store.runs()?, &store.attempts(None)?, by)
+    );
+    Ok(())
+}
+
+/// A batch approval. Every named run is checked before any is approved, so
+/// a list with one bad id changes nothing.
+fn approve_many(store: &Store, ids: &[i64]) -> Result<()> {
+    let mut runs = Vec::new();
+    for id in ids {
+        let run = store.run(*id)?;
+        let reasons = accept::review_reasons(&run);
+        if !reasons.is_empty() {
+            return Err(format!(
+                "#{id} is not clean, so it is not a batch approval: {}. \
+                 Approve it on its own after reading it.",
+                reasons.join("; ")
+            )
+            .into());
+        }
+        runs.push(run);
+    }
+    let by = whoami();
+    for mut run in runs {
+        dispatch::approve(store, &mut run, &by)?;
+        println!("#{} {}: approved", run.id, run.project);
+    }
     Ok(())
 }
 
@@ -962,13 +1546,19 @@ fn run_ship(projects: &[String]) -> Result<()> {
         return Ok(());
     }
     let mut failed = 0;
-    ship::ship(&store, &cfg, runs, |run, outcome| match outcome {
-        Ok(o) => println!("#{} {}: {o}", run.id, run.project),
-        Err(e) => {
-            failed += 1;
-            println!("#{} {}: {e}", run.id, run.project);
-        }
-    })?;
+    ship::ship(
+        &store,
+        &store::home()?,
+        &cfg,
+        runs,
+        |run, outcome| match outcome {
+            Ok(o) => println!("#{} {}: {o}", run.id, run.project),
+            Err(e) => {
+                failed += 1;
+                println!("#{} {}: {e}", run.id, run.project);
+            }
+        },
+    )?;
     if failed > 0 {
         return Err(format!("{failed} runs not shipped; they stay approved").into());
     }

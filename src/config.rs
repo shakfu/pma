@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 
-use crate::rank::Quadrant;
 use crate::todo::Priority;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -19,16 +18,18 @@ pub struct Config {
     pub priorities: [f64; 4],
     pub weights: Weights,
     /// Days open without `due:` before a task is urgent; `None` is never.
-    pub stale_after: [Option<i64>; 5],
     pub signals: SignalPriorities,
     /// Globs for paths whose commits do not count as activity.
     pub activity_ignore: Vec<String>,
     /// Days without activity at which the activity signal reaches 1, per tier.
     pub activity_horizon: [i64; 5],
-    /// Quadrants `pma dispatch --auto` draws from.
-    pub dispatch_quadrants: Vec<Quadrant>,
-    /// Drawn from once `dispatch_quadrants` has no candidate left.
-    pub overflow_quadrants: Vec<Quadrant>,
+    /// The worker `pma dispatch` runs, by name in the `agents` table.
+    pub agent: String,
+    /// The model to ask that worker for; `None` leaves it to the worker.
+    pub model: Option<String>,
+    /// Tier for a project that has none, so untiered projects are ranked
+    /// rather than invisible. `None` leaves them out, as before.
+    pub default_tier: Option<i64>,
     pub publish: Publish,
     pub attribution: Attribution,
     /// Agents running at once.
@@ -96,7 +97,6 @@ impl Default for Config {
                 deps: 1.0,
                 hygiene: 2.0,
             },
-            stale_after: [Some(30), Some(60), Some(90), None, None],
             signals: SignalPriorities {
                 ci: Priority::High,
                 deps: Priority::Medium,
@@ -107,8 +107,9 @@ impl Default for Config {
             // added an empty one to many repos at once, is not maintenance.
             activity_ignore: vec![".github/**".into(), "*.lock".into(), "TODO.md".into()],
             activity_horizon: [30, 60, 120, 240, 365],
-            dispatch_quadrants: vec![Quadrant::Q1, Quadrant::Q2],
-            overflow_quadrants: vec![],
+            agent: "claude".into(),
+            model: None,
+            default_tier: None,
             publish: Publish::Pr,
             attribution: Attribution::User,
             max_parallel: 2,
@@ -128,12 +129,13 @@ enum Slot<'a> {
     Never(&'a mut Option<i64>),
     Priority(&'a mut Priority),
     List(&'a mut Vec<String>),
-    Quadrants(&'a mut Vec<Quadrant>),
     Publish(&'a mut Publish),
     OptPublish(&'a mut Option<Publish>),
     Attribution(&'a mut Attribution),
     /// Empty text is `None`.
     OptText(&'a mut Option<String>),
+    /// Text that may not be empty.
+    Text(&'a mut String),
 }
 
 const PUBLISH: [(&str, Publish); 2] = [("push", Publish::Push), ("pr", Publish::Pr)];
@@ -150,6 +152,48 @@ fn parse_publish(s: &str) -> Result<Publish, String> {
         .ok_or_else(|| "expected push or pr".into())
 }
 
+/// Settings that no longer exist, with what replaced them. A retired name
+/// stays here so `pma config <old>` explains it. `with_overrides` skips a
+/// stored row for one, because an unknown key is a hard error on every
+/// command and an upgrade must not brick a store that set it.
+pub const RETIRED: [(&str, &str); 7] = [
+    (
+        "dispatch_quadrants",
+        "dispatch draws from eligible tasks: the ci and deps signals, and items tagged #agent",
+    ),
+    (
+        "overflow_quadrants",
+        "dispatch draws from eligible tasks; there is no overflow list",
+    ),
+    (
+        "stale_after.1",
+        "age no longer makes a task urgent; see `pma stale`",
+    ),
+    (
+        "stale_after.2",
+        "age no longer makes a task urgent; see `pma stale`",
+    ),
+    (
+        "stale_after.3",
+        "age no longer makes a task urgent; see `pma stale`",
+    ),
+    (
+        "stale_after.4",
+        "age no longer makes a task urgent; see `pma stale`",
+    ),
+    (
+        "stale_after.5",
+        "age no longer makes a task urgent; see `pma stale`",
+    ),
+];
+
+pub fn retired(key: &str) -> Option<&'static str> {
+    RETIRED
+        .iter()
+        .find(|(name, _)| *name == key)
+        .map(|(_, why)| *why)
+}
+
 impl Config {
     pub fn keys() -> Vec<String> {
         let mut keys: Vec<String> = ["important_threshold", "urgent_within", "quadrant_limit"]
@@ -159,14 +203,14 @@ impl Config {
         keys.extend(per_tier("tiers"));
         keys.extend(Priority::ALL.map(|p| format!("priorities.{}", p.name())));
         keys.extend(["tasks", "activity", "ci", "deps", "hygiene"].map(|w| format!("weights.{w}")));
-        keys.extend(per_tier("stale_after"));
         keys.extend(["ci", "deps", "activity", "hygiene"].map(|s| format!("signals.{s}")));
         keys.push("activity.ignore".into());
         keys.extend(per_tier("activity.horizon"));
         keys.extend(
             [
-                "dispatch_quadrants",
-                "overflow_quadrants",
+                "agent",
+                "model",
+                "default_tier",
                 "publish",
                 "attribution",
                 "max_parallel",
@@ -185,6 +229,11 @@ impl Config {
     ) -> Result<Config, String> {
         let mut cfg = Config::default();
         for (key, value) in rows {
+            // A row the migration has not dropped yet, or one written by
+            // another binary. Retirement must not make every command fail.
+            if retired(key).is_some() {
+                continue;
+            }
             cfg.set(key, value).map_err(|e| {
                 format!("stored setting {key} = {value:?} is invalid ({e}); run `pma config {key} --reset`")
             })?;
@@ -200,11 +249,6 @@ impl Config {
             Slot::Never(v) => v.map_or("never".into(), |n| n.to_string()),
             Slot::Priority(p) => p.name().into(),
             Slot::List(v) => v.join(","),
-            Slot::Quadrants(v) => v
-                .iter()
-                .map(|q| format!("{q:?}").to_lowercase())
-                .collect::<Vec<_>>()
-                .join(","),
             Slot::Publish(p) => publish_name(*p).into(),
             Slot::OptPublish(p) => p.map_or("", publish_name).into(),
             Slot::Attribution(a) => match a {
@@ -212,6 +256,7 @@ impl Config {
                 Attribution::CoAuthor => "co-author".into(),
             },
             Slot::OptText(v) => v.clone().unwrap_or_default(),
+            Slot::Text(v) => v.clone(),
         })
     }
 
@@ -224,9 +269,10 @@ impl Config {
     }
 
     fn set_in_place(&mut self, key: &str, value: &str) -> Result<(), String> {
-        let slot = self
-            .slot(key)
-            .ok_or_else(|| format!("unknown setting `{key}`"))?;
+        let slot = self.slot(key).ok_or_else(|| match retired(key) {
+            Some(why) => format!("`{key}` was retired: {why}"),
+            None => format!("unknown setting `{key}`"),
+        })?;
         let value = value.trim();
         match slot {
             Slot::Number(v, min) => {
@@ -266,19 +312,6 @@ impl Config {
                     .map(String::from)
                     .collect();
             }
-            Slot::Quadrants(v) => {
-                *v = value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        Quadrant::ALL
-                            .into_iter()
-                            .find(|q| format!("{q:?}").eq_ignore_ascii_case(s))
-                            .ok_or_else(|| format!("`{s}` is not q1, q2, q3 or q4"))
-                    })
-                    .collect::<Result<_, _>>()?;
-            }
             Slot::Publish(p) => *p = parse_publish(value)?,
             Slot::OptPublish(p) => {
                 *p = (!value.is_empty())
@@ -293,6 +326,12 @@ impl Config {
                 }
             }
             Slot::OptText(v) => *v = (!value.is_empty()).then(|| value.to_string()),
+            Slot::Text(v) => {
+                if value.is_empty() {
+                    return Err("expected a name".into());
+                }
+                *v = value.to_string();
+            }
         }
         Ok(())
     }
@@ -309,8 +348,9 @@ impl Config {
                 "important_threshold" => Slot::Number(&mut self.important_threshold, 0.0),
                 "urgent_within" => Slot::Count(&mut self.urgent_within, 0),
                 "quadrant_limit" => Slot::Count(&mut self.quadrant_limit, 1),
-                "dispatch_quadrants" => Slot::Quadrants(&mut self.dispatch_quadrants),
-                "overflow_quadrants" => Slot::Quadrants(&mut self.overflow_quadrants),
+                "agent" => Slot::Text(&mut self.agent),
+                "model" => Slot::OptText(&mut self.model),
+                "default_tier" => Slot::Never(&mut self.default_tier),
                 "publish" => Slot::Publish(&mut self.publish),
                 "attribution" => Slot::Attribution(&mut self.attribution),
                 "max_parallel" => Slot::Count(&mut self.max_parallel, 1),
@@ -335,7 +375,6 @@ impl Config {
                 },
                 0.0,
             ),
-            Some(("stale_after", t)) => Slot::Never(&mut self.stale_after[tier(t)?]),
             Some(("signals", s)) => Slot::Priority(match s {
                 "ci" => &mut self.signals.ci,
                 "deps" => &mut self.signals.deps,
@@ -389,7 +428,7 @@ mod tests {
     #[test]
     fn every_key_reads_and_round_trips() {
         let keys = Config::keys();
-        assert_eq!(keys.len(), 40);
+        assert_eq!(keys.len(), 36);
         let defaults = Config::default();
         let mut copy = Config::default();
         for key in &keys {
@@ -408,28 +447,26 @@ mod tests {
         cfg.set("tiers.3", "0.5").unwrap();
         cfg.set("priorities.high", "0.7").unwrap();
         cfg.set("weights.ci", "10").unwrap();
-        cfg.set("stale_after.1", "never").unwrap();
-        cfg.set("stale_after.5", "400").unwrap();
+        cfg.set("default_tier", "3").unwrap();
         cfg.set("signals.ci", "critical").unwrap();
         cfg.set("activity.ignore", " docs/** , ,*.md").unwrap();
         cfg.set("activity.horizon.2", "14").unwrap();
         assert_eq!(cfg.tiers[2], 0.5);
         assert_eq!(cfg.priority(Priority::High), 0.7);
         assert_eq!(cfg.weights.ci, 10.0);
-        assert_eq!(cfg.stale_after[0], None);
-        assert_eq!(cfg.stale_after[4], Some(400));
+        assert_eq!(cfg.default_tier, Some(3));
         assert_eq!(cfg.signals.ci, Priority::Critical);
         assert_eq!(cfg.activity_ignore, ["docs/**", "*.md"]);
         assert_eq!(cfg.activity_horizon[1], 14);
 
-        cfg.set("dispatch_quadrants", "Q1, q3").unwrap();
-        cfg.set("overflow_quadrants", "").unwrap();
+        cfg.set("agent", "codex").unwrap();
+        cfg.set("model", "haiku").unwrap();
         cfg.set("publish", "push").unwrap();
         cfg.set("attribution", "co-author").unwrap();
         cfg.set("projects.cyllama.verify", " make check ").unwrap();
         cfg.set("projects.cyllama.publish", "pr").unwrap();
-        assert_eq!(cfg.dispatch_quadrants, [Quadrant::Q1, Quadrant::Q3]);
-        assert!(cfg.overflow_quadrants.is_empty());
+        assert_eq!(cfg.agent, "codex");
+        assert_eq!(cfg.model.as_deref(), Some("haiku"));
         assert_eq!(cfg.attribution, Attribution::CoAuthor);
         assert_eq!(cfg.project("cyllama").verify.as_deref(), Some("make check"));
         assert_eq!(cfg.publish_for("cyllama"), Publish::Pr);
@@ -437,6 +474,30 @@ mod tests {
         assert_eq!(cfg.get("projects.cyllama.publish").unwrap(), "pr");
         cfg.set("projects.cyllama.publish", "").unwrap();
         assert_eq!(cfg.publish_for("cyllama"), Publish::Push, "empty unsets");
+    }
+
+    /// A store that set a retired key must still open, and asking about the
+    /// name must say what replaced it.
+    #[test]
+    fn retired_keys_explain_themselves_instead_of_failing() {
+        let cfg = Config::with_overrides([
+            ("stale_after.1", "30"),
+            ("dispatch_quadrants", "q1"),
+            ("urgent_within", "3"),
+        ])
+        .expect("a retired row does not break the config");
+        assert_eq!(cfg.urgent_within, 3);
+
+        let e = Config::default()
+            .set("stale_after.1", "30")
+            .expect_err("setting one is refused");
+        assert!(e.contains("was retired") && e.contains("pma stale"), "{e}");
+        assert!(
+            Config::default()
+                .set("nonsense", "1")
+                .unwrap_err()
+                .contains("unknown setting")
+        );
     }
 
     #[test]
@@ -450,11 +511,11 @@ mod tests {
             ("tiers.1", "inf"),
             ("urgent_within", "1.5"),
             ("quadrant_limit", "0"),
-            ("stale_after.2", "-1"),
+            ("default_tier", "-1"),
             ("signals.ci", "urgent"),
             ("weights.nope", "1"),
             ("activity.horizon.1", "0"),
-            ("dispatch_quadrants", "q1,q5"),
+            ("agent", ""),
             ("publish", "merge"),
             ("attribution", "agent"),
             ("max_parallel", "0"),

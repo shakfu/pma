@@ -1,14 +1,13 @@
 //! Runs a coding agent, and then the project's verify command, in a worktree.
 //!
 //! Both run without push credentials, in their own process group, under a
-//! timeout. Only `claude` is supported so far; see `docs/dev/design.md`.
+//! timeout. Which agent runs, and how it is invoked, is a record in the
+//! store: see `worker.rs`.
 
 use std::fs::File;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-
-pub const AGENT: &str = "claude";
 
 /// Removes what lets a child push. It stops an accidental push, not a
 /// determined process.
@@ -65,24 +64,11 @@ pub fn run_limited(mut cmd: Command, log: &Path, timeout: Duration) -> std::io::
     })
 }
 
-/// `claude -p` that may edit files and run `verify`, and nothing else
-/// without a rule in the user's own settings.
-pub fn claude(prompt: &str, budget_usd: f64, verify: Option<&str>) -> Command {
-    let mut cmd = Command::new(AGENT);
-    cmd.args(["-p", prompt, "--output-format", "json"])
-        .args(["--permission-mode", "acceptEdits"])
-        .args(["--max-budget-usd", &budget_usd.to_string()]);
-    let rules = verify.map(bash_rules).unwrap_or_default();
-    if !rules.is_empty() {
-        cmd.arg("--allowedTools").args(rules);
-    }
-    cmd
-}
-
-/// One exact `Bash(...)` rule per subcommand. Claude Code checks each part of
-/// a compound command against the rules separately. Quoting is not parsed: a
-/// rule that fails to match only denies the agent that command.
-fn bash_rules(command: &str) -> Vec<String> {
+/// The subcommands of a compound command. Claude Code checks each part of
+/// `a && b` against its rules separately, so an allowlist needs one rule per
+/// part. Quoting is not parsed: a rule that fails to match only denies the
+/// agent that command.
+pub fn bash_parts(command: &str) -> Vec<String> {
     // `>&` and `&>` are redirections, not separators.
     let command = command.replace(">&", "\u{0}").replace("&>", "\u{1}");
     command
@@ -90,7 +76,6 @@ fn bash_rules(command: &str) -> Vec<String> {
         .split(['\n', ';', '|', '&'])
         .map(|part| part.trim().replace('\u{0}', ">&").replace('\u{1}', "&>"))
         .filter(|part| !part.is_empty())
-        .map(|part| format!("Bash({part})"))
         .collect()
 }
 
@@ -198,27 +183,17 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_may_run_the_verify_command() {
-        let args = |verify| {
-            claude("do it", 0.5, verify)
-                .get_args()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-        };
-        assert!(
-            args(Some("make test")).ends_with(&["--allowedTools".into(), "Bash(make test)".into()])
-        );
-        assert!(!args(None).contains(&"--allowedTools".to_string()));
+    fn a_compound_verify_command_splits_into_its_parts() {
         assert_eq!(
-            bash_rules("make check && uv run pytest -q 2>&1 | tail -5; cargo test &> log"),
+            bash_parts("make check && uv run pytest -q 2>&1 | tail -5; cargo test &> log"),
             [
-                "Bash(make check)",
-                "Bash(uv run pytest -q 2>&1)",
-                "Bash(tail -5)",
-                "Bash(cargo test &> log)"
+                "make check",
+                "uv run pytest -q 2>&1",
+                "tail -5",
+                "cargo test &> log"
             ]
         );
-        assert_eq!(bash_rules("a || b |& c"), ["Bash(a)", "Bash(b)", "Bash(c)"]);
+        assert_eq!(bash_parts("a || b |& c"), ["a", "b", "c"]);
     }
 
     #[test]

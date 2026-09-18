@@ -39,9 +39,12 @@ pub fn review_reasons(run: &Run) -> Vec<String> {
     let Some(class) = run.class else {
         return vec!["dispatched before classes existed".into()];
     };
-    if !matches!(class, Class::Mechanical | Class::Specified) {
+    // A- is an ordinary run to read; what it may never be is unattended, and
+    // a policy document cannot even name that. C and D need a judgment no
+    // check supplies.
+    if matches!(class, Class::Judgment | Class::Never) {
         reasons.push(format!(
-            "class {} is never accepted without review",
+            "class {} needs a judgment no check makes",
             class.name()
         ));
     }
@@ -82,6 +85,13 @@ pub fn review_reasons(run: &Run) -> Vec<String> {
                 }
             }
         }
+    }
+    // `agent_budget` admits runs; it does not cap spend. A worker that
+    // overshoots is worth reading, not silently accepted.
+    if let (Some(cost), Some(budget)) = (run.cost_usd, run.agent_budget)
+        && cost > budget + 1e-9
+    {
+        reasons.push(format!("cost ${cost:.2} over the ${budget:.2} run budget"));
     }
     reasons.extend(verify_reason(run, class));
     reasons
@@ -210,6 +220,23 @@ mod tests {
         assert!(review_reasons(&run)[0].contains("changed nothing"));
     }
 
+    /// The budget admits runs; it is not a spend cap, and a worker that
+    /// exceeded it says so rather than passing quietly.
+    #[test]
+    fn a_run_over_its_budget_is_read() {
+        let mut run = ready(Class::Mechanical, Some(true), Some(true));
+        run.agent_budget = Some(0.05);
+        run.cost_usd = Some(0.09);
+        let r = review_reasons(&run);
+        assert_eq!(r, ["cost $0.09 over the $0.05 run budget"], "{r:?}");
+
+        run.cost_usd = Some(0.05);
+        assert!(review_reasons(&run).is_empty(), "at the budget, not over");
+        // A worker that reports no cost cannot be over it.
+        run.cost_usd = None;
+        assert!(review_reasons(&run).is_empty());
+    }
+
     #[test]
     fn a_run_that_is_not_ready_says_so() {
         let mut run = ready(Class::Mechanical, Some(true), Some(true));
@@ -218,14 +245,21 @@ mod tests {
     }
 
     #[test]
-    fn judgment_and_privileged_classes_are_never_clean() {
-        for class in [Class::Privileged, Class::Judgment, Class::Never] {
+    fn judgment_classes_are_never_clean() {
+        for class in [Class::Judgment, Class::Never] {
             let run = ready(class, Some(true), Some(true));
             let r = review_reasons(&run);
-            assert!(
-                r[0].contains("never accepted without review"),
-                "{class:?}: {r:?}"
-            );
+            assert!(r[0].contains("needs a judgment"), "{class:?}: {r:?}");
         }
+    }
+
+    /// A workflow edit is read like any other run. It is refused only for
+    /// unattended publication, which `route::Policy` will not parse.
+    #[test]
+    fn a_privileged_run_can_still_be_clean_to_read() {
+        let mut run = ready(Class::Privileged, Some(true), Some(true));
+        run.changed_paths = Some(vec![".github/workflows/ci.yml".into()]);
+        let r = review_reasons(&run);
+        assert!(r.is_empty(), "{r:?}");
     }
 }

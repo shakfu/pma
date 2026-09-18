@@ -14,6 +14,7 @@ use crate::todo;
 /// resumes them. `done` sees each run with its outcome.
 pub fn ship(
     store: &Store,
+    home: &std::path::Path,
     cfg: &Config,
     runs: Vec<Run>,
     mut done: impl FnMut(&Run, &std::result::Result<String, String>),
@@ -27,7 +28,7 @@ pub fn ship(
             );
             continue;
         }
-        match ship_one(cfg, &run) {
+        match ship_one(home, cfg, &run) {
             Ok(outcome) => {
                 run.enter(match cfg.publish_for(&run.project) {
                     Publish::Push => RunState::Shipped,
@@ -59,10 +60,28 @@ pub fn ship(
     Ok(())
 }
 
-fn ship_one(cfg: &Config, run: &Run) -> Result<String> {
+fn ship_one(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
     let wt = &run.worktree;
     if !wt.is_dir() {
         return Err(format!("{} no longer exists", wt.display()).into());
+    }
+    // What was approved is what gets published, or nothing is. Once ship has
+    // committed, the head has moved and the content is its own; a resumed
+    // ship is recognised further down by its pushed commits.
+    let head = git(wt, &["rev-parse", "HEAD"]).ok();
+    if let Some(approved) = &run.approved_tree
+        && head == run.approved_head
+    {
+        let now = crate::dispatch::tree(run)?;
+        if &now != approved {
+            return Err(format!(
+                "the worktree changed after it was approved by {}; read \
+                 `pma review {}` and approve it again, or reject it",
+                run.approved_by.as_deref().unwrap_or("?"),
+                run.id
+            )
+            .into());
+        }
     }
     let publish = cfg.publish_for(&run.project);
     if publish == Publish::Pr && which("gh").is_none() {
@@ -98,7 +117,7 @@ fn ship_one(cfg: &Config, run: &Run) -> Result<String> {
 
     // After the rebase, so ticks on nearby lines by tasks shipped together do
     // not conflict.
-    if !crate::dispatch::is_signal(&run.task_key) {
+    if !crate::dispatch::without_item(&run.task_key) {
         let path = wt.join("TODO.md");
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -114,6 +133,33 @@ fn ship_one(cfg: &Config, run: &Run) -> Result<String> {
     }
     if git(wt, &["rev-list", "--count", &format!("{upstream}..HEAD")])? == "0" {
         return Err("nothing to ship: no changes".into());
+    }
+    // The rebase merged other work into this tree, and the tick above added
+    // a line. Two changes that each pass against the same base can fail
+    // together, and a clean rebase is not a semantic one.
+    if let Some(command) = &run.verify {
+        let timeout = std::time::Duration::from_secs(cfg.timeout as u64 * 60);
+        let empty = home.join("empty");
+        let log = home
+            .join("runs")
+            .join(run.id.to_string())
+            .join("verify-ship.log");
+        let _ = std::fs::create_dir_all(&empty);
+        let _ = std::fs::create_dir_all(log.parent().unwrap_or(&empty));
+        match crate::dispatch::verify_once(command, wt, &empty, &log, timeout) {
+            Ok((Some(true), _)) => {}
+            Ok((Some(false), _)) => {
+                return Err(format!(
+                    "`{command}` failed on the integrated tree; see {}",
+                    log.display()
+                )
+                .into());
+            }
+            Ok((None, _)) => {
+                return Err(format!("`{command}` timed out on the integrated tree").into());
+            }
+            Err(e) => return Err(format!("`{command}` could not run: {e}").into()),
+        }
     }
 
     let outcome = match publish {
@@ -237,7 +283,9 @@ fn message(cfg: &Config, run: &Run) -> String {
     if let Some(n) = run.gh {
         body.push(format!("Closes #{n}"));
     }
-    if cfg.attribution == Attribution::CoAuthor && run.agent == crate::agent::AGENT {
+    // Only a worker whose identity `pma` knows gets a trailer. Inventing an
+    // address for an unknown one would attribute the commit to nobody.
+    if cfg.attribution == Attribution::CoAuthor && run.agent == "claude" {
         body.push("Co-Authored-By: Claude <noreply@anthropic.com>".into());
     }
     if body.is_empty() {

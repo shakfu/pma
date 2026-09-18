@@ -203,6 +203,7 @@ mod tests {
                 due: None,
                 tagged_urgent: false,
                 signal_urgent: false,
+                eligible: false,
                 age_days: 3,
             },
             importance: 0.5,

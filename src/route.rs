@@ -63,6 +63,13 @@ pub struct Route {
     /// For reading a replay. Defaults to the route's position.
     pub name: String,
     pub classes: Option<Vec<Class>>,
+    /// Workflow nodes this route serves: a qualified name, or `*/leaf` to
+    /// match one node wherever it was called from. `None` matches only a
+    /// dispatch that names no node, so an existing policy keeps its behaviour
+    /// exactly rather than absorbing every node into its catch-all.
+    pub nodes: Option<Vec<String>>,
+    /// Laps the unit has completed, as an inclusive range.
+    pub lap: Option<(i64, i64)>,
     pub complexity: Option<(i64, i64)>,
     pub tier: Option<(i64, i64)>,
     pub agent: Option<String>,
@@ -77,10 +84,15 @@ pub struct Route {
 /// run, so a replay reads these back rather than re-deriving them from a
 /// task that may since have been edited or rescanned.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Subject {
+pub struct Subject<'a> {
     pub class: Class,
     pub complexity: i64,
     pub tier: Option<u8>,
+    /// The qualified workflow node this dispatch serves, or `None` for a task
+    /// dispatched on its own.
+    pub node: Option<&'a str>,
+    /// Laps the unit had completed. 0 outside a workflow.
+    pub lap: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -88,8 +100,33 @@ pub struct Policy {
     pub routes: Vec<Route>,
 }
 
+/// A node condition matches an exact qualified name, or `*/leaf` against the
+/// name's last segment. Two forms, both readable; no glob language.
+fn node_matches(pattern: &str, node: &str) -> bool {
+    match pattern.strip_prefix("*/") {
+        Some(leaf) => node.rsplit('/').next() == Some(leaf),
+        None => pattern == node,
+    }
+}
+
 impl Route {
-    fn matches(&self, s: &Subject) -> bool {
+    fn matches(&self, s: &Subject<'_>) -> bool {
+        // Node is a partition rather than a filter: a route that states none
+        // serves task dispatch alone.
+        match (&self.nodes, s.node) {
+            (None, None) => {}
+            (None, Some(_)) | (Some(_), None) => return false,
+            (Some(names), Some(node)) => {
+                if !names.iter().any(|n| node_matches(n, node)) {
+                    return false;
+                }
+            }
+        }
+        if let Some((lo, hi)) = self.lap
+            && !(lo..=hi).contains(&s.lap)
+        {
+            return false;
+        }
         if let Some(classes) = &self.classes
             && !classes.contains(&s.class)
         {
@@ -118,7 +155,7 @@ impl Route {
 impl Policy {
     /// The first route whose every stated condition holds. Order is the
     /// policy: a document is read top to bottom, like the file it came from.
-    pub fn route(&self, s: &Subject) -> Option<&Route> {
+    pub fn route(&self, s: &Subject<'_>) -> Option<&Route> {
         self.routes.iter().find(|r| r.matches(s))
     }
 
@@ -156,6 +193,12 @@ impl Policy {
                         "class".into(),
                         c.iter().map(|c| c.name()).collect::<Vec<_>>().into(),
                     );
+                }
+                if let Some(n) = &r.nodes {
+                    cond.insert("node".into(), n.clone().into());
+                }
+                if let Some((lo, hi)) = r.lap {
+                    cond.insert("lap".into(), format!("{lo}-{hi}").into());
                 }
                 if let Some((lo, hi)) = r.complexity {
                     cond.insert("complexity".into(), format!("{lo}-{hi}").into());
@@ -209,6 +252,25 @@ fn parse_route(i: usize, v: &Value) -> Result<Route, String> {
                 .collect::<Result<Vec<_>, String>>()?,
         ),
         other => return Err(at(format!("class must be a name or a list, not {other}"))),
+    };
+    let nodes = match &cond["node"] {
+        Value::Null => None,
+        Value::String(s) => Some(vec![s.clone()]),
+        Value::Array(a) => {
+            let names = a
+                .iter()
+                .map(|n| {
+                    n.as_str()
+                        .map(String::from)
+                        .ok_or_else(|| at("a node condition takes names".into()))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            if names.is_empty() {
+                return Err(at("an empty node list matches nothing".into()));
+            }
+            Some(names)
+        }
+        other => return Err(at(format!("node must be a name or a list, not {other}"))),
     };
     let range = |key: &str| -> Result<Option<(i64, i64)>, String> {
         match &cond[key] {
@@ -271,6 +333,8 @@ fn parse_route(i: usize, v: &Value) -> Result<Route, String> {
     let route = Route {
         name,
         classes,
+        nodes,
+        lap: range("lap")?,
         complexity: range("complexity")?,
         tier: range("tier")?,
         agent: v["agent"].as_str().map(String::from),
@@ -318,6 +382,8 @@ pub fn replay(policy: &Policy, runs: &[crate::store::Run]) -> (Vec<Difference>, 
             class,
             complexity,
             tier: run.tier,
+            node: run.node.as_deref(),
+            lap: run.lap,
         };
         let was = describe(
             run.route.as_deref(),
@@ -367,11 +433,21 @@ mod tests {
       ]
     }"#;
 
-    fn subject(class: Class, complexity: i64, tier: Option<u8>) -> Subject {
+    fn subject(class: Class, complexity: i64, tier: Option<u8>) -> Subject<'static> {
         Subject {
             class,
             complexity,
             tier,
+            node: None,
+            lap: 0,
+        }
+    }
+
+    fn at_node<'a>(node: &'a str, lap: i64) -> Subject<'a> {
+        Subject {
+            node: Some(node),
+            lap,
+            ..subject(Class::Specified, 3, Some(1))
         }
     }
 
@@ -387,6 +463,45 @@ mod tests {
         assert_eq!(named(subject(Class::Specified, 3, Some(5))), "rest");
         // A condition that is not stated does not narrow anything.
         assert_eq!(named(subject(Class::Judgment, 5, None)), "rest");
+    }
+
+    /// Node is a partition, not a filter: an existing policy keeps serving
+    /// task dispatch and does not absorb a workflow's nodes into its
+    /// catch-all, which would route them at whatever approval it names.
+    #[test]
+    fn a_node_route_and_a_task_route_do_not_overlap() {
+        let doc = r#"{
+          "route": [
+            {"name": "audits", "match": {"node": "*/audit"}, "model": "opus", "approval": "each"},
+            {"name": "fixes", "match": {"node": ["repair/fix"], "lap": "1-2"},
+             "model": "sonnet", "approval": "batch"},
+            {"name": "tasks", "match": {}, "approval": "propose"}
+          ]
+        }"#;
+        let p = Policy::parse(doc).unwrap();
+        let named = |s: Subject<'_>| p.route(&s).map(|r| r.name.clone());
+
+        // A task names no node, so only the node-less route serves it.
+        assert_eq!(
+            named(subject(Class::Specified, 3, Some(1))).as_deref(),
+            Some("tasks")
+        );
+        // A node is served by a node route, and never by the catch-all.
+        assert_eq!(named(at_node("issues/audit", 0)).as_deref(), Some("audits"));
+        assert_eq!(named(at_node("repair/fix", 1)).as_deref(), Some("fixes"));
+        // `*/audit` matches the leaf wherever it was called from; an exact
+        // name does not.
+        assert_eq!(named(at_node("other/audit", 0)).as_deref(), Some("audits"));
+        assert_eq!(named(at_node("other/fix", 1)), None, "no route serves it");
+        // Lap narrows: the first attempt at `repair/fix` matches nothing.
+        assert_eq!(named(at_node("repair/fix", 0)), None);
+    }
+
+    #[test]
+    fn an_empty_node_list_is_refused() {
+        let e =
+            Policy::parse(r#"{"route":[{"match":{"node":[]},"approval":"each"}]}"#).unwrap_err();
+        assert!(e.contains("matches nothing"), "{e}");
     }
 
     /// A route that asks about tier cannot match a project without one.
@@ -405,6 +520,8 @@ mod tests {
             routes: vec![Route {
                 name: "narrow".into(),
                 classes: Some(vec![Class::Mechanical]),
+                nodes: None,
+                lap: None,
                 complexity: None,
                 tier: None,
                 agent: None,

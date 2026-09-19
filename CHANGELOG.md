@@ -4,6 +4,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+**`pma workflow check`, and the workflow document behind it.** A workflow is a typed, parameterised function over bags of units: a graph whose nodes apply one of five primitives and whose edges decide, by rule, where each unit goes next. `check` reads a document, refuses what it cannot apply exactly -- a type disagreement across an edge, a `0..n` node with no unit cap, a cycle that is not a declared lap edge, a lap edge with no terminal path, declared effects that differ from the graph's -- and prints the worst-case runs and cost per node. The bound is computed at every parameter's declared maximum, so it does not depend on what an invocation passes; `activate` will refuse a document above it. Nothing is stored and nothing runs yet. Design: `docs/dev/workflows.md`.
+
+A document may be written as JSON or built by a Rhai script, which is a second way to write the same thing: the script's value is converted to JSON and read by the same validator, and `--emit-json` prints it. A script applies one combinator per primitive to a graph value that carries its own output port, so a stage is wired by application and no node's name is repeated in an edge. A reusable piece of a graph is then an ordinary function, and a fan-out is a list of them:
+
+```rhai
+fn reviewer(node, what) {
+    |g| g.expand(node, "finding", "{$breadth}",
+                 "Review `{name}` for " + what + ". Write findings to {out}.")
+}
+
+let graph = source("project")
+    .fan([reviewer("bugs", "correctness bugs"), reviewer("tests", "missing tests")])
+    .join("merge", ["title"])
+    .filter("confirm", ["reason"], "Confirm each unit in {in}.")
+    .output();
+```
+
+`pma workflow propose` stores a document as a draft revision, normalised as `pma` read it, with the script that built it kept beside it for provenance: a revision reads back as JSON whichever form wrote it. `pma workflow activate` refuses a revision whose worst case per unit of input exceeds the new `workflow_budget` setting, naming both figures. A route may now match on `node` and `lap`, where a route stating no node serves task dispatch alone, so an existing policy's catch-all cannot absorb a workflow's nodes; `*/fix` matches that node wherever it was called from. Schema 20 adds the `workflows`, `workflow_instances`, `workflow_units`, `workflow_moves` and `workflow_verdicts` tables, and `workflow_instance`, `node`, `unit` and `lap` on `runs`.
+
+`effects` is inferred from the graph unless stated, since the builder knows whether an `edit` or an `emit` is present; a workflow that invokes another states its own, because a callee's effects are not visible from the caller.
+
+A script builds a document and nothing else: it never runs during a pass, sees no unit and decides no guard, because a graph whose shape a script chose could not be costed before it was activated. `rhai` is compiled without a clock and without modules, `eval` is disabled, and the operation, depth and size limits are set, so one script yields one document on every machine.
+
 ## [0.2.0]
 
 ### Added

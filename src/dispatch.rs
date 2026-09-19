@@ -319,6 +319,10 @@ pub fn prepare(
         class,
         complexity,
         tier: pick.tier,
+        // A task dispatched on its own names no node, which is what a route
+        // stating no node condition serves.
+        node: None,
+        lap: 0,
     };
     let active = store.active_route()?;
     let mut routed = (None, None, None, None, class.scope());
@@ -405,6 +409,11 @@ pub fn prepare(
         approved_tree: None,
         approved_head: None,
         approved_by: None,
+        // Set by the workflow pass; a task dispatched on its own has none.
+        workflow_instance: None,
+        node: None,
+        unit: None,
+        lap: 0,
     };
     run.prompt = prompt(&run, &details, verify.as_deref());
     store.insert_run(&mut run)?;
@@ -1159,6 +1168,10 @@ mod tests {
             approved_tree: None,
             approved_head: None,
             approved_by: None,
+            workflow_instance: None,
+            node: None,
+            unit: None,
+            lap: 0,
         };
         let p = prompt(&run, "for all classes\n", Some("make test"));
         assert!(p.contains("`cynn`"));

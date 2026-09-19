@@ -16,6 +16,7 @@ mod report;
 mod report_runs;
 mod route;
 mod scan;
+mod script;
 mod ship;
 mod store;
 mod sync;
@@ -199,10 +200,10 @@ enum Command {
         #[command(subcommand)]
         action: Option<RouteAction>,
     },
-    /// Workflow documents: read one, and print what it can cost at worst.
+    /// Workflow documents: read one, store a revision, put one into effect.
     Workflow {
         #[command(subcommand)]
-        action: WorkflowAction,
+        action: Option<WorkflowAction>,
     },
     /// List the workers `pma dispatch` can run, or change one.
     Agent {
@@ -382,14 +383,36 @@ enum RouteAction {
 
 #[derive(Subcommand)]
 enum WorkflowAction {
+    /// Store a document as a draft revision, printing its worst case.
+    Propose {
+        /// A workflow file: JSON, or a Rhai script (`.rhai`) that builds one.
+        file: String,
+        /// Who proposed it; defaults to the local user.
+        #[arg(long)]
+        by: Option<String>,
+    },
+    /// Put a revision into effect, unless its worst case exceeds
+    /// `workflow_budget`.
+    Activate {
+        revision: i64,
+        /// Who approved it; defaults to the local user.
+        #[arg(long)]
+        by: Option<String>,
+    },
+    /// Print a revision's document, as `pma` read it.
+    Show { revision: Option<i64> },
     /// Read a document and print the worst case each workflow can cost.
     /// Nothing is stored and nothing runs.
     Check {
-        /// A JSON workflow file, or `-` for stdin.
+        /// A workflow file: JSON, or a Rhai script (`.rhai`) that builds one.
+        /// `-` reads stdin as JSON.
         file: String,
         /// Size of the argument bag the estimate assumes.
         #[arg(long, default_value_t = 1, value_name = "N")]
         units: i64,
+        /// Print the document a script built, instead of the estimate.
+        #[arg(long)]
+        emit_json: bool,
     },
 }
 
@@ -1715,65 +1738,212 @@ fn run_campaign(name: &str, count: Option<usize>) -> Result<()> {
 }
 
 /// A policy document from a file, stdin, or a stored revision number.
-fn workflow_command(action: WorkflowAction) -> Result<()> {
+/// A document from a file: a script builds one, JSON is read as one. Both end
+/// up as the same `Document`, so everything downstream is one path.
+fn workflow_document(file: &str) -> Result<(workflow::Document, Option<String>)> {
+    let text = if file == "-" {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+        text
+    } else {
+        std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?
+    };
+    if file.ends_with(".rhai") {
+        Ok((workflow::Document::from_script(&text, file)?, Some(text)))
+    } else {
+        Ok((workflow::Document::parse(&text)?, None))
+    }
+}
+
+/// Per node, and the total. `units` is the argument bag the estimate assumes.
+fn workflow_estimate(
+    doc: &workflow::Document,
+    w: &workflow::Workflow,
+    units: i64,
+    budget: f64,
+) -> Result<workflow::Estimate> {
+    let estimate = doc.estimate(&w.name, units, budget)?;
+    let effects = match w.effects.names().as_slice() {
+        [] => "pure".to_string(),
+        names => names.join(" "),
+    };
+    println!(
+        "{}(in: [{}]{}) -> [{}]  {effects}",
+        w.name,
+        w.input,
+        w.params
+            .iter()
+            .map(|(k, p)| format!(", {k} = {}", p.default))
+            .collect::<String>(),
+        w.output.as_deref().unwrap_or("")
+    );
+    let mut rows = vec![
+        ["node", "op", "in", "out", "runs", "agent runs"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<_>>(),
+    ];
+    for b in &estimate.per_node {
+        let op = match w.node(&b.node).map(|n| &n.op) {
+            Some(workflow::Op::Map(m)) => format!("map {}", m.out.name()),
+            Some(op) => op.name().to_string(),
+            None => String::new(),
+        };
+        rows.push(vec![
+            b.node.clone(),
+            op,
+            b.units_in.to_string(),
+            b.units_out.to_string(),
+            b.runs.to_string(),
+            b.agent_runs.to_string(),
+        ]);
+    }
+    print!("{}", report::table(&rows, "  "));
+    println!(
+        "  worst case: {} agent runs, {} edits, ${:.2} at ${:.2} per run\n",
+        estimate.agent_runs, estimate.edits, estimate.cost, budget
+    );
+    Ok(estimate)
+}
+
+fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
+    let Some(action) = action else {
+        let store = Store::open_default()?;
+        let revisions = store.workflow_revisions()?;
+        if revisions.is_empty() {
+            println!(
+                "no workflow revisions. `pma workflow check <file>` reads a document, \n\
+                 `pma workflow propose <file>` stores one."
+            );
+            return Ok(());
+        }
+        let rows: Vec<Vec<String>> = revisions
+            .iter()
+            .map(|r| {
+                let state = match r.activated_at {
+                    None => "draft".to_string(),
+                    Some(_) => format!("active, by {}", r.activated_by.as_deref().unwrap_or("?")),
+                };
+                let names = r
+                    .document()
+                    .map(|d| {
+                        d.workflows
+                            .iter()
+                            .map(|w| w.name.clone())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                vec![
+                    format!("{}", r.revision),
+                    state,
+                    names,
+                    match (r.worst_case_runs, r.worst_case_cost) {
+                        (Some(runs), Some(cost)) => format!("<= {runs} runs, ${cost:.2} per unit"),
+                        _ => String::new(),
+                    },
+                    format!("proposed by {}", r.proposed_by),
+                    report::ago(dates::now() - r.created_at),
+                ]
+            })
+            .collect();
+        print!("{}", report::table(&rows, ""));
+        return Ok(());
+    };
     match action {
-        WorkflowAction::Check { file, units } => {
-            let text = if file == "-" {
-                let mut text = String::new();
-                std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
-                text
-            } else {
-                std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?
-            };
-            let doc = workflow::Document::parse(&text)?;
+        WorkflowAction::Check {
+            file,
+            units,
+            emit_json,
+        } => {
+            if emit_json {
+                if !file.ends_with(".rhai") {
+                    return Err(
+                        "--emit-json prints what a script built; this is already JSON".into(),
+                    );
+                }
+                let text = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&script::script_json(&text, &file)?)?
+                );
+                return Ok(());
+            }
+            let (doc, _) = workflow_document(&file)?;
             // A document is read without a store when there is none; the
             // budget only scales the estimate.
             let budget = Store::open_default()
                 .and_then(|s| load_config(&s))
                 .map_or(Config::default().agent_budget, |c| c.agent_budget);
             for w in &doc.workflows {
-                let estimate = doc.estimate(&w.name, units, budget)?;
-                let effects = match w.effects.names().as_slice() {
-                    [] => "pure".to_string(),
-                    names => names.join(" "),
-                };
-                println!(
-                    "{}(in: [{}]{}) -> [{}]  {effects}",
-                    w.name,
-                    w.input,
-                    w.params
-                        .iter()
-                        .map(|(k, p)| format!(", {k} = {}", p.default))
-                        .collect::<String>(),
-                    w.output.as_deref().unwrap_or("")
-                );
-                let mut rows = vec![
-                    ["node", "op", "in", "out", "runs", "agent runs"]
-                        .iter()
-                        .map(|s| (*s).to_string())
-                        .collect::<Vec<_>>(),
-                ];
-                for b in &estimate.per_node {
-                    let op = match w.node(&b.node).map(|n| &n.op) {
-                        Some(workflow::Op::Map(m)) => format!("map {}", m.out.name()),
-                        Some(op) => op.name().to_string(),
-                        None => String::new(),
-                    };
-                    rows.push(vec![
-                        b.node.clone(),
-                        op,
-                        b.units_in.to_string(),
-                        b.units_out.to_string(),
-                        b.runs.to_string(),
-                        b.agent_runs.to_string(),
-                    ]);
-                }
-                print!("{}", report::table(&rows, "  "));
-                println!(
-                    "  worst case: {} agent runs, {} edits, ${:.2} at ${:.2} per run\n",
-                    estimate.agent_runs, estimate.edits, estimate.cost, budget
-                );
+                workflow_estimate(&doc, w, units, budget)?;
             }
+            Ok(())
+        }
+        WorkflowAction::Propose { file, by } => {
+            let store = Store::open_default()?;
+            let cfg = load_config(&store)?;
+            let (doc, source) = workflow_document(&file)?;
+            // Over one unit of input: the argument bag is not known until a
+            // pass names its target, so the stored figure is per unit and a
+            // pass multiplies it.
+            let mut runs = 0;
+            let mut cost = 0.0f64;
+            for w in &doc.workflows {
+                let estimate = workflow_estimate(&doc, w, 1, cfg.agent_budget)?;
+                runs = runs.max(estimate.agent_runs);
+                cost = cost.max(estimate.cost);
+            }
+            let n = store.add_workflow_revision(
+                &doc,
+                source.as_deref(),
+                &by.unwrap_or_else(whoami),
+                runs,
+                cost,
+            )?;
+            println!(
+                "revision {n} stored as a draft: at most ${cost:.2} per unit of input.\n\
+                 `pma workflow activate {n}` puts it in effect."
+            );
+            Ok(())
+        }
+        WorkflowAction::Activate { revision, by } => {
+            let store = Store::open_default()?;
+            let cfg = load_config(&store)?;
+            let found = store
+                .workflow_revisions()?
+                .into_iter()
+                .find(|r| r.revision == revision)
+                .ok_or_else(|| format!("no workflow revision {revision}"))?;
+            // The ceiling is per unit of input, and it is checked here rather
+            // than at parse: the document is not wrong, the budget is a
+            // setting.
+            if let Some(cost) = found.worst_case_cost
+                && cost > cfg.workflow_budget
+            {
+                return Err(format!(
+                    "revision {revision} could cost ${cost:.2} per unit of input, over \
+                     workflow_budget of ${:.2}. Lower a cap, or raise the budget with \
+                     `pma config workflow_budget <n>`.",
+                    cfg.workflow_budget
+                )
+                .into());
+            }
+            store.activate_workflow(revision, &by.unwrap_or_else(whoami))?;
+            println!("revision {revision} is in effect");
+            Ok(())
+        }
+        WorkflowAction::Show { revision } => {
+            let store = Store::open_default()?;
+            let found = match revision {
+                Some(n) => store
+                    .workflow_revisions()?
+                    .into_iter()
+                    .find(|r| r.revision == n),
+                None => store.active_workflow()?,
+            }
+            .ok_or("no such workflow revision; `pma workflow` lists them")?;
+            println!("{}", found.document);
             Ok(())
         }
     }

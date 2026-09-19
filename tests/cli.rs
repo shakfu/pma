@@ -1680,3 +1680,113 @@ fn the_flags_outrank_the_configured_agent_and_model() {
     env.ok(&["dispatch", "alpha:8"]);
     assert!(env.ok(&["review", "3"]).contains("model=haiku"), "haiku");
 }
+
+/// A workflow document, in both its forms, through the store: a script and the
+/// JSON it generates are one revision, and the worst case is what `activate`
+/// weighs against the budget.
+#[test]
+fn a_workflow_document_is_a_draft_until_its_cost_is_accepted() {
+    let s = Scratch::new("workflow");
+    let home = s.0.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_pma"))
+            .env("PMA_HOME", &home)
+            .args(args)
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.success(),
+        )
+    };
+
+    let script = s.0.join("lib.rhai");
+    fs::write(
+        &script,
+        r#"
+        fn reviewer(node, what) {
+            |g| g.expand(node, "finding", "{$breadth}",
+                         "Review `{name}` for " + what + ". Write findings to {out}.")
+        }
+        let graph = source("project")
+            .fan([reviewer("bugs", "correctness"), reviewer("tests", "coverage")])
+            .join("merge", ["title"])
+            .filter("confirm", ["reason"], "Confirm each unit in {in}.")
+            .output();
+        document(#{ finding: #{ fields: #{
+            title: req(unique(line(200))),
+            reason: line(200),
+        }}}, [
+            workflow("look", graph, #{
+                params: #{ breadth: bounded("int", 4, 6) },
+                caps: #{ max_units: 40, max_edits: 0 },
+            }),
+        ])
+        "#,
+    )
+    .unwrap();
+
+    assert!(run(&["workflow"]).0.contains("no workflow revisions"));
+
+    // The script's document is checked and costed like any other: two
+    // reviewers at the parameter's maximum, then one confirm per finding.
+    let (out, err, ok) = run(&["workflow", "check", script.to_str().unwrap()]);
+    assert!(ok, "{err}");
+    assert!(
+        out.contains("look(in: [project], breadth = 4) -> [finding]  pure"),
+        "{out}"
+    );
+    assert!(
+        out.contains("worst case: 14 agent runs, 0 edits, $14.00"),
+        "{out}"
+    );
+
+    // The same document, emitted as JSON, is the same document.
+    let (json, err, ok) = run(&["workflow", "check", script.to_str().unwrap(), "--emit-json"]);
+    assert!(ok, "{err}");
+    let from_json = s.0.join("lib.json");
+    fs::write(&from_json, &json).unwrap();
+    let (a, _, _) = run(&["workflow", "check", from_json.to_str().unwrap()]);
+    assert_eq!(a, out, "the generated document estimates the same");
+
+    // Proposing stores it as a draft, with its cost per unit of input.
+    let (out, err, ok) = run(&[
+        "workflow",
+        "propose",
+        script.to_str().unwrap(),
+        "--by",
+        "me",
+    ]);
+    assert!(ok, "{err}");
+    assert!(
+        out.contains("revision 1 stored as a draft: at most $14.00"),
+        "{out}"
+    );
+    let listed = run(&["workflow"]).0;
+    assert!(
+        listed.contains("draft") && listed.contains("look"),
+        "{listed}"
+    );
+
+    // A budget below the worst case refuses activation, naming both numbers.
+    run(&["config", "workflow_budget", "10"]);
+    let (_, err, ok) = run(&["workflow", "activate", "1", "--by", "me"]);
+    assert!(!ok, "a revision over budget must not activate");
+    assert!(err.contains("$14.00") && err.contains("$10.00"), "{err}");
+    assert!(run(&["workflow"]).0.contains("draft"), "still a draft");
+
+    run(&["config", "workflow_budget", "20"]);
+    let (out, err, ok) = run(&["workflow", "activate", "1", "--by", "me"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("in effect"), "{out}");
+    assert!(run(&["workflow"]).0.contains("active, by me"));
+
+    // The stored form is the document, whichever form wrote it, so a script's
+    // revision reads back without the script.
+    let shown = run(&["workflow", "show"]).0;
+    assert!(shown.contains("\"name\": \"look\""), "{shown}");
+    assert!(shown.contains("\"max_units\": \"{$breadth}\""), "{shown}");
+    assert!(!shown.contains("fan("), "the script is not the document");
+}

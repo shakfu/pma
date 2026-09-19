@@ -1556,6 +1556,340 @@ impl Document {
     }
 }
 
+// ---------------------------------------------------------------- normalising
+
+impl Count {
+    fn to_json(&self) -> Value {
+        match self {
+            Count::Fixed(n) => Value::from(*n),
+            Count::Param(p) => Value::from(format!("{{${p}}}")),
+        }
+    }
+}
+
+impl FieldType {
+    fn write(&self, m: &mut serde_json::Map<String, Value>) {
+        match self {
+            FieldType::Line { max, unique } => {
+                m.insert("type".into(), "line".into());
+                m.insert("max".into(), Value::from(*max));
+                if *unique {
+                    m.insert("unique".into(), "normalised".into());
+                }
+            }
+            FieldType::Lines { max } => {
+                m.insert("type".into(), "lines".into());
+                m.insert("max".into(), Value::from(*max));
+            }
+            FieldType::Enum { values } => {
+                m.insert("type".into(), "enum".into());
+                m.insert("values".into(), values.clone().into());
+            }
+            FieldType::List => {
+                m.insert("type".into(), "list".into());
+            }
+            FieldType::Int { min, max } => {
+                m.insert("type".into(), "int".into());
+                if let Some(n) = min {
+                    m.insert("min".into(), Value::from(*n));
+                }
+                if let Some(n) = max {
+                    m.insert("max".into(), Value::from(*n));
+                }
+            }
+            FieldType::Bool => {
+                m.insert("type".into(), "bool".into());
+            }
+        }
+    }
+}
+
+impl Guard {
+    fn to_json(&self) -> Value {
+        let mut m = serde_json::Map::new();
+        for (key, test) in &self.0 {
+            let name = match key {
+                Key::Field(f) => f.clone(),
+                Key::System(s) => format!("@{s}"),
+            };
+            m.insert(
+                name,
+                match test {
+                    Test::In(values) => values.clone().into(),
+                    Test::Compare(cmp, c) => {
+                        let op = match cmp {
+                            Cmp::Eq => "==",
+                            Cmp::Lt => "<",
+                            Cmp::Le => "<=",
+                            Cmp::Gt => ">",
+                            Cmp::Ge => ">=",
+                        };
+                        serde_json::json!({op: c.to_json()})
+                    }
+                    Test::Present => "present".into(),
+                    Test::Absent => "absent".into(),
+                },
+            );
+        }
+        Value::Object(m)
+    }
+}
+
+impl Document {
+    /// The document as `pma` read it, with every default written out. A
+    /// revision is stored in this form, so two revisions diff by what they mean
+    /// rather than by how they were typed, and a document a script built reads
+    /// like one a person wrote.
+    pub fn to_json(&self) -> String {
+        let types: serde_json::Map<String, Value> = self
+            .types
+            .iter()
+            .map(|(name, ty)| {
+                let fields: serde_json::Map<String, Value> = ty
+                    .fields
+                    .iter()
+                    .map(|(field, decl)| {
+                        let mut m = serde_json::Map::new();
+                        decl.ty.write(&mut m);
+                        if decl.required {
+                            m.insert("required".into(), true.into());
+                        }
+                        (field.clone(), Value::Object(m))
+                    })
+                    .collect();
+                (
+                    name.clone(),
+                    serde_json::json!({"fields": Value::Object(fields)}),
+                )
+            })
+            .collect();
+        let workflows: Vec<Value> = self.workflows.iter().map(Workflow::to_json).collect();
+        let mut doc = serde_json::Map::new();
+        if !types.is_empty() {
+            doc.insert("types".into(), Value::Object(types));
+        }
+        doc.insert("workflow".into(), Value::Array(workflows));
+        serde_json::to_string_pretty(&Value::Object(doc)).unwrap_or_default()
+    }
+}
+
+impl Workflow {
+    fn to_json(&self) -> Value {
+        let params: serde_json::Map<String, Value> = self
+            .params
+            .iter()
+            .map(|(name, p)| {
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "type".into(),
+                    match &p.ty {
+                        ParamType::Name => "name",
+                        ParamType::Line => "line",
+                        ParamType::Int => "int",
+                        ParamType::Enum(_) => "enum",
+                        ParamType::Bool => "bool",
+                        ParamType::List => "list",
+                    }
+                    .into(),
+                );
+                if let ParamType::Enum(values) = &p.ty {
+                    m.insert("values".into(), values.clone().into());
+                }
+                m.insert("default".into(), p.default.clone());
+                if let Some(max) = p.max {
+                    m.insert("max".into(), Value::from(max));
+                }
+                (name.clone(), Value::Object(m))
+            })
+            .collect();
+        let mut w = serde_json::Map::new();
+        w.insert("name".into(), self.name.clone().into());
+        w.insert("in".into(), self.input.clone().into());
+        if let Some(out) = &self.output {
+            w.insert("out".into(), out.clone().into());
+        }
+        w.insert("effects".into(), self.effects.names().into());
+        w.insert("params".into(), Value::Object(params));
+        w.insert(
+            "caps".into(),
+            serde_json::json!({"max_units": self.caps.max_units, "max_edits": self.caps.max_edits}),
+        );
+        w.insert(
+            "nodes".into(),
+            self.nodes
+                .iter()
+                .map(Node::to_json)
+                .collect::<Vec<_>>()
+                .into(),
+        );
+        w.insert(
+            "edges".into(),
+            self.edges
+                .iter()
+                .map(Edge::to_json)
+                .collect::<Vec<_>>()
+                .into(),
+        );
+        Value::Object(w)
+    }
+}
+
+impl Retry {
+    fn to_json(&self) -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("max".into(), self.max.to_json());
+        m.insert("while".into(), self.predicate.clone().into());
+        if let Some(model) = &self.escalate {
+            m.insert("escalate".into(), serde_json::json!({"model": model}));
+        }
+        Value::Object(m)
+    }
+}
+
+impl Node {
+    fn to_json(&self) -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("name".into(), self.name.clone().into());
+        m.insert("op".into(), self.op.name().into());
+        m.insert("in".into(), self.input.clone().into());
+        let via = |m: &mut serde_json::Map<String, Value>, via: Via| {
+            m.insert(
+                "via".into(),
+                match via {
+                    Via::Agent => "agent",
+                    Via::Rule => "rule",
+                }
+                .into(),
+            );
+        };
+        match &self.op {
+            Op::Map(n) => {
+                via(&mut m, n.via);
+                m.insert("out".into(), n.out.name().into());
+                m.insert("emits".into(), n.emits.clone().into());
+                if !n.writes.is_empty() {
+                    m.insert("writes".into(), n.writes.clone().into());
+                }
+                if let Some(c) = &n.max_units {
+                    m.insert("max_units".into(), c.to_json());
+                }
+                if let Some(c) = &n.max_depth {
+                    m.insert("max_depth".into(), c.to_json());
+                }
+                if let Some(s) = &n.task {
+                    m.insert("task".into(), s.clone().into());
+                }
+                if let Some(s) = &n.rule {
+                    m.insert("rule".into(), s.clone().into());
+                }
+                if let Some(s) = &n.doc {
+                    m.insert("doc".into(), s.clone().into());
+                }
+                if n.publish {
+                    m.insert("publish".into(), true.into());
+                }
+                if let Some(r) = &n.retry {
+                    m.insert("retry".into(), r.to_json());
+                }
+            }
+            Op::Reduce(n) => {
+                via(&mut m, n.via);
+                m.insert("emits".into(), n.emits.clone().into());
+                if !n.group_by.is_empty() {
+                    m.insert("group_by".into(), n.group_by.clone().into());
+                }
+                if let Some(s) = &n.task {
+                    m.insert("task".into(), s.clone().into());
+                }
+                if let Some(s) = &n.rule {
+                    m.insert("rule".into(), s.clone().into());
+                }
+            }
+            Op::Edit(n) => {
+                m.insert("task".into(), n.task.clone().into());
+                if let Some(c) = &n.check {
+                    m.insert("check".into(), c.clone().into());
+                }
+                if let Some(r) = &n.retry {
+                    m.insert("retry".into(), r.to_json());
+                }
+            }
+            Op::Check { rule } => {
+                m.insert("rule".into(), rule.clone().into());
+            }
+            Op::Emit(n) => {
+                m.insert(
+                    "sink".into(),
+                    match n.sink {
+                        Sink::Todo => "todo",
+                        Sink::Note => "note",
+                        Sink::Doc => "doc",
+                    }
+                    .into(),
+                );
+                m.insert(
+                    "action".into(),
+                    match n.action {
+                        Action::Add => "add",
+                        Action::Tick => "tick",
+                        Action::Remove => "remove",
+                    }
+                    .into(),
+                );
+                m.insert(
+                    "map".into(),
+                    Value::Object(
+                        n.map
+                            .iter()
+                            .map(|(k, v)| (k.clone(), Value::from(v.clone())))
+                            .collect(),
+                    ),
+                );
+            }
+            Op::Call(n) => {
+                m.insert("workflow".into(), n.workflow.clone().into());
+                m.insert(
+                    "with".into(),
+                    Value::Object(n.with.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                );
+            }
+        }
+        Value::Object(m)
+    }
+}
+
+impl Edge {
+    fn to_json(&self) -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert(
+            "from".into(),
+            match &self.from {
+                From::Input => "@input".to_string(),
+                From::Node(n) => n.clone(),
+            }
+            .into(),
+        );
+        m.insert(
+            "to".into(),
+            match &self.to {
+                To::Output => "@output".to_string(),
+                To::Node(n) => n.clone(),
+            }
+            .into(),
+        );
+        if let Some(g) = &self.when {
+            m.insert("when".into(), g.to_json());
+        }
+        if self.default {
+            m.insert("default".into(), true.into());
+        }
+        if let Some(c) = &self.max_laps {
+            m.insert("max_laps".into(), c.to_json());
+        }
+        Value::Object(m)
+    }
+}
+
 // --------------------------------------------------------------------- bound
 
 /// What one node can cost at worst.
@@ -1849,6 +2183,21 @@ mod tests {
 
     fn doc() -> Document {
         Document::parse(FIND_ISSUES).expect("the library document parses")
+    }
+
+    /// A revision is stored as `pma` read it, so the stored form must read
+    /// back as the same document whichever form it arrived in.
+    #[test]
+    fn a_document_round_trips_through_its_stored_form() {
+        for text in [FIND_ISSUES, WITH_EDIT, COMPOSED] {
+            let doc = Document::parse(text).unwrap();
+            let stored = doc.to_json();
+            assert_eq!(
+                Document::parse(&stored),
+                Ok(doc),
+                "did not round trip:\n{stored}"
+            );
+        }
     }
 
     #[test]

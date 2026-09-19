@@ -38,6 +38,9 @@ pub struct Config {
     pub batch_budget: f64,
     /// USD one agent run may spend.
     pub agent_budget: f64,
+    /// The most a workflow revision's worst case may cost, per unit of input,
+    /// before `pma workflow activate` refuses it.
+    pub workflow_budget: f64,
     /// Minutes an agent run, or a verify run, may take.
     pub timeout: i64,
     pub projects: BTreeMap<String, ProjectSettings>,
@@ -115,6 +118,7 @@ impl Default for Config {
             max_parallel: 2,
             batch_budget: 5.0,
             agent_budget: 1.0,
+            workflow_budget: 25.0,
             timeout: 30,
             projects: BTreeMap::new(),
         }
@@ -216,6 +220,7 @@ impl Config {
                 "max_parallel",
                 "batch_budget",
                 "agent_budget",
+                "workflow_budget",
                 "timeout",
             ]
             .map(String::from),
@@ -356,6 +361,7 @@ impl Config {
                 "max_parallel" => Slot::Count(&mut self.max_parallel, 1),
                 "batch_budget" => Slot::Number(&mut self.batch_budget, 0.0),
                 "agent_budget" => Slot::Number(&mut self.agent_budget, 0.0),
+                "workflow_budget" => Slot::Number(&mut self.workflow_budget, 0.0),
                 "timeout" => Slot::Count(&mut self.timeout, 1),
                 _ => return None,
             },
@@ -428,7 +434,7 @@ mod tests {
     #[test]
     fn every_key_reads_and_round_trips() {
         let keys = Config::keys();
-        assert_eq!(keys.len(), 36);
+        assert_eq!(keys.len(), 37);
         let defaults = Config::default();
         let mut copy = Config::default();
         for key in &keys {

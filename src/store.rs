@@ -23,7 +23,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 19;
+const VERSION: i64 = 20;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -307,6 +307,74 @@ CREATE TABLE campaign_members (
 );
 ";
 
+/// Version 20. A workflow is a typed function over bags of units, stored as a
+/// revision and activated like a routing policy. Units are immutable and carry
+/// their lineage, so a lap, an annotation and a decomposition each leave a
+/// readable chain; a node's bag is derived from the units it wrote and the
+/// frontier from the moves recorded, so nothing holds a cursor a crash could
+/// lose. The worst case is stored with the revision, because what `activate`
+/// weighs against the budget must be what `propose` printed.
+const WORKFLOWS: &str = "
+CREATE TABLE workflows (
+    revision INTEGER PRIMARY KEY,
+    document TEXT NOT NULL,
+    source TEXT,
+    proposed_by TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    activated_at INTEGER,
+    activated_by TEXT,
+    worst_case_runs INTEGER,
+    worst_case_cost REAL
+);
+CREATE TABLE workflow_instances (
+    id INTEGER PRIMARY KEY,
+    workflow TEXT NOT NULL,
+    revision INTEGER NOT NULL REFERENCES workflows(revision),
+    args TEXT NOT NULL,
+    target TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    outcome TEXT
+);
+CREATE TABLE workflow_units (
+    instance INTEGER NOT NULL REFERENCES workflow_instances(id) ON DELETE CASCADE,
+    id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    node TEXT NOT NULL,
+    parent TEXT,
+    root TEXT NOT NULL,
+    depth INTEGER NOT NULL DEFAULT 0,
+    lap INTEGER NOT NULL DEFAULT 0,
+    project TEXT,
+    data TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (instance, id)
+);
+CREATE INDEX idx_workflow_units_root ON workflow_units(instance, root);
+CREATE TABLE workflow_moves (
+    instance INTEGER NOT NULL REFERENCES workflow_instances(id) ON DELETE CASCADE,
+    unit TEXT NOT NULL,
+    edge INTEGER NOT NULL,
+    taken INTEGER NOT NULL,
+    reason TEXT,
+    at INTEGER NOT NULL,
+    PRIMARY KEY (instance, unit, edge)
+);
+CREATE TABLE workflow_verdicts (
+    instance INTEGER NOT NULL REFERENCES workflow_instances(id) ON DELETE CASCADE,
+    unit TEXT NOT NULL,
+    check_name TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    detail TEXT,
+    at INTEGER NOT NULL,
+    PRIMARY KEY (instance, unit, check_name)
+);
+ALTER TABLE runs ADD COLUMN workflow_instance INTEGER;
+ALTER TABLE runs ADD COLUMN node TEXT;
+ALTER TABLE runs ADD COLUMN unit TEXT;
+ALTER TABLE runs ADD COLUMN lap INTEGER NOT NULL DEFAULT 0;
+";
+
 /// Version 19. A project's private tags, for grouping and for selecting a set
 /// to act on. A project carries several, so the tags cannot live in a column
 /// on its row. Kept out of `projects` for a second reason: a tag is the user's
@@ -497,6 +565,7 @@ impl Store {
                     SLUG,
                     ABSENCE,
                     PROJECT_TAGS,
+                    WORKFLOWS,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -876,9 +945,11 @@ impl Store {
                                class, scope, tier, description, agent_budget, timeout_minutes,
                                verify, verify_base_ok, verify_base_seconds, model,
                                complexity, features, estimator,
-                               route_revision, route, approval)
+                               route_revision, route, approval,
+                               workflow_instance, node, unit, lap)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                     ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
+                     ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
+                     ?31, ?32, ?33, ?34)",
             params![
                 run.project,
                 run.task_key,
@@ -910,6 +981,10 @@ impl Store {
                 run.route_revision,
                 run.route,
                 run.approval.map(Approval::name),
+                run.workflow_instance,
+                run.node,
+                run.unit,
+                run.lap,
             ],
         )?;
         run.id = self.conn.last_insert_rowid();
@@ -966,7 +1041,8 @@ impl Store {
                     class, scope, tier, description, agent_budget, timeout_minutes,
                     verify_base_ok, verify_base_seconds, changed_paths, scope_error, model,
                     complexity, features, estimator, route_revision, route, approval,
-                    approved_tree, approved_head, approved_by
+                    approved_tree, approved_head, approved_by,
+                    workflow_instance, node, unit, lap
              FROM runs ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1038,6 +1114,10 @@ impl Store {
                 approved_tree: r.get(46)?,
                 approved_head: r.get(47)?,
                 approved_by: r.get(48)?,
+                workflow_instance: r.get(49)?,
+                node: r.get(50)?,
+                unit: r.get(51)?,
+                lap: r.get(52)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1203,6 +1283,91 @@ impl Store {
     pub fn active_route(&self) -> Result<Option<RouteRevision>> {
         Ok(self
             .route_revisions()?
+            .into_iter()
+            .find(|r| r.activated_at.is_some()))
+    }
+
+    /// Stores a document as a draft. Refused here, so an unreadable one never
+    /// reaches the table, and stored normalised, so two revisions diff by what
+    /// they mean rather than by how they were typed -- or by whether a script
+    /// or a person wrote them. `source` keeps the script for provenance.
+    pub fn add_workflow_revision(
+        &self,
+        doc: &crate::workflow::Document,
+        source: Option<&str>,
+        by: &str,
+        worst_case_runs: i64,
+        worst_case_cost: f64,
+    ) -> Result<i64> {
+        let next: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(revision), 0) + 1 FROM workflows",
+            [],
+            |r| r.get(0),
+        )?;
+        self.conn.execute(
+            "INSERT INTO workflows
+                (revision, document, source, proposed_by, created_at,
+                 worst_case_runs, worst_case_cost)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                next,
+                doc.to_json(),
+                source,
+                by,
+                crate::dates::now(),
+                worst_case_runs,
+                worst_case_cost
+            ],
+        )?;
+        Ok(next)
+    }
+
+    /// Puts a revision into effect and retires any other. `by` is recorded:
+    /// what a workflow may spend is somebody's decision.
+    pub fn activate_workflow(&self, revision: i64, by: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let found = tx.execute(
+            "UPDATE workflows SET activated_at = ?2, activated_by = ?3 WHERE revision = ?1",
+            params![revision, crate::dates::now(), by],
+        )?;
+        if found == 0 {
+            return Err(format!("no workflow revision {revision}").into());
+        }
+        tx.execute(
+            "UPDATE workflows SET activated_at = NULL, activated_by = NULL WHERE revision <> ?1",
+            [revision],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every revision, oldest first.
+    pub fn workflow_revisions(&self) -> Result<Vec<WorkflowRevision>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT revision, document, source, proposed_by, created_at, activated_at,
+                    activated_by, worst_case_runs, worst_case_cost
+             FROM workflows ORDER BY revision",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(WorkflowRevision {
+                revision: r.get(0)?,
+                document: r.get(1)?,
+                source: r.get(2)?,
+                proposed_by: r.get(3)?,
+                created_at: r.get(4)?,
+                activated_at: r.get(5)?,
+                activated_by: r.get(6)?,
+                worst_case_runs: r.get(7)?,
+                worst_case_cost: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The revision in effect, if any.
+    pub fn active_workflow(&self) -> Result<Option<WorkflowRevision>> {
+        Ok(self
+            .workflow_revisions()?
             .into_iter()
             .find(|r| r.activated_at.is_some()))
     }
@@ -1567,6 +1732,15 @@ pub struct Run {
     /// that, a resumed ship is recognised by its own pushed commits.
     pub approved_head: Option<String>,
     pub approved_by: Option<String>,
+    /// The workflow instance that dispatched this run, or `None` for a task
+    /// dispatched on its own.
+    pub workflow_instance: Option<i64>,
+    /// The qualified node, which a route matches on and a report groups by.
+    pub node: Option<String>,
+    /// The unit that drove it.
+    pub unit: Option<String>,
+    /// Laps the unit had completed. 0 outside a workflow.
+    pub lap: i64,
 }
 
 impl Run {
@@ -1623,6 +1797,10 @@ impl Run {
             approved_tree: None,
             approved_head: None,
             approved_by: None,
+            workflow_instance: None,
+            node: None,
+            unit: None,
+            lap: 0,
         }
     }
 
@@ -1696,6 +1874,29 @@ pub struct RouteRevision {
     pub activated_by: Option<String>,
     /// Computed and recorded on each run, but not applied.
     pub shadow: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkflowRevision {
+    pub revision: i64,
+    /// The document as `pma` read it.
+    pub document: String,
+    /// The script that built it, where one did.
+    pub source: Option<String>,
+    pub proposed_by: String,
+    pub created_at: i64,
+    pub activated_at: Option<i64>,
+    pub activated_by: Option<String>,
+    /// Over one unit of input, so what a pass may spend is this times the
+    /// argument bag.
+    pub worst_case_runs: Option<i64>,
+    pub worst_case_cost: Option<f64>,
+}
+
+impl WorkflowRevision {
+    pub fn document(&self) -> Result<crate::workflow::Document> {
+        Ok(crate::workflow::Document::parse(&self.document)?)
+    }
 }
 
 impl RouteRevision {
@@ -2146,6 +2347,10 @@ mod tests {
             approved_tree: None,
             approved_head: None,
             approved_by: None,
+            workflow_instance: None,
+            node: None,
+            unit: None,
+            lap: 0,
         };
         store.insert_run(&mut run).unwrap();
         assert_eq!(store.run(run.id).unwrap(), run);

@@ -202,7 +202,9 @@ Database migrations do not define configuration compatibility. `with_overrides` 
 Rules for every retirement:
 
 - The migration deletes the stored row.
+
 - The name stays in a rejected-key list with a reason and a replacement, so `pma config <old>` explains rather than errors.
+
 - A key whose meaning changes gets a new name. Do not reinterpret an existing one.
 
 Retired so far: `dispatch_quadrants`, `overflow_quadrants`, and `stale_after.1` through `stale_after.5`. The `weights.*` group follows when the health score is cut.

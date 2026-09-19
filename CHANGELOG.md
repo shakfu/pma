@@ -4,6 +4,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.1]
+
+### Changed
+
+**The command list is grouped, and three project commands moved under one noun.** 24 commands listed alphabetically told a reader nothing about where to start. The listing now has six sections -- the loop, tasks, reading, setup, agents, many at once -- generated from clap's own metadata against a table, so a command missing from the table fails a test rather than vanishing from the help. A second test keeps every line inside 72 characters, which is why the one-liners are short and the long form stays in each command's own help.
+
+`pma tier`, `pma tag` and `pma forget` are now `pma project tier`, `pma project tag` and `pma project forget`: all three act on a project's record, none is in the common loop. `pma project` on its own lists the projects with their tier, tags and last scan. `scan`, `dispatch`, `review`, `ship` and `lint` did not move.
+
 ## [0.3.0]
 
 ### Added

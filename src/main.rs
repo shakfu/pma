@@ -30,11 +30,67 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use config::Config;
 use store::{Result, RunState, Session, Store};
 use todo::Priority;
+
+/// The commands, in the order someone reaching for one would look. Generated
+/// against clap's own list, so a command missing from here is a test failure
+/// rather than a command missing from the help.
+const GROUPS: [(&str, &[&str]); 6] = [
+    (
+        "The loop",
+        &["scan", "matrix", "dispatch", "review", "ship"],
+    ),
+    ("Tasks", &["lint", "prune", "stale", "sync", "note"]),
+    ("Reading", &["status", "report", "tui"]),
+    ("Setup", &["root", "project", "config"]),
+    ("Agents", &["agent", "preset", "route"]),
+    ("Many at once", &["campaign", "workflow"]),
+];
+
+/// The template that leaves the command list to `grouped_commands`.
+const HELP: &str = "\
+{about-with-newline}
+{usage-heading} {usage}{after-help}
+Options:
+{options}";
+
+/// One section per group, each command with the first line of its own help, so
+/// there is one place a description is written.
+fn grouped_commands(cmd: &clap::Command) -> String {
+    let width = cmd
+        .get_subcommands()
+        .map(|s| s.get_name().len())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    for (heading, names) in GROUPS {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(heading);
+        out.push('\n');
+        for name in names {
+            let Some(sub) = cmd.get_subcommands().find(|s| s.get_name() == *name) else {
+                continue;
+            };
+            let about = sub
+                .get_about()
+                .map(|a| a.to_string())
+                .unwrap_or_default()
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            out.push_str(&format!("  {name:width$}  {about}\n"));
+        }
+    }
+    out.push_str("\n`pma help <command>` explains one.\n");
+    out
+}
 
 #[derive(Parser)]
 #[command(name = "pma", version, about = "Maintain many projects from one place")]
@@ -53,7 +109,7 @@ enum Command {
         /// Files or directories; defaults to the current directory.
         paths: Vec<PathBuf>,
     },
-    /// Remove finished items and `Done` sections from TODO.md files.
+    /// Remove finished items and `Done` sections.
     ///
     /// Each path is a TODO.md file or a directory containing one. A file with
     /// lint errors is skipped. Edits stay uncommitted. Dry run unless --apply.
@@ -64,19 +120,17 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
-    /// List, add or remove the directories whose git repos are projects.
+    /// Directories whose git repos are projects.
     Root {
         #[command(subcommand)]
         action: Option<RootAction>,
     },
-    /// Show or set a project's tier: 1 (most important) to 5, or `none`.
-    Tier {
-        /// The project's directory name under a root.
-        project: String,
-        /// 1 to 5, or `none`; omit to show the current tier.
-        tier: Option<String>,
+    /// A project's record: its tier, its tags, or its removal.
+    Project {
+        #[command(subcommand)]
+        action: Option<ProjectAction>,
     },
-    /// List settings, show one, or set one.
+    /// List a setting, show one, or set one.
     Config {
         /// A setting such as `tiers.2` or `weights.ci`; omit to list all.
         key: Option<String>,
@@ -86,7 +140,7 @@ enum Command {
         #[arg(long, requires = "key", conflicts_with = "value")]
         reset: bool,
     },
-    /// Scan projects under the roots and record the results.
+    /// Read TODO.md, git state and CI into the database.
     ///
     /// With no names, scans every project and forgets projects no longer found.
     Scan {
@@ -104,7 +158,7 @@ enum Command {
         #[arg(long, conflicts_with = "offline")]
         deps: bool,
     },
-    /// Show tasks of tiered projects in the Eisenhower matrix.
+    /// Every tiered project's tasks, ranked, in one view.
     Matrix {
         /// Limit to these projects.
         projects: Vec<String>,
@@ -131,7 +185,7 @@ enum Command {
         #[arg(long)]
         explain: bool,
     },
-    /// Run an agent on tasks, each in its own worktree of the remote branch.
+    /// Run an agent on tasks, each in its own worktree.
     ///
     /// A target is `project:line`, a TODO.md line from the last scan,
     /// `project:ci` for failing CI, `project:deps` for outdated dependencies,
@@ -165,7 +219,7 @@ enum Command {
         #[arg(long, conflicts_with = "auto")]
         retry: bool,
     },
-    /// List runs that are not shipped or rejected, show one, or act on it.
+    /// Runs awaiting a decision; show one, or act on it.
     Review {
         /// Run ids; omit to list runs. Several are allowed with --approve.
         ids: Vec<i64>,
@@ -182,7 +236,7 @@ enum Command {
         #[arg(long, requires = "ids", value_name = "N")]
         minutes: Option<u32>,
     },
-    /// Open items by age, oldest first: a list to prune.
+    /// Open items by age, oldest first.
     Stale {
         /// Limit to these projects.
         projects: Vec<String>,
@@ -193,40 +247,45 @@ enum Command {
         #[arg(short = 'n', long)]
         count: Option<usize>,
     },
-    /// One task definition across many repositories.
+    /// One task across many repositories.
     Campaign {
         #[command(subcommand)]
         action: Option<CampaignAction>,
     },
-    /// Routing policy: propose a revision, put one into effect, or replay
-    /// a candidate over the runs already recorded.
+    /// Which worker and how much autonomy, per kind of task.
+    ///
+    /// Propose a revision, put one into effect, or replay a candidate over the
+    /// runs already recorded.
     Route {
         #[command(subcommand)]
         action: Option<RouteAction>,
     },
-    /// Workflow documents: read one, store a revision, put one into effect.
+    /// A graph of agents over a project.
+    ///
+    /// Read a document, store a revision, or put one into effect.
     Workflow {
         #[command(subcommand)]
         action: Option<WorkflowAction>,
     },
-    /// Presets: a named worker, model and configuration. List them, name one,
-    /// or make one the default.
+    /// A named worker, model and configuration.
+    ///
+    /// List them, name one, or make one the default.
     Preset {
         #[command(subcommand)]
         action: Option<PresetAction>,
     },
-    /// List the workers `pma dispatch` can run, or change one.
+    /// The workers `pma dispatch` can run.
     Agent {
         #[command(subcommand)]
         action: Option<AgentAction>,
     },
-    /// What dispatching has produced: outcomes, attempts, cost and time.
+    /// What dispatching produced: outcomes, cost, time.
     Report {
         /// Group by `project`, `class` or `agent`. Default: class.
         #[arg(long, value_name = "DIMENSION")]
         by: Option<String>,
     },
-    /// Commit and publish approved runs, then remove their worktrees.
+    /// Commit and publish approved runs.
     Ship {
         /// Limit to these projects.
         projects: Vec<String>,
@@ -234,35 +293,14 @@ enum Command {
         #[arg(long = "tag", value_name = "TAG")]
         tags: Vec<String>,
     },
-    /// List portfolio notes, or add, edit or remove one.
+    /// Portfolio notes, which belong to no one project.
     Note {
         #[command(subcommand)]
         action: Option<NoteAction>,
     },
-    /// Delete an absent project's record: its tasks, tags, attempt counters
-    /// and campaign memberships.
-    ///
-    /// Only a project that no full scan can find is forgotten, since one that
-    /// is still under a root returns on the next scan. Its runs are kept:
-    /// their worktrees may still exist. Dry run unless --apply.
-    Forget {
-        /// The project's name, as `pma status` shows it.
-        project: String,
-        /// Delete it instead of reporting what would go.
-        #[arg(long)]
-        apply: bool,
-    },
-    /// Group projects with private tags. A project may carry several.
-    ///
-    /// Tags are local to this database and are never read from or written to
-    /// GitHub. Commands that take project names also take `--tag`.
-    Tag {
-        #[command(subcommand)]
-        action: Option<TagAction>,
-    },
-    /// Browse the matrix in the terminal. Reads the last scan.
+    /// Browse the matrix in the terminal.
     Tui,
-    /// Sync `Critical` items with GitHub Issues. Dry run unless --apply.
+    /// Mirror `Critical` items to GitHub Issues.
     ///
     /// Opens an issue per Critical item and writes `gh:N` into its line,
     /// marks items done when their issue is closed, keeps issue titles and
@@ -276,6 +314,38 @@ enum Command {
         tags: Vec<String>,
 
         /// Make the changes instead of listing them.
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectAction {
+    /// Show or set a project's tier: 1 (most important) to 5, or `none`.
+    Tier {
+        /// The project's directory name under a root.
+        project: String,
+        /// 1 to 5, or `none`; omit to show the current tier.
+        tier: Option<String>,
+    },
+    /// Group projects with private tags. A project may carry several.
+    ///
+    /// Tags are local to this database and are never read from or written to
+    /// GitHub. Commands that take project names also take `--tag`.
+    Tag {
+        #[command(subcommand)]
+        action: Option<TagAction>,
+    },
+    /// Delete an absent project's record: its tasks, tags, attempt counters
+    /// and campaign memberships.
+    ///
+    /// Only a project that no full scan can find is forgotten, since one that
+    /// is still under a root returns on the next scan. Its runs are kept:
+    /// their worktrees may still exist. Dry run unless --apply.
+    Forget {
+        /// The project's name, as `pma status` shows it.
+        project: String,
+        /// Delete it instead of reporting what would go.
         #[arg(long)]
         apply: bool,
     },
@@ -493,11 +563,20 @@ enum AgentAction {
 }
 
 fn main() -> ExitCode {
-    let result = match Cli::parse().command {
+    // The command list is grouped rather than alphabetical, which needs the
+    // template and the list built before parsing.
+    let command = Cli::command();
+    let help = grouped_commands(&command);
+    let matches = command.help_template(HELP).after_help(help).get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
+    let result = match cli.command {
         Command::Lint { paths } => return lint(&paths),
         Command::Prune { paths, apply } => return prune(&paths, apply),
         Command::Root { action } => root(action),
-        Command::Tier { project, tier } => set_tier(&project, tier.as_deref()),
+        Command::Project { action } => project_command(action),
         Command::Config { key, value, reset } => configure(key.as_deref(), value.as_deref(), reset),
         Command::Scan {
             projects,
@@ -552,8 +631,7 @@ fn main() -> ExitCode {
             apply,
         } => run_sync(&projects, &tags, apply),
         Command::Note { action } => note(action),
-        Command::Forget { project, apply } => forget(&project, apply),
-        Command::Tag { action } => tag(action),
+
         Command::Tui => run_tui(),
     };
     match result {
@@ -1815,6 +1893,53 @@ fn overrides(
     })
 }
 
+/// A project's record. Bare, it lists the projects: what each is called, its
+/// tier, its tags and when it was last scanned.
+fn project_command(action: Option<ProjectAction>) -> Result<()> {
+    let Some(action) = action else {
+        let store = Store::open_default()?;
+        let projects = store.projects()?;
+        if projects.is_empty() {
+            println!("no projects; `pma root add <dir>` then `pma scan`");
+            return Ok(());
+        }
+        let tags = store.project_tags()?;
+        let rows: Vec<Vec<String>> = projects
+            .iter()
+            .map(|p| {
+                let mine: Vec<&str> = tags
+                    .iter()
+                    .filter(|(project, _)| *project == p.name)
+                    .map(|(_, tag)| tag.as_str())
+                    .collect();
+                vec![
+                    p.name.clone(),
+                    match p.tier {
+                        Some(t) => format!("tier {t}"),
+                        None => "untiered".into(),
+                    },
+                    mine.join(","),
+                    match p.absent_since {
+                        Some(_) => "absent".into(),
+                        None => String::new(),
+                    },
+                    match p.scanned_at {
+                        Some(at) => report::ago(dates::now() - at),
+                        None => "never scanned".into(),
+                    },
+                ]
+            })
+            .collect();
+        print!("{}", report::table(&rows, ""));
+        return Ok(());
+    };
+    match action {
+        ProjectAction::Tier { project, tier } => set_tier(&project, tier.as_deref()),
+        ProjectAction::Tag { action } => tag(action),
+        ProjectAction::Forget { project, apply } => forget(&project, apply),
+    }
+}
+
 fn preset_command(action: Option<PresetAction>) -> Result<()> {
     let store = Store::open_default()?;
     let cfg = load_config(&store)?;
@@ -2719,4 +2844,46 @@ fn run_tui() -> Result<()> {
     let placed = rank::place(&p.cfg, p.tasks, p.today);
     tui::run(tui::App::new(header, placed, p.today))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The grouped listing is the only listing, so a command missing from
+    /// `GROUPS` would be a command missing from the help. This is what makes
+    /// hand-written grouping safe.
+    #[test]
+    fn every_command_is_in_exactly_one_group() {
+        let command = Cli::command();
+        let grouped: Vec<&str> = GROUPS
+            .iter()
+            .flat_map(|(_, names)| *names)
+            .copied()
+            .collect();
+        for sub in command.get_subcommands() {
+            let name = sub.get_name();
+            if name == "help" {
+                continue;
+            }
+            let count = grouped.iter().filter(|n| **n == name).count();
+            assert_eq!(count, 1, "`{name}` appears in {count} groups, not 1");
+        }
+        for name in &grouped {
+            assert!(
+                command.get_subcommands().any(|s| s.get_name() == *name),
+                "`{name}` is grouped but is not a command"
+            );
+        }
+    }
+
+    /// Every line fits a narrow terminal, which is why the one-liners are
+    /// short and the long form lives in each command's own help.
+    #[test]
+    fn the_listing_does_not_wrap() {
+        let command = Cli::command();
+        for line in grouped_commands(&command).lines() {
+            assert!(line.len() <= 72, "{} chars: {line}", line.len());
+        }
+    }
 }

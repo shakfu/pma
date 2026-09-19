@@ -234,9 +234,9 @@ fn scan_rank_and_explain_a_real_repo() {
     assert!(!success && err.contains("pma scan"), "{err}");
 
     ok(&home, &["root", "add", root.to_str().unwrap()]);
-    ok(&home, &["tier", "alpha", "1"]);
-    assert_eq!(ok(&home, &["tier", "alpha"]), "1\n");
-    let (_, err, success) = pma_in(&home, &["tier", "alpha", "6"]);
+    ok(&home, &["project", "tier", "alpha", "1"]);
+    assert_eq!(ok(&home, &["project", "tier", "alpha"]), "1\n");
+    let (_, err, success) = pma_in(&home, &["project", "tier", "alpha", "6"]);
     assert!(!success && err.contains("1 to 5"), "{err}");
 
     let scanned = ok(&home, &["scan", "--offline"]);
@@ -310,7 +310,7 @@ Q4 Remove: 3
 
     // A rescan keeps the tier and each task's first sighting.
     ok(&home, &["scan", "--offline", "alpha"]);
-    assert_eq!(ok(&home, &["tier", "alpha"]), "1\n");
+    assert_eq!(ok(&home, &["project", "tier", "alpha"]), "1\n");
 }
 
 /// A stand-in for `claude -p`: writes a file named by the task, tries to push,
@@ -438,7 +438,7 @@ fn dispatch_env(s: &Scratch, scripts: &[(&str, &str)]) -> (Env, PathBuf, PathBuf
     let alpha = root.join("alpha");
 
     env.ok(&["root", "add", root.to_str().unwrap()]);
-    env.ok(&["tier", "alpha", "1"]);
+    env.ok(&["project", "tier", "alpha", "1"]);
     env.ok(&["scan", "--offline"]);
     (env, origin, alpha)
 }
@@ -952,7 +952,7 @@ fn a_campaign_applies_one_definition_across_repositories() {
     let root = s.0.join("root");
     for name in ["beta", "gamma"] {
         git(&root, &["clone", "-q", "../origin.git", name], None);
-        env.ok(&["tier", name, "3"]);
+        env.ok(&["project", "tier", name, "3"]);
     }
     env.ok(&["scan", "--offline"]);
     // The seed's `make test` needs hello.txt, which a workflow campaign has
@@ -1559,7 +1559,7 @@ fn notes_and_measured_dependencies() {
     git(&alpha, &["init", "-q"], None);
     fs::write(alpha.join("uv.lock"), "").unwrap();
     ok(&["root", "add", root.to_str().unwrap()]);
-    ok(&["tier", "alpha", "1"]);
+    ok(&["project", "tier", "alpha", "1"]);
     ok(&["scan", "--offline"]);
     assert!(ok(&["status", "--explain"]).contains("not measured; `pma scan --deps`"));
     let (_, err, success) = run(&["dispatch", "alpha:deps"]);

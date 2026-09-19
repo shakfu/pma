@@ -24,7 +24,13 @@ Measured on 2026-09-14:
 
 4. Portfolio notes that belong to no single project.
 
+5. Run the manager layer as an agent, under the rule that an LLM step proposes and code acts.
+
 Non-goals: replacing GitHub Issues, and a general task manager.
+
+**Two agent layers, and "agent" alone does not distinguish them.** A **worker** is one sub-agent on one task in one worktree: the command templates under [Agents](#agents). **`pma-agent`** is the manager layer. It classifies a task, writes its specification, reads a worker's output and instructs it mid-run, and proposes what to approve. `pma` the tool executes; `pma-agent` mints nothing, commits nothing and pushes nothing.
+
+Goal 5 is not built. The manager is deterministic today, in scoring formulas and route matching. `design-review.md` states the split under "Manager and workers"; implementation plan 3.7 is its first LLM step and phase 2b is the channel it needs to instruct a worker at all.
 
 ## Decisions taken
 
@@ -313,6 +319,8 @@ A glob without `/` matches a file name in any directory. `*` matches within one 
 Projects are the git repos directly under each root, named by directory. A project under a root with no tier is listed as untiered and left out of the matrix. A full `pma scan` marks projects it no longer finds as absent and says so, keeping the row, its tier and its tasks; commands that need a working tree refuse an absent project. `pma forget` deletes an absent project's record when the repository is gone for good; it refuses one with an unsettled run, whose worktree may still exist. Leaving a root is usually a move, and a rescan cannot rebuild a tier or a task's `first_seen`. Tags group projects for selection: a project carries several, and `--tag` on a name-taking command adds every project carrying it. They are private to the database, since GitHub topics describe a repository for search rather than organise a portfolio. `PMA_HOME` overrides `~/.config/pma`.
 
 ## Agents
+
+The worker layer. For the manager layer, see goal 5.
 
 Each agent is a command template run in the worktree. Flags below were checked against each tool's `--help` on 2026-09-14.
 

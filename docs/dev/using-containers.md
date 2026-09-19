@@ -30,9 +30,11 @@ State the boundary or the layers grow into each other.
 
 3. Make that traffic observable to a person while it happens, not only in a report afterwards.
 
-`minos` answers 2 and 3 together: `minosd` on the agent's own network is a bidirectional channel for the agent and a readable room for a person. See [Reaching minosd from a sealed container](#reaching-minosd-from-a-sealed-container).
+4. Carry a conversation between two agents. `pma-agent` reads a worker's output and instructs it; the developer reads both and intervenes. Driving `pma-agent` is what the dispatcher is for, so this is the requirement the others serve, not an extension of them. It rules out a report-only channel.
 
-Agent-to-agent messaging is not a requirement. Dispatch is fan-out into isolated worktrees and review is fan-in; two agents never need to converse.
+`minos` answers 2, 3 and 4 together: `minosd` on the agent's own network is a bidirectional channel for the agent and a readable room for a person. See [Reaching minosd from a sealed container](#reaching-minosd-from-a-sealed-container).
+
+An earlier version of this note said two agents never need to converse, and treated dispatch as fan-out and review as fan-in with nothing in between. That was wrong. What is open is the shape of `pma-agent`, not whether it exists: see open question 5.
 
 ## Stage (a): the agent contained, verify on the host
 
@@ -112,7 +114,7 @@ Decide which one is authoritative for a dispute about what an agent did, and set
 
 Two roles, and only the second was in the earlier draft.
 
-**Agent to `pma`, inside the sealed network.** The channel requirement 2 asks for. A room per run, or per long-lived agent. The agent posts a request; `pma` answers from policy; `pma` escalates what policy will not decide. A person reads the room while it happens, which is requirement 3, and reads it later from the archive.
+**A worker to `pma-agent`, inside the sealed network.** What requirements 2 and 4 ask for. A room per task, per minos design.md D5. The worker posts a request or a report; `pma-agent` answers within policy; `pma` the tool executes and escalates what policy will not decide. A person reads the room while it happens, which is requirement 3, and reads it later from the archive. The developer writes into the same room, which is how a correction reaches both at once and how a worker stays reachable when `pma-agent` is down.
 
 **`pma` to a person.** Escalation to a channel, answered with `/approve <id>` or `/reject <id> [why]`, which already match `pma review --approve` and `--rework "feedback"`. `/queue` is the pending set.
 
@@ -120,7 +122,7 @@ What minos brings over a polled mailbox directory: a push and delivery model (wi
 
 Keep the mailbox anyway, for the case it is better at: a single fire-and-forget `sanduk run` needs no server, no account and no room. Use the bind mount there and minos for anything long-lived. The decision rule is container lifetime, not preference.
 
-The escalation policy stays in `pma`, which already holds the inputs: `route.rs` (`Policy`, `Subject`), `class.rs`, `complexity.rs`, tiers and `agent_budget`. minos transports and records decisions; it does not make them.
+The escalation policy stays in `pma` the tool, which already holds the inputs: `route.rs` (`Policy`, `Subject`), `class.rs`, `complexity.rs`, tiers and `agent_budget`. `pma-agent` proposes within that policy and holds no authority to execute (minos design.md D2, D3). minos transports and records decisions; it does not make them.
 
 `sanduk` stays out of it. It ships no messaging adapters and holds no messaging credential, and it should keep holding none: the minos grant is minted by `pma` and passed in as an argument, like the model or the budget.
 
@@ -196,7 +198,7 @@ The `minos` channel, in dependency order. Items 8 and 9 gate the rest: without t
 
 10. `sanduk`: `--network <name>` so a run joins a network `minosd` is already on, and the agent image carries the `minos` client.
 
-11. `pma`: a `minos` client. Open the room, mint the grant, read requests, apply policy, answer, and escalate what policy declines.
+11. `pma`: a `minos` client. Open the room, mint the grant, read requests, apply policy, answer, and escalate what policy declines. `pma-agent` speaks over the same room under a grant of its own, minted by `pma` and never shared with a worker.
 
 12. `pma`: escalation as a channel post, with `/approve` and `/reject <why>` mapped to `review --approve` and `--rework`.
 
@@ -210,9 +212,9 @@ The `minos` channel, in dependency order. Items 8 and 9 gate the rest: without t
 
 3. In (b), does `pma` still diff the worktree, or does it trust what the container wrote into the bind mount? The worktree is on the host either way, so the diff stays available and should stay authoritative.
 
-4. Is a room per run or per agent? Per run matches the grant's lifetime and keeps the archive readable. Per agent keeps the history in one place and needs a grant that outlives a run.
+4. Is a room per run, per task or per project? Per run is out: a rework reuses the worktree and the second run should read what the first was told. minos design.md D5 says per task; [pma_feedback.md](https://github.com/shakfu/minos/blob/main/docs/dev/pma_feedback.md) argues per project on the count, 1031 open tasks against 96 projects, against a model with no deletion rule.
 
-5. Does an agent see other agents' rooms? Say no and keep the isolation dispatch already has. A shared room is a feature nobody has asked for yet.
+5. Is `pma-agent` one context across the fleet, or one instance per task? A fleet context reads every task room, which makes it a channel between workers and puts every worker inside every repository's content (minos design.md section 3, D10). One instance per task keeps the isolation dispatch already has, and gives up a cross-project judgement `rank.rs` and `route.rs` already compute from stored scores.
 
 6. Which record is authoritative for a dispute: the relay's bodies or the minos archive?
 

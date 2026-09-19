@@ -4,6 +4,7 @@
 
 mod accept;
 mod agent;
+mod choose;
 mod class;
 mod complexity;
 mod config;
@@ -30,6 +31,7 @@ use clap::{Parser, Subcommand};
 
 use config::Config;
 use store::{Result, RunState, Session, Store};
+use todo::Priority;
 
 #[derive(Parser)]
 #[command(name = "pma", version, about = "Maintain many projects from one place")]
@@ -129,17 +131,25 @@ enum Command {
     /// Run an agent on tasks, each in its own worktree of the remote branch.
     ///
     /// A target is `project:line`, a TODO.md line from the last scan,
-    /// `project:ci` for failing CI, or `project:deps` for outdated
-    /// dependencies. Blocks until every agent has finished.
+    /// `project:ci` for failing CI, `project:deps` for outdated dependencies,
+    /// `project:critical` and the other headings, or `project:q1` to
+    /// `project:q4`. A bare `project` opens its tasks in a list. Blocks until
+    /// every agent has finished.
     Dispatch {
         /// Targets; with --auto, projects to draw from.
         targets: Vec<String>,
+        /// The agent to run; defaults to `pma config agent`.
+        #[arg(short = 'a', long)]
+        agent: Option<String>,
+        /// The model to ask it for; defaults to the agent's own.
+        #[arg(short = 'm', long)]
+        model: Option<String>,
         /// With --auto, also draw from every project carrying this tag;
         /// repeatable.
         #[arg(long = "tag", value_name = "TAG", requires = "auto")]
         tags: Vec<String>,
-        /// Draw the top tasks from `dispatch_quadrants`, then
-        /// `overflow_quadrants`.
+        /// Draw eligible tasks in matrix order: the ci and deps signals,
+        /// and items tagged #agent.
         #[arg(long)]
         auto: bool,
         /// With --auto, how many tasks; defaults to `max_parallel`.
@@ -405,11 +415,20 @@ fn main() -> ExitCode {
         } => show_status(&projects, &tags, explain),
         Command::Dispatch {
             targets,
+            agent,
+            model,
             tags,
             auto,
             count,
             retry,
-        } => run_dispatch(&targets, &tags, auto, count, retry),
+        } => run_dispatch(
+            &targets,
+            &tags,
+            auto,
+            count,
+            retry,
+            &dispatch::Overrides { agent, model },
+        ),
         Command::Review {
             ids,
             approve,
@@ -1025,9 +1044,24 @@ fn run_dispatch(
     auto: bool,
     count: Option<usize>,
     retry: bool,
+    over: &dispatch::Overrides,
 ) -> Result<()> {
     let store = Store::open_default()?;
     let home = store::home()?;
+    if let Some(name) = &over.agent {
+        let known = store.agents()?;
+        if !known.iter().any(|w| &w.name == name) {
+            return Err(format!(
+                "unknown agent `{name}`; `pma agent` lists {}",
+                known
+                    .iter()
+                    .map(|w| w.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .into());
+        }
+    }
     let session = Session::acquire(&home)?;
     store.fail_interrupted_runs(&session)?;
     settle_prs(&store)?;
@@ -1054,6 +1088,9 @@ fn run_dispatch(
     // With --auto, every candidate in matrix order; `wanted` of them are
     // queued, so a refused candidate gives its place to the next.
     let mut picks = Vec::new();
+    // Whether any target named a task at all, which decides whether running
+    // nothing is a quiet result or a failure.
+    let mut named_any = auto;
     let wanted = match auto {
         true => count.unwrap_or(p.cfg.max_parallel as usize),
         false => targets.len(),
@@ -1101,13 +1138,15 @@ fn run_dispatch(
         }
     } else {
         if targets.is_empty() {
-            return Err("name a target such as `cynn:31`, or use --auto".into());
+            return Err(
+                "name a project such as `cynn`, a target such as `cynn:31`, \
+                        or use --auto"
+                    .into(),
+            );
         }
         let tasks = store.tasks()?;
         for target in targets {
-            let (project, what) = target.rsplit_once(':').ok_or_else(|| {
-                format!("`{target}`: expected project:line, project:ci or project:deps")
-            })?;
+            let (project, what) = dispatch::target(target)?;
             let row = rows
                 .iter()
                 .find(|r| r.name == project)
@@ -1120,77 +1159,242 @@ fn run_dispatch(
                 )
                 .into());
             }
-            let (key, text, gh) = if what == "deps" {
-                match row.deps.filter(|n| *n > 0) {
-                    Some(n) => (
-                        "deps".to_string(),
-                        format!("update dependencies: {n} outdated"),
-                        None,
-                    ),
-                    None => {
+            let named = match &what {
+                dispatch::Target::Project => {
+                    let mut all = task_rows(&tasks, project, None);
+                    all.extend(signal_rows(row));
+                    // `#manual` is already on the row, from the last scan.
+                    // The list is a view: it does not fetch to confirm it.
+                    for r in &mut all {
+                        if r.blocked.is_none() {
+                            r.blocked = blocked(&store, &active, project, r, retry)?;
+                        }
+                    }
+                    match chosen(project, all)? {
+                        Some(rows) => rows,
+                        // Cancelled: the other targets are left alone too.
+                        None => return Ok(()),
+                    }
+                }
+                dispatch::Target::Line(line) => {
+                    let t = tasks
+                        .iter()
+                        .find(|t| t.project == project && t.line == *line)
+                        .ok_or_else(|| {
+                            format!("{project}:{line} is not an open item at the last scan")
+                        })?;
+                    vec![task_row(t)]
+                }
+                dispatch::Target::Signal(which) => {
+                    let found = signal_rows(row).into_iter().find(|r| &r.key == which);
+                    match (found, which.as_str()) {
+                        (Some(r), _) => vec![r],
+                        (None, "ci") => {
+                            return Err(
+                                format!("{project}: CI was not failing at the last scan").into()
+                            );
+                        }
+                        (None, _) => {
+                            return Err(format!(
+                                "{project}: no outdated dependencies at the last \
+                                 `pma scan --deps`"
+                            )
+                            .into());
+                        }
+                    }
+                }
+                dispatch::Target::Priority(want) => {
+                    let named = task_rows(&tasks, project, Some(*want));
+                    if named.is_empty() {
                         return Err(format!(
-                            "{project}: no outdated dependencies at the last `pma scan --deps`"
+                            "{project}: no open {} items at the last scan",
+                            want.name()
                         )
                         .into());
                     }
+                    named
                 }
-            } else if what == "ci" {
-                match &row.ci {
-                    scan::Ci::Failing(w) => {
-                        ("ci".to_string(), format!("fix CI: {}", w.join(", ")), None)
+                // Quadrants are a ranking of tiered projects, so an untiered
+                // one has none rather than an empty one.
+                dispatch::Target::Quadrant(want) => {
+                    if row.tier.is_none() && p.cfg.default_tier.is_none() {
+                        return Err(format!(
+                            "{project} has no tier, so it is in no quadrant; \
+                             `pma tier {project} <1-5>`, or name the tasks"
+                        )
+                        .into());
                     }
-                    _ => {
-                        return Err(
-                            format!("{project}: CI was not failing at the last scan").into()
-                        );
+                    let named: Vec<choose::Row> = placed
+                        .iter()
+                        .filter(|x| x.task.project == project && x.quadrant == *want)
+                        .filter_map(placed_row)
+                        .collect();
+                    if named.is_empty() {
+                        return Err(format!(
+                            "{project}: no tasks in {want:?} at the last scan; `pma matrix`"
+                        )
+                        .into());
                     }
+                    named
                 }
-            } else {
-                let line: i64 = what.parse().map_err(|_| {
-                    format!("`{target}`: expected project:line, project:ci or project:deps")
-                })?;
-                let t = tasks
-                    .iter()
-                    .find(|t| t.project == project && t.line == line)
-                    .ok_or_else(|| {
-                        format!("{project}:{line} is not an open item at the last scan")
-                    })?;
-                (t.key.clone(), t.text.clone(), t.gh)
             };
-            if has_run(&active, project, &key, &text) {
-                return Err(format!("{target} already has a run; see `pma review`").into());
+            named_any |= !named.is_empty();
+            // One named task that cannot run is an error; one of many is
+            // passed over, so a selector is not held up by a single task.
+            let one = what.is_one();
+            for candidate in named {
+                let choose::Row { key, text, gh, .. } = candidate.clone();
+                if let Some(why) = blocked(&store, &active, project, &candidate, retry)? {
+                    let at = at(project, &candidate);
+                    if one {
+                        return Err(format!("{at}: {why}").into());
+                    }
+                    eprintln!("warning: {at}: {why}");
+                    continue;
+                }
+                if retry {
+                    store.reset_attempts(project, &dispatch::revision(&text))?;
+                }
+                picks.push(dispatch::Pick {
+                    project: project.into(),
+                    repo: row.path.clone(),
+                    tier: row.tier,
+                    class: None,
+                    details: None,
+                    quadrant: quadrant(project, &key),
+                    key,
+                    text,
+                    gh,
+                });
             }
-            let rev = dispatch::revision(&text);
-            if retry {
-                store.reset_attempts(project, &rev)?;
-            }
-            let spent = store.consumed_attempts(project, &rev)?;
-            if spent >= dispatch::ATTEMPT_LIMIT {
-                return Err(format!(
-                    "{target}: {spent} attempts on `{text}` were used without an accepted \
-                     result; reword the task, or `pma dispatch {target} --retry`. \
-                     Any worktree it left is removed by `pma review <id> --reject`"
-                )
-                .into());
-            }
-            picks.push(dispatch::Pick {
-                project: project.into(),
-                repo: row.path.clone(),
-                tier: row.tier,
-                class: None,
-                details: None,
-                quadrant: quadrant(project, &key),
-                key,
-                text,
-                gh,
-            });
         }
     }
+    // A selector expands to as many tasks as it names; `max_parallel` and
+    // `batch_budget` bound what runs at once, not what is queued.
+    let wanted = match auto {
+        true => wanted,
+        false => picks.len(),
+    };
     if picks.is_empty() || wanted == 0 {
-        println!("nothing to dispatch");
-        return Ok(());
+        // A draw that finds nothing is a quiet day, and so is a list nothing
+        // was checked in. A target that named tasks and ran none of them did
+        // not do what was asked, and the warnings above say why.
+        if !named_any {
+            println!("nothing to dispatch");
+            return Ok(());
+        }
+        return Err("nothing to dispatch: every task named was passed over".into());
     }
-    run_picks(&store, &home, &p.cfg, &picks, wanted).map(|_| ())
+    run_picks(&store, &home, &p.cfg, over, &picks, wanted).map(|_| ())
+}
+
+/// The project's open items from the last scan, one priority or all of them.
+fn task_rows(tasks: &[store::TaskRow], project: &str, want: Option<Priority>) -> Vec<choose::Row> {
+    tasks
+        .iter()
+        .filter(|t| t.project == project && want.is_none_or(|p| t.priority == p))
+        .map(task_row)
+        .collect()
+}
+
+fn task_row(t: &store::TaskRow) -> choose::Row {
+    choose::Row {
+        key: t.key.clone(),
+        text: t.text.clone(),
+        line: Some(t.line),
+        gh: t.gh,
+        priority: t.priority.name().into(),
+        blocked: t
+            .tags
+            .iter()
+            .any(|g| g == "manual")
+            .then(|| "tagged #manual, which is class D and never dispatched".to_string()),
+    }
+}
+
+/// A placed task, dropped when it is a signal no agent can act on.
+fn placed_row(x: &rank::Placed) -> Option<choose::Row> {
+    Some(choose::Row {
+        key: x.task.key.clone()?,
+        text: x.task.text.clone(),
+        line: x.task.line,
+        gh: None,
+        priority: x.task.priority.name().into(),
+        blocked: None,
+    })
+}
+
+/// The `ci` and `deps` signals the last scan left on a project. The text is
+/// the task an agent is given, so it is built in one place only.
+fn signal_rows(row: &store::ProjectRow) -> Vec<choose::Row> {
+    let signal = |key: &str, text: String| choose::Row {
+        key: key.into(),
+        text,
+        line: None,
+        gh: None,
+        priority: "signal".into(),
+        blocked: None,
+    };
+    let mut rows = Vec::new();
+    if let scan::Ci::Failing(w) = &row.ci {
+        rows.push(signal("ci", format!("fix CI: {}", w.join(", "))));
+    }
+    if let Some(n) = row.deps.filter(|n| *n > 0) {
+        rows.push(signal("deps", format!("update dependencies: {n} outdated")));
+    }
+    rows
+}
+
+/// Where a task is named on the command line: `project:line`, or
+/// `project:ci` and the other signals.
+fn at(project: &str, row: &choose::Row) -> String {
+    match row.line {
+        Some(line) => format!("{project}:{line}"),
+        None => format!("{project}:{}", row.key),
+    }
+}
+
+/// Why a task cannot be dispatched now, as the store knows it. `#manual` is
+/// not here: the tags that decide a class are read from origin at dispatch,
+/// not from the last local scan.
+fn blocked(
+    store: &Store,
+    active: &[store::Run],
+    project: &str,
+    row: &choose::Row,
+    retry: bool,
+) -> Result<Option<String>> {
+    if has_run(active, project, &row.key, &row.text) {
+        return Ok(Some("already has a run; see `pma review`".into()));
+    }
+    let spent = store.consumed_attempts(project, &dispatch::revision(&row.text))?;
+    if !retry && spent >= dispatch::ATTEMPT_LIMIT {
+        let at = at(project, row);
+        return Ok(Some(format!(
+            "{spent} attempts on `{}` were used without an accepted result; \
+             reword the task, or `pma dispatch {at} --retry`. Any worktree it \
+             left is removed by `pma review <id> --reject`",
+            row.text
+        )));
+    }
+    Ok(None)
+}
+
+/// Opens the project's tasks in a list. `None` when the list was cancelled.
+fn chosen(project: &str, rows: Vec<choose::Row>) -> Result<Option<Vec<choose::Row>>> {
+    use std::io::IsTerminal;
+    if rows.is_empty() {
+        return Err(format!("{project}: nothing open at the last scan; run `pma scan`").into());
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err(format!(
+            "`pma dispatch {project}` opens a list, which needs a terminal; \
+             name tasks such as `{project}:31`, or `{project}:critical`"
+        )
+        .into());
+    }
+    let mut app = choose::App::new(project.to_string(), rows);
+    Ok(choose::run(&mut app)?)
 }
 
 /// Prepares up to `wanted` picks and runs them, reporting each. Returns the
@@ -1199,6 +1403,7 @@ fn run_picks(
     store: &Store,
     home: &std::path::Path,
     cfg: &config::Config,
+    over: &dispatch::Overrides,
     picks: &[dispatch::Pick],
     wanted: usize,
 ) -> Result<Vec<store::Run>> {
@@ -1212,7 +1417,7 @@ fn run_picks(
         if unreachable.contains(&pick.project.as_str()) {
             continue;
         }
-        match dispatch::prepare(store, home, cfg, pick) {
+        match dispatch::prepare(store, home, cfg, over, pick) {
             Ok(dispatch::Prepared::Queued(run)) => {
                 println!("#{} {}: {}", run.id, run.project, run.text);
                 queued.push(*run);
@@ -1227,7 +1432,7 @@ fn run_picks(
     if queued.is_empty() {
         return Err("no run started".into());
     }
-    let finished = dispatch::execute(store, home, cfg, queued, |run| {
+    let finished = dispatch::execute(store, home, cfg, over, queued, |run| {
         println!("{}", report::run_line(run));
     })?;
     let ready = finished
@@ -1481,7 +1686,7 @@ fn run_campaign(name: &str, count: Option<usize>) -> Result<()> {
         return Ok(());
     }
     let wanted = count.unwrap_or(picks.len());
-    let finished = run_picks(&store, &home, &cfg, &picks, wanted)?;
+    let finished = run_picks(&store, &home, &cfg, &Default::default(), &picks, wanted)?;
     for run in &finished {
         store.set_campaign_run(name, &run.project, run.id)?;
     }

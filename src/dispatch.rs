@@ -12,10 +12,11 @@ use crate::agent;
 use crate::class::Class;
 use crate::complexity::{self, Features};
 use crate::config::Config;
+use crate::rank::Quadrant;
 use crate::route::{Policy, Subject};
 use crate::scan;
 use crate::store::{Attempt, Result, Run, RunState, Store};
-use crate::todo;
+use crate::todo::{self, Priority};
 use crate::worker::Worker;
 
 /// A task chosen for dispatch.
@@ -34,6 +35,70 @@ pub struct Pick {
     /// Extra prompt lines a campaign carries.
     pub details: Option<String>,
     pub quadrant: Option<String>,
+}
+
+/// An agent and a model named on the command line. Both override the
+/// configuration and an applied route: a flag is the most recent statement of
+/// intent there is, and it covers the whole invocation.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Overrides {
+    pub agent: Option<String>,
+    pub model: Option<String>,
+}
+
+/// What a target names after the colon.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Target {
+    /// No colon: the project's open tasks, chosen from a list.
+    Project,
+    /// A TODO.md line from the last scan.
+    Line(i64),
+    /// `ci` or `deps`.
+    Signal(String),
+    /// Every open item under that heading.
+    Priority(Priority),
+    /// Every task the last scan placed in that quadrant.
+    Quadrant(Quadrant),
+}
+
+impl Target {
+    /// Whether it names at most one task, so a task it cannot take is an
+    /// error rather than something to pass over.
+    pub fn is_one(&self) -> bool {
+        matches!(self, Target::Line(_) | Target::Signal(_))
+    }
+}
+
+/// Splits `project:what`, or reads a bare project name.
+pub fn target(s: &str) -> Result<(&str, Target)> {
+    let Some((project, what)) = s.rsplit_once(':') else {
+        return match s.is_empty() {
+            true => Err("empty target; name a project such as `cynn`".into()),
+            false => Ok((s, Target::Project)),
+        };
+    };
+    if project.is_empty() {
+        return Err(format!("`{s}`: no project before the colon").into());
+    }
+    let target = match what {
+        "ci" | "deps" => Target::Signal(what.to_string()),
+        _ => {
+            if let Ok(line) = what.parse::<i64>() {
+                Target::Line(line)
+            } else if let Some(p) = Priority::parse(what) {
+                Target::Priority(p)
+            } else if let Some(q) = Quadrant::parse(what) {
+                Target::Quadrant(q)
+            } else {
+                return Err(format!(
+                    "`{s}`: after the colon expected a TODO.md line, ci, deps, \
+                     critical, high, medium, low, or q1 to q4"
+                )
+                .into());
+            }
+        }
+    };
+    Ok((project, target))
 }
 
 /// Whether a task key names a signal rather than a TODO.md item.
@@ -120,7 +185,13 @@ pub enum Prepared {
 /// Checks `pick` against the remote default branch, then creates its worktree
 /// and branch and records a queued run. An error concerns the whole project,
 /// such as a failed fetch.
-pub fn prepare(store: &Store, home: &Path, cfg: &Config, pick: &Pick) -> Result<Prepared> {
+pub fn prepare(
+    store: &Store,
+    home: &Path,
+    cfg: &Config,
+    over: &Overrides,
+    pick: &Pick,
+) -> Result<Prepared> {
     let repo = &pick.repo;
     git(repo, &["fetch", "--quiet", "origin"])?;
     let default_branch = scan::default_branch(repo).ok_or(scan::DEFAULT_BRANCH_UNKNOWN)?;
@@ -275,6 +346,13 @@ pub fn prepare(store: &Store, home: &Path, cfg: &Config, pick: &Pick) -> Result<
             m.or_else(|| cfg.model.clone()),
         ),
         None => (cfg.agent.clone(), cfg.model.clone()),
+    };
+    // `config model` names a model of the configured agent, so naming another
+    // agent drops it: the new agent gets its own default rather than a model
+    // name it may not know.
+    let (agent, model) = match &over.agent {
+        Some(a) if *a != agent => (a.clone(), over.model.clone()),
+        _ => (agent, over.model.clone().or(model)),
     };
 
     let mut run = Run {
@@ -448,14 +526,17 @@ pub fn execute(
     store: &Store,
     home: &Path,
     cfg: &Config,
+    over: &Overrides,
     runs: Vec<Run>,
     mut done: impl FnMut(&Run),
 ) -> Result<Vec<Run>> {
     let workers = store.agents()?;
     // Escalation follows the policy only when it is applied. A shadow
-    // revision is recorded and not acted on, here as everywhere.
+    // revision is recorded and not acted on, here as everywhere. A model
+    // named on the command line also holds: escalation picks a stronger
+    // model, and the caller has just picked one.
     let policy = match store.active_route()? {
-        Some(rev) if !rev.shadow => Some(rev.policy()?),
+        Some(rev) if !rev.shadow && over.model.is_none() => Some(rev.policy()?),
         _ => None,
     };
     struct Queue {
@@ -966,6 +1047,51 @@ pub fn remove_worktree(repo: &Path, worktree: &Path, branch: &str) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_target_names_a_project_a_line_a_signal_a_heading_or_a_quadrant() {
+        let parse = |s| {
+            let (project, what) = target(s).unwrap();
+            (project.to_string(), what)
+        };
+        assert_eq!(parse("cynn"), ("cynn".into(), Target::Project));
+        assert_eq!(parse("cynn:31"), ("cynn".into(), Target::Line(31)));
+        assert_eq!(
+            parse("cynn:ci"),
+            ("cynn".into(), Target::Signal("ci".into()))
+        );
+        assert_eq!(
+            parse("cynn:critical"),
+            ("cynn".into(), Target::Priority(Priority::Critical))
+        );
+        assert_eq!(
+            parse("cynn:q1"),
+            ("cynn".into(), Target::Quadrant(Quadrant::Q1))
+        );
+        assert_eq!(
+            parse("cynn:Q4"),
+            ("cynn".into(), Target::Quadrant(Quadrant::Q4))
+        );
+    }
+
+    /// Only a target naming one task fails the batch when it cannot run.
+    #[test]
+    fn one_task_or_many() {
+        assert!(Target::Line(3).is_one());
+        assert!(Target::Signal("deps".into()).is_one());
+        assert!(!Target::Priority(Priority::Low).is_one());
+        assert!(!Target::Quadrant(Quadrant::Q2).is_one());
+        assert!(!Target::Project.is_one());
+    }
+
+    #[test]
+    fn an_unreadable_target_says_what_is_accepted() {
+        let err = |s| target(s).unwrap_err().to_string();
+        assert!(err("cynn:soon").contains("expected a TODO.md line, ci, deps, critical"));
+        assert!(err("cynn:q5").contains("expected a TODO.md line"));
+        assert!(err(":31").contains("no project before the colon"));
+        assert!(err("").contains("name a project"));
+    }
 
     #[test]
     fn slugs_are_short_ascii_words() {

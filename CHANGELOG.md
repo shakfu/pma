@@ -111,6 +111,16 @@ The item is marked done after the rebase, not before. Git treats changes to adja
 
 A `--tag` that matches no project is an error, because an empty selection means the whole portfolio everywhere else, and `pma sync --tag typo --apply` would then act on every project. A tag selection also makes `pma scan` partial: as a full scan it would mark every project it did not name absent. Schema 19.
 
+**One target can name more than one task, and the agent is chosen per dispatch.**
+
+```sh
+pma dispatch -a pi -m sonnet cynn:critical   # every open item under ## Critical
+pma dispatch cynn:q1                         # every task the last matrix placed in Q1
+pma dispatch cynn                            # the project's tasks, in a list with checkboxes
+```
+
+`-a` and `-m` outrank `config agent`, `config model` and an applied route: a flag is the last word on the run in front of you. Naming another agent drops the configured model, which names a model of the configured agent, and a named model pins it -- escalation exists to reach for a stronger model, and the caller has just reached. A target that names one task still fails the batch when that task cannot run; one that names many passes each over with its reason on stderr, since a heading held up by a single task with a live run would be useless. A bare project name opens the list rather than guessing, and nothing in it starts checked: dispatch spends money.
+
 ### Changed
 
 **A full scan marks a project absent instead of deleting it.** The row keeps its tier, its tasks and their `first_seen`, and records when it stopped being found; `pma scan` reports `absent: <name> is no longer under a root`. Deleting dropped the tier and every task's `first_seen`, and a later scan can rebuild neither, so a project moved between roots came back with all of its work aged from the day it returned. `pma dispatch`, `pma campaign` and `pma sync` refuse an absent project and name where it was last seen, since its recorded path no longer holds a working tree. Schema 18.

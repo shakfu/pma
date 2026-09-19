@@ -1585,3 +1585,98 @@ fn notes_and_measured_dependencies() {
         "the deps signal task"
     );
 }
+
+/// A worker that reports the model it was handed, so a test can see which one
+/// dispatch chose. With no model the placeholder is dropped and `$4` is empty.
+const MODEL_WORKER: &str = r#"#!/bin/sh
+cd "$3" || exit 1
+echo hi > hello.txt
+echo "model=$4"
+"#;
+
+/// One target can name a heading or a quadrant. A task that cannot run holds
+/// up only itself, where a target naming one task is an error.
+#[test]
+fn a_target_can_name_a_heading_or_a_quadrant() {
+    let s = Scratch::new("select");
+    let (env, _, _) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+
+    let (_, err, success) = env.run(&["dispatch", "-a", "pi", "alpha:5"]);
+    assert!(
+        !success && err.contains("unknown agent `pi`; `pma agent` lists claude"),
+        "{err}"
+    );
+    let (_, err, success) = env.run(&["dispatch", "alpha:soon"]);
+    assert!(
+        !success && err.contains("expected a TODO.md line, ci, deps, critical"),
+        "{err}"
+    );
+    let (_, err, success) = env.run(&["dispatch", "alpha:critical"]);
+    assert!(
+        !success && err.contains("alpha: no open critical items at the last scan"),
+        "{err}"
+    );
+    // A list needs a terminal; the test harness has none.
+    let (_, err, success) = env.run(&["dispatch", "alpha"]);
+    assert!(
+        !success && err.contains("opens a list, which needs a terminal"),
+        "{err}"
+    );
+
+    // Tier 1 high items are important and not urgent: the whole of Q2.
+    let out = env.ok(&["dispatch", "alpha:q2"]);
+    assert!(
+        out.starts_with("#1 alpha: add greeting\n#2 alpha: second task\n#3 alpha: third task\n"),
+        "{out}"
+    );
+
+    // The same three by heading now: each is passed over with its reason,
+    // rather than the first one ending the batch.
+    let (_, err, success) = env.run(&["dispatch", "alpha:high"]);
+    assert!(
+        !success && err.ends_with("pma: nothing to dispatch: every task named was passed over\n"),
+        "{err}"
+    );
+    assert_eq!(err.matches("already has a run").count(), 3, "{err}");
+    assert!(err.contains("warning: alpha:5: already has a run"), "{err}");
+
+    // The one Low item is #manual, so the heading selects nothing runnable.
+    let (_, err, success) = env.run(&["dispatch", "alpha:low"]);
+    assert!(
+        !success && err.contains("`guarded task` is class D and is not dispatched"),
+        "{err}"
+    );
+}
+
+/// `-a` and `-m` outrank the configuration. The configured model names a
+/// model of the configured agent, so naming another agent drops it.
+#[test]
+fn the_flags_outrank_the_configured_agent_and_model() {
+    let s = Scratch::new("flags");
+    let (env, _, _) = dispatch_env(&s, &[("mw", MODEL_WORKER)]);
+    env.ok(&["agent", "set", "mw", "command", "mw"]);
+    env.ok(&[
+        "agent",
+        "set",
+        "mw",
+        "args",
+        r#"["--task","{prompt}","{dir}","{model}"]"#,
+    ]);
+    env.ok(&["config", "model", "haiku"]);
+
+    // `claude` is configured and `haiku` is its model; neither reaches `mw`.
+    env.ok(&["dispatch", "-a", "mw", "alpha:5"]);
+    assert!(env.ok(&["review", "1"]).contains("model=\n"), "no model");
+    let detail = env.ok(&["review", "1"]);
+    assert!(detail.contains("mw, cost not reported"), "{detail}");
+
+    env.ok(&["dispatch", "-a", "mw", "-m", "sonnet", "alpha:7"]);
+    let detail = env.ok(&["review", "2"]);
+    assert!(detail.contains("model=sonnet"), "{detail}");
+    assert!(detail.contains("mw sonnet, cost not reported"), "{detail}");
+
+    // Configured as the agent, it takes the configured model.
+    env.ok(&["config", "agent", "mw"]);
+    env.ok(&["dispatch", "alpha:8"]);
+    assert!(env.ok(&["review", "3"]).contains("model=haiku"), "haiku");
+}

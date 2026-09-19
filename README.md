@@ -74,6 +74,10 @@ pma note add "move CI to reusable workflows"   # portfolio notes; `pma note` lis
 
 ```sh
 pma dispatch cynn:31              # a TODO.md line from the last scan; or cynn:ci, cynn:deps
+pma dispatch cynn:critical        # every open item under ## Critical; or high, medium, low
+pma dispatch cynn:q1              # every task the last matrix placed in that quadrant
+pma dispatch cynn                 # the project's tasks, in a list with checkboxes
+pma dispatch -a pi -m sonnet cynn:31   # this agent and model, not the configured ones
 pma dispatch --auto -n 3          # the top 3 dispatchable tasks in the matrix
 pma review                        # runs not yet shipped or rejected; settles merged PRs
 pma review 4                      # task, verify result, cost, summary, diff
@@ -81,9 +85,11 @@ pma review 4 --approve            # or --reject, or --rework "feedback"
 pma ship                          # commit, push or open a PR, remove worktrees
 ```
 
+A target that names one task fails when that task cannot run. One that names many passes each over with its reason and dispatches the rest. `-a` and `-m` outrank `pma config agent`, `pma config model` and any applied route; without `-m` the agent picks its own model, and `pma config model` applies only to the agent it was set alongside.
+
 Each run gets a worktree of the remote default branch under `~/.config/pma/worktrees`, so a dirty clone is never touched. The agent runs without push credentials. `pma` then runs the project's tests itself: set the command with `pma config projects.cynn.verify "make check"`, or let it be detected. Limits: `max_parallel`, `batch_budget`, `agent_budget`, `timeout`. `publish` is `pr` by default; `pma config publish push` pushes to the default branch instead. A run shipped as a PR stays `pr-open` until the PR is merged or closed, and its task is not dispatched again meanwhile.
 
-`dispatch`, `ship`, and `review --reject` or `--rework` hold a lock on `session.lock`, so only one of them runs at a time. Other commands, including `pma review` to watch a batch, can run alongside. The agent may edit files and run the verify command; other shell commands are denied unless your Claude Code settings allow them. `pma ship` resumes after a failure without publishing twice.
+`dispatch`, `ship`, and `review --reject` or `--rework` hold a lock on `session.lock`, so only one of them runs at a time; an open task list holds it too. Other commands, including `pma review` to watch a batch, can run alongside. The agent may edit files and run the verify command; other shell commands are denied unless your Claude Code settings allow them. `pma ship` resumes after a failure without publishing twice.
 
 ```sh
 pma sync                          # plan: issues to open, items to mark done

@@ -33,6 +33,13 @@ impl Quadrant {
             Quadrant::Q4 => "Remove",
         }
     }
+
+    /// `q1` to `q4`, in either case.
+    pub fn parse(s: &str) -> Option<Quadrant> {
+        Quadrant::ALL
+            .into_iter()
+            .find(|q| format!("{q:?}").eq_ignore_ascii_case(s))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

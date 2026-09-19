@@ -175,6 +175,27 @@ Gate outstanding: phase 4b in use, and a campaign you would actually run. The fi
 
 5.3 is unsized until a campaign needs it.
 
+## Phase 6: workflows
+
+Goal: a stage sequence over one project, each stage its own agent and model, specified in [workflows.md](workflows.md).
+
+A stage reads artifacts and writes one; what an artifact holds is declared in the document, so the mechanism is not specific to any one kind of work. Review then validate then fix, one-liner then specification then implementation, and issue triage are three documents over one sequencer. The parts exist -- `Route` carries the per-stage agent, model, approval and escalation; `routes` gives the propose-then-activate shape; campaigns give frozen membership. Missing are a sequencer, an artifact contract, and an acceptance rule for a stage that changes no code.
+
+| Step | Change | Files |
+|-|-|-|
+| 6.1 | The document and its revisions: `schemas` declaring row sets, and stages with `consumes`, `produces`, `accept`, `emits` and `expands`, each refusal named where the document is read. `workflows` and `workflow_runs` tables; `workflow_run`, `stage` and `row` on `runs`. | new `src/workflow.rs`, `store.rs` (schema 20) |
+| 6.2 | `stage` as a match dimension on a route. A route that states no stage matches only a dispatch that names none, so an existing policy keeps its behaviour and replay over earlier runs reports no difference. Agent and model stay in the routing policy alone, per 2.5. | `route.rs`, `dispatch.rs` |
+| 6.3 | Acceptance for a stage that changes no code: `artifact` for prose, `rows:<schema>` checked against the declaration, beside the existing `verify`. A schema is declared in the document rather than compiled in: a registry per kind costs the same code and makes every new workflow kind a code change. Artifacts live outside the worktree, so a produced file never enters a diff and ship never publishes one. | `accept.rs`, `workflow.rs` |
+| 6.4 | Sinks: `todo` writes rows as items in the project's `TODO.md` as an uncommitted edit, as `sync` does, and `note` writes one portfolio note per row. The mapping from row fields is in the document; the sink list is closed, because each writes to a real file or table. No stage writes `TODO.md` itself: `OWNED` keeps it outside every scope, and ship's tick depends on that. `issue` is refused until it is reconciled with `pma sync`. | new `todo::insert`, `workflow.rs` |
+| 6.5 | `expands`: one run per row, filtered by `where` on enumerated fields, keyed `workflow:<instance>:<row>` through the existing no-item path. A `TODO.md` item written by an earlier stage cannot be dispatched, since dispatch requires it open on origin, which is why a fan-out reads rows and a sink is independent of it. | `dispatch.rs`, `workflow.rs` |
+| 6.6 | `pma workflow propose\|activate\|run\|show\|stop`, and `pma report --by stage`. One pass per invocation, holding `session.lock` like dispatch; readiness is derived from the runs, so a killed pass resumes by re-deriving. | `main.rs`, `report_runs.rs` |
+
+Acceptance, in full, in [workflows.md](workflows.md#10-acceptance). Refused shapes, with what each would cost: [workflows.md](workflows.md#11-limits). The largest are a fan-out over projects, which is the campaign merge, and parallel stages with a join.
+
+Gate: 6.1 to 6.4 and 6.6 publish nothing and need none. 6.5 needs phase 0 measured and phase 4b's gate met, because it multiplies runs per human decision. No stage is `unattended` before phase 4c's gate; the parse guard already refuses it for A-, C, D and for a route with no class list.
+
+Size: 3 sessions for 6.1 to 6.4 and 6.6, 2 for 6.5.
+
 ## Schema and migrations
 
 Current `user_version` is 5. `runs` already carries `agent`; only `model` is new.
@@ -192,6 +213,8 @@ Current `user_version` is 5. `runs` already carries `agent`; only `model` is new
 | 14 | `routes` revisions with provenance; `route_revision`, `route` and `approval` on `runs`. Applied | 4a |
 | 15 | `approved_tree`, `approved_head` and `approved_by` on `runs`. Applied | 4b |
 | 16 | `campaigns` and `campaign_members`. Applied | 5 |
+| 17-19 | `owner/name` on a project, absence, project tags. Applied, outside this plan | - |
+| 20 | `workflows` revisions and `workflow_runs`; `workflow_run`, `stage` and `row` on `runs` | 6 |
 
 Each migration is additive to existing tables, applied on open in one transaction, and raises `user_version` so an older binary refuses the file rather than misreading it.
 

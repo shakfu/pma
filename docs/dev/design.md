@@ -443,4 +443,4 @@ Each stage is used before the next one is built.
 
 ## Open questions
 
-Open questions, what to cut, and the sequencing model for urgency: `design-review.md`. Sequenced work, with the phase that supersedes each decision above: `implementation-plan.md`. Review of that plan against this code: `plan-review.md`.
+Open questions, what to cut, and the sequencing model for urgency: `design-review.md`. Sequenced work, with the phase that supersedes each decision above: `implementation-plan.md`. Review of that plan against this code: `plan-review.md`. Stage sequences over one project: `workflows.md`.

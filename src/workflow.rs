@@ -1556,6 +1556,74 @@ impl Document {
     }
 }
 
+// ------------------------------------------------------------------- guards
+
+/// Whether a guard admits a unit. `data` is the unit's declared fields;
+/// `system` holds its `@` fields and the verdicts written against it, which the
+/// caller assembles because a guard reads what is recorded rather than
+/// recomputing it.
+///
+/// The error is the reason the unit was refused, which is what a move records.
+pub fn holds(
+    guard: &Guard,
+    data: &Value,
+    system: &std::collections::BTreeMap<String, Value>,
+) -> std::result::Result<(), String> {
+    for (key, test) in &guard.0 {
+        let (name, value) = match key {
+            Key::Field(f) => (f.clone(), data.get(f).cloned()),
+            Key::System(s) => (format!("@{s}"), system.get(s).cloned()),
+        };
+        let text = value.as_ref().and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Null => None,
+            other => Some(other.to_string()),
+        });
+        match test {
+            Test::In(want) => {
+                let held = text.as_deref().is_some_and(|t| want.iter().any(|w| w == t));
+                if !held {
+                    return Err(format!(
+                        "{name} is {}, not {}",
+                        text.as_deref().unwrap_or("unset"),
+                        want.join(" or ")
+                    ));
+                }
+            }
+            Test::Compare(cmp, Count::Fixed(n)) => {
+                let Some(have) = text.as_deref().and_then(|t| t.parse::<i64>().ok()) else {
+                    return Err(format!("{name} is not a number"));
+                };
+                let held = match cmp {
+                    Cmp::Eq => have == *n,
+                    Cmp::Lt => have < *n,
+                    Cmp::Le => have <= *n,
+                    Cmp::Gt => have > *n,
+                    Cmp::Ge => have >= *n,
+                };
+                if !held {
+                    return Err(format!("{name} is {have}"));
+                }
+            }
+            // A parameter in a comparison is substituted before a guard runs.
+            Test::Compare(_, Count::Param(p)) => {
+                return Err(format!("{name}: parameter `{p}` was not substituted"));
+            }
+            Test::Present => {
+                if text.is_none() {
+                    return Err(format!("{name} is unset"));
+                }
+            }
+            Test::Absent => {
+                if text.is_some() {
+                    return Err(format!("{name} is set"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- normalising
 
 impl Count {

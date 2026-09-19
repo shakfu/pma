@@ -44,6 +44,10 @@ pub struct Pick {
 pub struct Overrides {
     pub agent: Option<String>,
     pub model: Option<String>,
+    /// A preset named on the command line. Its fields sit below the flags and
+    /// above an applied route, because naming one is a statement of intent
+    /// about this invocation and a route is policy about the work.
+    pub preset: Option<crate::store::Preset>,
 }
 
 /// What a target names after the colon.
@@ -344,20 +348,8 @@ pub fn prepare(
         );
     }
     let (route_revision, route_name, approval, applied, scope) = routed;
-    let (agent, model) = match applied {
-        Some((a, m)) => (
-            a.unwrap_or_else(|| cfg.agent.clone()),
-            m.or_else(|| cfg.model.clone()),
-        ),
-        None => (cfg.agent.clone(), cfg.model.clone()),
-    };
-    // `config model` names a model of the configured agent, so naming another
-    // agent drops it: the new agent gets its own default rather than a model
-    // name it may not know.
-    let (agent, model) = match &over.agent {
-        Some(a) if *a != agent => (a.clone(), over.model.clone()),
-        _ => (agent, over.model.clone().or(model)),
-    };
+    let chosen = choose_worker(store, cfg, over, applied)?;
+    let (agent, model) = (chosen.agent.clone(), chosen.model.clone());
 
     let mut run = Run {
         id: 0,
@@ -414,6 +406,8 @@ pub fn prepare(
         node: None,
         unit: None,
         lap: 0,
+        preset: chosen.preset.clone(),
+        extra_args: chosen.args.clone(),
     };
     run.prompt = prompt(&run, &details, verify.as_deref());
     store.insert_run(&mut run)?;
@@ -517,6 +511,59 @@ fn prompt(run: &Run, details: &str, verify: Option<&str>) -> String {
     }
     p.push_str("\nEnd with a short summary of what you changed and what is left undone.\n");
     p
+}
+
+/// What a dispatch settled on: a worker, a model, the arguments that configure
+/// it, and the preset those came from.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Chosen {
+    pub agent: String,
+    pub model: Option<String>,
+    pub args: Vec<String>,
+    pub preset: Option<String>,
+}
+
+/// Which worker runs, at which model, with which configuration. Highest first:
+/// the `-a` and `-m` flags, a preset named on the command line, an applied
+/// route, then the default preset. A model named nowhere is a model this
+/// dispatch does not state: the worker is run without one and uses its own,
+/// which `runs.model` then records as null.
+pub fn choose_worker(
+    store: &Store,
+    cfg: &Config,
+    over: &Overrides,
+    applied: Option<(Option<String>, Option<String>)>,
+) -> Result<Chosen> {
+    let (route_agent, route_model) = applied.unwrap_or((None, None));
+    let default = match (&over.preset, &cfg.preset) {
+        (Some(_), _) => None,
+        (None, Some(name)) => Some(store.preset(name)?),
+        (None, None) => None,
+    };
+    let named = over.preset.clone().or(default);
+    let agent = over
+        .agent
+        .clone()
+        .or_else(|| named.as_ref().map(|p| p.agent.clone()))
+        .or(route_agent)
+        .unwrap_or_else(|| cfg.agent.clone());
+    let model = over
+        .model
+        .clone()
+        .or_else(|| named.as_ref().and_then(|p| p.model.clone()))
+        .or(route_model);
+    // Arguments come with the preset that named them or not at all: a route
+    // names a worker and a model, never a flag.
+    let (args, preset) = match &named {
+        Some(p) if p.agent == agent => (p.args.clone(), Some(p.name.clone())),
+        _ => (Vec::new(), None),
+    };
+    Ok(Chosen {
+        agent,
+        model,
+        args,
+        preset,
+    })
 }
 
 /// The project's `verify` setting, else a command detected in the worktree.
@@ -713,6 +760,7 @@ fn attempt(
         &run.worktree,
         run.model.as_deref(),
         cfg.agent_budget,
+        &run.extra_args,
     );
     worker.allow_verify(&mut cmd, run.verify.as_deref());
     cmd.current_dir(&run.worktree);
@@ -1172,6 +1220,8 @@ mod tests {
             node: None,
             unit: None,
             lap: 0,
+            preset: None,
+            extra_args: Vec::new(),
         };
         let p = prompt(&run, "for all classes\n", Some("make test"));
         assert!(p.contains("`cynn`"));

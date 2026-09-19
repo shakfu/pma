@@ -1592,6 +1592,12 @@ const MODEL_WORKER: &str = r#"#!/bin/sh
 cd "$3" || exit 1
 echo hi > hello.txt
 echo "model=$4"
+# Whatever a preset added arrives after the model, so the test can see it.
+shift 4 2>/dev/null || shift $#
+while [ $# -gt 0 ]; do
+  case "$1" in --thinking) echo "thinking=$2"; shift ;; esac
+  shift
+done
 "#;
 
 /// One target can name a heading or a quadrant. A task that cannot run holds
@@ -1647,11 +1653,10 @@ fn a_target_can_name_a_heading_or_a_quadrant() {
         "{err}"
     );
 }
-
-/// `-a` and `-m` outrank the configuration. The configured model names a
-/// model of the configured agent, so naming another agent drops it.
+/// A worker is how to run a program; which model it runs at is a preset. The
+/// retired field says so rather than failing as unknown.
 #[test]
-fn the_flags_outrank_the_configured_agent_and_model() {
+fn a_worker_no_longer_names_a_model() {
     let s = Scratch::new("flags");
     let (env, _, _) = dispatch_env(&s, &[("mw", MODEL_WORKER)]);
     env.ok(&["agent", "set", "mw", "command", "mw"]);
@@ -1660,25 +1665,129 @@ fn the_flags_outrank_the_configured_agent_and_model() {
         "set",
         "mw",
         "args",
-        r#"["--task","{prompt}","{dir}","{model}"]"#,
+        r#"["--task","{prompt}","{dir}","{model}","{extra}"]"#,
     ]);
-    env.ok(&["config", "model", "haiku"]);
+    let (_, err, ok) = env.run(&["agent", "set", "mw", "model", "haiku"]);
+    assert!(!ok, "the field is gone");
+    assert!(
+        err.contains("pma preset set"),
+        "it says where it went: {err}"
+    );
+    let (_, err, ok) = env.run(&["config", "model", "haiku"]);
+    assert!(!ok && err.contains("pma agent set"), "{err}");
 
-    // `claude` is configured and `haiku` is its model; neither reaches `mw`.
-    env.ok(&["dispatch", "-a", "mw", "alpha:5"]);
-    assert!(env.ok(&["review", "1"]).contains("model=\n"), "no model");
+    // With no preset and no flag, the worker is run without a model at all and
+    // uses its own.
+    env.ok(&["config", "agent", "mw"]);
+    env.ok(&["dispatch", "alpha:5"]);
+    assert!(
+        env.ok(&["review", "1"]).contains("model=\n"),
+        "no model named"
+    );
+
+    // A flag names one for the invocation.
+    env.ok(&["dispatch", "-m", "sonnet", "alpha:7"]);
+    assert!(
+        env.ok(&["review", "2"]).contains("model=sonnet"),
+        "the flag"
+    );
+
+    // The listing is about the program, not the model.
+    let listed = env.ok(&["agent"]);
+    assert!(listed.contains("* mw"), "{listed}");
+    assert!(!listed.contains("sonnet"), "no model column: {listed}");
+    assert!(
+        env.ok(&["agent", "show", "mw"]).contains("{extra}"),
+        "args shown"
+    );
+}
+
+/// A preset names a worker, a model and the configuration that goes with them,
+/// so a combination worth returning to has a name. Effort is arguments rather
+/// than a field, because what expresses it differs per agent.
+#[test]
+fn a_preset_names_a_worker_a_model_and_its_configuration() {
+    let s = Scratch::new("presets");
+    let (env, _, _) = dispatch_env(&s, &[("mw", MODEL_WORKER)]);
+    env.ok(&["agent", "set", "mw", "command", "mw"]);
+    // `{extra}` is where this worker wants a preset's arguments.
+    env.ok(&[
+        "agent",
+        "set",
+        "mw",
+        "args",
+        r#"["--task","{prompt}","{dir}","{model}","{extra}"]"#,
+    ]);
+
+    assert!(env.ok(&["preset"]).contains("no presets"), "empty");
+    // A preset may not name a worker that does not exist: it would name a
+    // combination nothing could run.
+    let (_, err, ok) = env.run(&["preset", "set", "bad", "nosuch", "haiku"]);
+    assert!(!ok && err.contains("no worker `nosuch`"), "{err}");
+
+    env.ok(&["preset", "set", "plain", "mw"]);
+    env.ok(&["preset", "set", "cheap", "mw", "haiku"]);
+    env.ok(&[
+        "preset",
+        "set",
+        "cheap-high",
+        "mw",
+        "haiku",
+        "--thinking",
+        "high",
+    ]);
+    let listed = env.ok(&["preset"]);
+    assert!(
+        listed.contains("its own default"),
+        "a preset may name no model"
+    );
+    assert!(listed.contains("--thinking high"), "{listed}");
+
+    // `-p` runs one command with that preset, and its arguments reach the
+    // worker where its record puts them.
+    env.ok(&["dispatch", "-p", "cheap-high", "alpha:5"]);
     let detail = env.ok(&["review", "1"]);
-    assert!(detail.contains("mw, cost not reported"), "{detail}");
+    assert!(detail.contains("model=haiku"), "{detail}");
+    assert!(
+        detail.contains("thinking=high"),
+        "the effort reached it: {detail}"
+    );
 
-    env.ok(&["dispatch", "-a", "mw", "-m", "sonnet", "alpha:7"]);
+    // A flag beside it is the more specific statement, so it wins.
+    env.ok(&["dispatch", "-p", "cheap-high", "-m", "sonnet", "alpha:7"]);
     let detail = env.ok(&["review", "2"]);
     assert!(detail.contains("model=sonnet"), "{detail}");
-    assert!(detail.contains("mw sonnet, cost not reported"), "{detail}");
+    assert!(
+        detail.contains("thinking=high"),
+        "the rest of the preset stands"
+    );
 
-    // Configured as the agent, it takes the configured model.
-    env.ok(&["config", "agent", "mw"]);
+    // `use` makes it the default, and then no flag is needed.
+    env.ok(&["preset", "use", "cheap"]);
+    assert!(env.ok(&["preset"]).contains("* cheap"), "marked default");
     env.ok(&["dispatch", "alpha:8"]);
-    assert!(env.ok(&["review", "3"]).contains("model=haiku"), "haiku");
+    let detail = env.ok(&["review", "3"]);
+    assert!(detail.contains("model=haiku"), "{detail}");
+    assert!(
+        !detail.contains("thinking=high"),
+        "a different preset: {detail}"
+    );
+
+    // Forgetting the default clears the setting rather than leaving a name
+    // nothing resolves.
+    env.ok(&["preset", "rm", "cheap"]);
+    let listed = env.ok(&["preset"]);
+    assert!(!listed.contains("* cheap"), "the default is gone: {listed}");
+    let settings = env.ok(&["config"]);
+    let preset_line = settings
+        .lines()
+        .find(|l| l.starts_with("preset ="))
+        .unwrap_or_default();
+    assert_eq!(
+        preset_line.trim_end_matches("  (set)").trim(),
+        "preset =",
+        "the setting is cleared with it"
+    );
 }
 
 /// A workflow document, in both its forms, through the store: a script and the
@@ -1789,4 +1898,180 @@ fn a_workflow_document_is_a_draft_until_its_cost_is_accepted() {
     assert!(shown.contains("\"name\": \"look\""), "{shown}");
     assert!(shown.contains("\"max_units\": \"{$breadth}\""), "{shown}");
     assert!(!shown.contains("fan("), "the script is not the document");
+}
+
+/// A pass over a workflow whose every node is a rule: it runs, it writes what
+/// `pma` owns, and it spends nothing. A second pass advances nothing, because
+/// what has run is derived from the units rather than from a cursor.
+#[test]
+fn a_pass_runs_the_free_nodes_and_never_spends_without_approval() {
+    let s = Scratch::new("pass");
+    let home = s.0.join("home");
+    let root = s.0.join("root");
+    let alpha = root.join("alpha");
+    fs::create_dir_all(&alpha).unwrap();
+    git(&alpha, &["init", "-q"], None);
+    fs::write(
+        alpha.join("TODO.md"),
+        "# TODO\n\n## Critical\n\n## High\n\n- [ ] first thing\n- [x] done thing\n\n## Medium\n\n## Low\n",
+    )
+    .unwrap();
+    git(&alpha, &["add", "."], None);
+    git(&alpha, &["commit", "-qm", "init"], None);
+
+    ok(&home, &["root", "add", root.to_str().unwrap()]);
+    ok(&home, &["scan", "--offline"]);
+
+    // Every node here is a rule or a check, so the worst case is $0.00.
+    let free = s.0.join("free.rhai");
+    fs::write(
+        &free,
+        r#"
+        let graph = source("project")
+            .check("lint", "lint-todo")
+            .rule_expand("items", "item", "todo-items", 100)
+            .rule_filter("open", "where:done=false")
+            .emit_note("record", #{ text: "open: {text}" })
+            .output();
+        document(#{}, [
+            workflow("stocktake", graph, #{ caps: #{ max_units: 200, max_edits: 0 }}),
+        ])
+        "#,
+    )
+    .unwrap();
+    let out = ok(&home, &["workflow", "propose", free.to_str().unwrap()]);
+    assert!(
+        out.contains("at most $0.00"),
+        "a graph of rules is free: {out}"
+    );
+    ok(&home, &["workflow", "activate", "1"]);
+
+    // A dry run plans and prices, and writes no note.
+    let out = ok(
+        &home,
+        &["workflow", "run", "stocktake", "alpha", "--dry-run"],
+    );
+    assert!(out.contains("instance 1"), "{out}");
+    assert!(
+        out.contains("would run: lint") && out.contains("a rule, free"),
+        "{out}"
+    );
+    assert!(
+        ok(&home, &["note"]).contains("no notes"),
+        "a dry run writes nothing"
+    );
+
+    // The pass runs every rule node to exhaustion, in one invocation.
+    let out = ok(&home, &["workflow", "run", "stocktake", "--instance", "1"]);
+    assert!(out.contains("nothing left to run"), "{out}");
+    let notes = ok(&home, &["note"]);
+    assert!(notes.contains("open: first thing"), "{notes}");
+    assert!(
+        !notes.contains("done thing"),
+        "the filter dropped it: {notes}"
+    );
+
+    // Again: the frontier is re-derived, and everything has been consumed.
+    let out = ok(&home, &["workflow", "run", "stocktake", "--instance", "1"]);
+    assert!(out.contains("nothing left to run"), "{out}");
+    assert_eq!(
+        ok(&home, &["note"]).lines().count(),
+        notes.lines().count(),
+        "a second pass writes no second note"
+    );
+}
+
+/// A pass that reaches a node an agent decides stops, prices it, and spends
+/// nothing until the developer says so.
+#[test]
+fn an_agent_node_is_priced_and_left_for_approval() {
+    let s = Scratch::new("gate");
+    let home = s.0.join("home");
+    let root = s.0.join("root");
+    let alpha = root.join("alpha");
+    fs::create_dir_all(&alpha).unwrap();
+    git(&alpha, &["init", "-q"], None);
+    fs::write(
+        alpha.join("TODO.md"),
+        "# TODO\n\n## High\n\n- [ ] a thing\n",
+    )
+    .unwrap();
+    git(&alpha, &["add", "."], None);
+    git(&alpha, &["commit", "-qm", "init"], None);
+
+    // A worker that records every invocation, so "nothing was spent" is a
+    // fact about the filesystem rather than a claim.
+    let bin = s.0.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let log = s.0.join("spend.log");
+    fs::write(
+        bin.join("claude"),
+        format!(
+            "#!/bin/sh\necho invoked >> {}\nprintf '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\",\"total_cost_usd\":0.1}}\\n'\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let run = |args: &[&str]| {
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = Command::new(env!("CARGO_BIN_EXE_pma"))
+            .env("PMA_HOME", &home)
+            .env("PATH", path)
+            .args(args)
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.success(),
+        )
+    };
+    run(&["root", "add", root.to_str().unwrap()]);
+    run(&["scan", "--offline"]);
+
+    let wf = s.0.join("review.rhai");
+    fs::write(
+        &wf,
+        r#"
+        let graph = source("project")
+            .expand("review", "finding", 3, "Review `{name}`. Write findings to {out}.")
+            .output();
+        document(#{ finding: #{ fields: #{ title: req(line(200)) }}}, [
+            workflow("review", graph, #{ caps: #{ max_units: 10, max_edits: 0 }}),
+        ])
+        "#,
+    )
+    .unwrap();
+    let (out, err, success) = run(&["workflow", "propose", wf.to_str().unwrap()]);
+    assert!(success, "{err}");
+    // One review run over one project; `max_units` bounds the findings it may
+    // produce, not the runs it takes.
+    assert!(out.contains("at most $1.00"), "{out}");
+    run(&["workflow", "activate", "1"]);
+
+    // The pass names the node, its worker and model, and its ceiling, and
+    // stops without running it.
+    let (out, err, success) = run(&["workflow", "run", "review", "alpha", "-m", "haiku"]);
+    assert!(success, "{err}");
+    assert!(out.contains("next: review"), "{out}");
+    assert!(
+        out.contains("claude/haiku"),
+        "the cheap model it would use: {out}"
+    );
+    assert!(out.contains("Nothing was spent"), "{out}");
+    assert!(out.contains("--yes"), "it says how to approve: {out}");
+    assert!(!log.exists(), "the worker must not have run");
+
+    // Approval is what unlocks it, and agent execution is the next step.
+    let (_, err, success) = run(&["workflow", "run", "review", "--instance", "1", "--yes"]);
+    assert!(!success && err.contains("not executable yet"), "{err}");
+    assert!(!log.exists(), "still nothing spent");
 }

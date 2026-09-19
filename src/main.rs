@@ -11,6 +11,7 @@ mod config;
 mod dates;
 mod deps;
 mod dispatch;
+mod pass;
 mod rank;
 mod report;
 mod report_runs;
@@ -146,6 +147,9 @@ enum Command {
         /// The model to ask it for; defaults to the agent's own.
         #[arg(short = 'm', long)]
         model: Option<String>,
+        /// A named preset; `-a` or `-m` beside it wins.
+        #[arg(short = 'p', long)]
+        preset: Option<String>,
         /// With --auto, also draw from every project carrying this tag;
         /// repeatable.
         #[arg(long = "tag", value_name = "TAG", requires = "auto")]
@@ -204,6 +208,12 @@ enum Command {
     Workflow {
         #[command(subcommand)]
         action: Option<WorkflowAction>,
+    },
+    /// Presets: a named worker, model and configuration. List them, name one,
+    /// or make one the default.
+    Preset {
+        #[command(subcommand)]
+        action: Option<PresetAction>,
     },
     /// List the workers `pma dispatch` can run, or change one.
     Agent {
@@ -382,6 +392,25 @@ enum RouteAction {
 }
 
 #[derive(Subcommand)]
+enum PresetAction {
+    /// Name a worker, a model and the arguments that configure it, replacing
+    /// one of that name. An empty model leaves the worker its own.
+    Set {
+        name: String,
+        agent: String,
+        model: Option<String>,
+        /// Arguments the worker's `{extra}` stands in for, such as
+        /// `--thinking high`. Leading dashes are taken literally.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Make a preset the default, as `pma config preset` does.
+    Use { name: String },
+    /// Forget a preset. The worker it named is untouched.
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
 enum WorkflowAction {
     /// Store a document as a draft revision, printing its worst case.
     Propose {
@@ -401,6 +430,36 @@ enum WorkflowAction {
     },
     /// Print a revision's document, as `pma` read it.
     Show { revision: Option<i64> },
+    /// Advance one pass of a workflow over a target, then exit. Nodes a rule
+    /// decides run; nodes an agent decides are planned, priced and left for
+    /// you to approve.
+    Run {
+        /// A workflow named by the revision in effect.
+        name: String,
+        /// Projects to run it over.
+        projects: Vec<String>,
+        /// Add every project carrying this tag.
+        #[arg(long)]
+        tag: Option<String>,
+        /// Resume an instance instead of starting one.
+        #[arg(long, value_name = "ID")]
+        instance: Option<i64>,
+        /// Plan and price the pass without running anything at all.
+        #[arg(long)]
+        dry_run: bool,
+        /// Approve the spend this pass plans.
+        #[arg(long)]
+        yes: bool,
+        /// Run agent nodes with this worker, whatever a route names.
+        #[arg(short = 'a', long)]
+        agent: Option<String>,
+        /// And this model. A cheap one is how to try a workflow out.
+        #[arg(short = 'm', long)]
+        model: Option<String>,
+        /// A named preset; `-a` or `-m` beside it wins.
+        #[arg(short = 'p', long)]
+        preset: Option<String>,
+    },
     /// Read a document and print the worst case each workflow can cost.
     /// Nothing is stored and nothing runs.
     Check {
@@ -427,6 +486,8 @@ enum AgentAction {
         /// The value; for `args`, a JSON array such as `["-p","{prompt}"]`.
         value: String,
     },
+    /// Print every field of one worker.
+    Show { name: String },
     /// Remove a worker.
     Rm { name: String },
 }
@@ -459,18 +520,13 @@ fn main() -> ExitCode {
             targets,
             agent,
             model,
+            preset,
             tags,
             auto,
             count,
             retry,
-        } => run_dispatch(
-            &targets,
-            &tags,
-            auto,
-            count,
-            retry,
-            &dispatch::Overrides { agent, model },
-        ),
+        } => overrides(agent, model, preset)
+            .and_then(|over| run_dispatch(&targets, &tags, auto, count, retry, &over)),
         Command::Review {
             ids,
             approve,
@@ -486,6 +542,7 @@ fn main() -> ExitCode {
         Command::Campaign { action } => campaign_command(action),
         Command::Route { action } => route_command(action),
         Command::Workflow { action } => workflow_command(action),
+        Command::Preset { action } => preset_command(action),
         Command::Agent { action } => agent_command(action),
         Command::Report { by } => run_report(by.as_deref()),
         Command::Ship { projects, tags } => run_ship(&projects, &tags),
@@ -1740,6 +1797,109 @@ fn run_campaign(name: &str, count: Option<usize>) -> Result<()> {
 /// A policy document from a file, stdin, or a stored revision number.
 /// A document from a file: a script builds one, JSON is read as one. Both end
 /// up as the same `Document`, so everything downstream is one path.
+/// The flags, with a named preset read. A flag beside one wins: it is the more
+/// specific statement of intent.
+fn overrides(
+    agent: Option<String>,
+    model: Option<String>,
+    preset: Option<String>,
+) -> Result<dispatch::Overrides> {
+    let preset = match preset {
+        None => None,
+        Some(name) => Some(Store::open_default()?.preset(&name)?),
+    };
+    Ok(dispatch::Overrides {
+        agent,
+        model,
+        preset,
+    })
+}
+
+fn preset_command(action: Option<PresetAction>) -> Result<()> {
+    let store = Store::open_default()?;
+    let cfg = load_config(&store)?;
+    let Some(action) = action else {
+        let presets = store.presets()?;
+        if presets.is_empty() {
+            println!(
+                "no presets. `pma preset set <name> <agent> [model] [args...]` names one, \n\
+                 and `pma agent` lists each worker and its own default model."
+            );
+            return Ok(());
+        }
+        let rows: Vec<Vec<String>> = presets
+            .iter()
+            .map(|p| {
+                vec![
+                    format!(
+                        "{} {}",
+                        if cfg.preset.as_deref() == Some(&p.name) {
+                            "*"
+                        } else {
+                            " "
+                        },
+                        p.name
+                    ),
+                    p.agent.clone(),
+                    p.model.clone().unwrap_or_else(|| "its own default".into()),
+                    p.args.join(" "),
+                    match store.agent(&p.agent) {
+                        Ok(_) => String::new(),
+                        Err(_) => "no such worker".into(),
+                    },
+                ]
+            })
+            .collect();
+        print!("{}", report::table(&rows, ""));
+        println!(
+            "\n* is `pma config preset`. `-p <name>` uses one for a command; \
+             `pma preset use <name>`\n  makes it the default, and `-a` or `-m` beside \
+             either one wins."
+        );
+        return Ok(());
+    };
+    match action {
+        PresetAction::Set {
+            name,
+            agent,
+            model,
+            args,
+        } => {
+            let p = store::Preset {
+                name: name.clone(),
+                agent: agent.clone(),
+                model: model.clone().filter(|m| !m.is_empty()),
+                args,
+            };
+            store.set_preset(&p)?;
+            println!(
+                "preset `{name}`: {agent}{}{}",
+                p.model.map(|m| format!(" at {m}")).unwrap_or_default(),
+                if p.args.is_empty() {
+                    String::new()
+                } else {
+                    format!(" with {}", p.args.join(" "))
+                }
+            );
+        }
+        PresetAction::Use { name } => {
+            // Read first, so naming one that does not exist changes nothing.
+            store.preset(&name)?;
+            store.set_config("preset", &name)?;
+            println!("`{name}` is the default preset");
+        }
+        PresetAction::Rm { name } => {
+            if !store.remove_preset(&name)? {
+                return Err(format!("no preset `{name}`").into());
+            }
+            if cfg.preset.as_deref() == Some(name.as_str()) {
+                store.set_config("preset", "")?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn workflow_document(file: &str) -> Result<(workflow::Document, Option<String>)> {
     let text = if file == "-" {
         let mut text = String::new();
@@ -1848,6 +2008,23 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
             })
             .collect();
         print!("{}", report::table(&rows, ""));
+        let instances = store.workflow_instances()?;
+        if !instances.is_empty() {
+            let rows: Vec<Vec<String>> = instances
+                .iter()
+                .map(|i| {
+                    vec![
+                        format!("instance {}", i.id),
+                        i.workflow.clone(),
+                        i.target.clone(),
+                        i.outcome.clone().unwrap_or_else(|| "open".into()),
+                        report::ago(dates::now() - i.started_at),
+                    ]
+                })
+                .collect();
+            println!();
+            print!("{}", report::table(&rows, ""));
+        }
         return Ok(());
     };
     match action {
@@ -1932,6 +2109,102 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
             store.activate_workflow(revision, &by.unwrap_or_else(whoami))?;
             println!("revision {revision} is in effect");
             Ok(())
+        }
+        WorkflowAction::Run {
+            name,
+            projects,
+            tag,
+            instance,
+            dry_run,
+            yes,
+            agent,
+            model,
+            preset,
+        } => {
+            let store = Store::open_default()?;
+            // A pass runs agents and edits worktrees, so it holds the session
+            // lock for its whole run, as `pma dispatch` does.
+            let _session = Session::acquire(&store::home()?)?;
+            let cfg = load_config(&store)?;
+            // The flags cover the whole pass and are not stored: a pass
+            // resolves its worker exactly as a dispatch does.
+            let over = overrides(agent, model, preset)?;
+            let revision = store
+                .active_workflow()?
+                .ok_or("no workflow revision is in effect; `pma workflow activate <rev>`")?;
+            let doc = revision.document()?;
+            let w = doc.workflow(&name).ok_or_else(|| {
+                format!("revision {} has no workflow `{name}`", revision.revision)
+            })?;
+
+            let instance = match instance {
+                Some(id) => id,
+                None => {
+                    let mut names = projects.clone();
+                    if let Some(tag) = &tag {
+                        for (project, t) in store.project_tags()? {
+                            if t == *tag && !names.contains(&project) {
+                                names.push(project);
+                            }
+                        }
+                    }
+                    let units = pass::root_units(&store, &doc, &name, &names)?;
+                    // The total a pass may spend scales with the argument bag,
+                    // which is only known now.
+                    let estimate = doc.estimate(&name, units.len() as i64, cfg.agent_budget)?;
+                    if estimate.cost > cfg.workflow_budget {
+                        return Err(format!(
+                            "over {} projects this pass could cost ${:.2}, over workflow_budget \
+                             of ${:.2}",
+                            units.len(),
+                            estimate.cost,
+                            cfg.workflow_budget
+                        )
+                        .into());
+                    }
+                    let target = match &tag {
+                        Some(t) => format!("--tag {t}"),
+                        None => names.join(" "),
+                    };
+                    let id =
+                        store.add_workflow_instance(&name, revision.revision, "{}", &target)?;
+                    for unit in &units {
+                        store.add_workflow_unit(id, unit)?;
+                        pass::enter(&store, id, w, unit)?;
+                    }
+                    println!(
+                        "instance {id} of `{name}`: {} unit(s), at most ${:.2}",
+                        units.len(),
+                        estimate.cost
+                    );
+                    id
+                }
+            };
+
+            if dry_run {
+                let plan = pass::plan(&store, &cfg, &over, w, instance)?;
+                print!("{}", pass::describe(&plan, "would run: "));
+                return Ok(());
+            }
+
+            let plan = pass::advance(&store, &cfg, &over, &doc, w, instance)?;
+            if plan.is_empty() {
+                store.finish_instance(instance, "finished")?;
+                println!("instance {instance}: nothing left to run");
+                return Ok(());
+            }
+            let cost: f64 = plan.iter().map(|p| p.cost).sum();
+            print!("{}", pass::describe(&plan, "next: "));
+            if !yes {
+                println!(
+                    "\nat most ${cost:.2}. Nothing was spent. Approve it with \
+                     `pma workflow run {name} --instance {instance} --yes`."
+                );
+                return Ok(());
+            }
+            // Agent nodes are the next step; the gate above is what they land
+            // behind.
+            Err("approved, but agent nodes are not executable yet".into())
         }
         WorkflowAction::Show { revision } => {
             let store = Store::open_default()?;
@@ -2110,13 +2383,12 @@ fn agent_command(action: Option<AgentAction>) -> Result<()> {
                         format!("  {}", w.name)
                     },
                     w.command.clone(),
-                    w.parse.name().into(),
+                    w.parse.name(),
                     if flags.is_empty() {
                         "-".into()
                     } else {
                         flags.join(",")
                     },
-                    serde_json::to_string(&w.args).unwrap_or_default(),
                 ]
             })
             .collect();
@@ -2124,11 +2396,40 @@ fn agent_command(action: Option<AgentAction>) -> Result<()> {
             println!("no agents; `pma agent set <name> command <program>` adds one");
         } else {
             print!("{}", report::table(&rows, ""));
-            println!("\n* is `pma config agent`; reports cost, enforces budget, has a sandbox");
+            println!(
+                "\n* is `pma config agent`. A worker is how to run a program; which model \
+                 it runs\n  at is a preset (`pma preset`). Flags are cost reported, budget \
+                 enforced, sandbox,\n  allowlist and resume; `pma agent show <name>` prints \
+                 the rest."
+            );
         }
         return Ok(());
     };
     match action {
+        AgentAction::Show { name } => {
+            let w = store.agent(&name)?;
+            let rows = vec![
+                vec!["command".into(), w.command.clone()],
+                vec![
+                    "args".into(),
+                    serde_json::to_string(&w.args).unwrap_or_default(),
+                ],
+                vec![
+                    "allow".into(),
+                    w.allow.clone().unwrap_or_else(|| "none".into()),
+                ],
+                vec!["parse".into(), w.parse.name()],
+                vec!["reports-cost".into(), w.reports_cost.to_string()],
+                vec!["enforces-budget".into(), w.enforces_budget.to_string()],
+                vec!["sandbox".into(), w.sandbox.to_string()],
+                vec!["resumes".into(), w.resumes.to_string()],
+                vec![
+                    "env".into(),
+                    serde_json::to_string(&w.env).unwrap_or_default(),
+                ],
+            ];
+            print!("{}", report::table(&rows, ""));
+        }
         AgentAction::Rm { name } => {
             if !store.remove_agent(&name)? {
                 return Err(format!("unknown agent `{name}`").into());
@@ -2145,6 +2446,7 @@ fn agent_command(action: Option<AgentAction>) -> Result<()> {
                 enforces_budget: false,
                 sandbox: false,
                 resumes: false,
+                env: std::collections::BTreeMap::new(),
             });
             let flag = |v: &str| match v {
                 "true" | "yes" => Ok(true),
@@ -2170,6 +2472,17 @@ fn agent_command(action: Option<AgentAction>) -> Result<()> {
                 "enforces-budget" => w.enforces_budget = flag(&value)?,
                 "sandbox" => w.sandbox = flag(&value)?,
                 "resumes" => w.resumes = flag(&value)?,
+                "model" => {
+                    return Err(format!(
+                        "a worker no longer names a model: \
+                         `pma preset set <name> {name} {value}`"
+                    )
+                    .into());
+                }
+                "env" => {
+                    w.env = serde_json::from_str(&value)
+                        .map_err(|e| format!("env must be a JSON object of name to value: {e}"))?;
+                }
                 _ => {
                     let names: Vec<&str> = worker::FIELDS.iter().map(|(n, _)| *n).collect();
                     return Err(

@@ -4,6 +4,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0]
+
 ### Added
 
 **`pma workflow check`, and the workflow document behind it.** A workflow is a typed, parameterised function over bags of units: a graph whose nodes apply one of five primitives and whose edges decide, by rule, where each unit goes next. `check` reads a document, refuses what it cannot apply exactly -- a type disagreement across an edge, a `0..n` node with no unit cap, a cycle that is not a declared lap edge, a lap edge with no terminal path, declared effects that differ from the graph's -- and prints the worst-case runs and cost per node. The bound is computed at every parameter's declared maximum, so it does not depend on what an invocation passes; `activate` will refuse a document above it. Nothing is stored and nothing runs yet. Design: `docs/dev/workflows.md`.
@@ -22,6 +24,20 @@ let graph = source("project")
     .filter("confirm", ["reason"], "Confirm each unit in {in}.")
     .output();
 ```
+
+**A model is named by a preset, and both older places for it are retired.** The `model` setting sat beside the choice of worker, so `-a opencode` had to drop it and a pairing could not be configured at all; migration 22 moved it onto the worker record. A worker's own model then said what a preset says and less, so migration 24 turns each one into a preset of that worker's name, makes it the default where that worker was the configured one, and drops the column. Both old commands explain where the setting went rather than failing as unknown. A worker is now how to run a program; which model it runs at, and with what configuration, is a preset.
+
+**`pma preset` names a worker, a model and the configuration that goes with them, and `-p` selects one.** `pma preset set omp-luna-high omp gpt-5.6-luna --thinking high`, then `pma dispatch -p omp-luna-high` or `pma workflow run … -p omp-luna-high`; `pma preset use <name>` makes it the default. Effort is arguments rather than a field, because what expresses it differs per agent -- `--thinking` for omp, `--variant` for opencode, nothing on claude's command line -- so a worker's `args` template says where they go with a new `{extra}` placeholder, which stands for however many a preset adds. A preset takes part in no matching, so it competes with no route, and a flag beside `-p` wins. A preset naming a worker that does not exist is refused where it is set; one naming no model leaves the worker its own. The preset and its arguments are recorded on each run, so a replay reads back what ran. Schema 23.
+
+`pma agent` is now that pair view: one line per worker, the model it would use, and any pair an active route names beyond them. The full record, args and environment included, moved to `pma agent show <name>`.
+
+**Two more workers, and providers as configuration rather than code.** `opencode` and `omp` are seeded as templates beside `claude`, checked against `opencode` 1.18.27 and `omp` 18.1.18. A seed is written only when no row has that name, so an edited worker survives an upgrade. Schema 21.
+
+`pma` runs agents and is not an API client: `{model}` reaches the worker verbatim, so `-a opencode -m openai/gpt-5.2` or `-m openrouter/anthropic/claude-sonnet-4.5` resolves in the agent's own provider configuration. Provider keys are inherited from the session, since `agent::restrict` strips only what lets a child push; a worker that needs a base URL for an OpenAI-compatible endpoint, or its own config path, carries it in a new `env` field, applied after `restrict` so a record cannot restore a stripped credential.
+
+`parse` gains `json:<summary>:<cost>[:<error>]`: dotted paths into the last JSON value a run printed. A worker whose output shape nothing else reads is then a record rather than another variant in the code, and `opencode` and `omp` ship as `text-tail` -- verdict from the exit status, cost unknown rather than guessed -- until their shapes are confirmed.
+
+**`pma workflow run` advances one pass and spends nothing without approval.** A node a rule decides -- `check`, `emit`, and `map` or `reduce` backed by a rule -- runs as soon as its units arrive, because it is free and deterministic. At the first node an agent would decide the pass stops and prints what it would run, with the worker, the model and a ceiling; `--yes` is what approves it, and `--dry-run` prices the pass without running even the free nodes. `-m haiku` runs a graph at a cheap model. A pass holds no state: units are immutable and every move a unit makes is recorded against the edge it took, or the guard that refused it, so the frontier is re-derived on each invocation and a killed pass resumes by recomputing. A test asserts the gate against the filesystem rather than against a claim: the fake worker writes a log line when invoked, and that file must not exist.
 
 `pma workflow propose` stores a document as a draft revision, normalised as `pma` read it, with the script that built it kept beside it for provenance: a revision reads back as JSON whichever form wrote it. `pma workflow activate` refuses a revision whose worst case per unit of input exceeds the new `workflow_budget` setting, naming both figures. A route may now match on `node` and `lap`, where a route stating no node serves task dispatch alone, so an existing policy's catch-all cannot absorb a workflow's nodes; `*/fix` matches that node wherever it was called from. Schema 20 adds the `workflows`, `workflow_instances`, `workflow_units`, `workflow_moves` and `workflow_verdicts` tables, and `workflow_instance`, `node`, `unit` and `lap` on `runs`.
 

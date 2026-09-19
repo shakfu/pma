@@ -23,7 +23,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 20;
+const VERSION: i64 = 24;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -307,6 +307,67 @@ CREATE TABLE campaign_members (
 );
 ";
 
+/// Version 24. Retires a worker's own default model in favour of presets. A
+/// preset says the same thing and more -- a worker, a model and the arguments
+/// that configure it -- and two ways to name a default model is one too many.
+/// Each worker that named one gets a preset of its own name, which becomes the
+/// default when that worker was the configured one. The column is dropped
+/// rather than left unread: a retirement that leaves the old place writable is
+/// not one.
+const PRESETS_REPLACE_WORKER_MODEL: &str = "
+INSERT OR IGNORE INTO presets (name, agent, model, args, created_at)
+ SELECT name, name, model, '[]', strftime('%s', 'now') FROM agents
+  WHERE model IS NOT NULL AND model <> '';
+INSERT OR REPLACE INTO config (key, value)
+ SELECT 'preset', a.name FROM agents a
+  WHERE a.model IS NOT NULL AND a.model <> ''
+    AND a.name = COALESCE((SELECT value FROM config WHERE key = 'agent'), 'claude')
+    AND NOT EXISTS (SELECT 1 FROM config WHERE key = 'preset' AND value <> '');
+ALTER TABLE agents DROP COLUMN model;
+";
+
+/// Version 23. Presets: a named worker, model and configuration. Effort is not
+/// a field, because what expresses it differs per agent -- `--thinking` for
+/// one, `--variant` for another -- so a preset carries arguments and the worker
+/// record says where they go. A preset takes part in no matching, so it
+/// competes with no route; what it buys is a name for a combination worth
+/// returning to, and a list of the ones in use.
+///
+/// The name and the arguments are recorded on each run, because a replay must
+/// read back what ran rather than what the preset says today.
+const PRESETS: &str = "
+CREATE TABLE presets (
+    name TEXT PRIMARY KEY,
+    agent TEXT NOT NULL,
+    model TEXT,
+    args TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL
+);
+ALTER TABLE runs ADD COLUMN preset TEXT;
+ALTER TABLE runs ADD COLUMN extra_args TEXT;
+";
+
+/// Version 22. A worker's default model. A model name is only meaningful to
+/// the worker that understands it, so storing it beside the choice of worker
+/// meant naming another worker had to drop it. The value the `model` setting
+/// held is carried onto the configured worker, and the setting is retired.
+const WORKER_MODEL: &str = "
+ALTER TABLE agents ADD COLUMN model TEXT;
+UPDATE agents SET model = (SELECT value FROM config WHERE key = 'model')
+ WHERE name = COALESCE((SELECT value FROM config WHERE key = 'agent'), 'claude')
+   AND EXISTS (SELECT 1 FROM config WHERE key = 'model' AND value <> '');
+DELETE FROM config WHERE key = 'model';
+";
+
+/// Version 21. Environment a worker needs, so reaching OpenAI, OpenRouter or
+/// any OpenAI-compatible endpoint is a record rather than a code path: a base
+/// URL or a config location belongs to the worker, and the key comes from the
+/// session. Seeds the two other workers `pma` ships a template for, without
+/// replacing one the user has already edited.
+const WORKER_ENV: &str = "
+ALTER TABLE agents ADD COLUMN env TEXT NOT NULL DEFAULT '{}';
+";
+
 /// Version 20. A workflow is a typed function over bags of units, stored as a
 /// revision and activated like a routing policy. Units are immutable and carry
 /// their lineage, so a lap, an annotation and a decomposition each leave a
@@ -566,6 +627,10 @@ impl Store {
                     ABSENCE,
                     PROJECT_TAGS,
                     WORKFLOWS,
+                    WORKER_ENV,
+                    WORKER_MODEL,
+                    PRESETS,
+                    PRESETS_REPLACE_WORKER_MODEL,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -573,6 +638,23 @@ impl Store {
                 }
                 if version < 11 {
                     seed_agent(&tx, &crate::worker::Worker::claude())?;
+                }
+                if version < 21 {
+                    // Not replacing an edited row: a template is a starting
+                    // point, and the store is the record.
+                    for w in [
+                        crate::worker::Worker::opencode(),
+                        crate::worker::Worker::omp(),
+                    ] {
+                        if tx.query_row(
+                            "SELECT count(*) FROM agents WHERE name = ?1",
+                            [&w.name],
+                            |r| r.get::<_, i64>(0),
+                        )? == 0
+                        {
+                            seed_agent(&tx, &w)?;
+                        }
+                    }
                 }
                 tx.pragma_update(None, "user_version", VERSION)?;
                 tx.commit()?;
@@ -946,10 +1028,10 @@ impl Store {
                                verify, verify_base_ok, verify_base_seconds, model,
                                complexity, features, estimator,
                                route_revision, route, approval,
-                               workflow_instance, node, unit, lap)
+                               workflow_instance, node, unit, lap, preset, extra_args)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
                      ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-                     ?31, ?32, ?33, ?34)",
+                     ?31, ?32, ?33, ?34, ?35, ?36)",
             params![
                 run.project,
                 run.task_key,
@@ -985,6 +1067,8 @@ impl Store {
                 run.node,
                 run.unit,
                 run.lap,
+                run.preset,
+                serde_json::to_string(&run.extra_args).unwrap_or_else(|_| "[]".into()),
             ],
         )?;
         run.id = self.conn.last_insert_rowid();
@@ -1042,7 +1126,7 @@ impl Store {
                     verify_base_ok, verify_base_seconds, changed_paths, scope_error, model,
                     complexity, features, estimator, route_revision, route, approval,
                     approved_tree, approved_head, approved_by,
-                    workflow_instance, node, unit, lap
+                    workflow_instance, node, unit, lap, preset, extra_args
              FROM runs ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1118,6 +1202,11 @@ impl Store {
                 node: r.get(50)?,
                 unit: r.get(51)?,
                 lap: r.get(52)?,
+                preset: r.get(53)?,
+                extra_args: r
+                    .get::<_, Option<String>>(54)?
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1372,11 +1461,215 @@ impl Store {
             .find(|r| r.activated_at.is_some()))
     }
 
+    /// Starts an instance: the frozen argument bag and what it was run over.
+    pub fn add_workflow_instance(
+        &self,
+        workflow: &str,
+        revision: i64,
+        args: &str,
+        target: &str,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO workflow_instances (workflow, revision, args, target, started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![workflow, revision, args, target, crate::dates::now()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn workflow_instances(&self) -> Result<Vec<WorkflowInstance>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workflow, revision, args, target, started_at, finished_at, outcome
+             FROM workflow_instances ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(WorkflowInstance {
+                id: r.get(0)?,
+                workflow: r.get(1)?,
+                revision: r.get(2)?,
+                args: r.get(3)?,
+                target: r.get(4)?,
+                started_at: r.get(5)?,
+                finished_at: r.get(6)?,
+                outcome: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn finish_instance(&self, instance: i64, outcome: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE workflow_instances SET finished_at = ?2, outcome = ?3 WHERE id = ?1",
+            params![instance, crate::dates::now(), outcome],
+        )?;
+        Ok(())
+    }
+
+    /// Units are immutable, so this only ever inserts.
+    pub fn add_workflow_unit(&self, instance: i64, u: &WorkflowUnit) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO workflow_units
+                (instance, id, type, node, parent, root, depth, lap, project, data, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                instance,
+                u.id,
+                u.ty,
+                u.node,
+                u.parent,
+                u.root,
+                u.depth,
+                u.lap,
+                u.project,
+                u.data,
+                crate::dates::now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn workflow_units(&self, instance: i64) -> Result<Vec<WorkflowUnit>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, type, node, parent, root, depth, lap, project, data
+             FROM workflow_units WHERE instance = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([instance], |r| {
+            Ok(WorkflowUnit {
+                id: r.get(0)?,
+                ty: r.get(1)?,
+                node: r.get(2)?,
+                parent: r.get(3)?,
+                root: r.get(4)?,
+                depth: r.get(5)?,
+                lap: r.get(6)?,
+                project: r.get(7)?,
+                data: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// One row per unit and edge: which way it went, or the guard that
+    /// refused it. A unit that stopped is therefore answerable for.
+    pub fn add_workflow_move(
+        &self,
+        instance: i64,
+        unit: &str,
+        edge: usize,
+        taken: bool,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO workflow_moves (instance, unit, edge, taken, reason, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                instance,
+                unit,
+                edge as i64,
+                taken,
+                reason,
+                crate::dates::now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every move recorded, as `(unit, edge, taken)`.
+    pub fn workflow_moves(&self, instance: i64) -> Result<Vec<(String, usize, bool)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT unit, edge, taken FROM workflow_moves WHERE instance = ?1")?;
+        let rows = stmt.query_map([instance], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as usize,
+                r.get::<_, bool>(2)?,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn add_workflow_verdict(
+        &self,
+        instance: i64,
+        unit: &str,
+        check: &str,
+        verdict: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO workflow_verdicts
+                (instance, unit, check_name, verdict, detail, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![instance, unit, check, verdict, detail, crate::dates::now()],
+        )?;
+        Ok(())
+    }
+
+    /// Verdicts by unit and check name.
+    pub fn workflow_verdicts(&self, instance: i64) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT unit, check_name, verdict FROM workflow_verdicts WHERE instance = ?1",
+        )?;
+        let rows = stmt.query_map([instance], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Names a worker, a model and the arguments that configure it. Replaces
+    /// one of the same name.
+    pub fn set_preset(&self, p: &Preset) -> Result<()> {
+        if self.agent(&p.agent).is_err() {
+            return Err(format!("no worker `{}`; `pma agent` lists them", p.agent).into());
+        }
+        self.conn.execute(
+            "INSERT OR REPLACE INTO presets (name, agent, model, args, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                p.name,
+                p.agent,
+                p.model,
+                serde_json::to_string(&p.args).unwrap_or_else(|_| "[]".into()),
+                crate::dates::now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn presets(&self) -> Result<Vec<Preset>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, agent, model, args FROM presets ORDER BY name")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Preset {
+                name: r.get(0)?,
+                agent: r.get(1)?,
+                model: r.get::<_, Option<String>>(2)?.filter(|m| !m.is_empty()),
+                args: serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or_default(),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn preset(&self, name: &str) -> Result<Preset> {
+        self.presets()?
+            .into_iter()
+            .find(|p| p.name == name)
+            .ok_or_else(|| format!("no preset `{name}`; `pma preset` lists them").into())
+    }
+
+    /// Returns false when no preset has the name.
+    pub fn remove_preset(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM presets WHERE name = ?1", [name])?
+            > 0)
+    }
+
     /// Every worker, by name.
     pub fn agents(&self) -> Result<Vec<Worker>> {
         let mut stmt = self.conn.prepare(
             "SELECT name, command, args, allow, parse, reports_cost, enforces_budget,
-                    sandbox, resumes
+                    sandbox, resumes, env
              FROM agents ORDER BY name",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1392,6 +1685,7 @@ impl Store {
                 enforces_budget: r.get(6)?,
                 sandbox: r.get(7)?,
                 resumes: r.get(8)?,
+                env: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1741,6 +2035,10 @@ pub struct Run {
     pub unit: Option<String>,
     /// Laps the unit had completed. 0 outside a workflow.
     pub lap: i64,
+    /// The preset this run was dispatched under, where one named it.
+    pub preset: Option<String>,
+    /// Arguments the preset added, recorded so a replay reads back what ran.
+    pub extra_args: Vec<String>,
 }
 
 impl Run {
@@ -1801,6 +2099,8 @@ impl Run {
             node: None,
             unit: None,
             lap: 0,
+            preset: None,
+            extra_args: Vec::new(),
         }
     }
 
@@ -1876,6 +2176,47 @@ pub struct RouteRevision {
     pub shadow: bool,
 }
 
+/// A named worker, model and configuration. `model` unset means the worker's
+/// own default, and `args` are inserted where its record puts `{extra}`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Preset {
+    pub name: String,
+    pub agent: String,
+    pub model: Option<String>,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkflowInstance {
+    pub id: i64,
+    pub workflow: String,
+    pub revision: i64,
+    /// The arguments the pass was given, as JSON, so a replay reads the same
+    /// instantiation rather than the document's defaults.
+    pub args: String,
+    /// What the argument bag was taken from.
+    pub target: String,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub outcome: Option<String>,
+}
+
+/// A unit as stored: immutable, carrying its lineage and its data.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkflowUnit {
+    pub id: String,
+    pub ty: String,
+    /// The node that wrote it; `@input` for a root unit.
+    pub node: String,
+    pub parent: Option<String>,
+    pub root: String,
+    pub depth: i64,
+    pub lap: i64,
+    pub project: Option<String>,
+    /// The declared fields, as JSON.
+    pub data: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkflowRevision {
     pub revision: i64,
@@ -1908,8 +2249,9 @@ impl RouteRevision {
 fn seed_agent(conn: &Connection, w: &Worker) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO agents
-            (name, command, args, allow, parse, reports_cost, enforces_budget, sandbox, resumes)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            (name, command, args, allow, parse, reports_cost, enforces_budget, sandbox,
+             resumes, env)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             w.name,
             w.command,
@@ -1920,6 +2262,7 @@ fn seed_agent(conn: &Connection, w: &Worker) -> Result<()> {
             w.enforces_budget,
             w.sandbox,
             w.resumes,
+            serde_json::to_string(&w.env).unwrap_or_else(|_| "{}".into()),
         ],
     )?;
     Ok(())
@@ -2104,7 +2447,12 @@ mod tests {
     fn upgrading_seeds_the_worker_that_was_compiled_in() {
         let dir = scratch("agents");
         let store = Store::open(&dir.join("p.db")).unwrap();
-        assert_eq!(store.agents().unwrap(), [Worker::claude()]);
+        // Three templates, alphabetically: the one that was compiled in, and
+        // the two installed separately.
+        assert_eq!(
+            store.agents().unwrap(),
+            [Worker::claude(), Worker::omp(), Worker::opencode()]
+        );
 
         let mut w = Worker::claude();
         w.name = "codex".into();
@@ -2120,13 +2468,79 @@ mod tests {
         w.reports_cost = false;
         w.sandbox = true;
         store.set_agent(&w).unwrap();
-        assert_eq!(store.agents().unwrap(), [Worker::claude(), w.clone()]);
+        assert_eq!(
+            store.agents().unwrap(),
+            [
+                Worker::claude(),
+                w.clone(),
+                Worker::omp(),
+                Worker::opencode()
+            ]
+        );
         assert_eq!(store.agent("codex").unwrap(), w);
         assert!(store.agent("cursor").is_err());
 
         assert!(store.remove_agent("codex").unwrap());
         assert!(!store.remove_agent("codex").unwrap());
-        assert_eq!(store.agents().unwrap(), [Worker::claude()]);
+        assert_eq!(
+            store.agents().unwrap(),
+            [Worker::claude(), Worker::omp(), Worker::opencode()]
+        );
+
+        // A template is a starting point: an edited row survives reopening,
+        // which is what seeding only an absent name buys.
+        let mut edited = Worker::opencode();
+        edited.env = std::collections::BTreeMap::from([(
+            "OPENAI_BASE_URL".to_string(),
+            "http://localhost:11434/v1".to_string(),
+        )]);
+        store.set_agent(&edited).unwrap();
+        drop(store);
+        let store = Store::open(&dir.join("p.db")).unwrap();
+        assert_eq!(store.agent("opencode").unwrap(), edited);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A worker that named a model before presets existed keeps that pairing:
+    /// it becomes a preset of the worker's name, and the default when that
+    /// worker was the configured one.
+    #[test]
+    fn retiring_a_workers_model_leaves_a_preset_in_its_place() {
+        let dir = scratch("worker-model");
+        let path = dir.join("p.db");
+        // A store as schema 23 left it: the column exists and holds a model.
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .conn
+                .execute_batch("ALTER TABLE agents ADD COLUMN model TEXT")
+                .unwrap();
+            store
+                .conn
+                .execute("UPDATE agents SET model = 'opus' WHERE name = 'claude'", [])
+                .unwrap();
+            store.set_config("agent", "claude").unwrap();
+            store.conn.pragma_update(None, "user_version", 23).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.preset("claude").unwrap(),
+            Preset {
+                name: "claude".into(),
+                agent: "claude".into(),
+                model: Some("opus".into()),
+                args: Vec::new(),
+            }
+        );
+        assert_eq!(
+            store
+                .config_rows()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k == "preset"),
+            Some(&("preset".to_string(), "claude".to_string())),
+            "and it is the default, because that worker was the configured one"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2351,6 +2765,8 @@ mod tests {
             node: None,
             unit: None,
             lap: 0,
+            preset: None,
+            extra_args: Vec::new(),
         };
         store.insert_run(&mut run).unwrap();
         assert_eq!(store.run(run.id).unwrap(), run);

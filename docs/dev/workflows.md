@@ -1,6 +1,6 @@
 # pma workflows (draft)
 
-Status: 2026-09-19. Built: the document in both its forms with its refusals and cost bound, migration 20, `node` and `lap` on a route, and `pma workflow check|propose|activate|show` (`src/workflow.rs`, `src/script.rs`, `src/route.rs`, `src/store.rs`). Not built: the pass, and every node's execution.
+Status: 2026-09-19. Built: the document in both its forms with its refusals and cost bound, migration 20, `node` and `lap` on a route, `pma workflow check|propose|activate|show|run`, and a pass that runs every node a rule decides. Not built: agent nodes, `edit`, and the `call` flattening.
 
 Two decisions below were corrected by the implementation rather than by review: an `edit` preserves its unit's type (section 3), and a lap mints a unit while a retry does not (section 11).
 
@@ -177,7 +177,7 @@ Prefixing by call site rather than by callee is what lets one workflow be called
 
 **W9. Readiness is derived, never stored.** A node is runnable when its incoming units have arrived. There is no cursor, so a crash resumes by re-deriving. This is plan 1.7's rule applied to sequencing: store the evidence, not the verdict.
 
-**W10. `pma workflow run` is a pass, not a daemon.** It advances every runnable node of every named instance and exits, holding `session.lock` for the pass like `pma dispatch`. A boundary that needs a human ends the pass; the next invocation resumes it. Waiting for an external condition is the same mechanism: a `check` node is simply not ready. Rejected: a resident process, which would hold the lock across a human decision.
+**W10. `pma workflow run` is a pass, not a daemon.** It advances every runnable node of every named instance and exits, holding `session.lock` for the pass like `pma dispatch`. A boundary that needs a human ends the pass; the next invocation resumes it. Waiting for an external condition is the same mechanism: a `check` node is simply not ready. Rejected: a resident process, which would hold the lock across a human decision. A pass runs every node a rule decides as soon as its units arrive, because a rule is free and deterministic. It stops at the first node an agent decides, prices it, and spends nothing until `--yes`: what a pass would spend is a decision, and it is the developer's. `--dry-run` plans and prices without running even the free nodes, and `-m` runs a graph at a cheap model, which is how a workflow is tried out.
 
 ### Policy and authority
 

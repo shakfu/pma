@@ -324,14 +324,54 @@ The worker layer. For the manager layer, see goal 5.
 
 Each agent is a command template run in the worktree. Flags below were checked against each tool's `--help` on 2026-09-14.
 
-| Agent | Headless invocation | Budget cap |
-|-|-|-|
-| `claude` | `claude -p <prompt> --output-format json --permission-mode acceptEdits --max-budget-usd <n>` | native |
-| `codex` | `codex exec -C <dir> -s workspace-write --json -o <file> <prompt>` | timeout only |
-| `cursor-agent` | `cursor-agent -p --output-format json --workspace <dir> --force <prompt>` | timeout only |
-| `opencode` | `opencode run --dir <dir> --format json --auto <prompt>` | timeout only |
+| Agent | Headless invocation | Budget cap | Seeded |
+|-|-|-|-|
+| `claude` | `claude -p <prompt> --output-format json --permission-mode acceptEdits --model <m> --max-budget-usd <n>` | native | yes, schema 11 |
+| `opencode` | `opencode run --dir <dir> --format json --auto --model <m> <prompt>` | timeout only | yes, schema 21 |
+| `omp` | `omp -p --mode json --cwd <dir> --model <m> <prompt>` | timeout only | yes, schema 21 |
+| `codex` | `codex exec -C <dir> -s workspace-write --json -o <file> <prompt>` | timeout only | no |
+| `cursor-agent` | `cursor-agent -p --output-format json --workspace <dir> --force <prompt>` | timeout only | no |
 
-Unverified: which permissions each agent needs to run the project's tests unattended, and whether each one's JSON output reports cost.
+Checked against each tool's `--help`: `claude`, `codex` and `cursor-agent` on 2026-09-14, `opencode` 1.18.27 and `omp` 18.1.18 on 2026-09-19. A seeded template is a starting point, not a fixed record: the migration writes it only when no row has that name, so an edited one survives an upgrade.
+
+Unverified: which permissions each agent needs to run the project's tests unattended, and whether `opencode` and `omp` report a cost in their JSON. Both are seeded with `text-tail`, which takes the verdict from the exit status and leaves the cost unknown rather than guessing at a field name. Reading a cost from one is then a setting rather than a code change: `parse` accepts `json:<summary>:<cost>[:<error>]`, dotted paths into the last JSON value the run printed.
+
+### Models and providers
+
+`pma` runs agents; it is not an API client and holds no keys. `{model}` is passed to the worker verbatim, so a provider-qualified name reaches the agent's own provider configuration: `pma dispatch -a opencode -m openai/gpt-5.2`, or `-m openrouter/anthropic/claude-sonnet-4.5`. Which providers exist, and where their endpoints are, is the agent's own configuration.
+
+### Presets
+
+**A worker, a model and the configuration that goes with them, under one name.** A preset takes part in no matching, so it competes with no route; what it buys is a name for a combination worth returning to.
+
+```sh
+pma preset set claude        claude
+pma preset set claude-haiku  claude haiku
+pma preset set omp-luna      omp    gpt-5.6-luna
+pma preset set omp-luna-high omp    gpt-5.6-luna --thinking high
+pma preset                                  # every preset; * is the default
+pma dispatch -p claude-haiku cynn:31        # one command with that preset
+pma workflow run review alpha -p omp-luna
+pma preset use omp-luna-high                # the default, as `pma config preset`
+```
+
+Effort is arguments rather than a field, because what expresses it differs per agent: `--thinking` for `omp`, `--variant` for `opencode`, and nothing at all on the `claude` command line. A worker's `args` template says where they go with `{extra}`, which stands for however many a preset adds, and sits before a positional prompt for a worker that takes its message last.
+
+A preset naming a worker that does not exist is refused where it is set. A preset naming no model leaves the worker its own. The name and the arguments are recorded on each run, so a replay reads back what ran rather than what the preset says today.
+
+`pma agent` lists the workers: a worker is how to run a program, and which model it runs at is a preset. `pma agent show <name>` prints one worker's whole record. `pma` cannot enumerate what models a provider offers -- that is the agent's own business, through its provider configuration -- so the preset list is the list of combinations you actually use.
+
+Which worker runs, at which model, with which configuration, highest first: the `-a` and `-m` flags, then `-p`, then an applied route's `agent` and `model`, then `pma config preset`, then `pma config agent` and that worker's own `model`. A flag is the most specific statement; a route is policy about the work; a preset's own `args` follow the preset that named them, since a route names a worker and a model but never a flag. A model named nowhere is a model this dispatch does not state: the worker is run without a `--model` argument at all -- `Worker::build` drops an argument whose placeholder has no value, and the flag before it -- so the agent uses its own default and `runs.model` is null.
+
+Two retirements got to that rule. The `model` setting sat beside the choice of worker, so naming another worker had to drop it; migration 22 moved it onto the worker record. A worker's own `model` then said the same thing a preset says, and less, so migration 24 turns each into a preset of that worker's name, makes it the default when that worker was the configured one, and drops the column. A retirement that leaves the old place writable is not one.
+
+Provider keys are inherited from the session, on purpose. `agent::restrict` strips what lets a child push -- `GH_TOKEN`, `GITHUB_TOKEN`, `SSH_AUTH_SOCK`, the credential helpers and the push URL -- and nothing else, so `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `OPENROUTER_API_KEY` pass through. A worker that needs something else, such as a base URL for an OpenAI-compatible endpoint or its own config path, carries it in the record:
+
+```sh
+pma agent set opencode env '{"OPENAI_BASE_URL": "http://localhost:11434/v1"}'
+```
+
+That environment is applied after `restrict`, so a record cannot put back a credential the pipeline took away. There is one test for exactly that.
 
 `claude` reports `total_cost_usd`. Its budget cap is checked between turns, so a run can exceed it: a one-word reply under a $0.05 cap cost $0.09 on 2026-09-15. `batch_budget` therefore bounds how many runs start, not what they spend.
 

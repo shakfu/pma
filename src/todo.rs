@@ -524,6 +524,60 @@ pub fn prune(text: &str) -> Pruned {
 
 /// Appends ` token` to the item on 1-based `line`, keeping the line ending.
 /// `None` when that line is not an item.
+/// Inserts an item into its priority section, with its description indented
+/// under it. `None` when the section heading is absent: `pma` adds items, not
+/// headings, so a file that does not declare the section is left alone.
+///
+/// The item goes before the section's first `###` heading, or at the end of the
+/// section when it has none. Appending at the end would put it under whatever
+/// group heading happened to be last and mislabel it.
+pub fn insert(
+    text: &str,
+    priority: Priority,
+    item: &str,
+    description: Option<&str>,
+) -> Option<String> {
+    let want = SECTIONS.iter().find(|(_, p)| *p == priority)?.0;
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let heading = lines.iter().position(|l| {
+        l.trim_end()
+            .strip_prefix("## ")
+            .is_some_and(|name| name.trim() == want)
+    })?;
+    let mut at = lines.len();
+    for (i, line) in lines.iter().enumerate().skip(heading + 1) {
+        let trimmed = line.trim_end();
+        if trimmed.starts_with("## ") || trimmed.starts_with("### ") {
+            at = i;
+            break;
+        }
+    }
+    // Back over the blank lines that separate one section from the next, so
+    // the item lands with the section it belongs to.
+    while at > heading + 1 && lines[at - 1].trim().is_empty() {
+        at -= 1;
+    }
+    let mut written = String::from("- [ ] ");
+    written.push_str(item.trim());
+    written.push('\n');
+    for line in description.unwrap_or_default().lines() {
+        written.push_str("  ");
+        written.push_str(line.trim_end());
+        written.push('\n');
+    }
+    let mut out: String = lines[..at].concat();
+    if !out.ends_with("\n\n") {
+        out.push('\n');
+    }
+    out.push_str(&written);
+    let rest: String = lines[at..].concat();
+    if !rest.is_empty() {
+        out.push('\n');
+        out.push_str(&rest);
+    }
+    Some(out)
+}
+
 pub fn add_token(text: &str, line: usize, token: &str) -> Option<String> {
     if !parse(text).items.iter().any(|i| i.line == line) {
         return None;

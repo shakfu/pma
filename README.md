@@ -2,7 +2,9 @@
 
 Maintenance across many repositories from one place.
 
-Status: every stage of the [design](docs/dev/design.md): lint, scan, matrix, health, agent dispatch with review and ship, Issues sync, notes, the deps signal, and a TUI. `claude` is the only agent.
+Status: every stage of the [design](docs/dev/design.md): lint, scan, matrix, health, agent dispatch with review and ship, Issues sync, notes, the deps signal, and a TUI. `claude`, `opencode` and `omp` come as worker templates; any coding agent with a headless mode is a record rather than a code change.
+
+Workflows -- a graph of agents over a project, specified in JSON or a Rhai script -- are in progress: a document is read, costed and stored, and a pass runs every node a rule decides. A node an agent decides is planned and priced, and spends nothing until you approve it. Design: [workflows.md](docs/dev/workflows.md).
 
 ## Install
 
@@ -22,7 +24,7 @@ Requirements:
 
 - `gh`, authenticated, for CI status. Without it, CI is recorded as unknown and left out of health; `pma scan --offline` skips GitHub on purpose. Also for fix-CI dispatch, `publish = pr`, and `pma sync`.
 
-- `claude`, logged in, for `pma dispatch`.
+- A coding agent for `pma dispatch`: `claude`, `opencode` or `omp`, logged in or holding its own provider key. `pma` runs agents and is not an API client, so `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `OPENROUTER_API_KEY` are inherited by the agent from your session; what it strips is what lets a child push.
 
 ## TODO.md format
 
@@ -88,6 +90,25 @@ pma ship                          # commit, push or open a PR, remove worktrees
 A target that names one task fails when that task cannot run. One that names many passes each over with its reason and dispatches the rest. `-a` and `-m` outrank `pma config agent`, `pma config model` and any applied route; without `-m` the agent picks its own model, and `pma config model` applies only to the agent it was set alongside.
 
 Each run gets a worktree of the remote default branch under `~/.config/pma/worktrees`, so a dirty clone is never touched. The agent runs without push credentials. `pma` then runs the project's tests itself: set the command with `pma config projects.cynn.verify "make check"`, or let it be detected. Limits: `max_parallel`, `batch_budget`, `agent_budget`, `timeout`. `publish` is `pr` by default; `pma config publish push` pushes to the default branch instead. A run shipped as a PR stays `pr-open` until the PR is merged or closed, and its task is not dispatched again meanwhile.
+
+```sh
+pma agent                       # the workers; `pma agent show claude` prints one whole
+pma preset set claude-haiku  claude haiku
+pma preset set omp-luna-high omp    gpt-5.6-luna --thinking high
+pma preset                      # every named worker, model and configuration
+pma preset use omp-luna-high    # the default; -p <name> uses one for a command
+pma dispatch -p claude-haiku cynn:31
+```
+
+A preset names a worker, a model and the arguments that configure it. Effort is arguments rather than a field, because what expresses it differs per agent. Highest first: `-a` and `-m`, then `-p`, then an applied route, then `pma config preset`, then `pma config agent`.
+
+```sh
+pma workflow check lib.rhai     # read a document and print its worst case
+pma workflow propose lib.rhai   # store it as a draft revision
+pma workflow activate 1         # unless its worst case exceeds workflow_budget
+pma workflow run review cynn --dry-run
+pma workflow run review cynn -p claude-haiku
+```
 
 `dispatch`, `ship`, and `review --reject` or `--rework` hold a lock on `session.lock`, so only one of them runs at a time; an open task list holds it too. Other commands, including `pma review` to watch a batch, can run alongside. The agent may edit files and run the verify command; other shell commands are denied unless your Claude Code settings allow them. `pma ship` resumes after a failure without publishing twice.
 

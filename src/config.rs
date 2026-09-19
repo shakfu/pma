@@ -25,8 +25,9 @@ pub struct Config {
     pub activity_horizon: [i64; 5],
     /// The worker `pma dispatch` runs, by name in the `agents` table.
     pub agent: String,
-    /// The model to ask that worker for; `None` leaves it to the worker.
-    pub model: Option<String>,
+    /// The preset a dispatch takes when nothing names one; `None` falls back to
+    /// `agent` and that worker's own model.
+    pub preset: Option<String>,
     /// Tier for a project that has none, so untiered projects are ranked
     /// rather than invisible. `None` leaves them out, as before.
     pub default_tier: Option<i64>,
@@ -111,7 +112,7 @@ impl Default for Config {
             activity_ignore: vec![".github/**".into(), "*.lock".into(), "TODO.md".into()],
             activity_horizon: [30, 60, 120, 240, 365],
             agent: "claude".into(),
-            model: None,
+            preset: None,
             default_tier: None,
             publish: Publish::Pr,
             attribution: Attribution::User,
@@ -160,7 +161,11 @@ fn parse_publish(s: &str) -> Result<Publish, String> {
 /// stays here so `pma config <old>` explains it. `with_overrides` skips a
 /// stored row for one, because an unknown key is a hard error on every
 /// command and an upgrade must not brick a store that set it.
-pub const RETIRED: [(&str, &str); 7] = [
+pub const RETIRED: [(&str, &str); 8] = [
+    (
+        "model",
+        "a model belongs to the worker that understands it: `pma agent set <name> model <m>`",
+    ),
     (
         "dispatch_quadrants",
         "dispatch draws from eligible tasks: the ci and deps signals, and items tagged #agent",
@@ -213,7 +218,7 @@ impl Config {
         keys.extend(
             [
                 "agent",
-                "model",
+                "preset",
                 "default_tier",
                 "publish",
                 "attribution",
@@ -354,7 +359,7 @@ impl Config {
                 "urgent_within" => Slot::Count(&mut self.urgent_within, 0),
                 "quadrant_limit" => Slot::Count(&mut self.quadrant_limit, 1),
                 "agent" => Slot::Text(&mut self.agent),
-                "model" => Slot::OptText(&mut self.model),
+                "preset" => Slot::OptText(&mut self.preset),
                 "default_tier" => Slot::Never(&mut self.default_tier),
                 "publish" => Slot::Publish(&mut self.publish),
                 "attribution" => Slot::Attribution(&mut self.attribution),
@@ -466,13 +471,13 @@ mod tests {
         assert_eq!(cfg.activity_horizon[1], 14);
 
         cfg.set("agent", "codex").unwrap();
-        cfg.set("model", "haiku").unwrap();
+        // `model` is retired: a model belongs to the worker record.
+        assert!(cfg.set("model", "haiku").is_err());
         cfg.set("publish", "push").unwrap();
         cfg.set("attribution", "co-author").unwrap();
         cfg.set("projects.cyllama.verify", " make check ").unwrap();
         cfg.set("projects.cyllama.publish", "pr").unwrap();
         assert_eq!(cfg.agent, "codex");
-        assert_eq!(cfg.model.as_deref(), Some("haiku"));
         assert_eq!(cfg.attribution, Attribution::CoAuthor);
         assert_eq!(cfg.project("cyllama").verify.as_deref(), Some("make check"));
         assert_eq!(cfg.publish_for("cyllama"), Publish::Pr);

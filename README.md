@@ -1,10 +1,73 @@
 # pma
 
-Maintenance across many repositories from one place.
+Maintain many repositories from one place.
 
-Status: every stage of the [design](docs/dev/design.md): lint, scan, matrix, health, agent dispatch with review and ship, Issues sync, notes, the deps signal, and a TUI. `claude`, `opencode` and `omp` come as worker templates; any coding agent with a headless mode is a record rather than a code change.
+If you keep dozens of small projects, the work is not hard, it is scattered. Each repository has a `TODO.md`, failing CI, outdated dependencies and a dirty working tree, and finding out means opening all of them. `pma` reads them all in one pass, ranks every task across every project in one list, and can hand a task to a coding agent in a throwaway worktree. You read the diff, and `pma` commits and publishes it.
 
-Workflows -- a graph of agents over a project, specified in JSON or a Rhai script -- are in progress: a document is read, costed and stored, and a pass runs every node a rule decides. A node an agent decides is planned and priced, and spends nothing until you approve it. Design: [workflows.md](docs/dev/workflows.md).
+Scanning 95 repositories takes about 15 seconds.
+
+Nothing is published without you. An agent runs with no push credentials, `pma` runs the project's tests itself rather than trusting the agent's report, and every change waits in a worktree until you approve it.
+
+```sh
+pma root add ~/projects        # git repos directly under it are projects
+pma tier myproject 1           # 1 is most important, 5 least
+pma scan                       # TODO.md, git state, CI
+pma matrix                     # every project's tasks, ranked, in one view
+pma dispatch myproject:31      # hand line 31 to an agent
+pma review 1                   # the diff, the test result, the cost
+pma review 1 --approve
+pma ship                       # commit, push or open a pull request
+```
+
+## Features
+
+**One view of everything**
+
+- Every task in every project in one Eisenhower matrix, ranked by project importance and item priority.
+
+- Failing CI, outdated dependencies, idle repositories and dirty working trees appear as tasks beside the written ones.
+
+- A terminal browser (`pma tui`), a per-project health ranking (`pma status`), and an oldest-first list to prune (`pma stale`).
+
+- Portfolio notes that belong to no single project.
+
+**Tasks in plain Markdown**
+
+- A root `TODO.md` per repository is the only task file. Nothing to keep in step, and no lock-in: remove `pma` and the files still read.
+
+- `pma lint` checks the format. `pma prune` removes what is finished.
+
+- `pma sync` mirrors `Critical` items to GitHub Issues and ticks items whose issue was closed.
+
+**Agents, with the brakes on**
+
+- `claude`, `opencode` and `omp` come as templates. Any coding agent with a headless mode is a record you edit, not a code change.
+
+- Each run gets its own worktree of the remote default branch, so your dirty checkout is never touched.
+
+- The agent runs without push credentials. `pma` runs the project's test command itself, before and after, and reports both ends.
+
+- Every run records the diff, the test result, the cost, the duration and the paths it touched. A run that changed a file its task had no business changing is flagged.
+
+- Limits you set: agents at once, dollars per run, dollars per batch, minutes per run.
+
+- `pma report` says what dispatching has produced: first-attempt passes, reworks, merges, cost, review time.
+
+**Which model, where**
+
+- A preset names a worker, a model and the arguments that configure it: `pma preset set omp-luna-high omp gpt-5.6-luna --thinking high`.
+
+- `pma` runs agents and is not an API client. Provider keys stay the agent's, reached through its own configuration, and `pma` stores none of them.
+
+- A routing policy decides the worker, the model and how much autonomy per kind of task. It is a document you propose, activate, and can replay over past runs to see what it would have changed.
+
+**Repeating work**
+
+- A campaign applies one task definition across many repositories, each verified on its own.
+
+- A workflow is a graph of agents over a project: review, then validate the review, then fix what it confirmed. Written as JSON or as a script, and costed before it runs.
+
+- `pma workflow run` prints what it would run, the worker, the model and a ceiling, and spends nothing until you approve it.
 
 ## Install
 
@@ -16,15 +79,13 @@ From a clone: `make install`.
 
 Requirements:
 
-- macOS or Linux. The database location is derived from `HOME`.
-
-- Rust 1.89 or later, and a C compiler: SQLite is compiled in.
+- macOS or Linux. Rust 1.89 or later, and a C compiler: SQLite is compiled in.
 
 - `git` on `PATH`.
 
-- `gh`, authenticated, for CI status. Without it, CI is recorded as unknown and left out of health; `pma scan --offline` skips GitHub on purpose. Also for fix-CI dispatch, `publish = pr`, and `pma sync`.
+- A coding agent for `pma dispatch`: `claude`, `opencode` or `omp`, logged in or holding its own provider key.
 
-- A coding agent for `pma dispatch`: `claude`, `opencode` or `omp`, logged in or holding its own provider key. `pma` runs agents and is not an API client, so `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `OPENROUTER_API_KEY` are inherited by the agent from your session; what it strips is what lets a child push.
+- `gh`, authenticated, for CI status, for opening pull requests and for `pma sync`. Without it CI reads as unknown, and `pma scan --offline` skips GitHub on purpose.
 
 ## TODO.md format
 
@@ -41,89 +102,134 @@ Requirements:
 
 ## Medium
 
+### parser
+
+- [ ] accept a trailing comma
+  the fixture in tests/bad.json covers it
+
 ## Low
 
 - [x] drop python 3.9
 ```
 
-The section gives the priority. A finished item is ticked where it stands; `pma prune` removes finished items. A `###` heading inside a section groups the items below it. Trailing `#tag`, `due:YYYY-MM-DD` and `gh:N` (a linked issue) are optional. The full rules are in the [design](docs/dev/design.md#todomd-format-v2).
+The rules, which `pma lint` checks:
+
+- The first non-blank line is `# TODO`, and there is no second `#` heading.
+
+- Priority comes from the enclosing `##` section: `Critical`, `High`, `Medium` or `Low`, spelled exactly, at most one of each. Other `##` sections are allowed and ignored.
+
+- An item is one line, `- [ ] text` or `- [x] text`. No other spelling of the checkbox.
+
+- Indented lines under an item are its description, carried to the agent verbatim.
+
+- A `###` heading groups the items below it, until the next heading.
+
+- Trailing tokens, read from the end of the line: `#tag`, `due:YYYY-MM-DD`, and `gh:N` for a linked issue. A token-shaped word earlier in the line is text.
+
+- `#urgent` makes an item urgent whatever its date. `#agent` marks one an agent may take. `#manual` keeps agents off it entirely.
+
+- A finished item is ticked where it stands. `pma prune` removes it.
+
+Two open items with the same text, or two items with the same `gh:N`, are errors. An item is identified by its text until an issue number is written into it.
 
 ## Commands
 
+Projects and tasks:
+
 ```sh
-pma lint                        # ./TODO.md
-pma lint ~/projects/*/          # every project; a directory means its TODO.md
-pma prune ~/projects/*/         # plan: finished items and `## Done` to remove; --apply
+pma lint                        # ./TODO.md; a directory means its TODO.md
+pma lint ~/projects/*/          # every project
+pma prune ~/projects/*/         # what would be removed; --apply to do it
+pma root add ~/projects/        # also `pma root` and `pma root rm`
+pma tier myproject 1            # or `none`; untiered projects are not ranked
+pma tag add rust myproject      # private groups; --tag <t> on most commands
+pma scan                        # TODO.md, git state, CI via gh
+pma scan --offline myproject    # one project, without GitHub
+pma scan --deps                 # also count outdated cargo, uv and go deps
+pma matrix                      # the ranked view; -q q1 for one quadrant
+pma status --explain            # projects by health, with each signal's share
+pma stale                       # open items by age, oldest first
+pma tui                         # browse the matrix; q quits
+pma note add "move CI to a reusable workflow"
 ```
 
-Output is `path:line: severity: message`. Exit status is 1 when any file has an error or cannot be read. Warnings alone exit 0.
+`matrix`, `status` and `tui` read the last scan. They do not rescan.
+
+Agents, models and presets:
 
 ```sh
-pma root add ~/projects/          # git repos directly under it are projects
-pma tier topproj 1                # 1 (most important) to 5, or none
-pma scan                          # TODO.md, git state, CI via gh; about 15s for 95 repos
-pma scan --offline topproj        # one project, without GitHub
-pma scan --deps                   # also count outdated cargo, uv and go dependencies
-pma matrix                        # tiered projects' tasks in the Eisenhower matrix
-pma matrix -q q1 --all
-pma status --explain              # projects by health, with each signal's share
-pma config                        # every setting; `pma config tiers.2 0.7`, `--reset`
-pma tui                           # the matrix in the terminal; q quits
-pma note add "move CI to reusable workflows"   # portfolio notes; `pma note` lists
+pma agent                       # the workers; `pma agent show claude` for one
+pma preset set claude-haiku claude haiku
+pma preset set omp-luna-high omp gpt-5.6-luna --thinking high
+pma preset                      # every named combination; * is the default
+pma preset use omp-luna-high
+pma config                      # every setting; `pma config <key> <value>` sets one
 ```
 
-`matrix` and `status` read the last scan; they do not rescan. Only tiered projects appear in them.
+Highest wins: the `-a` and `-m` flags, then `-p <preset>`, then an applied route, then the default preset.
+
+Dispatch, review, ship:
 
 ```sh
-pma dispatch cynn:31              # a TODO.md line from the last scan; or cynn:ci, cynn:deps
-pma dispatch cynn:critical        # every open item under ## Critical; or high, medium, low
-pma dispatch cynn:q1              # every task the last matrix placed in that quadrant
-pma dispatch cynn                 # the project's tasks, in a list with checkboxes
-pma dispatch -a pi -m sonnet cynn:31   # this agent and model, not the configured ones
-pma dispatch --auto -n 3          # the top 3 dispatchable tasks in the matrix
-pma review                        # runs not yet shipped or rejected; settles merged PRs
-pma review 4                      # task, verify result, cost, summary, diff
-pma review 4 --approve            # or --reject, or --rework "feedback"
-pma ship                          # commit, push or open a PR, remove worktrees
+pma dispatch myproject:31       # a TODO.md line from the last scan
+pma dispatch myproject:ci       # failing CI; or :deps for dependencies
+pma dispatch myproject:critical # every open item under that heading
+pma dispatch myproject          # pick from a list
+pma dispatch --auto -n 3        # the top 3 dispatchable tasks
+pma dispatch -p claude-haiku myproject:31
+pma review                      # runs not yet shipped or rejected
+pma review 4                    # task, test result, cost, summary, diff
+pma review 4 --approve          # or --reject, or --rework "feedback"
+pma review 4 5 6 --approve      # a batch; every run is checked before any is approved
+pma ship                        # commit, push or open a PR, remove worktrees
+pma report --by project         # also class or agent
 ```
 
-A target that names one task fails when that task cannot run. One that names many passes each over with its reason and dispatches the rest. `-a` and `-m` outrank `pma config agent`, `pma config model` and any applied route; without `-m` the agent picks its own model, and `pma config model` applies only to the agent it was set alongside.
+A target naming one task fails if that task cannot run. A target naming many passes over each with its reason, and dispatches the rest.
 
-Each run gets a worktree of the remote default branch under `~/.config/pma/worktrees`, so a dirty clone is never touched. The agent runs without push credentials. `pma` then runs the project's tests itself: set the command with `pma config projects.cynn.verify "make check"`, or let it be detected. Limits: `max_parallel`, `batch_budget`, `agent_budget`, `timeout`. `publish` is `pr` by default; `pma config publish push` pushes to the default branch instead. A run shipped as a PR stays `pr-open` until the PR is merged or closed, and its task is not dispatched again meanwhile.
+Each run gets a worktree of the remote default branch under `~/.config/pma/worktrees`, on a `pma/` branch. The item must be open in the remote `TODO.md`, so commit and push before dispatching. Set the test command with `pma config projects.myproject.verify "make check"`, or let it be detected. `publish` is `pr` by default; `pma config publish push` pushes to the default branch instead.
 
-```sh
-pma agent                       # the workers; `pma agent show claude` prints one whole
-pma preset set claude-haiku  claude haiku
-pma preset set omp-luna-high omp    gpt-5.6-luna --thinking high
-pma preset                      # every named worker, model and configuration
-pma preset use omp-luna-high    # the default; -p <name> uses one for a command
-pma dispatch -p claude-haiku cynn:31
-```
-
-A preset names a worker, a model and the arguments that configure it. Effort is arguments rather than a field, because what expresses it differs per agent. Highest first: `-a` and `-m`, then `-p`, then an applied route, then `pma config preset`, then `pma config agent`.
+Repeating work:
 
 ```sh
+pma campaign add ci-workflow "add a CI workflow" --projects a --projects b
+pma campaign run ci-workflow    # one worktree per repository, verified apart
+pma route propose routing.json  # worker, model and autonomy per kind of task
+pma route activate 2            # --shadow records the decision without applying it
+pma route replay routing.json   # what a candidate would have done differently
 pma workflow check lib.rhai     # read a document and print its worst case
 pma workflow propose lib.rhai   # store it as a draft revision
-pma workflow activate 1         # unless its worst case exceeds workflow_budget
-pma workflow run review cynn --dry-run
-pma workflow run review cynn -p claude-haiku
+pma workflow activate 1         # refused if its worst case is over budget
+pma workflow run review myproject --dry-run
+pma workflow run review myproject -p claude-haiku
 ```
 
-`dispatch`, `ship`, and `review --reject` or `--rework` hold a lock on `session.lock`, so only one of them runs at a time; an open task list holds it too. Other commands, including `pma review` to watch a batch, can run alongside. The agent may edit files and run the verify command; other shell commands are denied unless your Claude Code settings allow them. `pma ship` resumes after a failure without publishing twice.
+GitHub Issues:
 
 ```sh
-pma sync                          # plan: issues to open, items to mark done
-pma sync --apply topproj           # carry it out for one project
+pma sync                        # what would change
+pma sync --apply myproject      # carry it out
 ```
 
-Each `## Critical` item gets an issue labelled `pma:critical`, and `gh:N` is written into its line. An item whose issue is closed is ticked. TODO.md edits are left uncommitted; `scripts/commit_todo.py` commits them.
+Each `## Critical` item gets an issue labelled `pma:critical`, and `gh:N` is written into its line. An item whose issue is closed is ticked. Edits to `TODO.md` are left uncommitted, for you to read first.
 
-The database is `~/.config/pma/projects.db`, or `$PMA_HOME/projects.db`. Dates are compared as UTC calendar days.
+## Where things live
+
+- The database is `~/.config/pma/projects.db`, or `$PMA_HOME/projects.db`. That directory can be a git repository, which is how two machines share it.
+
+- Worktrees sit under the same directory and are removed when a run ships or is rejected.
+
+- Settings live in the database rather than a file. `pma config` lists them, `pma config <key> <value>` sets one, and `--reset` clears one.
+
+One command that runs agents or edits worktrees runs at a time. `dispatch`, `ship`, `workflow run` and `review --reject` take a lock and name the process holding it. Reading commands run alongside.
 
 ## Development
 
 ```sh
 make test     # cargo test, then pytest on scripts/
-make check    # fmt check, clippy -D warnings, test
+make check    # format check, clippy with warnings as errors, then test
 ```
+
+## Licence
+
+MIT.

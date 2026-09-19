@@ -4,6 +4,8 @@ Derived from `design-review.md` (2026-09-17) and revised against `plan-review.md
 
 Each phase states what it changes, how it is accepted, and the gate that must hold before the next phase starts. Sizes are rough estimates, in sessions of work, not commitments.
 
+Revision note, 2026-09-19. Phase 2b, containment and the channel, is added from `using-containers.md`, with the `design.md` decisions it supersedes listed under "Amendments to design.md". It is numbered out of order because phases 3, 4a and 4b were built before it.
+
 Revision note. The first version of this plan placed phase 1's gate ahead of the records that prove it, numbered one migration for a column that already exists, and treated unattended shipping as a single step. This version moves the attempt and decision records into phase 1, splits phase 4 into three gated parts, and adds the config schema work that the worker adapter needs. Superseded decisions in `design.md` are listed under "Amendments to design.md".
 
 ## Phase 0: measured pilot
@@ -89,6 +91,33 @@ Not covered by a test: concurrent attempts escalating at the batch limit, which 
 
 Gate met: a dispatch on a non-`claude` worker completes end to end, through ship.
 
+## Phase 2b: containment and the channel
+
+Goal: run the worker and its verify inside a container, and give the run a conversation the manager and the developer can both read while it happens.
+
+Out of order by number, in order by dependency. Phases 3, 4a and 4b were built before this one. It gates 4c: publishing without a person, from an agent running on the host with the user's credentials, is the combination `design.md` already warns about under Agents -- the credential drop "makes an accidental push fail. It does not stop a determined process."
+
+Three projects move and only the `pma` column is this plan's to sequence. `sanduk` holds containment, `minos` holds the channel, and [using-containers.md](using-containers.md) is the note behind the split.
+
+| Step | Change | Files |
+|-|-|-|
+| 2b.1 | `sanduk --json`: one object per run with `ok`, `exit`, `cost_usd`, token counts, `report_path`, `mode`, `model`, `container`. Then `Parser::SandukJson` beside `claude-json`. Without it `sanduk` reformats `total_cost_usd` into a prose stats line, `claude-json` finds no result line and falls back to `text-tail`, and every contained run records cost as unknown. | `sanduk`; `worker.rs` |
+| 2b.2 | Preflight `sanduk --version` against a minimum, as `gh` is checked, then register the worker with `pma agent set` and prove it on one project. `worker.allow` goes unused: `sanduk` passes `--dangerously-skip-permissions`, and a container that denies egress does not also need a `Bash()` allowlist. Do not ship both and believe in both. | `main.rs`, `dispatch.rs` |
+| 2b.3 | `verify` runs in the container, its status reported separately from the agent's, and `base_verify` moves with it. One combined status cannot separate a failed edit from a failed test, and a base run in a different environment is not that run's baseline. This is what answers `design.md` Agents: "Isolation would need a container around both." The cost is toolchain images -- the stock ones carry no Rust, Go or C, and `sealed` blocks the fetch -- which is the bulk of this phase, not the integration. | `sanduk` images; `dispatch.rs` |
+| 2b.4 | The mailbox: request and decision schemas under the workspace, read and answered by `pma`. Keeps a single fire-and-forget run serverless, and is the degraded path when `minosd` is absent. Dispatch must not depend on a server this tool did not start. | new `src/mailbox.rs`, `dispatch.rs` |
+| 2b.5 | The supervisor loop. `pma dispatch` blocks until every run finishes and holds an exclusive `flock` for its whole run (4.11), so a mid-run question has nowhere to be answered. Either the loop reads the channel inside that call, or dispatch stops blocking. The first keeps the lock contract and the pid ownership record true. | `dispatch.rs`, `agent.rs` |
+| 2b.6 | In `minos`: a grant `pma` mints per run, carrying its rooms, no admin group, expiring at `min(run timeout, task bound)`; `/vfs` and `/settings` refused to a grant; separable listeners, the agent-facing one bound to the sealed network and to loopback. Without the first two, an agent in the container holds a 7-day credential and a 100 MiB file channel. | `minos` |
+| 2b.7 | `sanduk --network <name>` so a run joins the network `minosd` is already on, and a `pma` client for the wire: `open`, `send`, `history`, `submission.*`, `grant.*`. Escalation posts to a channel, with `/approve` and `/reject <why>` mapped to `review --approve` and `--rework`. Policy stays in `route.rs`; minos transports and records. | `sanduk`; new `src/minos.rs`, `route.rs` |
+| 2b.8 | Retention for task rooms at least equal to the relay's log retention, and a task id and a run id on every message. Two records over different periods cover neither whole, and without the ids, reconstructing what an agent did means matching timestamps across three clocks. | `minos`; `store.rs` |
+
+This phase builds the channel, not the manager. 3.7 stays gated on the pilot; what 2b adds is a place where a manager and a worker can talk at all, and a record of it a person can read while it happens.
+
+Acceptance: a contained dispatch completes end to end through ship, with cost recorded and verify run at base and head inside the container, reported separately from the agent's status; a run whose `minosd` is down completes through the mailbox; a mid-run request is answered from policy with no person involved, and an escalated one blocks its own run and no other; a revoked grant closes the socket, and the container is stopped with it rather than left running against the worktree.
+
+Gate, in two parts. 2b.1 to 2b.3: ten contained runs through ship, cost recorded, no run failed on a missing toolchain. Then 2b.4 to 2b.8, and 4c stays closed until unattended routes run contained.
+
+Size: 4 sessions for the `pma` column. The image work is unsized until the toolchains are named, and the `sanduk` and `minos` columns are not this plan's to size.
+
 ## Phase 3: eligibility, specification and complexity
 
 Goal: decide what an agent may take, improve what it is told, and produce the complexity value phase 4 matches on.
@@ -104,6 +133,8 @@ Goal: decide what an agent may take, improve what it is told, and produce the co
 | 3.7 | Not built, and correctly so: its gate is measurement 3, which needs the phase 0 pilot. 3.6 is the applied rule and phase 4 has its producer either way. | new `src/judge.rs` |
 
 Steps 3.1 to 3.6 are complete; 3.7 waits on its gate. Acceptance met: deterministic tests for 3.6 over a fixture set, independent of 3.7; ranking tests updated for the urgency change; a store carrying a retired key opens and reports it; a CLI test showing two tasks in one repository estimated 2 and 4 from their own text.
+
+3.7 is the manager layer's first LLM step, per `design.md` goal 5. It classifies; instructing a worker mid-run needs the channel of phase 2b.
 
 Gate for 3.7: measurement 3, from the phase 0 pilot. If detail predicts success, the classifier is worth its cost; if not, 3.6 stands and routing keeps to deterministic features. The golden set of 50 hand-labelled items belongs with 3.7, not before it.
 
@@ -151,7 +182,7 @@ Unattended means opening a pull request and completing its merge. Restricted to 
 
 Acceptance: CLI tests proving each hard limit refuses; a pending check, a missing check, an unreadable API and a changed head each leave the pull request unmerged; a restart mid-pass neither double-merges nor loses a run; an unattended route ships only when every gate is clean.
 
-Gate: replay clean (4a), plus shadow mode until it has observed at least 20 routed runs, not for a fixed week. A week during which no task matched proves nothing. The first enabled unattended routes are the canary: tier 4 and 5 repositories, class A only, with a stated minimum of completed runs and tolerated failures before autonomy widens. Widening is an explicit approval, recorded like a policy activation.
+Gate: phase 2b contained, replay clean (4a), plus shadow mode until it has observed at least 20 routed runs, not for a fixed week. A week during which no task matched proves nothing. The first enabled unattended routes are the canary: tier 4 and 5 repositories, class A only, with a stated minimum of completed runs and tolerated failures before autonomy widens. Widening is an explicit approval, recorded like a policy activation.
 
 Size: 3 sessions.
 
@@ -218,6 +249,8 @@ Update alongside the relevant phase, marking each superseded decision rather tha
 | Quadrant actions, `dispatch_quadrants`, `overflow_quadrants` | 3.1 eligibility |
 | Urgency, `stale_after` | 3.4 sequencing |
 | Ship, step 4 publish | 4.7 reverification and 4.8 the merge lifecycle |
+| Agents, host-run verify and the credential drop | 2b.3 containment |
+| Dispatch, step 2 and the blocking loop | 2b.5 the supervisor loop |
 | Project health, `status --explain` | 1.10 for runs; portfolio views are not replaced, see Cuts |
 
 Two decisions stand and need no amendment. `design.md` already states that `batch_budget` bounds how many runs start rather than what they spend; step 2.4 restates it against the old step 4.5, which promised a spend cap. "No per-item ids" also stands: step 1.3's task revision identity is a hash of the item's text, derivable at scan time, so it needs no written-back id. Ids in the file remain under "Not yet".
@@ -254,5 +287,7 @@ Phase 0 may show that agents cannot close these tasks, or that review is too slo
 Phases 1 and 2 are worth building in either case: the first records what happened and proves a run is clean, the second removes a vendor from the core.
 
 Phase 1 grew from 2 sessions to 4 because the records moved into it. That cost is what makes replay, the per-day cap, the digest and the report possible at all.
+
+Phase 2b puts two projects outside this plan on its critical path. A `sanduk` or `minos` change that does not land leaves the contained path unfinished, and 2b.4's mailbox is what keeps dispatch working meanwhile.
 
 Every phase adds code to a tool that is itself one of the repositories being maintained. The cut list is not optional.

@@ -4,6 +4,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0]
+
 ### Added
 
 The agent-loop entries below turn one prompt per task into a measured, gated pipeline. `docs/dev/implementation-plan.md` sequences it; `docs/dev/plan-review.md` is the review it answers.

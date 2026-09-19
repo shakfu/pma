@@ -2,81 +2,138 @@
 
 Status: nothing here is built. 2026-09-19.
 
-A workflow is an ordered set of stages over one project. A stage is one agent invocation, or a fan-out of one invocation per row of a structured artifact. Each stage may take a different agent and model, so cost and strength are chosen per stage rather than per task.
+A workflow is a directed graph of operations over typed units of work. Nodes do work; edges carry units and decide, by rule, which node sees a unit next. Parallelism is a property of the graph, not a node kind: everything whose inputs are ready runs, bounded by `max_parallel` and the budget.
 
-Nothing in the mechanism is specific to reviewing. A stage reads artifacts and writes one; what the artifact holds is declared in the document. Section 9 works four shapes through it: review then fix, one-liner then specification then implementation, triage of GitHub issues, and probe then apply across repositories. The fourth does not fit, and section 11 says why.
+Five node primitives, three flow primitives, three forms of iteration, and one hard rule: **an agent produces data, a rule decides routing.**
 
-This specifies the document, the artifact contract, the one routing change and the one migration. It is phase 6 of [implementation-plan.md](implementation-plan.md). The chat and container half is `~/projects/minos/docs/dev/design.md`, which states the same definition from the other side: "It is `pma` policy: minos does not know what a workflow is and carries only its id."
+This specifies the model, the document, the one routing change, the one migration, and the bound computed before a document may be activated. It is phase 6 of [implementation-plan.md](implementation-plan.md). The chat and container half is `~/projects/minos/docs/dev/design.md`; its section 5 calls a node a stage and assumes a sequence, which is one shape of the graph.
 
-## 1. What already exists
+## 1. The test for a primitive
 
-The document is thin because most parts are built.
+A verb earns a primitive when it changes what `pma` must check. Everything else is vocabulary: review, validate, triage, decompose, dedupe, fix and ship are the same five operations with different prompts.
 
-| Part | Built as | Where |
+Three dimensions generate the set.
+
+| Dimension | Values | What it decides |
 |-|-|-|
-| per-stage agent, model, approval, escalation | `Route` | [route.rs:71](../../src/route.rs) |
-| a versioned policy, proposed then activated, replayable | `routes`, `pma route propose\|activate\|replay` | plan 4.1-4.4 |
-| a definition over a frozen project set | `campaigns`, `campaign_members` | [store.rs:1053](../../src/store.rs) |
-| a task with no `TODO.md` line | `dispatch::without_item` | [dispatch.rs:112](../../src/dispatch.rs) |
-| worktree, base and head verify, scope check, attempt counter | phase 1 | `dispatch.rs`, `class.rs`, `accept.rs` |
-| why a human must read a run | `accept::review_reasons` | [accept.rs:34](../../src/accept.rs) |
+| cardinality | `0..n`, `1`, `0..1`, many to one | where parallel work is created and joined |
+| effect | data, repository, outside world | which gates apply. Only a repository writer needs a worktree, base and head verify, a scope check, approval and ship |
+| decider | agent or rule | an agent costs money, is nondeterministic and untrusted; a rule is free, deterministic and replayable |
 
-Missing: a sequencer, an artifact contract, and an acceptance rule for a stage that changes no code.
+## 2. The five node primitives
 
-## 2. Decisions
+| Primitive | Shape | Decider | What `pma` checks -- its reason to exist |
+|-|-|-|-|
+| `map` | one unit in, `out` units out | agent or rule | the declared type; the `out` bound; at `0..1`, that kept ids are a subset of the input and each drop carries a reason; at `1` and `0..1`, that no field outside `writes` changed |
+| `reduce` | many units in, one per group, out | agent or rule | provenance: every output unit names the inputs it came from |
+| `edit` | one unit in, a patch to a worktree out | agent | all of phase 1: base and head verify, scope, attempts, approval evidence, ship. The only primitive that changes a repository |
+| `check` | a unit or a bag in, a verdict out | rule | nothing. It is the checker |
+| `emit` | a bag in, a write outside the repository | rule | the sink's rules: `TODO.md` lint and item identity, the `pma sync` conflict |
 
-### The mechanism
+Remove any one and something becomes inexpressible: without `map`, no units are created or dropped; without `reduce`, no join; without `edit`, no code changes; without `check`, every verdict comes from a model, so guards read untrusted data; without `emit`, nothing leaves the workflow.
+
+Domain verbs collapse onto them:
+
+| Verb | Primitive |
+|-|-|
+| review a project, list candidates, decompose a task | `map out: 0..n`, agent |
+| collect issues, read scan facts, list outdated dependencies, read `TODO.md` | `map out: 0..n`, rule |
+| validate, confirm, triage out | `map out: 0..1`, agent, drop reason required |
+| annotate, estimate, judge one unit | `map out: 1`, agent; the verdict is a field |
+| select by field, drop duplicates, rank, limit | `map out: 0..1` or `reduce`, rule |
+| synthesise one report from three reviews, choose the best of three patches | `reduce`, agent |
+| fix, implement, upgrade, add a workflow file | `edit` |
+| verify, lint, is CI green, did the pull request merge | `check` |
+| write items, tick items, prune items, add a note, write a report | `emit` |
+
+## 3. Units and bags
+
+A **unit** is a typed record. A **bag** is a node's output: the units it wrote. An edge names a source node, so a bag needs no separate name.
+
+System fields, on every unit, reserved and refused in a type declaration:
+
+| Field | Meaning |
+|-|-|
+| `@id` | minted by the node that wrote the unit |
+| `@type` | the declared type |
+| `@node` | the node that wrote it |
+| `@parent` | the unit it was derived from, or null |
+| `@root` | the first unit of its lineage. The attempt counter keys on this |
+| `@depth` | lineage depth, for recursion |
+| `@lap` | how many times it has crossed a lap edge |
+| `@children` | how many units this one produced, once its node has run |
+| `@project` | the project it belongs to |
+| `@<check>` | a verdict written by a check: `passed`, `failed` or `unknown` |
+
+Units are immutable. Every node writes new units with `@parent` set, so a lap, an annotation and a decomposition all leave a readable chain. Nothing in the graph mutates state, which is why the frontier can be re-derived rather than stored.
+
+## 4. Decisions
+
+### The model
 
 **W1. A workflow is a stored revision, proposed then activated.** The two-act shape is `routes`': a revision is a draft until someone activates it, and each run records the revision it ran under. Rejected: a file read at run time, which leaves no record of what ran.
 
-**W2. Agent and model live in the routing policy, not in the workflow document.** A stage names no agent. `stage` becomes a match dimension on a route (section 6). Rejected: inline `agent` and `model` per stage. Plan 2.5 already refused a second place to name them: "a second place to say the same thing would have to be reconciled with it."
+**W2. Parallelism is derived from the graph.** There is no parallel node, fork, join or barrier. Two edges out of one node fan out; a `reduce` with several incoming edges fans in. Rejected: declared concurrency, which would be a second statement of what the edges already say.
 
-**W3. A route that states no `stage` matches only a dispatch with no stage.** Stage is a partition, not a filter. Rejected: unstated means any, under which the trailing catch-all route of an existing policy absorbs every stage silently at whatever approval it names.
+**W3. An agent produces data; a rule decides routing.** Guards, checks and sinks are rules. A model's opinion enters as a field, and a rule reads the field. This is route.rs's existing commitment -- "the policy is an artifact, not a judgment per task" -- applied to the graph. Rejected: a guard that calls a model, which would let an untrusted party choose the graph's shape.
 
-**W4. Artifacts live outside the worktree**, at `<data>/artifacts/<instance>/<stage>/`. The path is passed in the prompt. Rejected: the worktree. An untracked file there enters `dispatch::changed_paths`, counts as a violation for any class whose scope is bounded ([class.rs:101](../../src/class.rs)), and `git add -A` at ship publishes it. A stage that wants its artifact committed says `"publish": true`.
+**W4. Conditions live on edges, never inside nodes.** A guarded edge is visible in the topology; a condition inside a node is not. A unit that no outgoing edge accepts is settled there, and the guard that refused it is recorded.
 
-**W5. A stage that changes no code is accepted by its artifact.** Verify at base against verify at head discriminates nothing for a document, so the acceptance table of plan 1.8 returns nothing. Three acceptance forms: `verify`, `artifact`, `rows:<schema>`.
+**W5. Readiness is derived, never stored.** A node is runnable when its incoming bags exist and its units have arrived. There is no cursor, so a crash resumes by re-deriving. This is plan 1.7's rule applied to sequencing: store the evidence, not the verdict.
 
-**W6. Readiness is derived, never stored.** A stage is runnable when every predecessor's runs are final and every artifact it consumes exists. There is no stored cursor, so a crash resumes by re-deriving. This is plan 1.7's rule applied to sequencing: store the evidence, not the verdict.
+**W6. `pma workflow run` is a pass, not a daemon.** It advances every runnable node of every named instance and exits, holding `session.lock` for the pass like `pma dispatch`. A boundary that needs a human ends the pass; the next invocation resumes it. Waiting for an external condition is the same mechanism: a `check` node is simply not ready. Rejected: a resident process, which would hold the lock across a human decision.
 
-**W7. `pma workflow run` is a pass, not a daemon.** It advances every runnable stage of every named instance and exits, holding `session.lock` for its whole pass like `pma dispatch`. A stage boundary that needs approval ends the pass; the next invocation resumes it. Rejected: a resident process, which would hold the lock across a human decision and need its own restart story. This is also the shape plan 4.11 needs for a scheduled pass.
+**W7. Agent and model live in the routing policy, not in the workflow document.** A node names no agent. `node` and `lap` become match dimensions on a route (section 10). Plan 2.5 refused a second place to name them: "a second place to say the same thing would have to be reconciled with it."
 
-**W8. One instance per project; a project set is a set of instances.** Membership is frozen when the set is taken, as `add_campaign` freezes it, so a rescan cannot move work under an instance in flight.
+**W8. A route that states no `node` matches only a dispatch with no node.** Node is a partition, not a filter. Rejected: unstated means any, under which an existing policy's trailing catch-all absorbs every node silently at whatever approval it names.
 
-**W9. Approval stays a route property.** A workflow adds no approval mode. The intended first use of a fan-out stage is `batch`: `pma review --approve <ids...>`, which checks every named run before approving any (plan 4.5).
+**W9. A workflow is not an escape from the class rules.** Every `edit` run goes through `dispatch::prepare` and the phase 1 gates: class D is refused before a worktree exists, `TODO.md` and the privileged paths are refused to the classes that may not touch them, and `unattended` on A-, C or D is refused where a policy is read. A workflow chooses order and prompts, never authority.
 
-**W10. Stages are a sequence. No branches, no conditionals, no parallel stages.** `on_refusal` takes `stop` or `continue`. Retry is `escalate` on the route (plan 4.3) and rework is `pma review --rework`. What this excludes is real and named in section 11.
+**W10. `pma-agent` may propose a revision and request a trigger; it may not activate one.** minos design section 2 puts "which workflow a situation gets" behind a submission to `pma`, and D2 keeps mint, ship and push out of a model's hands. `pma workflow activate` records who activated it.
 
-**W11. A workflow is not an escape from the class rules.** Every stage run goes through `dispatch::prepare` and the phase 1 gates: class D is refused before a worktree exists, `TODO.md` and the privileged paths are refused to the classes that may not touch them, and `unattended` on A-, C or D is refused where a policy is read. A workflow chooses order and prompts, never authority.
+### Data and artifacts
 
-**W12. `pma-agent` may propose a revision and request a trigger; it may not activate one.** minos design section 2 puts "which workflow a situation gets" behind a submission to `pma`, and D2 keeps mint, ship and push out of a model's hands. `pma workflow activate` records who activated it, as `pma route activate` does.
+**W11. A type is declared in the document, not registered in Rust.** A revision carries `types`; `pma` checks a node's output against the declaration it names. Rejected: a schema per workflow kind compiled in, which costs the same code and makes every new workflow a code change.
 
-### The artifact contract
+The declaration is deliberately weak: presence, type, enumerated values, length, uniqueness. It cannot express that a finding is real. That is what a `map out: 0..1` and the reviewer are for.
 
-**W13. An artifact's schema is declared in the document, not registered in Rust.** A revision carries a `schemas` block; `pma` checks a produced artifact against the declaration it names. Rejected: a schema per workflow kind compiled in, which was the first draft of this document. It cost about the same code and made every new workflow kind a code change, which is how a mechanism becomes a review mechanism.
+**W12. A `map out: 0..1` may not rewrite its input.** It returns ids to keep, plus fields named in `writes`. A validator that could edit a finding's text could launder work past the reviewer who reads it; the restriction is a trust boundary, not tidiness. Under `out: 1` the same rule bounds an annotation.
 
-The declaration is deliberately weak: field presence, type, enumerated values, length, uniqueness. It cannot express that a finding is real or that a specification is complete. Those are what the next stage and the reviewer are for.
+**W13. Files are how an agent reads and writes units; the store is where they live.** `pma` writes `in.json` before a run and reads `out.json` after, under `<data>/artifacts/<instance>/<node>/`. Prose artifacts sit beside them. Rejected: units as files only, which cannot record why a unit was dropped or which guard stopped it.
 
-**W14. A structured artifact is a set of rows, each with an `id`.** One shape covers findings, specifications, target lists and issue triage, and it is what a fan-out and a sink both need: something to iterate and something to key by. Rejected: free-form JSON per kind, which no general fan-out can read.
+**W14. Artifacts live outside the worktree.** An untracked file there enters `dispatch::changed_paths`, counts as a violation for any class whose scope is bounded ([class.rs:101](../../src/class.rs)), and `git add -A` at ship publishes it. A node that wants its prose committed says `"publish": true`.
 
-**W15. No stage writes `TODO.md`. A stage emits rows and `pma` writes the items.** `OWNED` puts `TODO.md` outside every class's scope ([class.rs:34](../../src/class.rs)), the dispatch prompt says so ([dispatch.rs:502](../../src/dispatch.rs)), and plan 4.7 depends on it: ship ticks the item after the rebase, which is admissible only because no agent may touch the file. An agent rewriting items also breaks item identity, which is file plus normalised text, and with it the attempt counter and `pma sync`'s `gh:N` links.
+**W15. No node writes `TODO.md`. A node emits units and `pma` writes the items.** `OWNED` puts `TODO.md` outside every class's scope ([class.rs:34](../../src/class.rs)), the dispatch prompt says so ([dispatch.rs:502](../../src/dispatch.rs)), and plan 4.7 depends on it: ship ticks the item after the rebase, which is admissible only because no agent may touch the file.
 
-**W16. A fan-out reads rows, not `TODO.md`.** Dispatch requires the item open in the remote default branch (`dispatch::on_origin`), so an item written by an earlier stage cannot be dispatched until it is committed and pushed. A row-keyed task takes the existing no-item path instead, with key `workflow:<instance>:<row>`. A sink is therefore independent of a fan-out: switching `emits` off changes nothing about what the next stage runs.
+**W16. An `edit` node takes its unit from the graph, not from `TODO.md`.** Dispatch requires the item open in the remote default branch (`dispatch::on_origin`), so an item written by an earlier node cannot be dispatched until it is committed and pushed. A unit-keyed task takes the existing no-item path, with key `workflow:<instance>:<root>`. A sink is therefore independent of an `edit`: switching `record` off changes nothing about what `fix` runs.
 
-**W17. A fan-out task's attempt counter keys on the instance and the row id**, not on normalised text. `dispatch::revision` keys on text so that a reworded specification starts fresh ([dispatch.rs:124](../../src/dispatch.rs)); rows are re-minted on every pass, so text keying would reset the limit whenever the producing agent rephrased.
+### Iteration
 
-**W18. `where` filters on enumerated fields only, by equality against a closed set.** No expression language. A filter on a free-text field is refused where the document is read, because it cannot be checked and it hides which rows a stage will take.
+**W17. Three forms, chosen by what re-applies between tries.** If no gate runs between attempts, the loop belongs inside the agent's own turn, where `timeout` and `agent_budget` bound it and `pma` neither sees nor records it.
 
-## 3. The document
+| Form | Example | Mechanism | Bound |
+|-|-|-|-|
+| retry | fix until `verify` passes | a node property; same worktree, appended attempts | `retry.max` |
+| lap | fix, audit, fix again | a back edge | `max_laps`, counted on the unit |
+| recursion | split until each piece is one change | a self-edge on `map out: 0..n` | `max_depth`, and the unit caps |
+| waiting | until CI is green | none: a `check` node is not ready | none |
 
-JSON, for the reason `route.rs` states: this crate parses JSON already. `schemas` sit beside `workflow` so two workflows can share one.
+**W18. Retries and laps draw from one counter per lineage.** `exhaustion` is keyed on project and task revision and refuses a third attempt (plan 1.9). A lap that re-keyed itself would be a hole straight through that limit; a lap that kept the existing key would make `max_laps` above 2 dead on arrival. One `attempts_used` per `@root`, consumed by a retry and by a lap alike, with `retry.max` and `max_laps` as tighter local bounds under the code ceiling. A red check or a rejection consumes one; an infrastructure failure or a timeout consumes none, as today.
+
+**W19. A lap edge requires a terminal path.** A document where a unit can exhaust its laps with nowhere to go is refused at parse. The usual terminal path emits the unit to `TODO.md`, which is the honest outcome of "the agent did not converge in two laps".
+
+**W20. Recursion terminates on the model's own answer, bounded by depth.** A unit that produced no children is a leaf and routes onward; a unit that produced children is settled and its children re-enter at `@depth + 1`. Models judge "small enough" poorly, so the caps are the real bound. Rejected: a declared termination predicate over unit content, which is a second control-flow language.
+
+**W21. No unbounded construct, and the bound is computed before activation.** Every loop bound and every `map out: 0..n` declares a constant, so the worst case is a product of constants. `pma workflow propose` prints the worst-case number of agent runs and the worst-case cost; `pma workflow activate` refuses a document whose worst case exceeds `workflow_budget`. What makes a loop safe to write down is not a promise to converge but a refusal to activate a graph that could cost more than you said.
+
+## 5. The document
+
+JSON, for the reason `route.rs` states: this crate parses JSON already. `types` sit beside `workflow` so two workflows share them. Nodes and edges are separate lists, so the topology is read in one place.
 
 ```json
 {
-  "schemas": {
-    "findings": {
-      "rows": "findings",
-      "max_rows": 20,
+  "types": {
+    "finding": {
       "fields": {
         "id":       {"type": "id",    "required": true},
         "severity": {"type": "enum",  "required": true, "values": ["critical", "high", "medium", "low"]},
@@ -84,182 +141,183 @@ JSON, for the reason `route.rs` states: this crate parses JSON already. `schemas
         "detail":   {"type": "lines", "max": 40},
         "paths":    {"type": "list"},
         "class":    {"type": "enum",  "values": ["A", "A-", "B", "C", "D"]},
-        "tags":     {"type": "list"}
+        "reason":   {"type": "line",  "max": 200}
       }
     }
   },
-
   "workflow": [
     {
       "name": "review-fix-critical",
-      "stages": [
-        {
-          "name": "review",
-          "task": "Review this project. Write your findings to {artifact}.",
-          "produces": "REVIEW.md",
-          "accept": "artifact"
-        },
-        {
-          "name": "validate",
-          "task": "Validate the review in {consumes}. Keep only findings you can confirm against the code. Write them to {artifact} as JSON matching the `findings` schema.",
-          "consumes": ["REVIEW.md"],
-          "produces": "findings.json",
-          "accept": "rows:findings",
-          "emits": {
-            "sink": "todo",
-            "priority": "{severity}",
-            "text": "{title}",
-            "description": "{detail}",
-            "tags": "{tags}"
-          }
-        },
-        {
-          "name": "fix",
-          "expands": {
-            "artifact": "findings.json",
-            "where": {"severity": ["critical"]},
-            "task": "Fix this, in project `{project}`:\n\n{title}\n\n{detail}",
-            "class": "{class}"
-          },
-          "accept": "verify",
-          "on_refusal": "continue"
-        }
-      ]
+      "input": {"type": "project"},
+      "caps": {"max_units": 40, "max_edits": 6},
+      "nodes": [],
+      "edges": []
     }
   ]
 }
 ```
 
-### Workflow
+### 5.1 Workflow
 
 | Field | Type | Default | Meaning |
 |-|-|-|-|
-| `name` | string | required | Unique in the revision. Names the instance and appears on every run. |
-| `stages` | array | required | Ordered, at least one. |
+| `name` | string | required | Unique in the revision. Names every instance and run. |
+| `input` | object | required | The root bag: `{"type": "project"}`, filled from the command's project or tag. |
+| `caps` | object | required | `max_units` and `max_edits` per instance. Section 11. |
+| `nodes` | array | required | At least one. |
+| `edges` | array | required | Every node but the input's successors must be reachable. |
 
-### Stage
+### 5.2 Node
 
-| Field | Type | Default | Meaning |
+| Field | Applies to | Default | Meaning |
 |-|-|-|-|
-| `name` | string | required | Unique in the workflow. Matched by a route's `stage` condition, and stored on the run. |
-| `task` | string | required unless `expands` | The prompt body. `{artifact}`, `{consumes}` and `{project}` are replaced. |
-| `consumes` | array of names | `[]` | Artifacts produced by earlier stages of this workflow. |
-| `produces` | name | none | A file name, written under the stage's artifact directory. |
-| `accept` | `verify` \| `artifact` \| `rows:<schema>` | `verify` | Section 4. |
-| `publish` | bool | `false` | Copy the artifact into the worktree, so ship commits it. |
-| `emits` | object | absent | Write the rows somewhere `pma` owns. Section 5. |
-| `expands` | object | absent | One run per row. Section 4.3. |
-| `on_refusal` | `stop` \| `continue` | `stop` | What a non-clean run of this stage does to the instance. |
-| `source` | name | absent | An input `pma` produces rather than an agent. Not built; see section 11. |
+| `name` | all | required | Unique. Matched by a route's `node` condition and stored on the run. |
+| `op` | all | required | `map`, `reduce`, `edit`, `check`, `emit`. |
+| `via` | map, reduce | `agent` | `agent` or `rule`. `edit` is agent only; `check` and `emit` are rule only. |
+| `in` | all | required | The type it expects. Every incoming edge must carry it. |
+| `out` | map | required | `0..n`, `1` or `0..1`. |
+| `emits` | map, reduce | required | The type it writes. |
+| `writes` | map at `1` or `0..1` | `[]` | Fields it may set. Any other change is refused (W12). |
+| `max_units` | map at `0..n` | required | Units one input unit may yield. |
+| `max_depth` | map with a self-edge | required | Lineage depth, counted from the root. |
+| `group_by` | reduce | `[]` | Fields forming a group. Empty means one group. |
+| `task` | agent nodes | required | The prompt. `{in}`, `{out}`, `{doc}`, `{project}` and `{field}` are replaced. |
+| `rule` | rule nodes | required | A named builtin. Sections 7 and 8. |
+| `doc` | map, agent | absent | A prose artifact the node also writes. |
+| `publish` | map, agent | `false` | Copy `doc` into the worktree, so ship commits it. |
+| `check` | edit | absent | A check run after the node. `verify` is the usual one. |
+| `retry` | edit, map | absent | `{max, while, escalate}`. Section 6. |
+| `sink` | emit | required | `todo`, `note` or `doc`. Section 8. |
+| `action` | emit | `add` | `add`, `tick` or `remove`. |
+| `map` | emit | required | Sink field to `{unit field}`. |
 
-### Schema
-
-| Field | Type | Meaning |
-|-|-|-|
-| `rows` | name | The document's array field holding the rows. |
-| `max_rows` | int | 1 to this many rows. A producer past it is refused, not truncated. |
-| `fields` | object | Field name to declaration. An undeclared field in a row is refused. |
-
-Field types, a closed list:
-
-| `type` | Checked |
-|-|-|
-| `id` | `[A-Za-z0-9_-]{1,16}`, unique in the document. Exactly one field per schema may be `id`, and it is required. |
-| `enum` | A string in `values`. The only type `where` may filter on. |
-| `line` | A one-line string, 1 to `max` characters. `unique: "normalised"` compares by `todo::normal_text`. |
-| `lines` | An array of strings, at most `max` entries. |
-| `list` | An array of strings, at most 20 entries, each at most 200 characters. |
-| `int` | A whole number, within `min` and `max` when given. |
-| `bool` | `true` or `false`. |
-
-Every declaration takes `required`, default false.
-
-### Refused where the document is read
-
-For the reason `route.rs` gives -- a stage that silently does nothing is worse than one that is refused:
-
-- a duplicate stage, workflow or schema name
-
-- a `consumes` naming an artifact no earlier stage produces
-
-- a stage with neither `task` nor `expands`
-
-- `accept` naming `artifact` or `rows:` with no `produces`
-
-- `accept: rows:<name>` where no schema has that name
-
-- an `expands` or `emits` naming an artifact whose stage does not accept rows
-
-- a `where` on a field that is not `enum`, or a value outside its `values`
-
-- a `{field}` placeholder in a `task`, `emits` or `expands` naming no declared field
-
-- a schema with no `id` field, or with two
-
-- an unknown field, at any level
-
-## 4. Acceptance
-
-### 4.1 The three forms
-
-| `accept` | Clean when | Used by |
-|-|-|-|
-| `verify` | the existing table of plan 1.8: base and head verify by class, scope respected | a stage that changes code |
-| `artifact` | `produces` exists, is a regular file, is non-empty, at most 1 MiB | a prose stage: a review, a specification, a draft |
-| `rows:<schema>` | `artifact`, plus the declaration in section 4.2 | a stage whose output another stage or a sink reads |
-
-An acceptance failure adds a reason to `accept::review_reasons`. It approves and rejects nothing, per plan 1.8. The instance stops or continues by `on_refusal`.
-
-The 1 MiB ceiling is stated so a stage cannot fill the artifact directory, and because the next stage reads the file into a prompt.
-
-### 4.2 Checking rows
-
-In order: the file parses as JSON; the top level is an object; `schema` equals the declared name; `rows` is an array of 1 to `max_rows` objects; each row's fields are all declared; every `required` field is present; each value matches its type.
-
-Two rules are applied after that, and they drop a row rather than failing the stage, because a duplicate is the normal result of running a workflow twice:
-
-- a `unique: "normalised"` value matching an open item of that project at the last scan
-
-- a value matching a row this instance already dispatched or emitted
-
-Each drop is named in the stage's record.
-
-### 4.3 Fan-out
-
-```json
-"expands": {
-  "artifact": "findings.json",
-  "where": {"severity": ["critical"]},
-  "task": "Fix this, in project `{project}`:\n\n{title}\n\n{detail}",
-  "class": "{class}"
-}
-```
+### 5.3 Edge
 
 | Field | Default | Meaning |
 |-|-|-|
-| `artifact` | required | An earlier stage's rows. |
-| `where` | `{}` | Enum field to allowed values. Every condition must hold. |
-| `task` | required | The prompt, with `{field}` from the row and `{project}`. |
-| `class` | `B` | A class name, or `{field}` reading one from the row. `B` is `Class::of`'s default. |
-| `max_runs` | 10 | Rows past it are left undispatched and named. A cap `pma` applies whatever the schema allows. |
+| `from` | required | A node name, or `@input`. |
+| `to` | required | A node name. |
+| `when` | absent | A guard. All keys must hold. |
+| `default` | `false` | Takes the units no guarded edge accepted. |
+| `max_laps` | absent | Marks a back edge and bounds it. Requires a terminal path (W19). |
 
-One run per matching row: its own worktree, base and head verify, scope check and attempt counter, keyed `workflow:<instance>:<row>` (W16, W17). The row's other fields are recorded on the run.
+Guards, a closed set of forms:
 
-A row-declared `class` widens nothing. `A-` is refused for `unattended` where a policy is read, and the privileged paths are judged against the paths a run actually changed, whatever class was predicted (plan 1.4, 1.7). A row whose class is `D` is not dispatched, which is how a producing stage hands work to the human.
+| Form | Example |
+|-|-|
+| membership | `{"severity": ["critical", "high"]}` |
+| number | `{"@children": {"==": 0}}`, `{"@depth": {"<": 2}}`. Operators `==`, `<`, `<=`, `>`, `>=` |
+| presence | `{"paths": "present"}`, `{"reason": "absent"}` |
+| verdict | `{"@verify": ["passed"]}` |
 
-Scope is not read from a row. It is policy: a route carries one ([route.rs:71](../../src/route.rs)) and a class resolves one ([class.rs:89](../../src/class.rs)). A `paths` field is recorded and shown.
+A bare name is a declared field; an `@` name is a system field or a verdict. No disjunction: two edges express it. A verdict guard matching only `passed` sends `unknown` to the default edge, which is why `unknown` is distinct from `failed` (the precedent is plan 1.6: a base check that could not start is unknown, not failing).
 
-## 5. Sinks
+### 5.4 Refused where the document is read
 
-`emits` writes rows to a place `pma` owns. The mapping is in the document; the sinks are a closed list, because each one writes to a real file or table.
+For the reason `route.rs` gives -- a node that silently does nothing is worse than one that is refused:
 
-| `sink` | Writes | Mapping fields |
+- a duplicate type, workflow, node or edge
+
+- an edge naming an unknown node, or a cycle that is not a `max_laps` back edge
+
+- an incoming edge whose source `emits` differs from the target's `in`
+
+- a `map out: 0..n` with no `max_units`, or a self-edge with no `max_depth`
+
+- a `max_laps` edge with no terminal path for units that exhaust it
+
+- a guard on an undeclared field, an unknown `@` name, or a value outside an enum's `values`
+
+- a `{field}` placeholder in a `task` or an emit `map` naming no declared field
+
+- a type declaring a reserved `@` name, or with no `id` field, or with two
+
+- `via: rule` with no `rule`, or `via: agent` with no `task`
+
+- `via: agent` on a `check` or an `emit`
+
+- a worst case above `workflow_budget` (at activation, not at parse)
+
+- an unknown field, at any level
+
+## 6. Iteration, concretely
+
+### Retry: the same node, the same gate
+
+```json
+{"name": "fix", "op": "edit", "in": "finding", "check": "verify",
+ "retry": {"max": 2, "while": "@verify != passed", "escalate": {"model": "opus"}},
+ "task": "Fix this in `{project}`:\n\n{title}\n\n{detail}"}
+```
+
+One run, up to three attempts, one worktree, cumulative cost, one `attempts` row each. This is the existing path made declarative: `escalate` is `retry.max: 1` with a model change (plan 4.3). `while` takes the same guard forms as an edge, negated with `!=` for a verdict.
+
+### Lap: two nodes alternating
+
+```json
+{"from": "fix",   "to": "audit"},
+{"from": "audit", "to": "fix",     "when": {"verdict": ["reject"]}, "max_laps": 2},
+{"from": "audit", "to": "record",  "when": {"verdict": ["accept"]}},
+{"from": "audit", "to": "handoff", "default": true}
+```
+
+`audit` is a `map out: 1` writing `verdict`; the guard reads it. The counter is on the unit, not the edge: two units crossing the same edge must not share a budget. Each lap mints a new unit whose `@parent` is the previous one and whose `@lap` is one higher, so the chain is readable and replay is exact.
+
+`handoff` is the terminal path W19 requires. It takes the units that exhausted their laps and the ones whose verdict was `unknown`.
+
+### Recursion: a self-edge with depth
+
+```json
+{"name": "split", "op": "map", "out": "0..n", "in": "task", "emits": "task",
+ "max_units": 5, "max_depth": 2,
+ "task": "If `{title}` needs more than one coherent change, return the independent subtasks. Otherwise return nothing."}
+```
+
+```json
+{"from": "@input", "to": "split"},
+{"from": "split",  "to": "split",     "when": {"@depth": {"<": 2}}},
+{"from": "split",  "to": "implement", "when": {"@children": {"==": 0}}}
+```
+
+A unit that produced children is settled; its children re-enter `split`. A unit that produced none is a leaf and goes to `implement`. Termination is the model's own answer under a depth cap (W20).
+
+### Waiting: not a loop
+
+```json
+{"name": "merged", "op": "check", "rule": "pr-merged", "in": "finding"}
+```
+
+The node is not runnable until the check passes. The pass ends, the next `pma workflow run` re-derives the frontier. This is what `ship.rs::settle` and the `pr-open` state already do (plan 4.8).
+
+## 7. Checks
+
+Rule only. Each writes `passed`, `failed` or `unknown`.
+
+| `rule` | Reads |
+|-|-|
+| `verify` | the project's verify command against the run's tree. Already built (plan 1.6) |
+| `scope-clean` | the run's recorded changed paths against its class (plan 1.7) |
+| `lint-todo` | `pma lint` on the project's `TODO.md` |
+| `ci-green` | required checks for the current head, through `gh` |
+| `pr-merged` | the pull request's state, through `gh` |
+| `nonempty` | whether the incoming bag holds at least one unit |
+
+A check costs nothing and is replayable, which is why guards read checks rather than models.
+
+## 8. Sinks
+
+`emit` is where a workflow writes outside the repository. The mapping is in the document; the sink list is closed, because each one writes to a real file or table.
+
+| `sink` | `action` | Writes |
 |-|-|-|
-| `todo` | items in the project's `TODO.md`, uncommitted, in the user's clone | `priority` (one of the four section names), `text`, `description`, `tags` |
-| `note` | a portfolio note per row, through `Store::add_note` | `text` |
-| `issue` | refused | `pma sync` owns issue creation for `Critical` items (design.md, Sync). A second creator needs reconciling with it first. |
+| `todo` | `add` | items in the project's `TODO.md`, uncommitted, in the user's clone |
+| `todo` | `tick` | marks matching items `[x]`, through `todo::mark_done` |
+| `todo` | `remove` | removes finished items, through `todo::prune`. Refused for an open item |
+| `note` | `add` | one portfolio note per unit, through `Store::add_note` |
+| `doc` | `add` | a rendered file under the instance's artifact directory |
+| `issue` | -- | refused. `pma sync` owns issue creation for `Critical` items (design.md, Sync); a second creator needs reconciling with it first |
 
-`todo` is the `pma sync` precedent, not a ship batch: the edit is uncommitted and `scripts/commit_todo.py` commits it.
+`todo` writes are the `pma sync` precedent, not a ship batch: the edit is uncommitted and `scripts/commit_todo.py` commits it.
 
 A new `todo::insert(text, priority, item, description) -> Option<String>`:
 
@@ -269,9 +327,24 @@ A new `todo::insert(text, priority, item, description) -> Option<String>`:
 
 - writes nothing when the file has lint errors, for the reason `pma sync` skips such a file: duplicate text breaks item identity.
 
-## 6. Routing: `Subject.stage`
+## 9. Acceptance per op
 
-One field, one match dimension, no new mechanism. `Policy::route` stays first match wins.
+| `op` | Clean when |
+|-|-|
+| `map out: 0..n` | `out.json` parses, every unit matches the declared type, count within `max_units`, `@depth` within `max_depth` |
+| `map out: 1` | the above, plus the id is preserved and no field outside `writes` changed |
+| `map out: 0..1` | the above, plus kept ids are a subset of the input, and every dropped id carries a non-empty reason |
+| `reduce` | every output unit names its inputs, and the count is at most one per group |
+| `edit` | the existing table of plan 1.8: base and head verify by class, scope respected |
+| `check` | the rule ran. `unknown` is a result, not a failure |
+| `emit` | the sink's rules held; every refusal is named per unit |
+| a `doc` | the file exists, is a regular file, is non-empty, at most 1 MiB |
+
+An acceptance failure adds a reason to `accept::review_reasons`. It approves and rejects nothing (plan 1.8). The unit routes by its guards; a node whose run was not clean sends its units to the default edge, or settles them when there is none.
+
+## 10. Routing: `node` and `lap`
+
+Two match dimensions, no new mechanism. `Policy::route` stays first match wins.
 
 `src/route.rs`:
 
@@ -281,48 +354,86 @@ pub struct Subject<'a> {
     pub class: Class,
     pub complexity: i64,
     pub tier: Option<u8>,
-    /// The workflow stage this dispatch serves, or `None` for a task
+    /// The workflow node this dispatch serves, or `None` for a task
     /// dispatched on its own.
-    pub stage: Option<&'a str>,
+    pub node: Option<&'a str>,
+    /// Laps completed by the unit. 0 outside a workflow.
+    pub lap: i64,
 }
 ```
 
 A shared reference is `Copy`, so `Subject` stays `Copy`. `Route` gains:
 
 ```rust
-    /// Stage names this route serves. `None` matches only a dispatch that
-    /// names no stage, so an existing policy keeps its behaviour exactly.
-    pub stages: Option<Vec<String>>,
+    /// Node names this route serves. `None` matches only a dispatch that
+    /// names no node, so an existing policy keeps its behaviour exactly.
+    pub nodes: Option<Vec<String>>,
+    /// Laps this route serves, as an inclusive range.
+    pub lap: Option<(i64, i64)>,
 ```
 
 `Route::matches`, added before the class test:
 
 ```rust
-        match (&self.stages, s.stage) {
+        match (&self.nodes, s.node) {
             (None, None) => {}
             (None, Some(_)) | (Some(_), None) => return false,
-            (Some(names), Some(stage)) if !names.iter().any(|n| n == stage) => return false,
+            (Some(names), Some(node)) if !names.iter().any(|n| n == node) => return false,
             (Some(_), Some(_)) => {}
+        }
+        if let Some((lo, hi)) = self.lap
+            && !(lo..=hi).contains(&s.lap)
+        {
+            return false;
         }
 ```
 
-`parse_route` reads `match.stage` with the shape `match.class` already has: a name, or a list of names. An empty list is refused, since it would match nothing. `Policy::to_json` writes `stage` into the condition map, so two revisions still diff by what they mean.
+`parse_route` reads `match.node` with the shape `match.class` already has -- a name or a list -- and `match.lap` with the existing range parser, so `"1-2"` and `2` both work. An empty node list is refused. `Policy::to_json` writes both, so two revisions still diff by what they mean.
 
-The `unattended` guard needs no change. It reads `classes`, so a stage route with `unattended` and no class list is refused exactly as a task route is.
+The `unattended` guard needs no change. It reads `classes`, so a node route with `unattended` and no class list is refused exactly as a task route is.
 
-`route::replay` fills `stage` from `run.stage`. Runs recorded before migration 20 have `stage` null, hence `None`, hence the same routes they matched before: replaying an old revision over old runs reports no new difference. That is the migration-safety property to test.
+`route::replay` fills `node` from `run.node` and `lap` from `run.lap`. Runs recorded before migration 20 have `node` null and `lap` 0, hence the same routes they matched before: replaying an old revision over old runs reports no new difference. That is the migration-safety property to test.
 
-A stage whose name no route matches refuses the dispatch by name, as a task with no matching route does today. There is no fallback to `pma config agent`.
+A node no route matches refuses the dispatch by name, as a task with no matching route does today. There is no fallback to `pma config agent`.
 
-## 7. Schema 20
+The `lap` dimension is what makes per-lap specialisation a policy statement rather than a document one: `{"match": {"node": "fix", "lap": "1-2"}, "model": "opus", "approval": "each"}` puts a second lap on a stronger model under a human, without the workflow naming a model.
+
+## 11. Bounds and cost
+
+Worst case per node, walked from the input:
+
+```
+bound(@input)        = the instance's project count
+bound(map 0..n)      = bound(in) x max_units, summed over depth <= max_depth
+bound(map 1|0..1)    = bound(in)
+bound(reduce)        = number of groups <= bound(in)
+runs(node)           = bound(in) x (1 + sum of max_laps on incoming lap edges)
+                                 x (1 + retry.max)
+cost                 = sum over agent nodes of runs(node) x agent_budget
+```
+
+Truncated by `caps.max_units` and `caps.max_edits` per instance, which is what actually holds a recursive graph: `max_units` per node compounds with depth, the instance cap does not.
+
+`pma workflow propose` prints the table. `pma workflow activate` refuses a document whose cost exceeds `workflow_budget`, a new setting under the config rules of the plan's "Configuration compatibility" section. A node that hits a cap leaves the remainder undispatched and names it, rather than truncating silently.
+
+Rule nodes cost nothing and are excluded from the sum. A document whose graph is all rules has a worst case of zero, and section 14.10 is one.
+
+## 12. Scheduling
+
+One pass: collect every runnable node, run them, record, route the units, exit. Within a pass, runs are bounded by `max_parallel` and admitted by `batch_budget`, exactly as `pma dispatch` admits them today. `edit` runs get one worktree each, as they do now.
+
+Two `edit` nodes over the same project in one pass produce two worktrees and two branches. That is today's behaviour under `--auto`, and the conflict at ship is plan 5.3's barrier problem, which this design does not solve.
+
+## 13. Schema 20
 
 `VERSION` is 19 ([store.rs:26](../../src/store.rs)); the migration list is indexed by version, so `WORKFLOWS` is appended to `steps` and `VERSION` becomes 20.
 
 ```rust
-/// Version 20. A workflow is an ordered set of stages over one project,
-/// stored as a revision and activated like a routing policy. An instance is
-/// per project, and its progress is derived from its runs rather than stored,
-/// so a crash resumes by re-deriving rather than by trusting a cursor.
+/// Version 20. A workflow is a graph of operations over typed units. Units
+/// are immutable and carry their lineage, so a lap, an annotation and a
+/// decomposition each leave a readable chain; a node's bag is derived from
+/// the units it wrote, and the frontier from the moves recorded, so nothing
+/// holds a cursor a crash could lose.
 const WORKFLOWS: &str = "
 CREATE TABLE workflows (
     revision INTEGER PRIMARY KEY,
@@ -330,207 +441,514 @@ CREATE TABLE workflows (
     proposed_by TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     activated_at INTEGER,
-    activated_by TEXT
+    activated_by TEXT,
+    worst_case_runs INTEGER,
+    worst_case_cost REAL
 );
-CREATE TABLE workflow_runs (
+CREATE TABLE workflow_instances (
     id INTEGER PRIMARY KEY,
     workflow TEXT NOT NULL,
     revision INTEGER NOT NULL REFERENCES workflows(revision),
-    project TEXT NOT NULL,
+    input TEXT NOT NULL,
     started_at INTEGER NOT NULL,
     finished_at INTEGER,
     outcome TEXT
 );
-CREATE INDEX idx_workflow_runs_project ON workflow_runs(project, workflow);
-ALTER TABLE runs ADD COLUMN workflow_run INTEGER;
-ALTER TABLE runs ADD COLUMN stage TEXT;
-ALTER TABLE runs ADD COLUMN row TEXT;
+CREATE TABLE workflow_units (
+    instance INTEGER NOT NULL REFERENCES workflow_instances(id) ON DELETE CASCADE,
+    id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    node TEXT NOT NULL,
+    parent TEXT,
+    root TEXT NOT NULL,
+    depth INTEGER NOT NULL DEFAULT 0,
+    lap INTEGER NOT NULL DEFAULT 0,
+    project TEXT,
+    data TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (instance, id)
+);
+CREATE INDEX idx_workflow_units_root ON workflow_units(instance, root);
+CREATE TABLE workflow_moves (
+    instance INTEGER NOT NULL REFERENCES workflow_instances(id) ON DELETE CASCADE,
+    unit TEXT NOT NULL,
+    edge INTEGER NOT NULL,
+    taken INTEGER NOT NULL,
+    reason TEXT,
+    at INTEGER NOT NULL,
+    PRIMARY KEY (instance, unit, edge)
+);
+CREATE TABLE workflow_verdicts (
+    instance INTEGER NOT NULL REFERENCES workflow_instances(id) ON DELETE CASCADE,
+    unit TEXT NOT NULL,
+    check_name TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    detail TEXT,
+    at INTEGER NOT NULL,
+    PRIMARY KEY (instance, unit, check_name)
+);
+ALTER TABLE runs ADD COLUMN workflow_instance INTEGER;
+ALTER TABLE runs ADD COLUMN node TEXT;
+ALTER TABLE runs ADD COLUMN unit TEXT;
+ALTER TABLE runs ADD COLUMN lap INTEGER NOT NULL DEFAULT 0;
 ";
 ```
 
-| Column | On | Null means |
+| Column | On | Null or zero means |
 |-|-|-|
-| `workflow_run` | `runs` | dispatched on its own, not by a workflow |
-| `stage` | `runs` | the same, and the routing partition of W3 reads it |
-| `row` | `runs` | not a fan-out run |
+| `workflow_instance` | `runs` | dispatched on its own, not by a workflow |
+| `node` | `runs` | the same, and the routing partition of W8 reads it |
+| `unit` | `runs` | not driven by a unit |
+| `lap` | `runs` | never crossed a lap edge |
 
 Notes on shape:
 
-- No `shadow` column on `workflows`. `routes` has one because a route can be computed and not applied; a workflow has no counterfactual to compute. `pma route replay` already covers the routing half of a stage decision.
+- A bag needs no table: it is the units whose `node` is that node. A unit's presence in a downstream node's input is `workflow_moves` with `taken = 1`.
 
-- No foreign key from `runs` to `workflow_runs`. `runs` is the calibration corpus and rows are never deleted, so a run must survive a workflow definition being removed. `runs.route_revision` is unconstrained for the same reason.
+- `workflow_moves.reason` holds the guard that refused a unit, so "why did F3 stop" is answerable without re-deriving anything.
 
-- `workflow_runs.outcome` is `finished`, `stopped` or `abandoned`. Which stage it reached is derived from its runs.
+- No `shadow` column on `workflows`. `routes` has one because a route can be computed and not applied; a workflow has no counterfactual to compute. `pma route replay` covers the routing half of a node's decision.
 
-- The exhaustion counter needs no schema change: its `revision` column is text, and a fan-out task supplies `workflow:<instance>:<row>` in place of the normalised item text (W17).
+- No foreign key from `runs` to `workflow_instances`. `runs` is the calibration corpus and rows are never deleted, so a run must survive a workflow being removed. `runs.route_revision` is unconstrained for the same reason.
+
+- The exhaustion counter needs no schema change: its `revision` column is text, and a unit-driven task supplies `workflow:<instance>:<root>`, which is what makes retries and laps draw from one budget (W18).
 
 - `dispatch::without_item` gains the `workflow:` prefix beside `campaign:`.
 
-- `row` holds the row's `id` value, not its text, so a reworded row is the same task (W17).
+## 14. Examples
 
-## 8. Commands
+Ten graphs. Each states the primitives it exercises, its worst case, and where the human is. `->` is an edge, `[...]` a guard, `=>` a sink.
 
-```sh
-pma workflow                         # revisions, and instances with their stage
-pma workflow propose <file>          # store a draft; activate nothing
-pma workflow activate <rev>          # put it into effect, recording who
-pma workflow show <rev|instance>
-pma workflow run <name> <project>    # or --tag <t>; one pass, then exit
-pma workflow run <name> --dry-run    # what the pass would dispatch, and under which route
-pma workflow stop <instance>         # no further stage; runs already open stand
+### 14.1 Review, validate, fix
+
+The original request. One fork: the confirmed findings are recorded for the human and, separately, the critical ones are fixed.
+
+```
+@input -> review -> confirm -> dedupe -+-> record => TODO.md
+                                        \-> fix [severity=critical] -> review, ship
 ```
 
-`run` holds `session.lock` for the pass, as `dispatch` does. `pma report --by stage` follows, for the reason plan 1.10 refuses `--by model` until routing produces one: the dimension arrives with the data.
+```json
+{
+  "name": "review-fix-critical",
+  "input": {"type": "project"},
+  "caps": {"max_units": 40, "max_edits": 6},
+  "nodes": [
+    {"name": "review", "op": "map", "out": "0..n", "in": "project", "emits": "finding",
+     "max_units": 20, "doc": "REVIEW.md",
+     "task": "Review `{project}`. Write your prose to {doc} and your findings to {out} as `finding` units."},
 
-## 9. Four shapes
+    {"name": "confirm", "op": "map", "out": "0..1", "in": "finding", "emits": "finding",
+     "writes": ["reason"],
+     "task": "Each unit in {in} is a claim. Confirm it against the code. Keep the ones you can prove; drop the rest with a `reason`. Change nothing else."},
 
-The first three are the same mechanism with different documents. The fourth is what does not fit.
+    {"name": "dedupe", "op": "reduce", "via": "rule", "rule": "dedupe",
+     "group_by": ["title"], "in": "finding", "emits": "finding"},
 
-### 9.1 Review, validate, fix
+    {"name": "record", "op": "emit", "in": "finding", "sink": "todo", "action": "add",
+     "map": {"priority": "{severity}", "text": "{title}", "description": "{detail}"}},
 
-The document of section 3. `pma workflow run review-fix-critical cynn`, with `max_parallel = 2`:
+    {"name": "fix", "op": "edit", "in": "finding", "check": "verify",
+     "retry": {"max": 1, "while": "@verify != passed", "escalate": {"model": "opus"}},
+     "task": "Fix this in `{project}`:\n\n{title}\n\n{detail}"}
+  ],
+  "edges": [
+    {"from": "@input", "to": "review"},
+    {"from": "review", "to": "confirm"},
+    {"from": "confirm", "to": "dedupe"},
+    {"from": "dedupe", "to": "record"},
+    {"from": "dedupe", "to": "fix", "when": {"severity": ["critical"]}}
+  ]
+}
+```
 
-| Pass | What runs | Where the human is |
-|-|-|-|
-| 1 | `review`: one run, route `review-cheap`, approval `propose`, writes `REVIEW.md`, accepted as `artifact` | reads it if they want; nothing is published |
-| 1 | `validate` is runnable at once: route `validate-strong`, writes 6 rows, one dropped as a duplicate of an open item | `TODO.md` in the clone gains 5 items, uncommitted |
-| 1 | `fix` expands the 2 rows with `severity: critical`: 2 runs, keys `workflow:17:F1` and `workflow:17:F4`, one worktree each, route `fix-strong`, approval `batch` | `pma review`, then `pma review --approve 41 42` |
-| 2 | nothing runnable; the instance is `finished` | `pma ship` |
+Worst case: 1 review, 20 confirms, 0 reduce runs (a rule), 6 edits at 2 attempts each. 33 agent runs at `agent_budget` 1.0 is $33, which `workflow_budget` had better allow. Routes: `review` cheap under `propose`, `confirm` strong under `propose`, `fix` under `batch`.
 
-Four runs, three routes, three models if the policy names three. The review file never enters a worktree diff, and no agent touched `TODO.md`.
+The human reads `pma review`, approves the fixes in one batch, ships. The uncommitted `TODO.md` edit is theirs to commit.
 
-### 9.2 Specify, then implement
+### 14.2 Specify, then implement
 
-One `TODO.md` one-liner into a specification, then the change. No fan-out, two stages, one artifact:
+Two nodes, no fan-out, no rules. The shape for a one-liner that an agent should not start coding against.
+
+```
+@input -> specify -> implement -> review, ship
+```
 
 ```json
 {
   "name": "specify-then-implement",
-  "stages": [
-    {"name": "specify",
-     "task": "The task is: {project}'s item `{consumes}`. Write a specification to {artifact}: what changes, which files, how it is checked, and what is out of scope.",
-     "produces": "SPEC.md", "accept": "artifact"},
-    {"name": "implement",
-     "consumes": ["SPEC.md"],
-     "task": "Implement the specification in {consumes}. Do not widen it.",
-     "accept": "verify"}
+  "input": {"type": "task"},
+  "caps": {"max_units": 4, "max_edits": 2},
+  "nodes": [
+    {"name": "specify", "op": "map", "out": "1", "in": "task", "emits": "task",
+     "writes": ["spec"], "doc": "SPEC.md",
+     "task": "The task is `{title}`. Write to {doc} what changes, which files, how it is checked, and what is out of scope. Put a one-line summary in `spec`."},
+    {"name": "implement", "op": "edit", "in": "task", "check": "verify",
+     "task": "Implement the specification in {doc}. Do not widen it.\n\nTask: {title}"}
+  ],
+  "edges": [
+    {"from": "@input", "to": "specify"},
+    {"from": "specify", "to": "implement"}
   ]
 }
 ```
 
-Routes: `specify` at a strong model under `propose`, `implement` at a cheaper one under `each`. This is the shape the plan's phase 3.7 was reaching for from the other direction -- it improves what an agent is told, rather than guessing whether the telling was good enough.
+`out: 1` with `writes: ["spec"]` is the enforceable part: the specifier may add its summary and may not rewrite the task it was given.
 
-### 9.3 Triage GitHub issues
+### 14.3 Triage issues, no model on the read
 
-Rows come from an artifact the *first* stage writes by reading the repository's issues, which today means an agent with `gh` in its allowlist. With `source` built (section 11) the first stage disappears and `pma` produces the rows.
+The first node is a rule, so reading the issues costs nothing. Only the classification spends a model, and nothing is dispatched.
+
+```
+@input -> issues(rule) -> classify -> file [actionable=true] => TODO.md
+```
 
 ```json
 {
   "name": "triage-issues",
-  "stages": [
-    {"name": "classify",
-     "task": "Read the open issues in {project} with `gh issue list --json number,title,body,labels`. For each one, decide a priority and whether it is actionable. Write rows to {artifact} matching the `triage` schema.",
-     "produces": "triage.json", "accept": "rows:triage",
-     "emits": {"sink": "todo", "priority": "{priority}", "text": "{title}", "description": "{why}"}}
+  "input": {"type": "project"},
+  "caps": {"max_units": 60, "max_edits": 0},
+  "nodes": [
+    {"name": "issues", "op": "map", "out": "0..n", "via": "rule", "rule": "open-issues",
+     "in": "project", "emits": "issue", "max_units": 50},
+    {"name": "classify", "op": "map", "out": "1", "in": "issue", "emits": "issue",
+     "writes": ["priority", "why", "actionable"],
+     "task": "For each issue in {in}, set `priority`, a one-line `why`, and `actionable`."},
+    {"name": "file", "op": "emit", "in": "issue", "sink": "todo", "action": "add",
+     "map": {"priority": "{priority}", "text": "{title}", "description": "{why}"}}
+  ],
+  "edges": [
+    {"from": "@input", "to": "issues"},
+    {"from": "issues", "to": "classify"},
+    {"from": "classify", "to": "file", "when": {"actionable": ["true"]}}
   ]
 }
 ```
 
-One stage, no fan-out, one sink. The `triage` schema declares `id, number, priority, title, why, actionable`. Nothing is dispatched: the output is items in `TODO.md` for the human to rank.
+A non-actionable issue is settled at `classify` with the guard recorded, so the reason it was not filed is readable later.
 
-### 9.4 Probe, then apply across repositories
+### 14.4 Ensemble review, then reduce
 
-Add a minimal CI workflow to every repository without one. The fan-out axis is projects, not rows, and this design has no way to say that. It is the campaign mechanism (plan 5.1, 5.2), and section 11 states the unresolved merge.
+Three reviewers at three models, joined. This is the shape a strictly sequential design cannot express.
 
-## 10. Acceptance
+```
+@input -+-> review-a -+
+        +-> review-b -+-> merge(rule) -> confirm -> record => TODO.md
+        \-> review-c -+
+```
+
+```json
+{
+  "name": "ensemble-review",
+  "input": {"type": "project"},
+  "caps": {"max_units": 80, "max_edits": 0},
+  "nodes": [
+    {"name": "review-a", "op": "map", "out": "0..n", "in": "project", "emits": "finding", "max_units": 20,
+     "task": "Review `{project}` for correctness bugs. Write findings to {out}."},
+    {"name": "review-b", "op": "map", "out": "0..n", "in": "project", "emits": "finding", "max_units": 20,
+     "task": "Review `{project}` for missing tests. Write findings to {out}."},
+    {"name": "review-c", "op": "map", "out": "0..n", "in": "project", "emits": "finding", "max_units": 20,
+     "task": "Review `{project}` for interfaces that are hard to use correctly. Write findings to {out}."},
+    {"name": "merge", "op": "reduce", "via": "rule", "rule": "dedupe", "group_by": ["title"],
+     "in": "finding", "emits": "finding"},
+    {"name": "confirm", "op": "map", "out": "0..1", "in": "finding", "emits": "finding",
+     "writes": ["reason"],
+     "task": "Confirm each unit in {in} against the code. Drop what you cannot prove, with a `reason`."},
+    {"name": "record", "op": "emit", "in": "finding", "sink": "todo", "action": "add",
+     "map": {"priority": "{severity}", "text": "{title}", "description": "{detail}"}}
+  ],
+  "edges": [
+    {"from": "@input", "to": "review-a"},
+    {"from": "@input", "to": "review-b"},
+    {"from": "@input", "to": "review-c"},
+    {"from": "review-a", "to": "merge"},
+    {"from": "review-b", "to": "merge"},
+    {"from": "review-c", "to": "merge"},
+    {"from": "merge", "to": "confirm"},
+    {"from": "confirm", "to": "record"}
+  ]
+}
+```
+
+Three reviewers run in one pass, bounded by `max_parallel`. `merge` waits for all three because it has three incoming edges and `reduce` is the barrier. The reviewers are three prompts rather than three temperatures, because three identical prompts at one model mostly agree and the cost triples either way.
+
+Routes may give `review-a` haiku, `review-b` sonnet and `review-c` opus, which is the cost experiment the whole design is for. Worst case: 3 reviews, up to 60 findings into the reducer, at most 60 confirms.
+
+### 14.5 Decompose recursively, then implement
+
+```
+@input -> split -+-> split [depth<2]
+                 \-> implement [children=0] -> review, ship
+```
+
+```json
+{
+  "name": "decompose-then-implement",
+  "input": {"type": "task"},
+  "caps": {"max_units": 20, "max_edits": 8},
+  "nodes": [
+    {"name": "split", "op": "map", "out": "0..n", "in": "task", "emits": "task",
+     "max_units": 5, "max_depth": 2,
+     "task": "`{title}` may be too large for one coherent change. If it is, return independent subtasks, each one change. If it is not, return nothing."},
+    {"name": "implement", "op": "edit", "in": "task", "check": "verify",
+     "retry": {"max": 1, "while": "@verify != passed"},
+     "task": "Implement `{title}`.\n\n{detail}"}
+  ],
+  "edges": [
+    {"from": "@input", "to": "split"},
+    {"from": "split", "to": "split", "when": {"@depth": {"<": 2}}},
+    {"from": "split", "to": "implement", "when": {"@children": {"==": 0}}}
+  ]
+}
+```
+
+Per-node worst case is 1 + 5 + 25 units, so `caps.max_units: 20` is what actually holds it, and the truncation is named in the report rather than hidden. Expect the depth cap to be reached: a model asked whether a task is small enough usually says no.
+
+The leaf test is the decomposer's own empty answer, so no termination predicate is needed (W20).
+
+### 14.6 Fix with an audit lap
+
+Two nodes alternating, with a bound and an honest exit.
+
+```
+@input -> fix -> audit -+-> record  [verdict=accept] => TODO.md
+                        +-> fix     [verdict=reject] (max_laps 2)
+                        \-> handoff (default) => TODO.md
+```
+
+```json
+{
+  "name": "fix-with-audit",
+  "input": {"type": "finding"},
+  "caps": {"max_units": 12, "max_edits": 9},
+  "nodes": [
+    {"name": "fix", "op": "edit", "in": "finding", "check": "verify",
+     "task": "Fix this in `{project}`:\n\n{title}\n\n{detail}"},
+    {"name": "audit", "op": "map", "out": "1", "in": "finding", "emits": "finding",
+     "writes": ["verdict", "reason"],
+     "task": "Read the diff for `{title}`. Set `verdict` to accept or reject, and `reason` to one line. You are checking the change, not making one."},
+    {"name": "record", "op": "emit", "in": "finding", "sink": "todo", "action": "add",
+     "map": {"priority": "{severity}", "text": "{title}", "description": "{reason}"}},
+    {"name": "handoff", "op": "emit", "in": "finding", "sink": "todo", "action": "add",
+     "map": {"priority": "{severity}", "text": "{title}", "description": "{reason}"}}
+  ],
+  "edges": [
+    {"from": "@input", "to": "fix"},
+    {"from": "fix", "to": "audit"},
+    {"from": "audit", "to": "record", "when": {"verdict": ["accept"]}},
+    {"from": "audit", "to": "fix", "when": {"verdict": ["reject"]}, "max_laps": 2},
+    {"from": "audit", "to": "handoff", "default": true}
+  ]
+}
+```
+
+Three findings, at most three `fix` runs each: 9 edits, 9 audits. The route for `fix` may state `lap: "1-2"` at a stronger model, so a rejected first attempt is retried by a better one without the document naming it.
+
+`handoff` catches two cases: laps exhausted, and a verdict the auditor left unreadable. Both end with the human holding the task, which is the truthful outcome.
+
+### 14.7 Upgrade, and triage only on breakage
+
+The conditional the earlier draft could not express, and it needs no `when` on a node: the guard reads a check's verdict, and a node with no units does nothing.
+
+```
+@input -> upgrade -+-> diagnose [verify=failed] -> fix -> review, ship
+                    \-> (settled) [verify=passed]
+```
+
+```json
+{
+  "name": "upgrade-then-triage",
+  "input": {"type": "project"},
+  "caps": {"max_units": 20, "max_edits": 6},
+  "nodes": [
+    {"name": "upgrade", "op": "edit", "in": "project", "check": "verify",
+     "task": "Update this project's dependencies within its version constraints. Change a constraint only where the tests still pass."},
+    {"name": "diagnose", "op": "map", "out": "0..n", "in": "project", "emits": "finding",
+     "max_units": 10,
+     "task": "The upgrade in this worktree broke the build. Write one `finding` per distinct breakage to {out}: what broke, where, and the smallest fix."},
+    {"name": "fix", "op": "edit", "in": "finding", "check": "verify",
+     "task": "Fix this breakage from the dependency upgrade:\n\n{title}\n\n{detail}"}
+  ],
+  "edges": [
+    {"from": "@input", "to": "upgrade"},
+    {"from": "upgrade", "to": "diagnose", "when": {"@verify": ["failed"]}},
+    {"from": "diagnose", "to": "fix"}
+  ]
+}
+```
+
+A green upgrade settles at `upgrade` and the run goes to review as a clean patch. A red one routes into `diagnose`, whose bag is empty when nothing broke, so `fix` is never even considered. `@verify: unknown` matches no edge and settles, which is right: a check that could not run is not evidence of breakage.
+
+### 14.8 A campaign, as a graph
+
+One definition over a set of repositories: probe by rule, then edit what needs it. This is the campaign mechanism (plan 5.1, 5.2) expressed in the same document, with the fan-out axis being a bag of projects rather than a bag of findings.
+
+```
+@input(tag) -> needs-ci(rule) -> add-ci -> review, ship
+```
+
+```json
+{
+  "name": "add-missing-ci",
+  "input": {"type": "project"},
+  "caps": {"max_units": 100, "max_edits": 10},
+  "nodes": [
+    {"name": "needs-ci", "op": "map", "out": "0..1", "via": "rule",
+     "rule": "path-absent:.github/workflows", "in": "project", "emits": "project"},
+    {"name": "add-ci", "op": "edit", "in": "project", "check": "verify",
+     "task": "Add a minimal CI workflow that runs this project's own check command on push and on pull request. Change nothing else."}
+  ],
+  "edges": [
+    {"from": "@input", "to": "needs-ci"},
+    {"from": "needs-ci", "to": "add-ci"}
+  ]
+}
+```
+
+`pma workflow run add-missing-ci --tag rust` freezes the project set as the input bag, which is `add_campaign`'s frozen membership by another route: the bag is written once and never recomputed, so a rescan cannot move work under a running instance.
+
+Class A- applies because the change touches `.github/**`, `unattended` is refused for A- where the policy is read, and `max_edits: 10` caps the blast radius per instance. Plan 4.9's per-repository daily cap still applies on top.
+
+### 14.9 Ship, then wait for the merge
+
+No loop, no model. The graph expresses waiting by having a node that is not ready.
+
+```
+@input -> merged(check) -> close => note
+```
+
+```json
+{
+  "name": "settle-pull-requests",
+  "input": {"type": "finding"},
+  "caps": {"max_units": 40, "max_edits": 0},
+  "nodes": [
+    {"name": "merged", "op": "check", "rule": "pr-merged", "in": "finding"},
+    {"name": "close", "op": "emit", "in": "finding", "sink": "note", "action": "add",
+     "map": {"text": "shipped: {title}"}}
+  ],
+  "edges": [
+    {"from": "@input", "to": "merged"},
+    {"from": "merged", "to": "close", "when": {"@merged": ["passed"]}}
+  ]
+}
+```
+
+Each pass costs nothing and either advances or does not. Run it from the same place a scheduled `pma dispatch` pass would run (plan 4.11).
+
+### 14.10 Prune finished items, with no model at all
+
+Every node is a rule. Worst-case cost is zero, which `pma workflow propose` prints as `$0.00`, and the document is a scheduled chore rather than an agent workflow.
+
+```
+@input -> items(rule) -> prune [done=true] => TODO.md (remove)
+```
+
+```json
+{
+  "name": "prune-finished",
+  "input": {"type": "project"},
+  "caps": {"max_units": 500, "max_edits": 0},
+  "nodes": [
+    {"name": "items", "op": "map", "out": "0..n", "via": "rule", "rule": "todo-items",
+     "in": "project", "emits": "item", "max_units": 400},
+    {"name": "prune", "op": "emit", "in": "item", "sink": "todo", "action": "remove",
+     "map": {"text": "{text}"}}
+  ],
+  "edges": [
+    {"from": "@input", "to": "items"},
+    {"from": "items", "to": "prune", "when": {"done": ["true"]}}
+  ]
+}
+```
+
+`action: remove` refuses an open item, so the guard and the sink agree. This is `pma prune` with a record of what it removed and why.
+
+## 15. Acceptance
 
 Routing:
 
-- a route with `stage` does not match a stage-less dispatch, and a route without `stage` does not match a stage
+- a route with `node` does not match a node-less dispatch, and a route without `node` does not match a node
 
-- `to_json` round trip keeps `stage`; a revision with an empty stage list is refused
+- `lap` matches a range, and a run outside a workflow has lap 0
 
-- `unattended` with a stage and no class list is refused
+- `to_json` round trip keeps `node` and `lap`; an empty node list is refused
+
+- `unattended` with a node and no class list is refused
 
 - replay over runs recorded before migration 20 reports no difference
 
-The document:
+The document, one test per refusal in 5.4, each naming its position as `route.rs`'s parse tests do. In particular: a cycle without `max_laps`; a `max_laps` edge with no terminal path; a `map out: 0..n` with no `max_units`; a self-edge with no `max_depth`; a type agreement failure across an edge; a guard on an undeclared field.
 
-- each refusal in section 3 has a test naming its position, as `route.rs`'s parse tests do
+Units and ops:
 
-- a `{field}` naming no declared field is refused
+- `0..n` past `max_units` is refused, and the instance cap truncates with a named remainder
 
-- a `where` on a `line` field is refused
+- `0..1` returning an id that was not in the input is refused; a drop with no reason is refused
 
-Rows:
+- `1` changing a field outside `writes` is refused
 
-- duplicate `id`; a duplicate `line` by `normal_text`; a `line` ending in `due:2026-10-01`, which `todo::is_token` accepts and an item line may not carry as text; an unknown `enum` value; `max_rows` plus one; an undeclared field present; a row duplicating an open item is dropped and named, not failed
+- a `reduce` output with no provenance is refused
 
-- a schema with two `id` fields is refused
+- a duplicate `unique: "normalised"` value against an open item is dropped and named, not failed
 
-Artifacts:
+Iteration:
 
-- a prose stage's `changed_paths` is empty, and its artifact is outside the worktree
+- `retry` appends attempts to one run in one worktree, and stops at `max`
 
-- with `publish: true` the artifact is in the diff; without it, ship does not carry it
+- a lap mints a new unit with `@parent`, `@lap + 1`, and the same `@root`
+
+- retries and laps draw from one counter: a unit that used two attempts on retries cannot take a third on a lap
+
+- a unit that exhausts its laps reaches the terminal path, and the move is recorded
+
+- recursion stops at `max_depth`, and a unit with no children routes to the leaf edge
+
+- a `check` node that is not satisfied ends the pass without advancing, and the next pass re-derives the same frontier
+
+Bounds:
+
+- `propose` prints per-node worst case and total cost; a rules-only document prints zero
+
+- `activate` refuses a document above `workflow_budget`
 
 Sinks:
 
-- `todo` into a section with a `###` group inserts above the group
+- `todo add` into a section with a `###` group inserts above the group
 
-- a missing section refuses
+- a missing section refuses; a file with lint errors is skipped
 
-- a file with lint errors is skipped
+- `todo remove` refuses an open item
 
-- `note` writes one note per row
+- `note add` writes one note per unit
 
-Fan-out:
+End to end, on a fixture repository: 14.1 with two findings, one fixed and shipped; 14.7 with a red upgrade producing one breakage; 14.10 with three finished items.
 
-- `where` selects a subset, and `max_runs` leaves the remainder undispatched and named
+## 16. Limits
 
-- a row whose `class` is `D` is not dispatched
+**No sub-workflows.** Reusing "review and confirm" inside three documents means copying two nodes. A `call` node needs nested instances, nested caps and a cost bound that composes. Deferred until a second document wants the same pair.
 
-- `on_refusal: continue` finishes the rest; `stop` does not start the remainder
+**Two `edit` nodes can conflict at ship.** Separate worktrees make them safe to run; merging them is plan 5.3's barrier problem, and nothing here solves it. `caps.max_edits` bounds how bad it gets.
 
-- two passes over the same rows do not dispatch the same row twice
+**A node's input is unbounded in size.** A 200-file repository does not fit a prompt, and no node declares which files it reads. The agent walks the worktree within its timeout.
 
-Sequencer:
-
-- a second pass with no intervening approval advances nothing
-
-- an instance whose process was killed mid-pass re-derives the same next stage
-
-CLI, end to end: a fixture repository, the section 3 document, 2 rows, both fan-out runs verified, one approved and shipped.
-
-## 11. Limits
-
-Each of these is a shape the mechanism refuses. They are stated rather than solved, and each names what it would cost.
-
-**No stage input that `pma` produces.** A triage workflow starts by having an agent shell out to `gh`, which needs an allowlist entry and spends a model on work `pma` already does. The fix is a `source` field naming a closed list of producers -- `todo`, `issues`, `runs`, `scan` -- run by `pma`, costing nothing, accepted automatically. The field is in the stage table now so that adding it later is additive rather than a reshape. Build it when a second workflow wants it.
-
-**One fan-out axis.** Rows of an artifact, within one project. Fan-out over projects is a campaign, and the two objects are not joined: a campaign is one task over many projects, a workflow many stages over one. `--tag` gives a set of instances, which is a fan-out of workflows rather than a workflow over a set, and it cannot express probe-then-apply, where one stage decides the membership of the next. Merging them means one object -- stages by projects -- with campaigns as the single-stage case. That is a larger change than this document, and it should not be attempted before a real campaign runs.
-
-**No parallel stages and no join.** Three reviewers at three models, merged and deduplicated, is a common and cheap ensemble, and this refuses it. Sequencing two prose stages costs a second full pass for no reason. What it needs: a stage group that runs together, and a merge rule for rows with the same normalised text. What it risks: several agents in one project at once, which is where minos D10 draws its line, although read-only prose stages in separate worktrees are the easy case.
-
-**No conditional edge.** Upgrade dependencies, and only on breakage produce a findings artifact and fix them, is a natural three-stage workflow with one condition. `on_refusal` is not that condition: it decides whether the instance continues, not which stage comes next. A `when` on a stage, reading an earlier stage's outcome, is the smallest form. Refused for now because W10 keeps the document a sequence, and because a second control-flow field invites a third.
-
-**A prose stage's input is unbounded.** A 200-file repository does not fit a prompt, and no stage declares which files it reads. Today's answer is that the agent walks the worktree within its timeout.
+**Recursion is the least bounded construct.** The model decides termination and is bad at it. Only `max_depth` and the instance cap hold, and they truncate rather than converge. Do not build it before 14.1 and 14.5's cheaper forms have run.
 
 **Artifacts are never collected.** `<data>/artifacts/<instance>/` grows with every pass. A finished instance is an unambiguous trigger, as minos section 11 says of a completed workflow, and nothing acts on it.
 
-**Per-stage specialisation is unmeasured.** The premise -- a cheap model reviews, a strong one fixes -- has no data behind it. `pma report --by stage` is what would show it, and it needs runs first.
+**Per-node specialisation is unmeasured.** The premise -- a cheap model reviews, a strong one fixes -- has no data behind it. `pma report --by node` is what would show it, and it needs runs first.
 
-**A validating stage reads the producer's prose.** It is meant to check the producer, so what it inherits matters. Here it inherits the named artifacts and nothing else, which is minos D19's default setting expressed as an artifact edge. When minos lands, a stage's grant carries `since` and the same choice becomes three-valued.
+**A confirming node reads its producer's prose.** It is meant to check the producer, so what it inherits matters. Here it inherits the units and the named document, which is minos D19's default setting expressed as a data edge. When minos lands, a node's grant carries `since` and the same choice becomes three-valued.
 
-## 12. Gates and sequencing
+## 17. Gates and sequencing
 
 | Part | Contents | Gate |
 |-|-|-|
-| 6a | the document and its schemas, migration 20, `Subject.stage`, `accept: artifact` and `rows:`, the `todo` and `note` sinks, `pma workflow` commands. Prose and row stages only | none. It publishes nothing: stages produce artifacts, and a sink writes an uncommitted `TODO.md` edit |
-| 6b | `expands` | phase 0 measured, and phase 4b's gate met: 10 runs shipped through batch approval |
+| 6a | types, units, `map` at three bounds, `check`, `emit`, guards, default edges, the pass, caps and the cost bound, migration 20, `node` and `lap` on a route, `pma workflow` commands | none. No `edit`, so nothing changes a repository: 14.2, 14.3, 14.9 and 14.10 run under it |
+| 6b | `edit` with `retry` | phase 0 measured, and phase 4b's gate met: 10 runs shipped through batch approval. 14.1 and 14.8 run here |
+| 6c | `reduce`, lap edges | 6a in use. 14.4 and 14.6 run here |
+| 6d | recursion | evidence that one level of decomposition helps. 14.5 runs here |
 
-6a is worth having on its own: 9.2 and 9.3 both run under it, and it publishes nothing.
+No node is `unattended` before phase 4c's gate. The parse guard already refuses it for A-, C, D and for a route with no class list.
 
-No stage is `unattended` before phase 4c's gate. The parse guard already refuses it for A-, C, D and for a route with no class list.
-
-Size: 3 sessions for 6a, 2 for 6b. Both exclude agent cost.
+Size: 4 sessions for 6a, 2 for 6b, 2 for 6c, 1 for 6d. All exclude agent cost.

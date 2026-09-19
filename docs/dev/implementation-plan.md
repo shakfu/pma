@@ -177,24 +177,30 @@ Gate outstanding: phase 4b in use, and a campaign you would actually run. The fi
 
 ## Phase 6: workflows
 
-Goal: a stage sequence over one project, each stage its own agent and model, specified in [workflows.md](workflows.md).
+Goal: a graph of operations over typed units of work, each node routed to its own agent and model, specified in [workflows.md](workflows.md).
 
-A stage reads artifacts and writes one; what an artifact holds is declared in the document, so the mechanism is not specific to any one kind of work. Review then validate then fix, one-liner then specification then implementation, and issue triage are three documents over one sequencer. The parts exist -- `Route` carries the per-stage agent, model, approval and escalation; `routes` gives the propose-then-activate shape; campaigns give frozen membership. Missing are a sequencer, an artifact contract, and an acceptance rule for a stage that changes no code.
+Five node primitives, chosen because each changes what `pma` must check: `map` with a declared output bound, `reduce`, `edit`, `check` and `emit`. Parallelism is derived from the graph rather than declared, conditions live on edges as rules, and an agent produces data while a rule decides routing. Iteration has three forms -- a node retry, a bounded lap edge, and a bounded self-edge for decomposition -- drawing on one attempt counter per lineage, so none of them is a hole through the limit of 1.9. Waiting needs no construct: a `check` node is simply not ready, and the pass ends.
 
 | Step | Change | Files |
 |-|-|-|
-| 6.1 | The document and its revisions: `schemas` declaring row sets, and stages with `consumes`, `produces`, `accept`, `emits` and `expands`, each refusal named where the document is read. `workflows` and `workflow_runs` tables; `workflow_run`, `stage` and `row` on `runs`. | new `src/workflow.rs`, `store.rs` (schema 20) |
-| 6.2 | `stage` as a match dimension on a route. A route that states no stage matches only a dispatch that names none, so an existing policy keeps its behaviour and replay over earlier runs reports no difference. Agent and model stay in the routing policy alone, per 2.5. | `route.rs`, `dispatch.rs` |
-| 6.3 | Acceptance for a stage that changes no code: `artifact` for prose, `rows:<schema>` checked against the declaration, beside the existing `verify`. A schema is declared in the document rather than compiled in: a registry per kind costs the same code and makes every new workflow kind a code change. Artifacts live outside the worktree, so a produced file never enters a diff and ship never publishes one. | `accept.rs`, `workflow.rs` |
-| 6.4 | Sinks: `todo` writes rows as items in the project's `TODO.md` as an uncommitted edit, as `sync` does, and `note` writes one portfolio note per row. The mapping from row fields is in the document; the sink list is closed, because each writes to a real file or table. No stage writes `TODO.md` itself: `OWNED` keeps it outside every scope, and ship's tick depends on that. `issue` is refused until it is reconciled with `pma sync`. | new `todo::insert`, `workflow.rs` |
-| 6.5 | `expands`: one run per row, filtered by `where` on enumerated fields, keyed `workflow:<instance>:<row>` through the existing no-item path. A `TODO.md` item written by an earlier stage cannot be dispatched, since dispatch requires it open on origin, which is why a fan-out reads rows and a sink is independent of it. | `dispatch.rs`, `workflow.rs` |
-| 6.6 | `pma workflow propose\|activate\|run\|show\|stop`, and `pma report --by stage`. One pass per invocation, holding `session.lock` like dispatch; readiness is derived from the runs, so a killed pass resumes by re-deriving. | `main.rs`, `report_runs.rs` |
+| 6.1 | The document and its revisions: `types` declaring units, nodes, edges with guards, and per-instance caps. Every refusal named where the document is read, including a cycle that is not a bounded lap, a `0..n` node with no unit cap, and an edge whose types disagree. | new `src/workflow.rs`, `store.rs` (schema 20) |
+| 6.2 | Units, bags and moves: immutable units carrying lineage, depth and lap; a bag derived from the units a node wrote; one move row per unit and edge, holding the guard that refused it. The frontier is re-derived from these, so a killed pass resumes without a cursor. | `store.rs`, `workflow.rs` |
+| 6.3 | `map` at `0..n`, `1` and `0..1`, by agent or by rule, with the checks that make each bound worth declaring: type conformance, the cap, ids kept being a subset of the input with a reason per drop, and no field changed outside `writes`. A validator that could rewrite its input could launder work past the reviewer. | `workflow.rs`, `accept.rs` |
+| 6.4 | `check` and `emit`: the rule-only ends of the graph. Checks write `passed`, `failed` or `unknown`, and guards read them. Sinks are `todo` with `add`, `tick` and `remove`, `note`, and `doc`; `issue` is refused until it is reconciled with `pma sync`. No node writes `TODO.md` itself: `OWNED` keeps it outside every scope and ship's tick depends on that. | new `todo::insert`, `workflow.rs` |
+| 6.5 | `node` and `lap` as match dimensions on a route. A route that states no node matches only a dispatch that names none, so an existing policy keeps its behaviour and replay over earlier runs reports no difference. `lap` is what makes "a second attempt at a stronger model" a policy statement rather than a document one. | `route.rs`, `dispatch.rs` |
+| 6.6 | The bound: worst-case runs and cost per node, computed by walking the graph over the declared constants. `pma workflow propose` prints it; `pma workflow activate` refuses a document above `workflow_budget`. A rules-only document costs zero. This is what makes a loop safe to write down. | `workflow.rs`, `config.rs` |
+| 6.7 | `pma workflow propose\|activate\|run\|show\|stop`, and `pma report --by node`. One pass per invocation, holding `session.lock` like dispatch. | `main.rs`, `report_runs.rs` |
+| 6.8 | `edit` as a node: one unit in, a patch out, through `dispatch::prepare` and every phase 1 gate. `retry` makes the existing attempt series declarative; `escalate` is the case `retry.max: 1` with a model change. | `dispatch.rs`, `workflow.rs` |
+| 6.9 | `reduce`, by rule (dedupe, rank, limit) or by agent (synthesise, choose), with provenance on every output unit; and lap edges with their terminal path. A `reduce` is the only barrier the design needs. | `workflow.rs` |
+| 6.10 | Recursion: a self-edge bounded by `max_depth`, terminating on the producing node's own empty answer. | `workflow.rs` |
 
-Acceptance, in full, in [workflows.md](workflows.md#10-acceptance). Refused shapes, with what each would cost: [workflows.md](workflows.md#11-limits). The largest are a fan-out over projects, which is the campaign merge, and parallel stages with a join.
+Worked graphs, ten of them, in [workflows.md](workflows.md#14-examples): review then confirm then fix, specify then implement, issue triage with no model on the read, an ensemble of three reviewers joined by a reducer, recursive decomposition, a fix with an audit lap, an upgrade that triages only on breakage, a campaign as a bag of projects, waiting for a merge, and a rules-only prune that costs nothing.
 
-Gate: 6.1 to 6.4 and 6.6 publish nothing and need none. 6.5 needs phase 0 measured and phase 4b's gate met, because it multiplies runs per human decision. No stage is `unattended` before phase 4c's gate; the parse guard already refuses it for A-, C, D and for a route with no class list.
+Acceptance, in full, in [workflows.md](workflows.md#15-acceptance). Refused shapes with what each would cost: [workflows.md](workflows.md#16-limits). The largest are sub-workflows and the ship-time conflict between two `edit` nodes, which is 5.3's barrier problem.
 
-Size: 3 sessions for 6.1 to 6.4 and 6.6, 2 for 6.5.
+Gate: 6.1 to 6.7 publish nothing and change no repository, so they need none. 6.8 needs phase 0 measured and phase 4b's gate met, because it multiplies runs per human decision. 6.9 needs 6a in use. 6.10 needs evidence that one level of decomposition helps at all. No node is `unattended` before phase 4c's gate.
+
+Size: 4 sessions for 6.1 to 6.7, 2 for 6.8, 2 for 6.9, 1 for 6.10.
 
 ## Schema and migrations
 
@@ -214,7 +220,7 @@ Current `user_version` is 5. `runs` already carries `agent`; only `model` is new
 | 15 | `approved_tree`, `approved_head` and `approved_by` on `runs`. Applied | 4b |
 | 16 | `campaigns` and `campaign_members`. Applied | 5 |
 | 17-19 | `owner/name` on a project, absence, project tags. Applied, outside this plan | - |
-| 20 | `workflows` revisions and `workflow_runs`; `workflow_run`, `stage` and `row` on `runs` | 6 |
+| 20 | `workflows` revisions, `workflow_instances`, `workflow_units`, `workflow_moves`, `workflow_verdicts`; `workflow_instance`, `node`, `unit` and `lap` on `runs` | 6 |
 
 Each migration is additive to existing tables, applied on open in one transaction, and raises `user_version` so an older binary refuses the file rather than misreading it.
 

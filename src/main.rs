@@ -22,6 +22,7 @@ mod sync;
 mod todo;
 mod tui;
 mod worker;
+mod workflow;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -197,6 +198,11 @@ enum Command {
     Route {
         #[command(subcommand)]
         action: Option<RouteAction>,
+    },
+    /// Workflow documents: read one, and print what it can cost at worst.
+    Workflow {
+        #[command(subcommand)]
+        action: WorkflowAction,
     },
     /// List the workers `pma dispatch` can run, or change one.
     Agent {
@@ -375,6 +381,19 @@ enum RouteAction {
 }
 
 #[derive(Subcommand)]
+enum WorkflowAction {
+    /// Read a document and print the worst case each workflow can cost.
+    /// Nothing is stored and nothing runs.
+    Check {
+        /// A JSON workflow file, or `-` for stdin.
+        file: String,
+        /// Size of the argument bag the estimate assumes.
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        units: i64,
+    },
+}
+
+#[derive(Subcommand)]
 enum AgentAction {
     /// Set one field, creating the worker when `command` is set first.
     Set {
@@ -443,6 +462,7 @@ fn main() -> ExitCode {
         } => show_stale(&projects, &tags, count),
         Command::Campaign { action } => campaign_command(action),
         Command::Route { action } => route_command(action),
+        Command::Workflow { action } => workflow_command(action),
         Command::Agent { action } => agent_command(action),
         Command::Report { by } => run_report(by.as_deref()),
         Command::Ship { projects, tags } => run_ship(&projects, &tags),
@@ -1695,6 +1715,70 @@ fn run_campaign(name: &str, count: Option<usize>) -> Result<()> {
 }
 
 /// A policy document from a file, stdin, or a stored revision number.
+fn workflow_command(action: WorkflowAction) -> Result<()> {
+    match action {
+        WorkflowAction::Check { file, units } => {
+            let text = if file == "-" {
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+                text
+            } else {
+                std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?
+            };
+            let doc = workflow::Document::parse(&text)?;
+            // A document is read without a store when there is none; the
+            // budget only scales the estimate.
+            let budget = Store::open_default()
+                .and_then(|s| load_config(&s))
+                .map_or(Config::default().agent_budget, |c| c.agent_budget);
+            for w in &doc.workflows {
+                let estimate = doc.estimate(&w.name, units, budget)?;
+                let effects = match w.effects.names().as_slice() {
+                    [] => "pure".to_string(),
+                    names => names.join(" "),
+                };
+                println!(
+                    "{}(in: [{}]{}) -> [{}]  {effects}",
+                    w.name,
+                    w.input,
+                    w.params
+                        .iter()
+                        .map(|(k, p)| format!(", {k} = {}", p.default))
+                        .collect::<String>(),
+                    w.output.as_deref().unwrap_or("")
+                );
+                let mut rows = vec![
+                    ["node", "op", "in", "out", "runs", "agent runs"]
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect::<Vec<_>>(),
+                ];
+                for b in &estimate.per_node {
+                    let op = match w.node(&b.node).map(|n| &n.op) {
+                        Some(workflow::Op::Map(m)) => format!("map {}", m.out.name()),
+                        Some(op) => op.name().to_string(),
+                        None => String::new(),
+                    };
+                    rows.push(vec![
+                        b.node.clone(),
+                        op,
+                        b.units_in.to_string(),
+                        b.units_out.to_string(),
+                        b.runs.to_string(),
+                        b.agent_runs.to_string(),
+                    ]);
+                }
+                print!("{}", report::table(&rows, "  "));
+                println!(
+                    "  worst case: {} agent runs, {} edits, ${:.2} at ${:.2} per run\n",
+                    estimate.agent_runs, estimate.edits, estimate.cost, budget
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 fn policy_text(store: &Store, from: &str) -> Result<String> {
     if from == "-" {
         let mut text = String::new();

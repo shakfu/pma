@@ -6,9 +6,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+**`pma workflow run` executes every primitive.** Agent `map` and `reduce` nodes run one model per unit, reading `in.json` and writing `out.json` under `<data>/artifacts/<instance>/<node>/`; what comes back is checked against the declared type, the node's `max_units`, and, for `out: 1` and `out: 0..1`, that the id is one it was given and no field outside `writes` changed. A node that is not an `edit` works in a detached worktree, so a model that writes cannot reach the clone. An `edit` node goes through `dispatch::prepare` and the phase 1 gates and leaves a run to review, as a dispatch does. The four remaining `check` rules -- `verify`, `scope-clean`, `ci-green`, `pr-merged` -- read the run an `edit` recorded against the unit; with no run they are `unknown`, which takes the default edge rather than passing or failing.
+
+**The rules of section 8 are all built.** `open-issues` through `gh issue list`, `open-runs` from the runs that are not shipped or rejected, `outdated-deps` from the last `--deps` measurement, and `rank` and `limit:<n>` on a reduce. A rule that names something unbuilt is an error, never a verdict of `unknown` or a quiet fallback to another rule's behaviour.
+
+**Calls are flattened at propose time (W2).** A `call` node is replaced by its callee's nodes, named `<call site>/<node>`, before anything is estimated or run, so the runtime holds one graph, one set of caps and one frontier. An argument the call site passed becomes the default of a parameter the flat graph declares, under the same qualified name, while the callee's `max` still bounds it. Guards on both sides of a call compose by union; a field both guard differently is refused, since picking one would silently drop the other.
+
+**`pma workflow run` takes `dispatch`'s targets and `--set`.** `cynn:31` is one item, `cynn:critical` one per open item under the heading, `cynn:ci` a signal; a target whose element type is not the one the workflow reads is refused by name, and `cynn:q1` is refused because it holds items and signals at once. `--set name=value` binds a declared parameter, checked against its type and its maximum where it is given, and recorded on the instance so a replay reads the same instantiation.
+
 **`pma project export` and `pma project import`: every project's tier and tags as one file.** Tiering a portfolio meant one command per project. `export` writes a row per project, the extension picking the format -- `.csv` as `name,tier,tag,tag`, `.json` as a list of objects -- and `import` reads an edited file back, listing what would change until `--apply`. A file naming something that is not a project is refused whole, so a typo does not leave half the portfolio retiered. A project the file leaves out keeps what it has; a project it names ends with exactly the tags in its row.
 
 **`pma scan` draws a progress bar.** `[########------------] 38/95 alpha` on stderr, redrawn as each project lands, cleared before the summary. A scan of 95 repositories takes about 15 seconds and printed nothing until it was over. Silent when stderr is not a terminal, so a pipe or a CI log holds the bytes it held before.
+
+### Fixed
+
+**An instance now resumes under the revision it started with.** `--instance` read whichever revision was active, so activating another between passes walked old units with a different graph: moves are keyed by edge index, so the units could route through unrelated edges or reach a changed sink. The instance is loaded first, the name on the command line must be the one it runs, and its own recorded revision is what the pass walks. An instance that stopped short records why and is not resumed into the same wall; a finished one still re-derives to nothing, because readiness is evidence rather than a cursor (W9).
+
+**`caps.max_units` and `caps.max_edits` are enforced where units and runs are written.** The estimator capped a node's output but the pass did not, so a project with more `TODO.md` items than the declared `max_units` minted more units than the figure `activate` weighed against the budget. Both caps are now checked at the write boundary. Exhaustion stops the pass, names the node and the cap, and records the instance as `capped`: a bag silently short of its input cannot be told from a complete one by anything downstream.
+
+**`--dry-run` starts no instance.** It created one, inserted the root units and recorded their entry moves before testing the flag, so repeating a dry run left open instances the listing then showed. The root bag is built in memory and priced there.
+
+**A node's bookkeeping commits per unit.** Each unit's children, its routing and the marker saying its node is done with it were separate writes, so a failure part way through a bag left a unit routed by a node that had not finished with it. They now commit together. The boundary is one unit rather than one node because a sink writes a file: a unit whose file was written and whose move was rolled back would have its sink run twice.
+
+**A `reduce` applies the rule it names.** Every reduce ran `dedupe`'s "one per group, keep the first" whatever its `rule` said, so `rank` and `limit:<n>` were accepted, costed and then silently wrong. `limit:<n>` now truncates each group and `rank` orders it by `priority`, which is why a type declaring no `priority` is refused at `rank`; `limit:` with a count below 1 is refused where the document is read.
+
+**A `reduce` marks its kept input handled.** Only the units it dropped got a settled move, so the unit it kept was still waiting at the node and the frontier offered it again on the next turn, node after node until the instance hit its cap. No test reached a reduce in a pass, which is why it held.
+
+**A declaration is checked where it is written.** `parse_params` checked an enum's members and nothing else, and a field's `max`, `min` and `unique` were read with `as_i64` and `as_str`, so `"max": "ten"` silently meant 200 and `"unique": true` silently meant not unique. A default is now checked against its parameter's own type and maximum, `max` is refused on a parameter that is not an int, and a field option that does not apply to its type is refused by name.
 
 ### Changed
 

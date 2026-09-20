@@ -1461,6 +1461,15 @@ impl Store {
             .find(|r| r.activated_at.is_some()))
     }
 
+    /// One revision by number. What an instance resumes under, which is the
+    /// revision it recorded rather than whichever is in effect now.
+    pub fn workflow_revision(&self, revision: i64) -> Result<Option<WorkflowRevision>> {
+        Ok(self
+            .workflow_revisions()?
+            .into_iter()
+            .find(|r| r.revision == revision))
+    }
+
     /// Starts an instance: the frozen argument bag and what it was run over.
     pub fn add_workflow_instance(
         &self,
@@ -1495,6 +1504,40 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Runs `work` in one transaction, committing only where it succeeds.
+    ///
+    /// A workflow node writes several rows per unit -- the units it produced,
+    /// the moves that route them, the marker saying it is done with its
+    /// input -- and a failure part way through would leave a unit routed by a
+    /// node that had not finished with it. The boundary is one unit, not one
+    /// node: a sink writes a file, and a unit whose file is written and whose
+    /// move is not would have its sink run twice.
+    pub fn atomically<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        let tx = self.conn.unchecked_transaction()?;
+        let out = work()?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// One instance by id.
+    pub fn workflow_instance(&self, instance: i64) -> Result<Option<WorkflowInstance>> {
+        Ok(self
+            .workflow_instances()?
+            .into_iter()
+            .find(|i| i.id == instance))
+    }
+
+    /// Records why an instance cannot go on, without closing it. A pass that
+    /// hit a cap has work recorded and a reason it stopped, and neither is a
+    /// finished workflow.
+    pub fn note_instance_outcome(&self, instance: i64, outcome: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE workflow_instances SET outcome = ?2 WHERE id = ?1",
+            params![instance, outcome],
+        )?;
+        Ok(())
     }
 
     pub fn finish_instance(&self, instance: i64, outcome: &str) -> Result<()> {
@@ -1887,8 +1930,9 @@ pub struct Note {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RunState {
+    #[default]
     Queued,
     Running,
     Ready,
@@ -1929,8 +1973,10 @@ impl RunState {
     }
 }
 
-/// One task dispatched to an agent, from its worktree to shipping.
-#[derive(Debug, Clone, PartialEq)]
+/// One task dispatched to an agent, from its worktree to shipping. `Default`
+/// is every field empty, which a workflow node fills differently from a
+/// dispatch: it has no branch to push and no item to tick.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Run {
     pub id: i64,
     pub project: String,

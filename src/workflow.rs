@@ -94,7 +94,7 @@ pub enum Count {
 
 impl Count {
     /// The largest value this count can take, which is what a bound reads.
-    fn ceiling(&self, params: &BTreeMap<String, Param>) -> i64 {
+    pub fn ceiling(&self, params: &BTreeMap<String, Param>) -> i64 {
         match self {
             Count::Fixed(n) => *n,
             Count::Param(p) => params.get(p).and_then(|p| p.max).unwrap_or(0),
@@ -118,12 +118,110 @@ pub struct Field {
     pub required: bool,
 }
 
+/// At most 20 entries in a `list`, each at most 200 characters (section 4.2).
+const LIST_MAX: usize = 20;
+const LIST_ENTRY_MAX: usize = 200;
+
+impl FieldType {
+    fn check(&self, name: &str, v: &Value) -> Result<(), String> {
+        let at = |e: String| format!("`{name}`: {e}");
+        match self {
+            FieldType::Line { max, .. } => {
+                let s = v.as_str().ok_or_else(|| at("expected a string".into()))?;
+                if s.contains('\n') {
+                    return Err(at("expected one line".into()));
+                }
+                if s.is_empty() || s.chars().count() > *max as usize {
+                    return Err(at(format!("expected 1 to {max} characters")));
+                }
+                Ok(())
+            }
+            FieldType::Lines { max } => {
+                let lines = v.as_array().ok_or_else(|| at("expected an array".into()))?;
+                if lines.len() > *max as usize {
+                    return Err(at(format!("expected at most {max} lines")));
+                }
+                match lines.iter().all(Value::is_string) {
+                    true => Ok(()),
+                    false => Err(at("every line must be a string".into())),
+                }
+            }
+            FieldType::Enum { values } => {
+                let s = v.as_str().ok_or_else(|| at("expected a string".into()))?;
+                match values.iter().any(|x| x == s) {
+                    true => Ok(()),
+                    false => Err(at(format!("`{s}` is not one of {}", values.join(", ")))),
+                }
+            }
+            FieldType::List => {
+                let list = v.as_array().ok_or_else(|| at("expected an array".into()))?;
+                if list.len() > LIST_MAX {
+                    return Err(at(format!("expected at most {LIST_MAX} entries")));
+                }
+                match list.iter().all(|e| {
+                    e.as_str()
+                        .is_some_and(|s| s.chars().count() <= LIST_ENTRY_MAX)
+                }) {
+                    true => Ok(()),
+                    false => Err(at(format!(
+                        "every entry must be a string of at most {LIST_ENTRY_MAX} characters"
+                    ))),
+                }
+            }
+            FieldType::Int { min, max } => {
+                let n = v
+                    .as_i64()
+                    .ok_or_else(|| at("expected a whole number".into()))?;
+                if min.is_some_and(|m| n < m) || max.is_some_and(|m| n > m) {
+                    return Err(at(format!(
+                        "expected {} to {}",
+                        min.map_or("any".into(), |m| m.to_string()),
+                        max.map_or("any".into(), |m| m.to_string())
+                    )));
+                }
+                Ok(())
+            }
+            FieldType::Bool => match v.is_boolean() {
+                true => Ok(()),
+                false => Err(at("expected true or false".into())),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Type {
     pub fields: BTreeMap<String, Field>,
 }
 
 impl Type {
+    /// Whether a unit a model returned matches what the document declared.
+    /// The checks are the ones section 4.2 states, and nothing here consults
+    /// a model: a type is the boundary an agent's output crosses.
+    pub fn check(&self, v: &Value) -> Result<(), String> {
+        let Some(map) = v.as_object() else {
+            return Err("a unit must be an object".into());
+        };
+        // `@id` and the other system fields are `pma`'s, and an agent echoes
+        // them back on a unit it kept.
+        if let Some(unknown) = map
+            .keys()
+            .find(|k| !k.starts_with('@') && !self.fields.contains_key(*k))
+        {
+            return Err(format!("unknown field `{unknown}`"));
+        }
+        for (name, field) in &self.fields {
+            let Some(value) = map.get(name).filter(|v| !v.is_null()) else {
+                if field.required {
+                    return Err(format!("`{name}` is required"));
+                }
+                continue;
+            };
+            field.ty.check(name, value)?;
+        }
+        Ok(())
+    }
+
     fn of(names: &[&str]) -> Type {
         Type {
             fields: names
@@ -186,6 +284,89 @@ pub enum ParamType {
     Enum(Vec<String>),
     Bool,
     List,
+}
+
+impl ParamType {
+    pub fn name(&self) -> &'static str {
+        match self {
+            ParamType::Name => "name",
+            ParamType::Line => "line",
+            ParamType::Int => "int",
+            ParamType::Bool => "bool",
+            ParamType::List => "list",
+            ParamType::Enum(_) => "enum",
+        }
+    }
+
+    /// A value for this parameter, from the text `--set` was given or from a
+    /// declared default. The checks are the ones section 6.2 states.
+    pub fn read(&self, text: &str) -> Result<Value, String> {
+        match self {
+            ParamType::Name => {
+                let ok = !text.is_empty()
+                    && text != "."
+                    && text != ".."
+                    && text
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+                match ok {
+                    true => Ok(Value::from(text)),
+                    false => Err("expected a filename, such as `REVIEW.md`".into()),
+                }
+            }
+            ParamType::Line => match !text.is_empty() && !text.contains('\n') {
+                true => Ok(Value::from(text)),
+                false => Err("expected one non-empty line".into()),
+            },
+            ParamType::Int => text
+                .parse::<i64>()
+                .map(Value::from)
+                .map_err(|_| "expected a whole number".to_string()),
+            ParamType::Bool => match text {
+                "true" => Ok(Value::Bool(true)),
+                "false" => Ok(Value::Bool(false)),
+                _ => Err("expected true or false".into()),
+            },
+            ParamType::List => {
+                let parts: Vec<&str> = match text.is_empty() {
+                    true => Vec::new(),
+                    false => text.split(',').map(str::trim).collect(),
+                };
+                if parts.len() > LIST_MAX {
+                    return Err(format!("expected at most {LIST_MAX} entries"));
+                }
+                match parts.iter().all(|p| p.chars().count() <= LIST_ENTRY_MAX) {
+                    true => Ok(Value::from(parts)),
+                    false => Err(format!(
+                        "every entry must be at most {LIST_ENTRY_MAX} characters"
+                    )),
+                }
+            }
+            ParamType::Enum(values) => match values.iter().any(|v| v == text) {
+                true => Ok(Value::from(text)),
+                false => Err(format!("expected one of {}", values.join(", "))),
+            },
+        }
+    }
+
+    /// Whether a value already parsed -- a document's `default`, or a call's
+    /// argument -- is one this type can take.
+    pub fn holds(&self, v: &Value) -> Result<(), String> {
+        match (self, v) {
+            (ParamType::Int, Value::Number(n)) if n.is_i64() => Ok(()),
+            (ParamType::Bool, Value::Bool(_)) => Ok(()),
+            (ParamType::List, Value::Array(items)) => {
+                match items.len() <= LIST_MAX && items.iter().all(Value::is_string) {
+                    true => Ok(()),
+                    false => Err(format!("expected at most {LIST_MAX} strings")),
+                }
+            }
+            (ParamType::Name | ParamType::Line | ParamType::Enum(_), Value::String(s)) => {
+                self.read(s).map(|_| ())
+            }
+            _ => Err(format!("expected {}", self.name())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -494,11 +675,55 @@ fn parse_type(name: &str, v: &Value) -> Result<Type, String> {
         let kind = decl["type"]
             .as_str()
             .ok_or_else(|| at(format!("field `{field}` has no `type`")))?;
-        let max = decl["max"].as_i64();
+        // A malformed option read as absent would silently give the field a
+        // different shape from the one written down.
+        let whole = |key: &str| -> Result<Option<i64>, String> {
+            match &decl[key] {
+                Value::Null => Ok(None),
+                v => v
+                    .as_i64()
+                    .map(Some)
+                    .ok_or_else(|| at(format!("field `{field}`: `{key}` must be a whole number"))),
+            }
+        };
+        let max = whole("max")?;
+        let min = whole("min")?;
+        if !matches!(kind, "int") && min.is_some() {
+            return Err(at(format!(
+                "field `{field}`: `min` belongs to an int, and this is {kind}"
+            )));
+        }
+        if matches!(kind, "enum" | "list" | "bool") && max.is_some() {
+            return Err(at(format!(
+                "field `{field}`: `max` does not apply to {kind}"
+            )));
+        }
+        if matches!(kind, "line" | "lines") && max.is_some_and(|m| m < 1) {
+            return Err(at(format!("field `{field}`: `max` must be 1 or more")));
+        }
+        let unique = match &decl["unique"] {
+            Value::Null => false,
+            Value::String(s) if s == "normalised" && kind == "line" => true,
+            _ => {
+                return Err(at(format!(
+                    "field `{field}`: `unique` takes `normalised`, on a line"
+                )));
+            }
+        };
+        if kind != "enum" && !decl["values"].is_null() {
+            return Err(at(format!(
+                "field `{field}`: `values` belongs to an enum, and this is {kind}"
+            )));
+        }
+        if !decl["required"].is_null() && !decl["required"].is_boolean() {
+            return Err(at(format!(
+                "field `{field}`: `required` must be true or false"
+            )));
+        }
         let ty = match kind {
             "line" => FieldType::Line {
                 max: max.unwrap_or(200),
-                unique: decl["unique"].as_str() == Some("normalised"),
+                unique,
             },
             "lines" => FieldType::Lines {
                 max: max.unwrap_or(40),
@@ -520,10 +745,14 @@ fn parse_type(name: &str, v: &Value) -> Result<Type, String> {
                 FieldType::Enum { values }
             }
             "list" => FieldType::List,
-            "int" => FieldType::Int {
-                min: decl["min"].as_i64(),
-                max,
-            },
+            "int" => {
+                if let (Some(lo), Some(hi)) = (min, max)
+                    && lo > hi
+                {
+                    return Err(at(format!("field `{field}`: `min` is over `max`")));
+                }
+                FieldType::Int { min, max }
+            }
             "bool" => FieldType::Bool,
             other => return Err(at(format!("field `{field}`: unknown type `{other}`"))),
         };
@@ -590,33 +819,57 @@ fn parse_params(
                     .as_array()
                     .ok_or_else(|| at(format!("parameter `{name}` is an enum with no `values`")))?
                     .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect(),
+                    .map(|v| {
+                        v.as_str().map(String::from).ok_or_else(|| {
+                            at(format!("parameter `{name}`: values must be strings"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
             ),
             other => return Err(at(format!("parameter `{name}`: unknown type `{other}`"))),
+        };
+        if let ParamType::Enum(values) = &ty
+            && values.is_empty()
+        {
+            return Err(at(format!("parameter `{name}`: an enum with no values")));
+        }
+        if !matches!(ty, ParamType::Enum(_)) && !decl["values"].is_null() {
+            return Err(at(format!(
+                "parameter `{name}`: `values` belongs to an enum, and this is {kind}"
+            )));
+        }
+        // `max` is what a bound reads, and a bound is a count. A maximum on
+        // any other type would be read by nothing.
+        let max = match &decl["max"] {
+            Value::Null => None,
+            _ if !matches!(ty, ParamType::Int) => {
+                return Err(at(format!(
+                    "parameter `{name}`: `max` bounds an int, and this is {kind}"
+                )));
+            }
+            v => Some(
+                v.as_i64()
+                    .filter(|n| *n >= 0)
+                    .ok_or_else(|| at(format!("parameter `{name}`: `max` must be 0 or more")))?,
+            ),
         };
         let default = decl.get("default").cloned().ok_or_else(|| {
             at(format!(
                 "parameter `{name}` has no `default`; a workflow must be runnable with no arguments"
             ))
         })?;
-        if let ParamType::Enum(values) = &ty
-            && !default
-                .as_str()
-                .is_some_and(|d| values.iter().any(|v| v == d))
+        // A default the parameter's own type cannot take is an authoring
+        // error, and the authoring point is the only place it reads as one.
+        ty.holds(&default)
+            .map_err(|e| at(format!("parameter `{name}`: default `{default}`: {e}")))?;
+        if let Some(max) = max
+            && default.as_i64().is_some_and(|d| d > max)
         {
             return Err(at(format!(
-                "parameter `{name}`: default `{default}` is not one of its values"
+                "parameter `{name}`: default {default} is over its own maximum of {max}"
             )));
         }
-        out.insert(
-            name.clone(),
-            Param {
-                ty,
-                default,
-                max: decl["max"].as_i64(),
-            },
-        );
+        out.insert(name.clone(), Param { ty, default, max });
     }
     Ok(out)
 }
@@ -1215,6 +1468,22 @@ impl Document {
                             && !REDUCE_RULE_PREFIXES.iter().any(|p| rule.starts_with(p))
                         {
                             return Err(at(format!("unknown reduce rule `{rule}`")));
+                        }
+                        if let Some(n) = rule.strip_prefix("limit:")
+                            && !n.parse::<i64>().is_ok_and(|n| n >= 1)
+                        {
+                            return Err(at(format!(
+                                "rule `{rule}`: expected a count of 1 or more"
+                            )));
+                        }
+                        // `rank` orders a group, and the order is the
+                        // project's own: a type with no `priority` gives it
+                        // nothing to read.
+                        if rule == "rank" && !input.fields.contains_key("priority") {
+                            return Err(at(format!(
+                                "rule `rank` orders by `priority`, which `{}` does not declare",
+                                n.input
+                            )));
                         }
                     }
                     _ => {}
@@ -1974,6 +2243,329 @@ pub struct NodeBound {
     pub agent_runs: i64,
 }
 
+impl Document {
+    /// The graph a pass walks: every `call` replaced by its callee's nodes,
+    /// prefixed with the call site. The runtime then holds one flat graph, one
+    /// set of caps and one frontier, and workflow-level recursion cannot
+    /// arise because there is nothing left to recurse through (W2).
+    ///
+    /// Deterministic, so the edge indexes a move is keyed by are the same on
+    /// every pass over one revision.
+    pub fn flatten(&self, workflow: &str) -> Result<Workflow, String> {
+        let mut flat = self
+            .workflow(workflow)
+            .ok_or_else(|| format!("unknown workflow `{workflow}`"))?
+            .clone();
+        // Validation refuses a call cycle, so each round strictly reduces the
+        // calls left and this terminates.
+        while flat.nodes.iter().any(|n| matches!(n.op, Op::Call(_))) {
+            flat = self.inline(&flat)?;
+        }
+        Ok(flat)
+    }
+
+    /// Replaces the first call site with its callee.
+    fn inline(&self, w: &Workflow) -> Result<Workflow, String> {
+        let site = w
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, Op::Call(_)))
+            .expect("checked by the caller");
+        let Op::Call(c) = &site.op else {
+            unreachable!()
+        };
+        let at = |e: String| format!("workflow `{}`: node `{}`: {e}", w.name, site.name);
+        let callee = self
+            .workflow(&c.workflow)
+            .ok_or_else(|| at(format!("unknown workflow `{}`", c.workflow)))?;
+
+        // A callee parameter either takes the caller's own, which then carries
+        // one declaration and one maximum, or becomes a parameter of the flat
+        // graph under the call site's name.
+        let mut out = w.clone();
+        let mut rename: BTreeMap<String, String> = BTreeMap::new();
+        for (p, decl) in &callee.params {
+            let passed = c.with.get(p);
+            match passed.and_then(Value::as_str).and_then(param_ref) {
+                Some(q) => {
+                    if decl.max.is_some()
+                        && w.params.get(&q).is_some_and(|caller| caller.max.is_none())
+                    {
+                        return Err(at(format!(
+                            "`{p}` bounds `{}` and takes `{q}`, which declares no `max`",
+                            c.workflow
+                        )));
+                    }
+                    rename.insert(p.clone(), q);
+                }
+                None => {
+                    let qualified = format!("{}/{p}", site.name);
+                    out.params.insert(
+                        qualified.clone(),
+                        Param {
+                            ty: decl.ty.clone(),
+                            default: passed.cloned().unwrap_or_else(|| decl.default.clone()),
+                            max: decl.max,
+                        },
+                    );
+                    rename.insert(p.clone(), qualified);
+                }
+            }
+        }
+
+        let qualify = |name: &str| format!("{}/{name}", site.name);
+        out.nodes.retain(|n| n.name != site.name);
+        for n in &callee.nodes {
+            let mut n = n.clone();
+            n.name = qualify(&n.name);
+            rename_node(&mut n, &rename);
+            out.nodes.push(n);
+        }
+
+        let into: Vec<Edge> = w
+            .edges
+            .iter()
+            .filter(|e| e.to == To::Node(site.name.clone()))
+            .cloned()
+            .collect();
+        let from: Vec<Edge> = w
+            .edges
+            .iter()
+            .filter(|e| e.from == From::Node(site.name.clone()))
+            .cloned()
+            .collect();
+        out.edges.retain(|e| {
+            e.to != To::Node(site.name.clone()) && e.from != From::Node(site.name.clone())
+        });
+
+        for e in &callee.edges {
+            let mut e = e.clone();
+            rename_guard(&mut e, &rename);
+            match (&e.from, &e.to) {
+                // The callee's entry becomes the call site's, one edge per
+                // pair, because either end may carry a guard.
+                (From::Input, To::Node(to)) => {
+                    for i in &into {
+                        out.edges
+                            .push(join(&at, i, &e, i.from.clone(), To::Node(qualify(to)))?);
+                    }
+                }
+                (From::Node(src), To::Output) => {
+                    for o in &from {
+                        out.edges
+                            .push(join(&at, &e, o, From::Node(qualify(src)), o.to.clone())?);
+                    }
+                }
+                // A callee with no node between `@input` and `@output` has
+                // nothing to inline and no unit could reach the caller's
+                // successors, which validation of the callee already refuses.
+                (From::Input, To::Output) => {
+                    return Err(at(format!(
+                        "`{}` passes its input straight out",
+                        c.workflow
+                    )));
+                }
+                (From::Node(src), To::Node(to)) => {
+                    e.from = From::Node(qualify(src));
+                    e.to = To::Node(qualify(to));
+                    out.edges.push(e);
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// One edge from two, where a call site's edge meets the callee's. Guards
+/// compose by union: both must hold. A field both name differently cannot be
+/// composed, and saying so beats picking one.
+fn join(
+    at: &dyn Fn(String) -> String,
+    first: &Edge,
+    second: &Edge,
+    from: From,
+    to: To,
+) -> Result<Edge, String> {
+    let when = match (&first.when, &second.when) {
+        (None, g) | (g, None) => g.clone(),
+        (Some(a), Some(b)) => {
+            let mut merged = a.clone();
+            for (key, test) in &b.0 {
+                match merged.0.iter().find(|(k, _)| k == key) {
+                    Some((_, held)) if held != test => {
+                        return Err(at(format!(
+                            "the call site and `{}` both guard the same field, differently",
+                            match key {
+                                Key::Field(f) => f.clone(),
+                                Key::System(f) => format!("@{f}"),
+                            }
+                        )));
+                    }
+                    Some(_) => {}
+                    None => merged.0.push((key.clone(), test.clone())),
+                }
+            }
+            Some(merged)
+        }
+    };
+    let max_laps = match (&first.max_laps, &second.max_laps) {
+        (Some(_), Some(_)) => {
+            return Err(at(
+                "a lap edge on both sides of a call cannot be composed".into()
+            ));
+        }
+        (a, b) => a.clone().or_else(|| b.clone()),
+    };
+    Ok(Edge {
+        from,
+        to,
+        when,
+        default: first.default || second.default,
+        max_laps,
+    })
+}
+
+/// Rewrites `{$p}` to the name the flat graph gave it, wherever a node reads a
+/// parameter: a bound, a prompt, a document name or a sink mapping.
+fn rename_node(n: &mut Node, rename: &BTreeMap<String, String>) {
+    let text = |s: &mut String| rename_text(s, rename);
+    match &mut n.op {
+        Op::Map(m) => {
+            for c in [&mut m.max_units, &mut m.max_depth].into_iter().flatten() {
+                rename_count(c, rename);
+            }
+            for s in [&mut m.task, &mut m.doc].into_iter().flatten() {
+                text(s);
+            }
+            if let Some(r) = &mut m.retry {
+                rename_retry(r, rename);
+            }
+        }
+        Op::Reduce(r) => {
+            if let Some(t) = &mut r.task {
+                text(t);
+            }
+        }
+        Op::Edit(e) => {
+            text(&mut e.task);
+            if let Some(r) = &mut e.retry {
+                rename_retry(r, rename);
+            }
+        }
+        Op::Emit(e) => {
+            for v in e.map.values_mut() {
+                text(v);
+            }
+        }
+        // A nested call's own arguments are rewritten, and the next round
+        // inlines it.
+        Op::Call(c) => {
+            for v in c.with.values_mut() {
+                if let Some(s) = v.as_str() {
+                    let mut owned = s.to_string();
+                    rename_text(&mut owned, rename);
+                    *v = Value::from(owned);
+                }
+            }
+        }
+        Op::Check { .. } => {}
+    }
+}
+
+fn rename_retry(r: &mut Retry, rename: &BTreeMap<String, String>) {
+    rename_count(&mut r.max, rename);
+    rename_text(&mut r.predicate, rename);
+}
+
+fn rename_count(c: &mut Count, rename: &BTreeMap<String, String>) {
+    if let Count::Param(p) = c
+        && let Some(to) = rename.get(p)
+    {
+        *p = to.clone();
+    }
+}
+
+fn rename_text(s: &mut String, rename: &BTreeMap<String, String>) {
+    for (from, to) in rename {
+        if from != to {
+            *s = s.replace(&format!("{{${from}}}"), &format!("{{${to}}}"));
+        }
+    }
+}
+
+fn rename_guard(e: &mut Edge, rename: &BTreeMap<String, String>) {
+    if let Some(c) = &mut e.max_laps {
+        rename_count(c, rename);
+    }
+    let Some(g) = &mut e.when else { return };
+    for (_, test) in &mut g.0 {
+        match test {
+            Test::In(values) => {
+                for v in values {
+                    rename_text(v, rename);
+                }
+            }
+            Test::Compare(_, c) => rename_count(c, rename),
+            Test::Present | Test::Absent => {}
+        }
+    }
+}
+
+impl Workflow {
+    /// The arguments a run was given, read against what this workflow
+    /// declares. `--set name=value`, checked by type, so a bad argument is an
+    /// error at the command line rather than a surprise in a prompt.
+    pub fn bind(&self, set: &[String]) -> Result<BTreeMap<String, Value>, String> {
+        let mut out = BTreeMap::new();
+        for arg in set {
+            let (name, text) = arg
+                .split_once('=')
+                .ok_or_else(|| format!("`{arg}`: expected name=value"))?;
+            let param = self.params.get(name).ok_or_else(|| {
+                format!(
+                    "`{}` declares no parameter `{name}`; it takes {}",
+                    self.name,
+                    match self.params.is_empty() {
+                        true => "none".to_string(),
+                        false => self.params.keys().cloned().collect::<Vec<_>>().join(", "),
+                    }
+                )
+            })?;
+            let value = param
+                .ty
+                .read(text)
+                .map_err(|e| format!("parameter `{name}`: {e}"))?;
+            if let (ParamType::Int, Some(max)) = (&param.ty, param.max)
+                && value.as_i64().is_some_and(|n| n > max)
+            {
+                return Err(format!(
+                    "parameter `{name}`: {text} is over its declared maximum of {max}"
+                ));
+            }
+            out.insert(name.to_string(), value);
+        }
+        Ok(out)
+    }
+
+    /// Every parameter's value for one run: the declared default, replaced by
+    /// an argument where the run gave one. What a prompt reads.
+    pub fn arguments(&self, given: &Value) -> BTreeMap<String, Value> {
+        let mut out: BTreeMap<String, Value> = self
+            .params
+            .iter()
+            .map(|(k, p)| (k.clone(), p.default.clone()))
+            .collect();
+        if let Some(map) = given.as_object() {
+            for (k, v) in map {
+                if self.params.contains_key(k) {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Estimate {
     pub workflow: String,
@@ -2001,10 +2593,9 @@ impl Document {
         input_units: i64,
         agent_budget: f64,
     ) -> Result<Estimate, String> {
-        let w = self
-            .workflow(workflow)
-            .ok_or_else(|| format!("unknown workflow `{workflow}`"))?;
-        self.estimate_inner(w, input_units, agent_budget, &mut Vec::new())
+        // Over the flat graph, because that is what runs: a call costs what
+        // its callee's nodes cost, under the caller's caps.
+        self.estimate_inner(&self.flatten(workflow)?, input_units, agent_budget)
     }
 
     fn estimate_inner(
@@ -2012,12 +2603,7 @@ impl Document {
         w: &Workflow,
         input_units: i64,
         agent_budget: f64,
-        stack: &mut Vec<String>,
     ) -> Result<Estimate, String> {
-        if stack.contains(&w.name) {
-            return Err(format!("workflow `{}` calls itself", w.name));
-        }
-        stack.push(w.name.clone());
         let order = self.topological(w);
         let mut out_units: BTreeMap<&str, i64> = BTreeMap::new();
         let mut per_node = Vec::new();
@@ -2110,39 +2696,11 @@ impl Document {
                     )
                 }
                 Op::Check { .. } | Op::Emit(_) => (units_seen, 0, 0, 0.0),
-                Op::Call(c) => {
-                    let callee = self.workflow(&c.workflow).expect("checked at validation");
-                    let inner = self.estimate_inner(callee, units_in, agent_budget, stack)?;
-                    let returned = inner
-                        .per_node
-                        .iter()
-                        .filter(|b| {
-                            callee.edges.iter().any(
-                                |e| matches!((&e.from, &e.to), (From::Node(n), To::Output) if *n == b.node),
-                            )
-                        })
-                        .map(|b| b.units_out)
-                        .sum::<i64>();
-                    (
-                        returned.min(w.caps.max_units),
-                        inner.agent_runs,
-                        inner.edits,
-                        inner.cost,
-                    )
-                }
+                // Flattening replaced every call site, so nothing here costs
+                // a callee.
+                Op::Call(_) => (units_seen, 0, 0, 0.0),
             };
 
-            // A call runs nothing itself; what it costs is its callee's.
-            let node_runs = match &node.op {
-                Op::Call(c) => self
-                    .workflow(&c.workflow)
-                    .and_then(|callee| {
-                        self.estimate_inner(callee, units_in, agent_budget, stack)
-                            .ok()
-                    })
-                    .map_or(node_runs, |e| e.runs),
-                _ => node_runs,
-            };
             out_units.insert(node.name.as_str(), units_out);
             runs = runs.saturating_add(node_runs);
             agent_runs = agent_runs.saturating_add(node_agent_runs);
@@ -2156,7 +2714,6 @@ impl Document {
                 agent_runs: node_agent_runs,
             });
         }
-        stack.pop();
         Ok(Estimate {
             workflow: w.name.clone(),
             per_node,
@@ -2343,6 +2900,88 @@ mod tests {
         );
         let e = Document::parse(&broken).unwrap_err();
         assert!(e.contains("has no `default`"), "{e}");
+    }
+
+    /// A declaration read loosely is a declaration that means something other
+    /// than what it says, and the authoring point is where that has to be
+    /// caught: nothing downstream reads the difference.
+    #[test]
+    fn a_declaration_is_checked_where_it_is_written() {
+        const NAME: &str = r#""review_doc": {"type": "name", "default": "REVIEW.md"}"#;
+        const INT: &str = r#""breadth":    {"type": "int", "default": 20, "max": 40}"#;
+        for (from, to, want) in [
+            (
+                NAME,
+                r#""review_doc": {"type": "name", "default": 3}"#,
+                "expected name",
+            ),
+            (
+                NAME,
+                r#""review_doc": {"type": "name", "default": "../etc/passwd"}"#,
+                "expected a filename",
+            ),
+            (
+                NAME,
+                r#""review_doc": {"type": "name", "default": "REVIEW.md", "max": 4}"#,
+                "`max` bounds an int",
+            ),
+            (
+                INT,
+                r#""breadth": {"type": "int", "default": true, "max": 40}"#,
+                "expected int",
+            ),
+            (
+                INT,
+                r#""breadth": {"type": "int", "default": 50, "max": 40}"#,
+                "over its own maximum",
+            ),
+            (
+                INT,
+                r#""breadth": {"type": "int", "default": 20, "max": "forty"}"#,
+                "`max` must be 0 or more",
+            ),
+        ] {
+            let broken = FIND_ISSUES.replace(from, to);
+            assert_ne!(broken, FIND_ISSUES, "`{from}` is in the document");
+            let e = Document::parse(&broken).unwrap_err();
+            assert!(e.contains(want), "expected `{want}`, got `{e}`");
+        }
+    }
+
+    #[test]
+    fn a_field_option_that_does_not_apply_is_refused() {
+        const REASON: &str = r#""reason":   {"type": "line", "max": 200}"#;
+        for (to, want) in [
+            (
+                r#""reason": {"type": "line", "max": "long"}"#,
+                "`max` must be a whole number",
+            ),
+            (
+                r#""reason": {"type": "line", "max": 200, "unique": true}"#,
+                "`unique` takes `normalised`",
+            ),
+            (
+                r#""reason": {"type": "line", "max": 200, "min": 2}"#,
+                "`min` belongs to an int",
+            ),
+            (
+                r#""reason": {"type": "line", "max": 200, "required": "yes"}"#,
+                "`required` must be true or false",
+            ),
+            (
+                r#""reason": {"type": "line", "max": 200, "values": ["a"]}"#,
+                "`values` belongs to an enum",
+            ),
+            (
+                r#""reason": {"type": "line", "max": 0}"#,
+                "`max` must be 1 or more",
+            ),
+        ] {
+            let broken = FIND_ISSUES.replace(REASON, to);
+            assert_ne!(broken, FIND_ISSUES, "the reason field is in the document");
+            let e = Document::parse(&broken).unwrap_err();
+            assert!(e.contains(want), "expected `{want}`, got `{e}`");
+        }
     }
 
     #[test]
@@ -2587,9 +3226,54 @@ mod tests {
         // The callee's bound composes into the caller's: 3 projects, 10 each
         // at the maximum, then one emit per finding and no model.
         let e = d.estimate("sweep", 3, 1.0).unwrap();
-        let issues = e.per_node.iter().find(|b| b.node == "issues").unwrap();
+        let issues = e
+            .per_node
+            .iter()
+            .find(|b| b.node == "issues/review")
+            .unwrap();
         assert_eq!(issues.units_out, 30);
         assert_eq!(e.agent_runs, 3, "one review run per project");
+    }
+
+    /// Flattening is what the runtime walks: the call site is gone, its
+    /// callee's nodes carry its name, and the argument it passed became the
+    /// default of a parameter the flat graph declares.
+    #[test]
+    fn a_call_is_replaced_by_its_callee() {
+        let d = Document::parse(COMPOSED).unwrap();
+        let flat = d.flatten("sweep").unwrap();
+        assert_eq!(
+            flat.nodes
+                .iter()
+                .map(|n| n.name.as_str())
+                .collect::<Vec<_>>(),
+            ["keep", "issues/review"]
+        );
+        let breadth = flat
+            .params
+            .get("issues/breadth")
+            .expect("the call's argument");
+        assert_eq!(breadth.default, Value::from(4), "`with` set the default");
+        assert_eq!(
+            breadth.max,
+            Some(10),
+            "the callee's maximum still bounds it"
+        );
+        let Op::Map(m) = &flat.node("issues/review").unwrap().op else {
+            panic!("the callee's node")
+        };
+        assert_eq!(m.max_units, Some(Count::Param("issues/breadth".into())));
+
+        // `@input` and `@output` of the callee became the call site's edges.
+        assert!(
+            flat.edges
+                .iter()
+                .any(|e| e.from == From::Input && e.to == To::Node("issues/review".into()))
+        );
+        assert!(flat.edges.iter().any(
+            |e| e.from == From::Node("issues/review".into()) && e.to == To::Node("keep".into())
+        ));
+        assert!(!flat.edges.iter().any(|e| e.to == To::Node("issues".into())));
     }
 
     #[test]

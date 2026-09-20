@@ -1,6 +1,6 @@
 # pma workflows (draft)
 
-Status: 2026-09-19. Built: the document in both its forms with its refusals and cost bound, migration 20, `node` and `lap` on a route, `pma workflow check|propose|activate|show|run`, and a pass that runs every node a rule decides. Not built: agent nodes, `edit`, and the `call` flattening.
+Status: 2026-09-20. Built: all of it. The document in both its forms with its refusals and cost bound, migration 20, `node` and `lap` on a route, `pma workflow check|propose|activate|show|run`, call flattening at propose time, the five primitives, the rules of section 8, typed targets and `--set`, and the caps enforced where units are written. Not built: `max_parallel` within a pass, which runs its nodes one at a time.
 
 Two decisions below were corrected by the implementation rather than by review: an `edit` preserves its unit's type (section 3), and a lap mints a unit while a retry does not (section 11).
 

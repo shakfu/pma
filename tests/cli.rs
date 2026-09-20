@@ -1946,22 +1946,30 @@ fn a_pass_runs_the_free_nodes_and_never_spends_without_approval() {
     );
     ok(&home, &["workflow", "activate", "1"]);
 
-    // A dry run plans and prices, and writes no note.
-    let out = ok(
-        &home,
-        &["workflow", "run", "stocktake", "alpha", "--dry-run"],
-    );
-    assert!(out.contains("instance 1"), "{out}");
-    assert!(
-        out.contains("would run: lint") && out.contains("a rule, free"),
-        "{out}"
-    );
+    // A dry run plans and prices, and starts nothing: repeating it leaves no
+    // instance behind and writes no note.
+    for _ in 0..2 {
+        let out = ok(
+            &home,
+            &["workflow", "run", "stocktake", "alpha", "--dry-run"],
+        );
+        assert!(out.contains("`stocktake` over 1 unit(s)"), "{out}");
+        assert!(
+            out.contains("would run: lint") && out.contains("a rule, free"),
+            "{out}"
+        );
+    }
     assert!(
         ok(&home, &["note"]).contains("no notes"),
         "a dry run writes nothing"
     );
+    assert!(
+        !ok(&home, &["workflow"]).contains("instance"),
+        "a dry run starts no instance"
+    );
 
     // The pass runs every rule node to exhaustion, in one invocation.
+    ok(&home, &["workflow", "run", "stocktake", "alpha"]);
     let out = ok(&home, &["workflow", "run", "stocktake", "--instance", "1"]);
     assert!(out.contains("nothing left to run"), "{out}");
     let notes = ok(&home, &["note"]);
@@ -1982,9 +1990,10 @@ fn a_pass_runs_the_free_nodes_and_never_spends_without_approval() {
 }
 
 /// A pass that reaches a node an agent decides stops, prices it, and spends
-/// nothing until the developer says so.
+/// nothing until the developer says so. Approved, it runs the node, admits
+/// what the model returned through the declared type, and carries it on.
 #[test]
-fn an_agent_node_is_priced_and_left_for_approval() {
+fn an_agent_node_is_priced_then_run_on_approval() {
     let s = Scratch::new("gate");
     let home = s.0.join("home");
     let root = s.0.join("root");
@@ -2000,14 +2009,19 @@ fn an_agent_node_is_priced_and_left_for_approval() {
     git(&alpha, &["commit", "-qm", "init"], None);
 
     // A worker that records every invocation, so "nothing was spent" is a
-    // fact about the filesystem rather than a claim.
+    // fact about the filesystem rather than a claim. It answers by writing
+    // the file the prompt named, which is the protocol a node uses.
     let bin = s.0.join("bin");
     fs::create_dir_all(&bin).unwrap();
     let log = s.0.join("spend.log");
     fs::write(
         bin.join("claude"),
         format!(
-            "#!/bin/sh\necho invoked >> {}\nprintf '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\",\"total_cost_usd\":0.1}}\\n'\n",
+            "#!/bin/sh\n\
+             echo invoked >> {}\n\
+             out=$(printf '%s' \"$2\" | sed -n 's/.*findings to //p')\n\
+             printf '[{{\"title\":\"a finding\",\"@id\":\"u1\"}}]' > \"$out\"\n\
+             printf '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\",\"total_cost_usd\":0.1}}\\n'\n",
             log.display()
         ),
     )
@@ -2042,7 +2056,8 @@ fn an_agent_node_is_priced_and_left_for_approval() {
         &wf,
         r#"
         let graph = source("project")
-            .expand("review", "finding", 3, "Review `{name}`. Write findings to {out}.")
+            .expand("review", "finding", 3, "Review `{name}`. Write findings to {out}")
+            .emit_note("record", #{ text: "found: {title}" })
             .output();
         document(#{ finding: #{ fields: #{ title: req(line(200)) }}}, [
             workflow("review", graph, #{ caps: #{ max_units: 10, max_edits: 0 }}),
@@ -2070,10 +2085,27 @@ fn an_agent_node_is_priced_and_left_for_approval() {
     assert!(out.contains("--yes"), "it says how to approve: {out}");
     assert!(!log.exists(), "the worker must not have run");
 
-    // Approval is what unlocks it, and agent execution is the next step.
-    let (_, err, success) = run(&["workflow", "run", "review", "--instance", "1", "--yes"]);
-    assert!(!success && err.contains("not executable yet"), "{err}");
-    assert!(!log.exists(), "still nothing spent");
+    // Approval is what unlocks it. The finding the model wrote enters the
+    // graph as a unit and reaches the sink downstream of it.
+    let (out, err, success) = run(&["workflow", "run", "review", "--instance", "1", "--yes"]);
+    assert!(success, "{err}");
+    assert!(out.contains("nothing left to run"), "{out}");
+    assert_eq!(
+        fs::read_to_string(&log).unwrap().lines().count(),
+        1,
+        "one run per unit"
+    );
+    assert!(
+        run(&["note"]).0.contains("found: a finding"),
+        "the unit carried on"
+    );
+
+    // The spend is recorded against the workflow, not loose in the run table.
+    let report = run(&["report"]).0;
+    assert!(
+        report.contains("0.10"),
+        "the run's cost is recorded: {report}"
+    );
 }
 
 /// Tiering a portfolio by hand is the pain this file replaces: a dump of every
@@ -2166,4 +2198,613 @@ fn tiers_and_tags_go_out_to_a_file_and_come_back() {
         ok(&home, &["project"]).contains("alpha  tier 5"),
         "nothing applied"
     );
+}
+
+/// An instance is frozen at the revision it started under. Activating another
+/// between passes must not change the graph an open instance walks, and the
+/// name on the command line must be the one the instance runs.
+#[test]
+fn an_instance_resumes_under_its_own_revision() {
+    let s = Scratch::new("resume");
+    let home = s.0.join("home");
+    let root = s.0.join("root");
+    let alpha = root.join("alpha");
+    fs::create_dir_all(&alpha).unwrap();
+    git(&alpha, &["init", "-q"], None);
+    fs::write(
+        alpha.join("TODO.md"),
+        "# TODO\n\n## High\n\n- [ ] a thing\n",
+    )
+    .unwrap();
+    git(&alpha, &["add", "."], None);
+    git(&alpha, &["commit", "-qm", "init"], None);
+    ok(&home, &["root", "add", root.to_str().unwrap()]);
+    ok(&home, &["scan", "--offline"]);
+
+    // Two revisions of one workflow, differing only in the node an agent
+    // decides, so the plan names which graph a pass is walking.
+    let write = |file: &str, node: &str| {
+        let path = s.0.join(file);
+        fs::write(
+            &path,
+            format!(
+                r#"
+                let graph = source("project")
+                    .expand("{node}", "finding", 3, "Review `{{name}}`. Findings to {{out}}.")
+                    .output();
+                document(#{{ finding: #{{ fields: #{{ title: req(line(200)) }}}}}}, [
+                    workflow("look", graph, #{{ caps: #{{ max_units: 10, max_edits: 0 }}}}),
+                ])
+                "#
+            ),
+        )
+        .unwrap();
+        path
+    };
+    let first = write("one.rhai", "review");
+    let second = write("two.rhai", "audit");
+
+    ok(&home, &["workflow", "propose", first.to_str().unwrap()]);
+    ok(&home, &["workflow", "activate", "1"]);
+    let out = ok(&home, &["workflow", "run", "look", "alpha"]);
+    assert!(out.contains("next: review"), "{out}");
+
+    // Revision 2 is in effect, and instance 1 still walks revision 1.
+    ok(&home, &["workflow", "propose", second.to_str().unwrap()]);
+    ok(&home, &["workflow", "activate", "2"]);
+    let out = ok(&home, &["workflow", "run", "look", "--instance", "1"]);
+    assert!(
+        out.contains("next: review") && !out.contains("audit"),
+        "an open instance keeps the graph it started with: {out}"
+    );
+
+    // A name that is not the instance's is refused, not quietly resolved
+    // against whichever document is in effect.
+    let (_, err, success) = pma_in(&home, &["workflow", "run", "other", "--instance", "1"]);
+    assert!(
+        !success && err.contains("runs `look`, not `other`"),
+        "{err}"
+    );
+
+    let (_, err, success) = pma_in(&home, &["workflow", "run", "look", "--instance", "9"]);
+    assert!(!success && err.contains("no workflow instance 9"), "{err}");
+
+    // A target beside `--instance` would be silently dropped, so it is an
+    // error: the instance already holds the bag it started with.
+    let (_, err, success) = pma_in(
+        &home,
+        &["workflow", "run", "look", "alpha", "--instance", "1"],
+    );
+    assert!(
+        !success && err.contains("target and arguments it started with"),
+        "{err}"
+    );
+}
+
+/// The caps `activate` weighed are enforced where units are written. A rule
+/// that yields more than its declared width stops the pass and names the cap,
+/// rather than minting past the figure the developer approved.
+#[test]
+fn a_rule_that_overflows_its_cap_stops_the_pass() {
+    let s = Scratch::new("cap");
+    let home = s.0.join("home");
+    let root = s.0.join("root");
+    let alpha = root.join("alpha");
+    fs::create_dir_all(&alpha).unwrap();
+    git(&alpha, &["init", "-q"], None);
+    fs::write(
+        alpha.join("TODO.md"),
+        "# TODO\n\n## High\n\n- [ ] one\n- [ ] two\n- [ ] three\n",
+    )
+    .unwrap();
+    git(&alpha, &["add", "."], None);
+    git(&alpha, &["commit", "-qm", "init"], None);
+    ok(&home, &["root", "add", root.to_str().unwrap()]);
+    ok(&home, &["scan", "--offline"]);
+
+    // The node declares two units per project; the project holds three items.
+    let wf = s.0.join("narrow.rhai");
+    fs::write(
+        &wf,
+        r#"
+        let graph = source("project")
+            .rule_expand("items", "item", "todo-items", 2)
+            .emit_note("record", #{ text: "open: {text}" })
+            .output();
+        document(#{}, [
+            workflow("narrow", graph, #{ caps: #{ max_units: 50, max_edits: 0 }}),
+        ])
+        "#,
+    )
+    .unwrap();
+    ok(&home, &["workflow", "propose", wf.to_str().unwrap()]);
+    ok(&home, &["workflow", "activate", "1"]);
+
+    let (_, err, success) = pma_in(&home, &["workflow", "run", "narrow", "alpha"]);
+    assert!(!success, "an over-cap expansion must not be written");
+    assert!(
+        err.contains("node `items`") && err.contains("max_units") && err.contains("3"),
+        "the cap and the overflow are named: {err}"
+    );
+    assert!(
+        ok(&home, &["note"]).contains("no notes"),
+        "nothing downstream ran"
+    );
+
+    // The instance records why it stopped, and does not resume into the same
+    // wall.
+    assert!(ok(&home, &["workflow"]).contains("capped"));
+    let (_, err, success) = pma_in(&home, &["workflow", "run", "narrow", "--instance", "1"]);
+    assert!(!success && err.contains("stopped: capped"), "{err}");
+}
+
+/// An `edit` node changes a repository, so it goes through the same gates a
+/// dispatch does: a worktree of its own, the class rules, the verify command,
+/// and a run left for review. The verdict it writes is what the graph routes
+/// on.
+#[test]
+fn an_edit_node_dispatches_a_run_and_routes_on_its_verdict() {
+    let s = Scratch::new("wfedit");
+    let worker = r#"#!/bin/sh
+echo hi > hello.txt
+echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","total_cost_usd":0.1}'
+"#;
+    let (env, _origin, _alpha) = dispatch_env(&s, &[("claude", worker)]);
+
+    let wf = s.0.join("fix.rhai");
+    fs::write(
+        &wf,
+        r#"
+        let graph = source("project")
+            .edit("greet", "verify", "Say hello in hello.txt for `{name}`.")
+            .when(#{ "@verify": ["passed"] })
+            .emit_note("record", #{ text: "verified: {name}" })
+            .output();
+        document(#{}, [
+            workflow("greet", graph, #{ caps: #{ max_units: 10, max_edits: 1 }}),
+        ])
+        "#,
+    )
+    .unwrap();
+    env.ok(&["config", "workflow_budget", "20"]);
+    let out = env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    assert!(out.contains("!repo") || out.contains("repo"), "{out}");
+    env.ok(&["workflow", "activate", "1"]);
+
+    // Priced and left alone, as any agent node is.
+    let out = env.ok(&["workflow", "run", "greet", "alpha"]);
+    assert!(out.contains("next: greet") && out.contains("edit"), "{out}");
+    assert!(
+        env.ok(&["review"]).contains("no runs to review"),
+        "no run yet: {out}"
+    );
+
+    // Approved: one run, in a worktree of its own, verified and waiting for a
+    // decision.
+    let (out, err, success) = env.run(&["workflow", "run", "greet", "--instance", "1", "--yes"]);
+    assert!(success, "{err}\n{out}");
+    let review = env.ok(&["review"]);
+    assert!(
+        review.contains("alpha"),
+        "the run is in the queue: {review}"
+    );
+    let report = env.ok(&["report"]);
+    assert!(report.contains("0.10"), "the spend is recorded: {report}");
+
+    // `verify` passed, so the guarded edge carried the unit to the sink.
+    assert!(
+        env.ok(&["note"]).contains("verified: alpha"),
+        "the verdict routed the unit"
+    );
+}
+
+/// `caps.max_edits` bounds what one instance may change, and it is enforced
+/// where the edit is dispatched rather than only where it was estimated.
+#[test]
+fn an_instance_may_not_exceed_its_edit_cap() {
+    let s = Scratch::new("wfcap");
+    let worker = r#"#!/bin/sh
+echo hi > hello.txt
+echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","total_cost_usd":0.1}'
+"#;
+    let (env, _origin, _alpha) = dispatch_env(&s, &[("claude", worker)]);
+
+    let wf = s.0.join("none.rhai");
+    fs::write(
+        &wf,
+        r#"
+        let graph = source("project")
+            .edit("greet", "verify", "Say hello in hello.txt for `{name}`.")
+            .output();
+        document(#{}, [
+            workflow("greet", graph, #{ caps: #{ max_units: 10, max_edits: 0 }}),
+        ])
+        "#,
+    )
+    .unwrap();
+    env.ok(&["config", "workflow_budget", "20"]);
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+    let (_, err, success) = env.run(&["workflow", "run", "greet", "alpha", "--yes"]);
+    assert!(!success, "an instance with no edit budget must not edit");
+    assert!(err.contains("max_edits"), "{err}");
+    assert!(
+        env.ok(&["review"]).contains("no runs to review"),
+        "no run was made"
+    );
+}
+
+/// A target names what a workflow reads: a heading yields items, a signal
+/// yields one signal, and a bare project yields the project. The type has to
+/// be the one the workflow declares, and arguments are checked where they are
+/// given rather than where they are read.
+#[test]
+fn a_target_yields_the_type_the_workflow_reads() {
+    let s = Scratch::new("targets");
+    let home = s.0.join("home");
+    let root = s.0.join("root");
+    let alpha = root.join("alpha");
+    fs::create_dir_all(&alpha).unwrap();
+    git(&alpha, &["init", "-q"], None);
+    fs::write(
+        alpha.join("TODO.md"),
+        "# TODO\n\n## High\n\n- [ ] first thing\n- [ ] second thing\n\n## Low\n\n- [ ] later\n",
+    )
+    .unwrap();
+    git(&alpha, &["add", "."], None);
+    git(&alpha, &["commit", "-qm", "init"], None);
+    ok(&home, &["root", "add", root.to_str().unwrap()]);
+    ok(&home, &["scan", "--offline"]);
+
+    let wf = s.0.join("items.rhai");
+    fs::write(
+        &wf,
+        r#"
+        let graph = source("item")
+            .emit_note("record", #{ text: "{$label}: {text}" })
+            .output();
+        document(#{}, [
+            workflow("log", graph, #{
+                params: #{ label: param("line", "item") },
+                caps: #{ max_units: 20, max_edits: 0 },
+            }),
+        ])
+        "#,
+    )
+    .unwrap();
+    ok(&home, &["workflow", "propose", wf.to_str().unwrap()]);
+    ok(&home, &["workflow", "activate", "1"]);
+
+    // A project where an item is read is a type error, named as one.
+    let (_, err, success) = pma_in(&home, &["workflow", "run", "log", "alpha"]);
+    assert!(
+        !success && err.contains("reads `item`") && err.contains("yields `project`"),
+        "{err}"
+    );
+
+    // A quadrant holds two types at once, so it is not an argument.
+    let (_, err, success) = pma_in(&home, &["workflow", "run", "log", "alpha:q1"]);
+    assert!(!success && err.contains("not an argument"), "{err}");
+
+    // An argument is checked against its declaration at the command line.
+    let (_, err, success) = pma_in(
+        &home,
+        &["workflow", "run", "log", "alpha:high", "--set", "depth=2"],
+    );
+    assert!(
+        !success && err.contains("declares no parameter `depth`"),
+        "{err}"
+    );
+
+    // A heading yields one unit per open item under it, and the argument
+    // replaces the declared default in the prompt the sink writes.
+    let out = ok(
+        &home,
+        &[
+            "workflow",
+            "run",
+            "log",
+            "alpha:high",
+            "--set",
+            "label=seen",
+        ],
+    );
+    assert!(out.contains("2 unit(s)"), "{out}");
+    let notes = ok(&home, &["note"]);
+    assert!(notes.contains("seen: first thing"), "{notes}");
+    assert!(notes.contains("seen: second thing"), "{notes}");
+    assert!(
+        !notes.contains("later"),
+        "the Low heading was not named: {notes}"
+    );
+
+    // A line names exactly one item, and the default applies when nothing is
+    // set.
+    let out = ok(&home, &["workflow", "run", "log", "alpha:10"]);
+    assert!(out.contains("1 unit(s)"), "{out}");
+    assert!(
+        ok(&home, &["note"]).contains("item: later"),
+        "the default label"
+    );
+}
+
+/// A sink writes outside the database, so each unit's write and the moves
+/// that record it commit together. A pass that fails on the second project
+/// leaves the first one's work recorded and does not repeat it on resume.
+#[test]
+fn a_sink_that_fails_part_way_does_not_repeat_what_it_wrote() {
+    let s = Scratch::new("sink");
+    let home = s.0.join("home");
+    let root = s.0.join("root");
+    let good = "# TODO\n\n## Critical\n\n## High\n\n- [ ] a thing\n\n## Medium\n\n## Low\n";
+    for (name, text) in [("alpha", good), ("beta", "## High\n")] {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"], None);
+        fs::write(dir.join("TODO.md"), text).unwrap();
+        git(&dir, &["add", "."], None);
+        git(&dir, &["commit", "-qm", "init"], None);
+    }
+    ok(&home, &["root", "add", root.to_str().unwrap()]);
+    ok(&home, &["scan", "--offline"]);
+
+    let wf = s.0.join("stamp.rhai");
+    fs::write(
+        &wf,
+        r#"
+        let graph = source("project")
+            .emit_todo("stamp", "add", #{ text: "reviewed {name}", priority: "high" })
+            .output();
+        document(#{}, [
+            workflow("stamp", graph, #{ caps: #{ max_units: 20, max_edits: 0 }}),
+        ])
+        "#,
+    )
+    .unwrap();
+    ok(&home, &["workflow", "propose", wf.to_str().unwrap()]);
+    ok(&home, &["workflow", "activate", "1"]);
+
+    // `beta`'s file has lint errors, so an item cannot be identified in it.
+    let (_, err, success) = pma_in(&home, &["workflow", "run", "stamp", "alpha", "beta"]);
+    assert!(!success, "the pass must report the sink it could not write");
+    assert!(err.contains("lint errors"), "{err}");
+
+    let alpha = root.join("alpha").join("TODO.md");
+    let written = fs::read_to_string(&alpha).unwrap();
+    assert_eq!(
+        written.matches("reviewed alpha").count(),
+        1,
+        "the first project's write committed: {written}"
+    );
+
+    // Resuming does not write it a second time, and still names `beta`.
+    let (_, err, success) = pma_in(&home, &["workflow", "run", "stamp", "--instance", "1"]);
+    assert!(!success && err.contains("lint errors"), "{err}");
+    assert_eq!(
+        fs::read_to_string(&alpha)
+            .unwrap()
+            .matches("reviewed alpha")
+            .count(),
+        1,
+        "a resumed pass does not repeat a sink it already wrote"
+    );
+
+    // Fixed, `beta` goes through and the pass settles.
+    fs::write(
+        root.join("beta").join("TODO.md"),
+        "# TODO\n\n## High\n\n- [ ] something\n",
+    )
+    .unwrap();
+    let out = ok(&home, &["workflow", "run", "stamp", "--instance", "1"]);
+    assert!(out.contains("nothing left to run"), "{out}");
+    assert!(
+        fs::read_to_string(root.join("beta").join("TODO.md"))
+            .unwrap()
+            .contains("reviewed beta")
+    );
+    assert_eq!(
+        fs::read_to_string(&alpha)
+            .unwrap()
+            .matches("reviewed alpha")
+            .count(),
+        1,
+        "still once"
+    );
+}
+
+/// A call is resolved before anything runs, so a caller around an all-rule
+/// callee is an all-rule pass: it costs nothing and needs no approval.
+#[test]
+fn a_call_around_a_rule_only_callee_runs_as_one_graph() {
+    let s = Scratch::new("compose");
+    let home = s.0.join("home");
+    let root = s.0.join("root");
+    let alpha = root.join("alpha");
+    fs::create_dir_all(&alpha).unwrap();
+    git(&alpha, &["init", "-q"], None);
+    fs::write(
+        alpha.join("TODO.md"),
+        "# TODO\n\n## High\n\n- [ ] first thing\n- [ ] second thing\n",
+    )
+    .unwrap();
+    git(&alpha, &["add", "."], None);
+    git(&alpha, &["commit", "-qm", "init"], None);
+    ok(&home, &["root", "add", root.to_str().unwrap()]);
+    ok(&home, &["scan", "--offline"]);
+
+    let wf = s.0.join("compose.rhai");
+    fs::write(
+        &wf,
+        r#"
+        let inner = source("project")
+            .rule_expand("items", "item", "todo-items", 50)
+            .output();
+        let outer = source("project")
+            .invoke("listing", "inner", #{}, "item")
+            .emit_note("record", #{ text: "{$tag}: {text}" })
+            .output();
+        document(#{}, [
+            workflow("inner", inner, #{ caps: #{ max_units: 50, max_edits: 0 }}),
+            workflow("outer", outer, #{
+                params: #{ tag: param("line", "open") },
+                caps: #{ max_units: 50, max_edits: 0 },
+                effects: ["writes"],
+            }),
+        ])
+        "#,
+    )
+    .unwrap();
+    let out = ok(&home, &["workflow", "propose", wf.to_str().unwrap()]);
+    assert!(
+        out.contains("at most $0.00"),
+        "a graph of rules is free: {out}"
+    );
+    // The estimate is over the flat graph, so the callee's node is named by
+    // its call site.
+    assert!(out.contains("listing/items"), "{out}");
+    ok(&home, &["workflow", "activate", "1"]);
+
+    let out = ok(
+        &home,
+        &["workflow", "run", "outer", "alpha", "--set", "tag=todo"],
+    );
+    assert!(out.contains("nothing left to run"), "{out}");
+    let notes = ok(&home, &["note"]);
+    assert!(notes.contains("todo: first thing"), "{notes}");
+    assert!(notes.contains("todo: second thing"), "{notes}");
+}
+
+/// `unknown` is a result, not a failure: a check that could not run sends its
+/// unit down the default edge, where an implemented rule that passed would
+/// have taken the guarded one.
+#[test]
+fn a_check_that_cannot_run_is_unknown_and_takes_the_default_edge() {
+    let s = Scratch::new("verdict");
+    let home = s.0.join("home");
+    let root = s.0.join("root");
+    let alpha = root.join("alpha");
+    fs::create_dir_all(&alpha).unwrap();
+    git(&alpha, &["init", "-q"], None);
+    fs::write(
+        alpha.join("TODO.md"),
+        "# TODO\n\n## High\n\n- [ ] a thing\n",
+    )
+    .unwrap();
+    git(&alpha, &["add", "."], None);
+    git(&alpha, &["commit", "-qm", "init"], None);
+    ok(&home, &["root", "add", root.to_str().unwrap()]);
+    ok(&home, &["scan", "--offline"]);
+
+    let wf = s.0.join("verdicts.rhai");
+    fs::write(
+        &wf,
+        r#"
+        let graph = source("project")
+            .check("lint", "lint-todo")
+            .when(#{ "@lint-todo": ["passed"] })
+            .check("merged", "pr-merged")
+            .otherwise(|g| g.emit_note("waiting", #{ text: "waiting: {name}" }))
+            .when(#{ "@pr-merged": ["passed"] })
+            .emit_note("shipped", #{ text: "merged: {name}" })
+            .output();
+        document(#{}, [
+            workflow("gate", graph, #{ caps: #{ max_units: 10, max_edits: 0 }}),
+        ])
+        "#,
+    )
+    .unwrap();
+    ok(&home, &["workflow", "propose", wf.to_str().unwrap()]);
+    ok(&home, &["workflow", "activate", "1"]);
+    let out = ok(&home, &["workflow", "run", "gate", "alpha"]);
+    assert!(out.contains("nothing left to run"), "{out}");
+
+    // `lint-todo` ran and passed, so the unit reached the second check.
+    // `pr-merged` has no run to read, which is neither pass nor fail.
+    let notes = ok(&home, &["note"]);
+    assert!(notes.contains("waiting: alpha"), "{notes}");
+    assert!(!notes.contains("merged: alpha"), "{notes}");
+}
+
+/// A `reduce` applies the rule it names. `limit:` truncates each group and
+/// every unit it dropped says so, where `dedupe` keeps one per group.
+#[test]
+fn a_reduce_applies_the_rule_it_names() {
+    let s = Scratch::new("reduce");
+    let home = s.0.join("home");
+    let root = s.0.join("root");
+    let alpha = root.join("alpha");
+    fs::create_dir_all(&alpha).unwrap();
+    git(&alpha, &["init", "-q"], None);
+    fs::write(
+        alpha.join("TODO.md"),
+        "# TODO\n\n## High\n\n- [ ] first\n- [ ] second\n- [ ] third\n\n## Low\n\n- [ ] later\n",
+    )
+    .unwrap();
+    git(&alpha, &["add", "."], None);
+    git(&alpha, &["commit", "-qm", "init"], None);
+    ok(&home, &["root", "add", root.to_str().unwrap()]);
+    ok(&home, &["scan", "--offline"]);
+
+    let write = |file: &str, rule: &str| {
+        let path = s.0.join(file);
+        fs::write(
+            &path,
+            format!(
+                r#"
+                let graph = source("project")
+                    .rule_expand("items", "item", "todo-items", 50)
+                    .join_by("pick", ["priority"], "{rule}")
+                    .emit_note("record", #{{ text: "kept: {{text}}" }})
+                    .output();
+                document(#{{}}, [
+                    workflow("pick", graph, #{{ caps: #{{ max_units: 50, max_edits: 0 }}}}),
+                ])
+                "#
+            ),
+        )
+        .unwrap();
+        path
+    };
+
+    // One per priority group, so one High and one Low.
+    ok(
+        &home,
+        &[
+            "workflow",
+            "propose",
+            write("a.rhai", "limit:1").to_str().unwrap(),
+        ],
+    );
+    ok(&home, &["workflow", "activate", "1"]);
+    ok(&home, &["workflow", "run", "pick", "alpha"]);
+    let notes = ok(&home, &["note"]);
+    assert_eq!(notes.matches("kept:").count(), 2, "{notes}");
+    assert!(
+        notes.contains("kept: later"),
+        "the Low group kept one: {notes}"
+    );
+
+    // Two per group instead: three High items yield two, and the one Low
+    // item yields one.
+    ok(
+        &home,
+        &[
+            "workflow",
+            "propose",
+            write("b.rhai", "limit:2").to_str().unwrap(),
+        ],
+    );
+    ok(&home, &["workflow", "activate", "2"]);
+    ok(&home, &["workflow", "run", "pick", "alpha"]);
+    let notes = ok(&home, &["note"]);
+    assert_eq!(
+        notes.matches("kept:").count(),
+        5,
+        "two more High, one more Low: {notes}"
+    );
+
+    // A count that keeps nothing is refused where the document is read.
+    let bad = write("c.rhai", "limit:0");
+    let (_, err, success) = pma_in(&home, &["workflow", "check", bad.to_str().unwrap()]);
+    assert!(!success && err.contains("a count of 1 or more"), "{err}");
 }

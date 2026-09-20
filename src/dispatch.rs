@@ -22,6 +22,9 @@ use crate::worker::Worker;
 /// A task chosen for dispatch.
 #[derive(Debug, Clone)]
 pub struct Pick {
+    /// The workflow unit this dispatch serves, where one does. A route
+    /// matches on the node (W13) and a report groups by it.
+    pub workflow: Option<UnitRef>,
     pub project: String,
     pub repo: PathBuf,
     /// The item's key, or a signal: `ci` or `deps`.
@@ -35,6 +38,16 @@ pub struct Pick {
     /// Extra prompt lines a campaign carries.
     pub details: Option<String>,
     pub quadrant: Option<String>,
+}
+
+/// Which workflow unit a dispatch serves.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct UnitRef {
+    pub instance: i64,
+    /// The qualified node name.
+    pub node: String,
+    pub unit: String,
+    pub lap: i64,
 }
 
 /// An agent and a model named on the command line. Both override the
@@ -114,7 +127,7 @@ pub fn is_signal(key: &str) -> bool {
 /// definition across repositories. There is nothing to check on origin before
 /// dispatch and nothing to tick at ship.
 pub fn without_item(key: &str) -> bool {
-    is_signal(key) || key.starts_with("campaign:")
+    is_signal(key) || key.starts_with("campaign:") || key.starts_with("workflow:")
 }
 
 /// Consumed attempts after which a task revision is not dispatched again.
@@ -234,7 +247,7 @@ pub fn prepare(
                 Vec::new(),
             )
         }
-        key if key.starts_with("campaign:") => {
+        key if without_item(key) && !is_signal(key) => {
             (pick.details.clone().unwrap_or_default(), Vec::new())
         }
         _ => {
@@ -402,10 +415,10 @@ pub fn prepare(
         approved_head: None,
         approved_by: None,
         // Set by the workflow pass; a task dispatched on its own has none.
-        workflow_instance: None,
-        node: None,
-        unit: None,
-        lap: 0,
+        workflow_instance: pick.workflow.as_ref().map(|u| u.instance),
+        node: pick.workflow.as_ref().map(|u| u.node.clone()),
+        unit: pick.workflow.as_ref().map(|u| u.unit.clone()),
+        lap: pick.workflow.as_ref().map_or(0, |u| u.lap),
         preset: chosen.preset.clone(),
         extra_args: chosen.args.clone(),
     };

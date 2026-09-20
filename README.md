@@ -67,7 +67,7 @@ pma ship                       # commit, push or open a pull request
 
 - A workflow is a graph of agents over a project: review, then validate the review, then fix what it confirmed. Written as JSON or as a script, and costed before it runs.
 
-- `pma workflow run` prints what it would run, the worker, the model and a ceiling, and spends nothing until you approve it.
+- `pma workflow run` prints what it would run, the worker, the model and a ceiling, and spends nothing until you approve it. Its target is `dispatch`'s: a project, a `TODO.md` line, a heading or a signal, whichever type the workflow reads.
 
 ## Install
 
@@ -205,8 +205,10 @@ pma route replay routing.json   # what a candidate would have done differently
 pma workflow check lib.rhai     # read a document and print its worst case
 pma workflow propose lib.rhai   # store it as a draft revision
 pma workflow activate 1         # refused if its worst case is over budget
-pma workflow run review myproject --dry-run
+pma workflow run review myproject --dry-run   # plan and price, starting nothing
 pma workflow run review myproject -p claude-haiku
+pma workflow run triage myproject:critical --set severity=high
+pma workflow run triage --instance 3 --yes    # approve the spend it printed
 ```
 
 GitHub Issues:

@@ -527,11 +527,16 @@ enum WorkflowAction {
     Show { revision: Option<i64> },
     /// Advance one pass of a workflow over a target, then exit. Nodes a rule
     /// decides run; nodes an agent decides are planned, priced and left for
-    /// you to approve.
+    /// you to approve with `--yes`.
+    ///
+    /// An instance is frozen at the revision it started under, so activating
+    /// another does not change a pass already under way.
     Run {
         /// A workflow named by the revision in effect.
         name: String,
-        /// Projects to run it over.
+        /// What to run it over, in `pma dispatch`'s target syntax: `cynn`,
+        /// `cynn:31`, `cynn:critical`, `cynn:ci`. The element type must be
+        /// the one the workflow reads.
         projects: Vec<String>,
         /// Add every project carrying this tag.
         #[arg(long)]
@@ -539,6 +544,10 @@ enum WorkflowAction {
         /// Resume an instance instead of starting one.
         #[arg(long, value_name = "ID")]
         instance: Option<i64>,
+        /// Set a declared parameter: `--set severity=high`. Repeatable. An
+        /// instance records what it was given, so a replay reads the same.
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        set: Vec<String>,
         /// Plan and price the pass without running anything at all.
         #[arg(long)]
         dry_run: bool,
@@ -1445,6 +1454,7 @@ fn run_dispatch(
                 continue;
             }
             picks.push(dispatch::Pick {
+                workflow: None,
                 project: x.task.project.clone(),
                 repo: r.path.clone(),
                 key: key.clone(),
@@ -1583,6 +1593,7 @@ fn run_dispatch(
                     store.reset_attempts(project, &dispatch::revision(&text))?;
                 }
                 picks.push(dispatch::Pick {
+                    workflow: None,
                     project: project.into(),
                     repo: row.path.clone(),
                     tier: row.tier,
@@ -1996,6 +2007,7 @@ fn run_campaign(name: &str, count: Option<usize>) -> Result<()> {
             continue;
         };
         picks.push(dispatch::Pick {
+            workflow: None,
             project: project.clone(),
             repo: row.path.clone(),
             key: format!("campaign:{name}"),
@@ -2204,6 +2216,9 @@ fn workflow_estimate(
     budget: f64,
 ) -> Result<workflow::Estimate> {
     let estimate = doc.estimate(&w.name, units, budget)?;
+    // The rows are the flat graph's nodes, so the op each one applies is read
+    // from there rather than from the call site the document wrote.
+    let flat = doc.flatten(&w.name)?;
     let effects = match w.effects.names().as_slice() {
         [] => "pure".to_string(),
         names => names.join(" "),
@@ -2225,7 +2240,7 @@ fn workflow_estimate(
             .collect::<Vec<_>>(),
     ];
     for b in &estimate.per_node {
-        let op = match w.node(&b.node).map(|n| &n.op) {
+        let op = match flat.node(&b.node).map(|n| &n.op) {
             Some(workflow::Op::Map(m)) => format!("map {}", m.out.name()),
             Some(op) => op.name().to_string(),
             None => String::new(),
@@ -2396,6 +2411,7 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
             projects,
             tag,
             instance,
+            set,
             dry_run,
             yes,
             agent,
@@ -2410,16 +2426,65 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
             // The flags cover the whole pass and are not stored: a pass
             // resolves its worker exactly as a dispatch does.
             let over = overrides(agent, model, preset)?;
-            let revision = store
-                .active_workflow()?
-                .ok_or("no workflow revision is in effect; `pma workflow activate <rev>`")?;
+            // An instance is frozen at the revision it started under. Reading
+            // the active revision instead would walk units one graph wrote
+            // with another graph's edge indexes.
+            let revision = match instance {
+                Some(id) => {
+                    let found = store.workflow_instance(id)?.ok_or_else(|| {
+                        format!("no workflow instance {id}; `pma workflow` lists them")
+                    })?;
+                    if found.workflow != name {
+                        return Err(format!(
+                            "instance {id} runs `{}`, not `{name}`",
+                            found.workflow
+                        )
+                        .into());
+                    }
+                    // An instance that stopped short records why and has no
+                    // finish time. A finished one is re-derived like any
+                    // other: the frontier is evidence, not a cursor (W9).
+                    if let (Some(outcome), None) = (&found.outcome, found.finished_at) {
+                        return Err(format!(
+                            "instance {id} stopped: {outcome}. It cannot be resumed."
+                        )
+                        .into());
+                    }
+                    if !projects.is_empty() || tag.is_some() || !set.is_empty() {
+                        return Err(format!(
+                            "instance {id} holds the target and arguments it started with; \
+                             `--instance` takes no projects, no `--tag` and no `--set`"
+                        )
+                        .into());
+                    }
+                    store.workflow_revision(found.revision)?.ok_or_else(|| {
+                        format!(
+                            "instance {id} ran under revision {}, which is gone",
+                            found.revision
+                        )
+                    })?
+                }
+                None => store
+                    .active_workflow()?
+                    .ok_or("no workflow revision is in effect; `pma workflow activate <rev>`")?,
+            };
             let doc = revision.document()?;
-            let w = doc.workflow(&name).ok_or_else(|| {
-                format!("revision {} has no workflow `{name}`", revision.revision)
-            })?;
+            if doc.workflow(&name).is_none() {
+                return Err(
+                    format!("revision {} has no workflow `{name}`", revision.revision).into(),
+                );
+            }
+            // A pass walks the flat graph: a call is resolved before anything
+            // runs, so the frontier, the caps and the edge indexes a move is
+            // keyed by are all one graph's.
+            let w = &doc.flatten(&name)?;
 
-            let instance = match instance {
-                Some(id) => id,
+            let (instance, args) = match instance {
+                Some(id) => (
+                    id,
+                    serde_json::from_str(&store.workflow_instance(id)?.expect("loaded above").args)
+                        .unwrap_or(serde_json::Value::Null),
+                ),
                 None => {
                     let mut names = projects.clone();
                     if let Some(tag) = &tag {
@@ -2429,13 +2494,14 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                             }
                         }
                     }
+                    let args = serde_json::to_value(w.bind(&set)?)?;
                     let units = pass::root_units(&store, &doc, &name, &names)?;
                     // The total a pass may spend scales with the argument bag,
                     // which is only known now.
                     let estimate = doc.estimate(&name, units.len() as i64, cfg.agent_budget)?;
                     if estimate.cost > cfg.workflow_budget {
                         return Err(format!(
-                            "over {} projects this pass could cost ${:.2}, over workflow_budget \
+                            "over {} unit(s) this pass could cost ${:.2}, over workflow_budget \
                              of ${:.2}",
                             units.len(),
                             estimate.cost,
@@ -2443,12 +2509,37 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                         )
                         .into());
                     }
+                    // A dry run plans and prices and writes nothing: an
+                    // instance it left behind would be an open instance
+                    // nobody meant to start.
+                    if dry_run {
+                        let moves: Vec<(String, usize, bool)> = units
+                            .iter()
+                            .flat_map(|u| {
+                                pass::entry_moves(w, u)
+                                    .into_iter()
+                                    .map(move |(edge, taken, _)| (u.id.clone(), edge, taken))
+                            })
+                            .collect();
+                        let plan = pass::plan_over(&store, &cfg, &over, w, &units, &moves)?;
+                        println!(
+                            "`{name}` over {} unit(s), at most ${:.2}",
+                            units.len(),
+                            estimate.cost
+                        );
+                        print!("{}", pass::describe(&plan, "would run: "));
+                        return Ok(());
+                    }
                     let target = match &tag {
                         Some(t) => format!("--tag {t}"),
                         None => names.join(" "),
                     };
-                    let id =
-                        store.add_workflow_instance(&name, revision.revision, "{}", &target)?;
+                    let id = store.add_workflow_instance(
+                        &name,
+                        revision.revision,
+                        &args.to_string(),
+                        &target,
+                    )?;
                     for unit in &units {
                         store.add_workflow_unit(id, unit)?;
                         pass::enter(&store, id, w, unit)?;
@@ -2458,7 +2549,7 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                         units.len(),
                         estimate.cost
                     );
-                    id
+                    (id, args)
                 }
             };
 
@@ -2468,7 +2559,13 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                 return Ok(());
             }
 
-            let plan = pass::advance(&store, &cfg, &over, &doc, w, instance)?;
+            let home = store::home()?;
+            let given = pass::Invocation {
+                home: &home,
+                args: &args,
+                approved: yes,
+            };
+            let plan = pass::advance(&store, &cfg, &over, &doc, w, instance, &given)?;
             if plan.is_empty() {
                 store.finish_instance(instance, "finished")?;
                 println!("instance {instance}: nothing left to run");
@@ -2476,16 +2573,11 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
             }
             let cost: f64 = plan.iter().map(|p| p.cost).sum();
             print!("{}", pass::describe(&plan, "next: "));
-            if !yes {
-                println!(
-                    "\nat most ${cost:.2}. Nothing was spent. Approve it with \
-                     `pma workflow run {name} --instance {instance} --yes`."
-                );
-                return Ok(());
-            }
-            // Agent nodes are the next step; the gate above is what they land
-            // behind.
-            Err("approved, but agent nodes are not executable yet".into())
+            println!(
+                "\nat most ${cost:.2}. Nothing was spent. Approve it with \
+                 `pma workflow run {name} --instance {instance} --yes`."
+            );
+            Ok(())
         }
         WorkflowAction::Show { revision } => {
             let store = Store::open_default()?;

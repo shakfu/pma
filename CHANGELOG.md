@@ -4,6 +4,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+`make install` now builds the release binary and copies it to `~/.local/bin`, overridable with `PREFIX`. It ran `cargo install --path .` before, which rebuilds from scratch into `~/.cargo/bin` and ignores any release binary already in `target/`.
+
 ## [0.3.1]
 
 ### Changed

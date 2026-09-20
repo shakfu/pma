@@ -10,9 +10,13 @@ build: ## compile a debug binary
 release: ## compile an optimised binary
 	@cargo build --release
 
+PREFIX ?= $(HOME)/.local
+
 .PHONY: install
-install: ## install into ~/.cargo/bin
-	@cargo install --path .
+install: release ## install the release binary into ~/.local/bin (override PREFIX)
+	@install -d $(PREFIX)/bin
+	@install -m 755 target/release/pma $(PREFIX)/bin/pma
+	@echo "installed $(PREFIX)/bin/pma"
 
 .PHONY: test
 test: ## run every test

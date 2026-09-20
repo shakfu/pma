@@ -75,7 +75,8 @@ pma ship                       # commit, push or open a pull request
 cargo install pma
 ```
 
-From a clone: `make install`.
+From a clone: `make install`, which builds the release binary and copies it to
+`~/.local/bin`. Set `PREFIX` to install elsewhere: `make install PREFIX=/usr/local`.
 
 Requirements:
 

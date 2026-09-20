@@ -1,6 +1,8 @@
 # pma workflows (draft)
 
-Status: 2026-09-20. Built: all of it. The document in both its forms with its refusals and cost bound, migration 20, `node` and `lap` on a route, `pma workflow check|propose|activate|show|run`, call flattening at propose time, the five primitives, the rules of section 8, typed targets and `--set`, and the caps enforced where units are written. Not built: `max_parallel` within a pass, which runs its nodes one at a time.
+Status: 2026-09-20. Built: the document in both its forms with its refusals and cost bound, migration 20, `node` and `lap` on a route, `pma workflow check|propose|activate|show|run`, call flattening at propose time, all five primitives including `edit`, the rules of section 8, typed targets and `--set`, and the caps enforced where units and runs are written. Runs go `max_parallel` at a time within a node's bag, and `batch_budget` bounds the pass.
+
+Not built: section 7's iteration. `retry`, a lap edge and a self-edge are parsed, bounded and costed, and none of the three is taken -- nothing increments `@lap`, and `handled` cannot tell a unit a node routed onward from one an edge routed back in. A document using them runs its forward path once. Also not built: a reason per drop at `map out: 0..1` (section 10), which the runtime records against the move rather than taking from the model; and `publish` on a node, which is parsed and ignored -- an agent node's worktree is discarded after the run, so there is nothing for its document to be committed from (W19).
 
 Two decisions below were corrected by the implementation rather than by review: an `edit` preserves its unit's type (section 3), and a lap mints a unit while a retry does not (section 11).
 
@@ -197,7 +199,7 @@ Prefixing by call site rather than by callee is what lets one workflow be called
 
 **W17. A `map out: 0..1` may not rewrite its input.** It returns ids to keep, plus fields named in `writes`. A validator that could edit a finding's text could launder work past the reviewer who reads it; the restriction is a trust boundary, not tidiness. Under `out: 1` the same rule bounds an annotation.
 
-**W18. Files are how an agent reads and writes units; the store is where they live.** `pma` writes `in.json` before a run and reads `out.json` after, under `<data>/artifacts/<instance>/<node>/`. Prose documents sit beside them. Rejected: units as files only, which cannot record why a unit was dropped or which guard stopped it.
+**W18. Files are how an agent reads and writes units; the store is where they live.** `pma` writes `in.json` before a run and reads `out.json` after, under `<data>/artifacts/<instance>/<node>/<n>/`, numbered per run so nothing overwrites an earlier one. Prose documents sit beside them. Rejected: units as files only, which cannot record why a unit was dropped or which guard stopped it.
 
 **W19. Prose documents live outside the worktree.** An untracked file there enters `dispatch::changed_paths`, counts as a violation for any class whose scope is bounded ([class.rs:101](../../src/class.rs)), and `git add -A` at ship publishes it. A node that wants its prose committed says `"publish": true`.
 
@@ -436,6 +438,8 @@ Declarations, for a type's fields and a workflow's parameters:
 The raw constructors -- `node`, `edge`, `edge_when`, `edge_default`, `edge_lap`, `call_to`, `retry` -- stay registered as an escape hatch for a shape the combinators do not cover. `in`, `while` and `with` are Rhai keywords, which is why those take their arguments positionally.
 
 ## 7. Iteration, concretely
+
+Specified, not built. See the status note at the top: the three constructs below parse, bound and cost correctly, and the runtime takes none of them.
 
 ### Retry: the same node, the same gate
 

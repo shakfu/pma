@@ -191,6 +191,11 @@ pub fn slug(text: &str) -> String {
 }
 
 /// What `prepare` made of a pick.
+/// How a run refused before it started says so, in `Run::error`. A run that
+/// never reached the agent is not a run that failed: the caller leaves its
+/// work where it was rather than recording a result for it.
+pub const NOT_STARTED: &str = "not started: batch budget";
+
 #[derive(Debug)]
 pub enum Prepared {
     Queued(Box<Run>),
@@ -648,10 +653,8 @@ pub fn execute(
                             + tries as f64 * cfg.agent_budget;
                         if committed > cfg.batch_budget + 1e-9 {
                             run.state = RunState::Failed;
-                            run.error = Some(format!(
-                                "not started: batch budget ${} reached",
-                                cfg.batch_budget
-                            ));
+                            run.error =
+                                Some(format!("{NOT_STARTED} ${} reached", cfg.batch_budget));
                             // Refused before the agent ran, so it consumes
                             // no attempt.
                             let _ = tx.send((run, Vec::new()));

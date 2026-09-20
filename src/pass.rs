@@ -40,6 +40,15 @@ struct Ctx<'a> {
     params: BTreeMap<String, Value>,
 }
 
+/// What one node's turn did: the batch budget it committed, and whether it
+/// moved any unit. A turn that committed nothing and moved nothing is the
+/// budget saying stop, not a node that has finished, so the pass leaves the
+/// node on the frontier and the next invocation picks it up.
+struct Turn {
+    spent: f64,
+    advanced: bool,
+}
+
 /// What one invocation of a pass was told: where to work, the arguments the
 /// instance was given, and whether its spend was approved.
 pub struct Invocation<'a> {
@@ -544,6 +553,10 @@ pub fn advance(
     // pass that exceeds this is a bug rather than a long job, and saying so is
     // better than spinning.
     let ceiling = (w.caps.max_units.max(1) as usize + 1) * (w.nodes.len() + 1);
+    // What this pass has committed against `batch_budget`, over every node it
+    // has run. Held here because a pass is the unit the budget bounds, not a
+    // node's turn: `advance` re-enters a node as its frontier refills.
+    let mut committed = 0.0;
     let ctx = Ctx {
         store,
         cfg,
@@ -578,20 +591,38 @@ pub fn advance(
                     ran = true;
                     break;
                 }
+                let priced = Planned {
+                    node: name.clone(),
+                    op: node.op.name().to_string(),
+                    units: waiting.len(),
+                    agent: Some(agent.clone()),
+                    model: model.clone(),
+                    cost: waiting.len() as f64 * cfg.agent_budget,
+                };
                 if !approved {
-                    plan.push(Planned {
-                        node: name.clone(),
-                        op: node.op.name().to_string(),
-                        units: waiting.len(),
-                        agent: Some(agent.clone()),
-                        model: model.clone(),
-                        cost: waiting.len() as f64 * cfg.agent_budget,
-                    });
+                    plan.push(priced);
                     continue;
                 }
-                match node.op {
-                    Op::Edit(_) => run_edit(&ctx, node, waiting, &verdicts)?,
-                    _ => run_agent(&ctx, node, waiting, &verdicts, &chosen)?,
+                let turn = match node.op {
+                    Op::Edit(_) => {
+                        run_edit(&ctx, node, waiting, &verdicts, cfg.batch_budget - committed)?
+                    }
+                    _ => run_agent(
+                        &ctx,
+                        node,
+                        waiting,
+                        &verdicts,
+                        &chosen,
+                        cfg.batch_budget - committed,
+                    )?,
+                };
+                committed += turn.spent;
+                // The batch budget admitted nothing, so the node keeps its
+                // place: the pass ends and the next one resumes here. A pass
+                // is not a daemon, and stopping at a budget is not an error.
+                if !turn.advanced {
+                    plan.push(priced);
+                    continue;
                 }
                 ran = true;
                 break;
@@ -1243,76 +1274,133 @@ fn emit(
 /// artifact directory, and it works in a detached worktree rather than in the
 /// user's clone: a node that is not an `edit` may read the code and must not
 /// be able to change it (W14).
+///
+/// Runs go `max_parallel` at a time. The store is a single connection, so it
+/// stays on this thread: a worker is handed everything it needs as files and
+/// paths, and what comes back is recorded here, in the order it arrives.
 fn run_agent(
     ctx: &Ctx<'_>,
     node: &Node,
     waiting: &[WorkflowUnit],
     verdicts: &BTreeMap<(String, String), String>,
     chosen: &Chosen,
-) -> Result<()> {
+    left: f64,
+) -> Result<Turn> {
     let batches: Vec<Vec<WorkflowUnit>> = match &node.op {
         Op::Reduce(r) => {
-            let mut groups: BTreeMap<String, Vec<WorkflowUnit>> = BTreeMap::new();
+            let mut groups: Vec<(String, Vec<WorkflowUnit>)> = Vec::new();
             for unit in waiting {
-                groups
-                    .entry(group_key(r, unit))
-                    .or_default()
-                    .push(unit.clone());
+                let key = group_key(r, unit);
+                match groups.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, bag)) => bag.push(unit.clone()),
+                    None => groups.push((key, vec![unit.clone()])),
+                }
             }
-            groups.into_values().collect()
+            groups.into_iter().map(|(_, bag)| bag).collect()
         }
         _ => waiting.iter().map(|u| vec![u.clone()]).collect(),
     };
+    let worker = ctx
+        .store
+        .agents()?
+        .into_iter()
+        .find(|w| w.name == chosen.agent)
+        .ok_or_else(|| format!("unknown agent `{}`; see `pma agent`", chosen.agent))?;
+
+    // What the batch budget admits, decided before anything is staged: a run
+    // refused after its worktree exists would leave the worktree behind. The
+    // rest wait for the next pass, which is not an error.
+    let room = match ctx.cfg.agent_budget > 0.0 {
+        true => (left / ctx.cfg.agent_budget).floor().max(0.0) as usize,
+        false => batches.len(),
+    };
+    let mut staged = Vec::new();
+    for batch in batches.iter().take(room) {
+        staged.push(stage(ctx, node, batch, verdicts, chosen)?);
+    }
+    if staged.is_empty() {
+        return Ok(Turn {
+            spent: 0.0,
+            advanced: false,
+        });
+    }
+    // Each staged run is committed against the budget at its ceiling. What it
+    // actually cost is recorded on its row; the budget admits on the ceiling,
+    // as a dispatch does, because the cost is not known until it has run.
+    let committed = staged.len() as f64 * ctx.cfg.agent_budget;
+
+    let queue = std::sync::Mutex::new(std::collections::VecDeque::from(staged));
+    let (tx, rx) = std::sync::mpsc::channel::<(Staged, Ran)>();
     let mut held = ctx.store.workflow_units(ctx.instance)?.len() as i64;
-    let mut spent = 0.0;
-    for batch in &batches {
-        // The batch budget admits a run, as it does for a dispatch. Stopping
-        // is not an error: the next pass picks the node up again.
-        if spent + ctx.cfg.agent_budget > ctx.cfg.batch_budget {
-            break;
-        }
-        let (produced, cost) = invoke(ctx, node, batch, verdicts, chosen)?;
-        spent += cost;
-        match produced {
-            Ok(units) => accept(ctx, node, batch, units, &mut held, verdicts)?,
-            // A run that was not clean settles its input by the guards, which
-            // is where a default edge catches it. Nothing is minted.
-            Err(why) => {
-                for unit in batch {
-                    ctx.store.add_workflow_verdict(
-                        ctx.instance,
-                        &unit.id,
-                        &node.name,
-                        "failed",
-                        Some(&why),
-                    )?;
-                    route_unit(ctx.store, ctx.instance, ctx.w, &node.name, unit, verdicts)?;
-                    mark_handled(ctx.store, ctx.instance, ctx.w, &node.name, &unit.id)?;
+    let mut failure = None;
+    // The store is one connection and is not shared between threads, so a
+    // worker is given the settings and nothing else.
+    let cfg = ctx.cfg;
+    std::thread::scope(|scope| {
+        for _ in 0..(cfg.max_parallel as usize).max(1) {
+            let tx = tx.clone();
+            let queue = &queue;
+            let worker = &worker;
+            scope.spawn(move || {
+                loop {
+                    let Some(job) = queue.lock().unwrap().pop_front() else {
+                        break;
+                    };
+                    let ran = work(cfg, worker, chosen, &job);
+                    let _ = tx.send((job, ran));
                 }
+            });
+        }
+        drop(tx);
+        for (job, ran) in rx {
+            if let Err(e) = record(ctx, node, job, ran, &mut held, verdicts) {
+                failure.get_or_insert(e.to_string());
             }
         }
+    });
+    match failure {
+        Some(e) => Err(e.into()),
+        None => Ok(Turn {
+            spent: committed,
+            advanced: true,
+        }),
     }
-    Ok(())
 }
 
-fn group_key(r: &crate::workflow::ReduceNode, unit: &WorkflowUnit) -> String {
-    let data: Value = serde_json::from_str(&unit.data).unwrap_or(Value::Null);
-    r.group_by
-        .iter()
-        .map(|f| todo::normal_text(data.get(f).and_then(Value::as_str).unwrap_or_default()))
-        .collect::<Vec<_>>()
-        .join("\u{0}")
+/// One agent run, staged: everything the store and the repository had to say
+/// about it, so a worker thread needs nothing but the filesystem.
+struct Staged {
+    run: crate::store::Run,
+    batch: Vec<WorkflowUnit>,
+    repo: std::path::PathBuf,
+    tree: std::path::PathBuf,
+    out: std::path::PathBuf,
+    doc: Option<std::path::PathBuf>,
+    log: std::path::PathBuf,
+    /// An empty directory outside the worktree, which `agent::restrict` hands
+    /// the child as its `gh` configuration. Inside the tree the agent could
+    /// write credentials back into it.
+    empty: std::path::PathBuf,
 }
 
-/// One agent run over one batch: the files it reads and writes, the worktree
-/// it works in, and the `runs` row that records what it cost.
-fn invoke(
+/// What a worker thread produced: no store, no repository, just the run's own
+/// numbers and the units it wrote.
+struct Ran {
+    seconds: i64,
+    cost_usd: Option<f64>,
+    summary: String,
+    produced: std::result::Result<Vec<Value>, String>,
+}
+
+/// Everything a run needs before a thread can take it: the files it reads and
+/// writes, the worktree it works in, and the `runs` row that records it.
+fn stage(
     ctx: &Ctx<'_>,
     node: &Node,
     batch: &[WorkflowUnit],
     verdicts: &BTreeMap<(String, String), String>,
     chosen: &Chosen,
-) -> Result<(std::result::Result<Vec<Value>, String>, f64)> {
+) -> Result<Staged> {
     let lead = batch.first().expect("a batch holds at least one unit");
     let project = lead
         .project
@@ -1322,12 +1410,6 @@ fn invoke(
         .store
         .project(&project)?
         .ok_or_else(|| format!("no project `{project}`; `pma scan` first"))?;
-    let worker = ctx
-        .store
-        .agents()?
-        .into_iter()
-        .find(|w| w.name == chosen.agent)
-        .ok_or_else(|| format!("unknown agent `{}`; see `pma agent`", chosen.agent))?;
 
     let dir = artifacts(ctx, node)?;
     let input: Vec<Value> = batch.iter().map(|u| exported(u, verdicts)).collect();
@@ -1357,7 +1439,9 @@ fn invoke(
     );
 
     // A read-only node still gets a tree of its own. An agent that writes to
-    // the clone would put a change past every review this tool has.
+    // the clone would put a change past every review this tool has. The trees
+    // are added from this thread: two `git worktree add` in one repository
+    // contend for its index lock.
     let tree = ctx
         .home
         .join("workflow-trees")
@@ -1389,7 +1473,7 @@ fn invoke(
         branch: String::new(),
         worktree: tree.clone(),
         base: String::new(),
-        prompt: prompt.clone(),
+        prompt,
         state: crate::store::RunState::Running,
         agent_budget: Some(ctx.cfg.agent_budget),
         timeout_minutes: Some(ctx.cfg.timeout),
@@ -1403,57 +1487,133 @@ fn invoke(
         ..crate::store::Run::default()
     };
     ctx.store.insert_run(&mut run)?;
-
-    let logs = ctx.home.join("runs").join(run.id.to_string());
+    let log = ctx
+        .home
+        .join("runs")
+        .join(run.id.to_string())
+        .join("agent-1.log");
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
     let empty = ctx.home.join("empty");
-    std::fs::create_dir_all(&logs).map_err(|e| format!("{}: {e}", logs.display()))?;
     std::fs::create_dir_all(&empty).map_err(|e| format!("{}: {e}", empty.display()))?;
-    let log = logs.join("agent-1.log");
+    Ok(Staged {
+        run,
+        batch: batch.to_vec(),
+        repo: row.path,
+        tree,
+        out: out_file,
+        doc: doc_file,
+        log,
+        empty,
+    })
+}
+
+/// The agent itself. No store and no `&Ctx`: this is the half that runs on a
+/// worker thread.
+fn work(cfg: &Config, worker: &crate::worker::Worker, chosen: &Chosen, job: &Staged) -> Ran {
     let mut cmd = worker.build(
-        &prompt,
-        &tree,
+        &job.run.prompt,
+        &job.tree,
         chosen.model.as_deref(),
-        ctx.cfg.agent_budget,
+        cfg.agent_budget,
         &chosen.args,
     );
-    cmd.current_dir(&tree);
-    crate::agent::restrict(&mut cmd, &empty);
-    let finished = crate::agent::run_limited(
+    cmd.current_dir(&job.tree);
+    crate::agent::restrict(&mut cmd, &job.empty);
+    let finished = match crate::agent::run_limited(
         cmd,
-        &log,
-        std::time::Duration::from_secs(ctx.cfg.timeout as u64 * 60),
-    )
-    .map_err(|e| format!("{}: {e}", worker.command))?;
+        &job.log,
+        std::time::Duration::from_secs(cfg.timeout as u64 * 60),
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            return Ran {
+                seconds: 0,
+                cost_usd: None,
+                summary: String::new(),
+                produced: Err(format!("{}: {e}", worker.command)),
+            };
+        }
+    };
     let report = worker.parse.report(
-        &std::fs::read_to_string(&log).unwrap_or_default(),
+        &std::fs::read_to_string(&job.log).unwrap_or_default(),
         finished.success == Some(true),
     );
-
-    run.seconds = Some(finished.seconds);
-    run.cost_usd = report.cost_usd;
-    run.summary = Some(report.summary.clone());
-    let cost = report.cost_usd.unwrap_or(ctx.cfg.agent_budget);
-
     let produced = match finished.success {
-        None => Err(format!("timed out after {} minutes", ctx.cfg.timeout)),
-        Some(_) if !report.ok => Err(format!("the agent failed; log: {}", log.display())),
-        _ => read_out(&out_file).and_then(|units| match &doc_file {
+        None => Err(format!("timed out after {} minutes", cfg.timeout)),
+        Some(_) if !report.ok => Err(format!("the agent failed; log: {}", job.log.display())),
+        _ => read_out(&job.out).and_then(|units| match &job.doc {
             Some(f) => doc_written(f).map(|()| units),
             None => Ok(units),
         }),
     };
-    run.state = match &produced {
+    Ran {
+        seconds: finished.seconds,
+        cost_usd: report.cost_usd,
+        summary: report.summary,
+        produced,
+    }
+}
+
+/// What a finished run leaves behind: the row, the units it wrote, and the
+/// worktree it no longer needs. Every store write of a pass happens here.
+fn record(
+    ctx: &Ctx<'_>,
+    node: &Node,
+    job: Staged,
+    ran: Ran,
+    held: &mut i64,
+    verdicts: &BTreeMap<(String, String), String>,
+) -> Result<()> {
+    let Staged {
+        mut run,
+        batch,
+        repo,
+        tree,
+        ..
+    } = job;
+    run.seconds = Some(ran.seconds);
+    run.cost_usd = ran.cost_usd;
+    run.summary = Some(ran.summary);
+    run.state = match &ran.produced {
         Ok(_) => crate::store::RunState::Ready,
         Err(_) => crate::store::RunState::Failed,
     };
-    run.error = produced.as_ref().err().cloned();
+    run.error = ran.produced.as_ref().err().cloned();
     run.ready_at = Some(crate::dates::now());
     ctx.store.update_run(&run)?;
-
     // The tree was the agent's scratch space, and a node that is not an
     // `edit` publishes nothing from it.
-    let _ = crate::dispatch::remove_worktree(&row.path, &tree, "");
-    Ok((produced, cost))
+    let _ = crate::dispatch::remove_worktree(&repo, &tree, "");
+    match ran.produced {
+        Ok(units) => accept(ctx, node, &batch, units, held, verdicts),
+        // A run that was not clean settles its input by the guards, which is
+        // where a default edge catches it. Nothing is minted.
+        Err(why) => {
+            for unit in &batch {
+                ctx.store.add_workflow_verdict(
+                    ctx.instance,
+                    &unit.id,
+                    &node.name,
+                    "failed",
+                    Some(&why),
+                )?;
+                route_unit(ctx.store, ctx.instance, ctx.w, &node.name, unit, verdicts)?;
+                mark_handled(ctx.store, ctx.instance, ctx.w, &node.name, &unit.id)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn group_key(r: &crate::workflow::ReduceNode, unit: &WorkflowUnit) -> String {
+    let data: Value = serde_json::from_str(&unit.data).unwrap_or(Value::Null);
+    r.group_by
+        .iter()
+        .map(|f| todo::normal_text(data.get(f).and_then(Value::as_str).unwrap_or_default()))
+        .collect::<Vec<_>>()
+        .join("\u{0}")
 }
 
 /// `out.json` as a list of units, or why it could not be read. An agent that
@@ -1733,20 +1893,37 @@ fn fill(
 /// An `edit` node: the only op that changes a repository. It goes through
 /// `dispatch::prepare` and the phase 1 gates like any other dispatch, so a
 /// workflow chooses order, prompts and parameters, never authority (W14). The
-/// run it leaves is reviewed and shipped the way every other run is.
+/// runs it leaves are reviewed and shipped the way every other run is.
+///
+/// Every unit is prepared before any is run, because `dispatch::execute`
+/// admits runs against `batch_budget` across the set it is given and spreads
+/// them over `max_parallel`. Handing it one run at a time would make both
+/// settings mean nothing here while they mean something to `pma dispatch`.
 fn run_edit(
     ctx: &Ctx<'_>,
     node: &Node,
     waiting: &[WorkflowUnit],
     verdicts: &BTreeMap<(String, String), String>,
-) -> Result<()> {
+    left: f64,
+) -> Result<Turn> {
     let Op::Edit(e) = &node.op else {
         return Err(format!("node `{}` is not an edit", node.name).into());
     };
     let mut verdicts = verdicts.clone();
     let mut edits = edits_made(ctx)?;
-    let mut spent = 0.0;
+    let mut queued: Vec<crate::store::Run> = Vec::new();
+    let mut driving: BTreeMap<i64, WorkflowUnit> = BTreeMap::new();
+    let mut refused = 0;
+    // `execute` admits against the budget too, but a run it refuses already
+    // has a worktree. Preparing only what fits leaves none to clean up.
+    let room = match ctx.cfg.agent_budget > 0.0 {
+        true => (left / ctx.cfg.agent_budget).floor().max(0.0) as usize,
+        false => waiting.len(),
+    };
     for unit in waiting {
+        if queued.len() >= room {
+            break;
+        }
         if edits >= ctx.w.caps.max_edits {
             return Err(capped(
                 ctx,
@@ -1756,9 +1933,6 @@ fn run_edit(
                     ctx.instance
                 ),
             ));
-        }
-        if spent + ctx.cfg.agent_budget > ctx.cfg.batch_budget {
-            break;
         }
         let project = unit
             .project
@@ -1795,8 +1969,7 @@ fn run_edit(
             details: Some(task),
             quadrant: None,
         };
-        let prepared = crate::dispatch::prepare(ctx.store, ctx.home, ctx.cfg, ctx.over, &pick)?;
-        let queued = match prepared {
+        match crate::dispatch::prepare(ctx.store, ctx.home, ctx.cfg, ctx.over, &pick)? {
             crate::dispatch::Prepared::Refused(why) => {
                 ctx.store.add_workflow_verdict(
                     ctx.instance,
@@ -1807,17 +1980,38 @@ fn run_edit(
                 )?;
                 route_unit(ctx.store, ctx.instance, ctx.w, &node.name, unit, &verdicts)?;
                 mark_handled(ctx.store, ctx.instance, ctx.w, &node.name, &unit.id)?;
-                continue;
+                refused += 1;
             }
-            crate::dispatch::Prepared::Queued(run) => *run,
-        };
-        edits += 1;
-        let done =
-            crate::dispatch::execute(ctx.store, ctx.home, ctx.cfg, ctx.over, vec![queued], |_| {})?;
-        let Some(run) = done.into_iter().next() else {
+            crate::dispatch::Prepared::Queued(run) => {
+                edits += 1;
+                driving.insert(run.id, unit.clone());
+                queued.push(*run);
+            }
+        }
+    }
+    if queued.is_empty() {
+        return Ok(Turn {
+            spent: 0.0,
+            advanced: refused > 0,
+        });
+    }
+    let committed = queued.len() as f64 * ctx.cfg.agent_budget;
+    let done = crate::dispatch::execute(ctx.store, ctx.home, ctx.cfg, ctx.over, queued, |_| {})?;
+    for run in done {
+        let Some(unit) = driving.get(&run.id) else {
             continue;
         };
-        spent += run.cost_usd.unwrap_or(ctx.cfg.agent_budget);
+        // A run the batch budget refused never reached the agent, so its unit
+        // keeps its place in the frontier and the next pass prepares it
+        // again. Its worktree goes, or the branch would be in the way.
+        if run
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(crate::dispatch::NOT_STARTED))
+        {
+            let _ = crate::dispatch::remove_worktree(&run.repo, &run.worktree, &run.branch);
+            continue;
+        }
         // The node's own check writes its verdict against the unit, under the
         // rule's name, so a guard reads `@verify` rather than the run.
         if let Some(rule) = &e.check {
@@ -1834,7 +2028,10 @@ fn run_edit(
         route_unit(ctx.store, ctx.instance, ctx.w, &node.name, unit, &verdicts)?;
         mark_handled(ctx.store, ctx.instance, ctx.w, &node.name, &unit.id)?;
     }
-    Ok(())
+    Ok(Turn {
+        spent: committed,
+        advanced: true,
+    })
 }
 
 /// Edits this instance has already made, which is what `caps.max_edits`

@@ -69,6 +69,8 @@ pma ship                       # commit, push or open a pull request
 
 - `pma workflow run` prints what it would run, the worker, the model and a ceiling, and spends nothing until you approve it. Its target is `dispatch`'s: a project, a `TODO.md` line, a heading or a signal, whichever type the workflow reads.
 
+- One run of a workflow is an instance. It is frozen at the revision it started under, so activating a new one does not change work already under way, and `--instance <id>` resumes it where the last pass stopped. A node that edits a repository leaves a run in `pma review` like any other.
+
 ## Install
 
 ```sh
@@ -209,7 +211,10 @@ pma workflow run review myproject --dry-run   # plan and price, starting nothing
 pma workflow run review myproject -p claude-haiku
 pma workflow run triage myproject:critical --set severity=high
 pma workflow run triage --instance 3 --yes    # approve the spend it printed
+pma workflow                    # revisions, and every instance with its state
 ```
+
+A pass runs every node a rule decides, then stops at the first an agent decides and prices it. `--yes` approves that spend; the pass then runs `max_parallel` agents at a time until `batch_budget` is reached, and the next invocation resumes from there.
 
 GitHub Issues:
 
@@ -224,7 +229,7 @@ Each `## Critical` item gets an issue labelled `pma:critical`, and `gh:N` is wri
 
 - The database is `~/.config/pma/projects.db`, or `$PMA_HOME/projects.db`. That directory can be a git repository, which is how two machines share it.
 
-- Worktrees sit under the same directory and are removed when a run ships or is rejected.
+- Worktrees sit under the same directory and are removed when a run ships or is rejected. A workflow's agent nodes read the code in a worktree of their own and leave nothing behind; what they read and wrote stays in `artifacts/<instance>/<node>/<n>/`, numbered per run.
 
 - Settings live in the database rather than a file. `pma config` lists them, `pma config <key> <value>` sets one, and `--reset` clears one.
 

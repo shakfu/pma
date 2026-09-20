@@ -2808,3 +2808,120 @@ fn a_reduce_applies_the_rule_it_names() {
     let (_, err, success) = pma_in(&home, &["workflow", "check", bad.to_str().unwrap()]);
     assert!(!success && err.contains("a count of 1 or more"), "{err}");
 }
+
+/// Agent nodes run `max_parallel` at a time, and `batch_budget` bounds a whole
+/// pass rather than one node's turn: the runs it did not admit keep their
+/// place in the frontier, and the next pass takes them.
+#[test]
+fn agent_runs_go_in_parallel_and_the_batch_budget_bounds_the_pass() {
+    let s = Scratch::new("parallel");
+    let home = s.0.join("home");
+    let root = s.0.join("root");
+    for name in ["alpha", "beta"] {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"], None);
+        fs::write(dir.join("TODO.md"), "# TODO\n\n## High\n\n- [ ] a thing\n").unwrap();
+        git(&dir, &["add", "."], None);
+        git(&dir, &["commit", "-qm", "init"], None);
+    }
+
+    // The worker brackets its own run in a shared log. Two runs in flight
+    // write `start start end end`; one after the other writes `start end`
+    // twice.
+    let bin = s.0.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let log = s.0.join("order.log");
+    fs::write(
+        bin.join("claude"),
+        format!(
+            "#!/bin/sh\n\
+             echo start >> {0}\n\
+             sleep 1\n\
+             out=$(printf '%s' \"$2\" | sed -n 's/.*findings to //p')\n\
+             printf '[{{\"title\":\"a finding\"}}]' > \"$out\"\n\
+             echo end >> {0}\n\
+             printf '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\",\"total_cost_usd\":0.1}}\\n'\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let run = |args: &[&str]| {
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = Command::new(env!("CARGO_BIN_EXE_pma"))
+            .env("PMA_HOME", &home)
+            .env("PATH", path)
+            .args(args)
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.success(),
+        )
+    };
+    run(&["root", "add", root.to_str().unwrap()]);
+    run(&["scan", "--offline"]);
+
+    let wf = s.0.join("review.rhai");
+    fs::write(
+        &wf,
+        r#"
+        let graph = source("project")
+            .expand("review", "finding", 3, "Review `{name}`. Write findings to {out}")
+            .output();
+        document(#{ finding: #{ fields: #{ title: req(line(200)) }}}, [
+            workflow("review", graph, #{ caps: #{ max_units: 10, max_edits: 0 }}),
+        ])
+        "#,
+    )
+    .unwrap();
+    run(&["workflow", "propose", wf.to_str().unwrap()]);
+    run(&["workflow", "activate", "1"]);
+
+    // Two projects, two threads, room for both.
+    run(&["config", "max_parallel", "2"]);
+    let (out, err, success) = run(&["workflow", "run", "review", "alpha", "beta", "--yes"]);
+    assert!(success, "{err}\n{out}");
+    let order: Vec<String> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(order.len(), 4, "two runs, bracketed: {order:?}");
+    assert_eq!(
+        &order[..2],
+        ["start", "start"],
+        "the second run started before the first finished: {order:?}"
+    );
+
+    // One run's worth of budget, two units: the pass takes one and says what
+    // is left, and the next pass takes the other.
+    fs::remove_file(&log).unwrap();
+    run(&["config", "batch_budget", "1"]);
+    let (out, err, success) = run(&["workflow", "run", "review", "alpha", "beta", "--yes"]);
+    assert!(success, "{err}\n{out}");
+    assert!(out.contains("next: review"), "the rest is priced: {out}");
+    assert_eq!(
+        fs::read_to_string(&log).unwrap().matches("start").count(),
+        1,
+        "the batch budget admitted one run"
+    );
+
+    let (out, err, success) = run(&["workflow", "run", "review", "--instance", "2", "--yes"]);
+    assert!(success, "{err}\n{out}");
+    assert!(out.contains("nothing left to run"), "{out}");
+    assert_eq!(
+        fs::read_to_string(&log).unwrap().matches("start").count(),
+        2,
+        "the next pass took the other"
+    );
+}

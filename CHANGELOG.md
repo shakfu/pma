@@ -4,7 +4,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+**`pma project export` and `pma project import`: every project's tier and tags as one file.** Tiering a portfolio meant one command per project. `export` writes a row per project, the extension picking the format -- `.csv` as `name,tier,tag,tag`, `.json` as a list of objects -- and `import` reads an edited file back, listing what would change until `--apply`. A file naming something that is not a project is refused whole, so a typo does not leave half the portfolio retiered. A project the file leaves out keeps what it has; a project it names ends with exactly the tags in its row.
+
+**`pma scan` draws a progress bar.** `[########------------] 38/95 alpha` on stderr, redrawn as each project lands, cleared before the summary. A scan of 95 repositories takes about 15 seconds and printed nothing until it was over. Silent when stderr is not a terminal, so a pipe or a CI log holds the bytes it held before.
+
 ### Changed
+
+**`pma project tier` takes the tier first and any number of projects:** `pma project tier 1 alpha beta gamma`. The tier is the argument shared across a run of projects, so it goes first and the list follows, as `pma project tag add` already reads. Setting a tier no longer resolves one project at a time: every name is checked before any is written. The form that printed one project's tier is gone, since `pma project` lists every name beside its tier.
 
 `make install` now builds the release binary and copies it to `~/.local/bin`, overridable with `PREFIX`. It ran `cargo install --path .` before, which rebuilds from scratch into `~/.cargo/bin` and ignores any release binary already in `target/`.
 

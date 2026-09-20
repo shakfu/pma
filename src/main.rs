@@ -12,6 +12,8 @@ mod dates;
 mod deps;
 mod dispatch;
 mod pass;
+mod progress;
+mod projects;
 mod rank;
 mod report;
 mod report_runs;
@@ -26,7 +28,7 @@ mod tui;
 mod worker;
 mod workflow;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -321,12 +323,35 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ProjectAction {
-    /// Show or set a project's tier: 1 (most important) to 5, or `none`.
+    /// Set the tier of one project or many: 1 (most important) to 5, or `none`.
+    ///
+    /// `pma project` lists every project's tier.
     Tier {
-        /// The project's directory name under a root.
-        project: String,
-        /// 1 to 5, or `none`; omit to show the current tier.
-        tier: Option<String>,
+        /// 1 to 5, or `none`.
+        tier: String,
+        /// Project directory names under a root.
+        #[arg(required = true)]
+        projects: Vec<String>,
+    },
+    /// Write every project's tier and tags to a file to edit in bulk.
+    ///
+    /// The extension picks the format: `.csv` holds one project per line as
+    /// `name,tier,tag,tag`; `.json` holds a list of objects.
+    Export {
+        /// The file to write, ending `.csv` or `.json`.
+        file: PathBuf,
+    },
+    /// Read tiers and tags back from an edited `export` file.
+    ///
+    /// A project the file leaves out keeps the tier and tags it has; a
+    /// project it names gets exactly the tags in its row. Dry run unless
+    /// --apply.
+    Import {
+        /// The file to read, ending `.csv` or `.json`.
+        file: PathBuf,
+        /// Make the changes instead of listing them.
+        #[arg(long)]
+        apply: bool,
     },
     /// Group projects with private tags. A project may carry several.
     ///
@@ -861,7 +886,7 @@ fn tag(action: Option<TagAction>) -> Result<()> {
             }
         }
         Some(TagAction::Add { tag, projects }) => {
-            let tag = normal_tag(&tag)?;
+            let tag = projects::normal_tag(&tag)?;
             known(&projects)?;
             for p in &projects {
                 if !store.add_project_tag(p, &tag)? {
@@ -870,7 +895,7 @@ fn tag(action: Option<TagAction>) -> Result<()> {
             }
         }
         Some(TagAction::Rm { tag, projects }) => {
-            let tag = normal_tag(&tag)?;
+            let tag = projects::normal_tag(&tag)?;
             for p in &projects {
                 if !store.remove_project_tag(p, &tag)? {
                     println!("{p} does not carry `{tag}`");
@@ -878,7 +903,7 @@ fn tag(action: Option<TagAction>) -> Result<()> {
             }
         }
         Some(TagAction::Show { tag }) => {
-            let tag = normal_tag(&tag)?;
+            let tag = projects::normal_tag(&tag)?;
             for p in store.projects_tagged(&[tag])? {
                 println!("{p}");
             }
@@ -889,22 +914,8 @@ fn tag(action: Option<TagAction>) -> Result<()> {
 
 /// Tags are matched exactly, so they are lowercased once here rather than
 /// leaving `ai` and `AI` as two groups.
-fn normal_tag(tag: &str) -> Result<String> {
-    let tag = tag.trim().to_lowercase();
-    if tag.is_empty() || tag.split_whitespace().count() > 1 {
-        return Err("a tag is one word".into());
-    }
-    Ok(tag)
-}
-
-fn set_tier(name: &str, tier: Option<&str>) -> Result<()> {
+fn set_tier(tier: &str, names: &[String]) -> Result<()> {
     let store = Store::open_default()?;
-    let known = store.project(name)?;
-    let Some(tier) = tier else {
-        let row = known.ok_or_else(|| format!("unknown project `{name}`"))?;
-        println!("{}", row.tier.map_or("none".into(), |t| t.to_string()));
-        return Ok(());
-    };
     let tier = match tier {
         "none" => None,
         t => Some(
@@ -914,11 +925,145 @@ fn set_tier(name: &str, tier: Option<&str>) -> Result<()> {
                 .ok_or("tier must be 1 to 5, or none")?,
         ),
     };
-    let path = match known {
-        Some(row) => row.path,
-        None => find_project(&store, name)?,
+    // Every project is resolved before any is written, so a name typed wrong
+    // does not leave half the list retiered.
+    let mut paths = Vec::with_capacity(names.len());
+    for name in names {
+        paths.push(match store.project(name)? {
+            Some(row) => row.path,
+            None => find_project(&store, name)?,
+        });
+    }
+    for (name, path) in names.iter().zip(paths) {
+        store.set_tier(name, &path, tier)?;
+    }
+    Ok(())
+}
+
+fn export_projects(file: &Path) -> Result<()> {
+    let store = Store::open_default()?;
+    let format = projects::Format::of(file)?;
+    let tags = store.project_tags()?;
+    let entries: Vec<projects::Entry> = store
+        .projects()?
+        .into_iter()
+        .map(|p| projects::Entry {
+            tier: p.tier,
+            tags: tags
+                .iter()
+                .filter(|(project, _)| *project == p.name)
+                .map(|(_, tag)| tag.clone())
+                .collect(),
+            name: p.name,
+        })
+        .collect();
+    if entries.is_empty() {
+        return Err("no projects; `pma root add <dir>` then `pma scan`".into());
+    }
+    std::fs::write(file, projects::write(&entries, format)?)
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    println!(
+        "{} projects to {}; edit it, then `pma project import {} --apply`",
+        entries.len(),
+        file.display(),
+        file.display()
+    );
+    Ok(())
+}
+
+fn import_projects(file: &Path, apply: bool) -> Result<()> {
+    let store = Store::open_default()?;
+    let format = projects::Format::of(file)?;
+    let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let entries = projects::read(&text, format)?;
+    let rows = store.projects()?;
+    let tags = store.project_tags()?;
+
+    // The whole file is checked first: a name that is not a project usually
+    // means the wrong file, and half of it applied is worse than none.
+    let unknown: Vec<&str> = entries
+        .iter()
+        .map(|e| e.name.as_str())
+        .filter(|n| !rows.iter().any(|r| r.name == *n))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "not projects: {}; `pma project` lists them, `pma scan` finds new ones",
+            unknown.join(", ")
+        )
+        .into());
+    }
+
+    let mut changes = 0;
+    for entry in &entries {
+        let row = rows.iter().find(|r| r.name == entry.name).expect("checked");
+        let was: Vec<String> = tags
+            .iter()
+            .filter(|(project, _)| *project == entry.name)
+            .map(|(_, tag)| tag.clone())
+            .collect();
+        if row.tier != entry.tier {
+            changes += 1;
+            println!(
+                "{}: tier {} -> {}",
+                entry.name,
+                show_tier(row.tier),
+                show_tier(entry.tier)
+            );
+            if apply {
+                store.set_tier(&entry.name, &row.path, entry.tier)?;
+            }
+        }
+        let gone: Vec<&String> = was.iter().filter(|t| !entry.tags.contains(t)).collect();
+        let new: Vec<&String> = entry.tags.iter().filter(|t| !was.contains(t)).collect();
+        if !gone.is_empty() || !new.is_empty() {
+            changes += 1;
+            println!(
+                "{}: tags {} -> {}",
+                entry.name,
+                show_tags(&was),
+                show_tags(&entry.tags)
+            );
+            if apply {
+                for tag in gone {
+                    store.remove_project_tag(&entry.name, tag)?;
+                }
+                for tag in new {
+                    store.add_project_tag(&entry.name, tag)?;
+                }
+            }
+        }
+    }
+
+    let absent = rows.len() - entries.len();
+    let kept = match absent {
+        0 => String::new(),
+        n => format!("; {n} projects the file leaves out keep what they have"),
     };
-    store.set_tier(name, &path, tier)
+    println!(
+        "{}",
+        match (changes, apply) {
+            (0, _) => format!("{} projects, nothing to change{kept}", entries.len()),
+            (n, true) => format!("{n} changes applied{kept}"),
+            (n, false) => format!("{n} changes; --apply to make them{kept}"),
+        }
+    );
+    Ok(())
+}
+
+fn show_tier(tier: Option<u8>) -> String {
+    tier.map_or("none".into(), |t| t.to_string())
+}
+
+fn show_tags<T: std::fmt::Display>(tags: &[T]) -> String {
+    match tags.is_empty() {
+        true => "none".into(),
+        false => tags
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<String>>()
+            .join(","),
+    }
 }
 
 fn find_project(store: &Store, name: &str) -> Result<PathBuf> {
@@ -1012,7 +1157,11 @@ fn run_scan(names: &[String], tags: &[String], offline: bool, deps: bool) -> Res
     };
 
     let started = Instant::now();
-    let facts = scan::scan_all(&selected, &cfg.activity_ignore, offline, deps);
+    let bar = progress::Bar::new(selected.len());
+    let facts = scan::scan_all(&selected, &cfg.activity_ignore, offline, deps, &|name| {
+        bar.done(name)
+    });
+    bar.finish();
     for f in facts.iter().filter(|f| f.error.is_some()) {
         eprintln!(
             "warning: {}: {}",
@@ -1164,7 +1313,7 @@ fn portfolio(names: &[String], tags: &[String]) -> Result<Portfolio> {
 
 fn header_text(p: &Portfolio) -> String {
     format!(
-        "last scan {}; {} tiered projects, {} untiered (pma tier <project> <1-5>)",
+        "last scan {}; {} tiered projects, {} untiered (pma project tier <1-5> <project>...)",
         report::ago(p.scanned_ago),
         p.projects.len(),
         p.untiered
@@ -1398,7 +1547,7 @@ fn run_dispatch(
                     if row.tier.is_none() && p.cfg.default_tier.is_none() {
                         return Err(format!(
                             "{project} has no tier, so it is in no quadrant; \
-                             `pma tier {project} <1-5>`, or name the tasks"
+                             `pma project tier <1-5> {project}`, or name the tasks"
                         )
                         .into());
                     }
@@ -1931,10 +2080,17 @@ fn project_command(action: Option<ProjectAction>) -> Result<()> {
             })
             .collect();
         print!("{}", report::table(&rows, ""));
+        println!(
+            "\n`pma project tier <1-5> <project>...` sets tiers; \
+             `pma project export\n  <file.csv>` writes them all to edit at \
+             once, `import` reads it back."
+        );
         return Ok(());
     };
     match action {
-        ProjectAction::Tier { project, tier } => set_tier(&project, tier.as_deref()),
+        ProjectAction::Tier { tier, projects } => set_tier(&tier, &projects),
+        ProjectAction::Export { file } => export_projects(&file),
+        ProjectAction::Import { file, apply } => import_projects(&file, apply),
         ProjectAction::Tag { action } => tag(action),
         ProjectAction::Forget { project, apply } => forget(&project, apply),
     }

@@ -10,7 +10,7 @@ Nothing is published without you. An agent runs with no push credentials, `pma` 
 
 ```sh
 pma root add ~/projects        # git repos directly under it are projects
-pma project tier myproject 1   # 1 is most important, 5 least
+pma project tier 1 myproject   # 1 is most important, 5 least
 pma scan                       # TODO.md, git state, CI
 pma matrix                     # every project's tasks, ranked, in one view
 pma dispatch myproject:31      # hand line 31 to an agent
@@ -143,7 +143,9 @@ pma lint ~/projects/*/          # every project
 pma prune ~/projects/*/         # what would be removed; --apply to do it
 pma root add ~/projects/        # also `pma root` and `pma root rm`
 pma project                     # every project: tier, tags, last scanned
-pma project tier myproject 1    # or `none`; untiered projects are not ranked
+pma project tier 1 alpha beta   # or `none`; untiered projects are not ranked
+pma project export tiers.csv    # every project's tier and tags, to edit
+pma project import tiers.csv --apply   # read them back
 pma project tag add rust myproject     # private groups; --tag <t> elsewhere
 pma project forget gone         # an absent project's record
 pma scan                        # TODO.md, git state, CI via gh

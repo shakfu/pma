@@ -234,9 +234,9 @@ fn scan_rank_and_explain_a_real_repo() {
     assert!(!success && err.contains("pma scan"), "{err}");
 
     ok(&home, &["root", "add", root.to_str().unwrap()]);
-    ok(&home, &["project", "tier", "alpha", "1"]);
-    assert_eq!(ok(&home, &["project", "tier", "alpha"]), "1\n");
-    let (_, err, success) = pma_in(&home, &["project", "tier", "alpha", "6"]);
+    ok(&home, &["project", "tier", "1", "alpha"]);
+    assert!(ok(&home, &["project"]).contains("alpha  tier 1"));
+    let (_, err, success) = pma_in(&home, &["project", "tier", "6", "alpha"]);
     assert!(!success && err.contains("1 to 5"), "{err}");
 
     let scanned = ok(&home, &["scan", "--offline"]);
@@ -268,7 +268,7 @@ Q4 Remove: 3
     let (head, body) = matrix.split_once("\n\n").unwrap();
     assert_eq!(
         head,
-        "last scan just now; 1 tiered projects, 1 untiered (pma tier <project> <1-5>)"
+        "last scan just now; 1 tiered projects, 1 untiered (pma project tier <1-5> <project>...)"
     );
     assert_eq!(body, expected);
 
@@ -310,7 +310,7 @@ Q4 Remove: 3
 
     // A rescan keeps the tier and each task's first sighting.
     ok(&home, &["scan", "--offline", "alpha"]);
-    assert_eq!(ok(&home, &["project", "tier", "alpha"]), "1\n");
+    assert!(ok(&home, &["project"]).contains("alpha  tier 1"));
 }
 
 /// A stand-in for `claude -p`: writes a file named by the task, tries to push,
@@ -438,7 +438,7 @@ fn dispatch_env(s: &Scratch, scripts: &[(&str, &str)]) -> (Env, PathBuf, PathBuf
     let alpha = root.join("alpha");
 
     env.ok(&["root", "add", root.to_str().unwrap()]);
-    env.ok(&["project", "tier", "alpha", "1"]);
+    env.ok(&["project", "tier", "1", "alpha"]);
     env.ok(&["scan", "--offline"]);
     (env, origin, alpha)
 }
@@ -952,7 +952,7 @@ fn a_campaign_applies_one_definition_across_repositories() {
     let root = s.0.join("root");
     for name in ["beta", "gamma"] {
         git(&root, &["clone", "-q", "../origin.git", name], None);
-        env.ok(&["project", "tier", name, "3"]);
+        env.ok(&["project", "tier", "3", name]);
     }
     env.ok(&["scan", "--offline"]);
     // The seed's `make test` needs hello.txt, which a workflow campaign has
@@ -1559,7 +1559,7 @@ fn notes_and_measured_dependencies() {
     git(&alpha, &["init", "-q"], None);
     fs::write(alpha.join("uv.lock"), "").unwrap();
     ok(&["root", "add", root.to_str().unwrap()]);
-    ok(&["project", "tier", "alpha", "1"]);
+    ok(&["project", "tier", "1", "alpha"]);
     ok(&["scan", "--offline"]);
     assert!(ok(&["status", "--explain"]).contains("not measured; `pma scan --deps`"));
     let (_, err, success) = run(&["dispatch", "alpha:deps"]);
@@ -2074,4 +2074,96 @@ fn an_agent_node_is_priced_and_left_for_approval() {
     let (_, err, success) = run(&["workflow", "run", "review", "--instance", "1", "--yes"]);
     assert!(!success && err.contains("not executable yet"), "{err}");
     assert!(!log.exists(), "still nothing spent");
+}
+
+/// Tiering a portfolio by hand is the pain this file replaces: a dump of every
+/// project, edited, read back.
+#[test]
+fn tiers_and_tags_go_out_to_a_file_and_come_back() {
+    let s = Scratch::new("bulk");
+    let home = s.0.join("home");
+    let root = s.0.join("root");
+    for name in ["alpha", "beta", "gamma"] {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"], None);
+    }
+    ok(&home, &["root", "add", root.to_str().unwrap()]);
+    ok(&home, &["scan", "--offline"]);
+
+    // One tier for many projects, in one command.
+    ok(&home, &["project", "tier", "2", "alpha", "beta", "gamma"]);
+    ok(&home, &["project", "tag", "add", "rust", "alpha"]);
+
+    let csv = s.0.join("projects.csv");
+    let out = ok(&home, &["project", "export", csv.to_str().unwrap()]);
+    assert!(out.starts_with("3 projects to "), "{out}");
+    assert_eq!(
+        fs::read_to_string(&csv).unwrap(),
+        "name,tier,tags\nalpha,2,rust\nbeta,2\ngamma,2\n"
+    );
+
+    // Edited by hand: a retier, a tag added, a tag dropped, a row deleted.
+    fs::write(&csv, "name,tier,tags\nalpha,1\nbeta,none,python,cli\n").unwrap();
+    let out = ok(&home, &["project", "import", csv.to_str().unwrap()]);
+    assert!(out.contains("alpha: tier 2 -> 1"), "{out}");
+    assert!(out.contains("alpha: tags rust -> none"), "{out}");
+    assert!(out.contains("beta: tier 2 -> none"), "{out}");
+    assert!(out.contains("beta: tags none -> python,cli"), "{out}");
+    assert!(out.contains("4 changes; --apply to make them"), "{out}");
+    assert!(
+        out.contains("1 projects the file leaves out keep what they have"),
+        "{out}"
+    );
+    // A dry run changed nothing.
+    assert!(ok(&home, &["project"]).contains("alpha  tier 2  rust"));
+
+    let out = ok(
+        &home,
+        &["project", "import", csv.to_str().unwrap(), "--apply"],
+    );
+    assert!(out.contains("4 changes applied"), "{out}");
+    let listed = ok(&home, &["project"]);
+    assert!(listed.contains("alpha  tier 1"), "{listed}");
+    assert!(listed.contains("beta   untiered  cli,python"), "{listed}");
+    assert!(listed.contains("gamma  tier 2"), "{listed}");
+    // Applied once, it is a no-op.
+    let out = ok(
+        &home,
+        &["project", "import", csv.to_str().unwrap(), "--apply"],
+    );
+    assert!(out.contains("nothing to change"), "{out}");
+
+    // JSON is the same round trip, and the extension is what picks it.
+    let json = s.0.join("projects.json");
+    ok(&home, &["project", "export", json.to_str().unwrap()]);
+    let text = fs::read_to_string(&json).unwrap();
+    assert!(
+        text.starts_with(r#"[{"name":"alpha","tags":[],"tier":1}"#),
+        "{text}"
+    );
+    fs::write(&json, text.replace(r#""tier":1"#, r#""tier":5"#)).unwrap();
+    ok(
+        &home,
+        &["project", "import", json.to_str().unwrap(), "--apply"],
+    );
+    assert!(ok(&home, &["project"]).contains("alpha  tier 5"));
+
+    let (_, err, success) = pma_in(
+        &home,
+        &["project", "export", &s.0.join("p.txt").to_string_lossy()],
+    );
+    assert!(!success && err.contains(".csv` or `.json"), "{err}");
+
+    // A file naming something that is not a project is refused whole.
+    fs::write(&csv, "name,tier,tags\nalpha,3\ndelta,1\n").unwrap();
+    let (_, err, success) = pma_in(
+        &home,
+        &["project", "import", csv.to_str().unwrap(), "--apply"],
+    );
+    assert!(!success && err.contains("not projects: delta"), "{err}");
+    assert!(
+        ok(&home, &["project"]).contains("alpha  tier 5"),
+        "nothing applied"
+    );
 }

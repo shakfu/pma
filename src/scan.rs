@@ -139,12 +139,14 @@ pub fn discover(roots: &[PathBuf]) -> (Vec<(String, PathBuf)>, Vec<String>) {
 
 /// Scans projects on up to 8 threads, returning facts in input order.
 /// Dependencies are measured only with `deps`, since it takes seconds per
-/// project.
+/// project. `finished` is called with each project's name as it lands, from
+/// whichever thread scanned it.
 pub fn scan_all(
     projects: &[(String, PathBuf)],
     ignore: &[String],
     offline: bool,
     deps: bool,
+    finished: &(dyn Fn(&str) + Sync),
 ) -> Vec<Facts> {
     let next = AtomicUsize::new(0);
     let results = Mutex::new(Vec::with_capacity(projects.len()));
@@ -158,6 +160,7 @@ pub fn scan_all(
                     };
                     let facts = scan_project(name, path, ignore, offline, deps);
                     results.lock().unwrap().push((i, facts));
+                    finished(name);
                 }
             });
         }

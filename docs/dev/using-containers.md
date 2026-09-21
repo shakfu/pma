@@ -58,6 +58,27 @@ Two corrections it needs:
 
 `--budget` is OpenRouter-only (`sanduk/README.md`), so `agent_budget` stops being enforced against Anthropic. The timeout remains the only bound.
 
+### Stage (a), as built
+
+2026-09-21. Items 1, 2 and 4 are done, and 1 and 2 were done differently from what was planned above.
+
+`sanduk --json` was not added. `sanduk --stream-json` copies the agent's own records to stdout before sanduk parses them, so `Parser::ClaudeJson` finds the `result` line and reads `total_cost_usd` from it. No new parser, and the cost is the agent's own figure rather than one relayed through a second format.
+
+The worker is a seeded template, `Worker::sanduk()` in `src/worker.rs`, rather than a `pma agent set` recipe in the README. Four flags have to be right and are not guessable:
+
+| Flag | Why |
+|-|-|
+| `--work-at-host-path` | the worktree is mounted where the host has it, so a path in a diff, a patch or a stack trace resolves for the person reading it |
+| `--stream-json` | the agent's own records reach the log, which is where the cost is |
+| `--no-report-instruction` | `REPORT.md` would land in the tree the diff is taken from, and in the scope check |
+| `--provider anthropic` | sanduk's default provider is openai, which `claude` cannot speak; without it every dispatch fails before the container starts |
+
+`--timeout {timeout}` carries `pma`'s own deadline less 30 seconds, so sanduk stops the run and deletes the container rather than being killed by `pma` and leaving it for its own sweep.
+
+Item 3, a `sanduk --version` check at preflight, was not done: a missing program already fails the run with `sanduk: No such file or directory (os error 2)`, which names the program and the run it stopped.
+
+What (a) still does not buy is unchanged: `verify` runs on the host, so an agent that edits `Makefile` or `conftest.py` is contained and the build that reads them is not. `--budget` reaches OpenRouter alone, so the timeout is the only bound on an Anthropic run's spend.
+
 ## Stage (b): both contained
 
 `sanduk` runs the agent and then `verify`, inside the box. `pma` reads the result rather than re-running the command.

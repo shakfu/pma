@@ -23,7 +23,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 24;
+const VERSION: i64 = 25;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -306,6 +306,12 @@ CREATE TABLE campaign_members (
     PRIMARY KEY (campaign, project)
 );
 ";
+
+/// Version 25. Seeds `sanduk`, the worker that runs the same agent in a
+/// disposable container. No schema: a worker is a record, and this one exists
+/// so the flags that have to be right are right without being typed. An
+/// existing row of that name is left alone, as the other templates are.
+const SANDUK_WORKER: &str = "-- no schema change; the seed is in Rust";
 
 /// Version 24. Retires a worker's own default model in favour of presets. A
 /// preset says the same thing and more -- a worker, a model and the arguments
@@ -631,6 +637,7 @@ impl Store {
                     WORKER_MODEL,
                     PRESETS,
                     PRESETS_REPLACE_WORKER_MODEL,
+                    SANDUK_WORKER,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -639,21 +646,26 @@ impl Store {
                 if version < 11 {
                     seed_agent(&tx, &crate::worker::Worker::claude())?;
                 }
+                // Not replacing an edited row: a template is a starting
+                // point, and the store is the record.
+                let mut seeded = Vec::new();
                 if version < 21 {
-                    // Not replacing an edited row: a template is a starting
-                    // point, and the store is the record.
-                    for w in [
+                    seeded.extend([
                         crate::worker::Worker::opencode(),
                         crate::worker::Worker::omp(),
-                    ] {
-                        if tx.query_row(
-                            "SELECT count(*) FROM agents WHERE name = ?1",
-                            [&w.name],
-                            |r| r.get::<_, i64>(0),
-                        )? == 0
-                        {
-                            seed_agent(&tx, &w)?;
-                        }
+                    ]);
+                }
+                if version < 25 {
+                    seeded.push(crate::worker::Worker::sanduk());
+                }
+                for w in seeded {
+                    if tx.query_row(
+                        "SELECT count(*) FROM agents WHERE name = ?1",
+                        [&w.name],
+                        |r| r.get::<_, i64>(0),
+                    )? == 0
+                    {
+                        seed_agent(&tx, &w)?;
                     }
                 }
                 tx.pragma_update(None, "user_version", VERSION)?;
@@ -2493,11 +2505,16 @@ mod tests {
     fn upgrading_seeds_the_worker_that_was_compiled_in() {
         let dir = scratch("agents");
         let store = Store::open(&dir.join("p.db")).unwrap();
-        // Three templates, alphabetically: the one that was compiled in, and
-        // the two installed separately.
+        // Four templates, alphabetically: the one that was compiled in, the
+        // two installed separately, and the same agent in a container.
         assert_eq!(
             store.agents().unwrap(),
-            [Worker::claude(), Worker::omp(), Worker::opencode()]
+            [
+                Worker::claude(),
+                Worker::omp(),
+                Worker::opencode(),
+                Worker::sanduk()
+            ]
         );
 
         let mut w = Worker::claude();
@@ -2520,7 +2537,8 @@ mod tests {
                 Worker::claude(),
                 w.clone(),
                 Worker::omp(),
-                Worker::opencode()
+                Worker::opencode(),
+                Worker::sanduk()
             ]
         );
         assert_eq!(store.agent("codex").unwrap(), w);
@@ -2530,7 +2548,12 @@ mod tests {
         assert!(!store.remove_agent("codex").unwrap());
         assert_eq!(
             store.agents().unwrap(),
-            [Worker::claude(), Worker::omp(), Worker::opencode()]
+            [
+                Worker::claude(),
+                Worker::omp(),
+                Worker::opencode(),
+                Worker::sanduk()
+            ]
         );
 
         // A template is a starting point: an edited row survives reopening,

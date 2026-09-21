@@ -43,6 +43,8 @@ pma ship                       # commit, push or open a pull request
 
 - `claude`, `opencode` and `omp` come as templates. Any coding agent with a headless mode is a record you edit, not a code change.
 
+- `sanduk` is the same agent in a disposable container: the key stays on the host, the worktree is mounted at its own path, and the box is the bound. Needs [sanduk](https://github.com/shakfu/sanduk) and a container engine; `pma agent show sanduk` prints what it runs. Verify still runs on the host, so a run that edits the build file is contained and the build is not.
+
 - Each run gets its own worktree of the remote default branch, so your dirty checkout is never touched.
 
 - The agent runs without push credentials. `pma` runs the project's test command itself, before and after, and reports both ends.

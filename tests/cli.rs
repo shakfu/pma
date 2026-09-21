@@ -3,11 +3,19 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 /// A scratch directory unique to one test, removed when dropped.
+///
+/// The name is a label, not the identity: tests in one binary share a pid and
+/// run in parallel, so two that picked the same label shared a directory --
+/// each wiped it on the way in and deleted it on the way out, under the other.
+/// The counter is what makes the path unique.
 struct Scratch(PathBuf);
+
+static SCRATCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl Scratch {
     fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("pma-test-{}-{name}", std::process::id()));
+        let n = SCRATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("pma-test-{}-{name}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         Scratch(dir)

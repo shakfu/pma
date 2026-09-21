@@ -183,10 +183,10 @@ fn truthy(value: &serde_json::Value) -> bool {
 pub struct Worker {
     pub name: String,
     pub command: String,
-    /// Arguments, with `{prompt}`, `{dir}`, `{model}` and `{budget}` filled
-    /// in at dispatch. `{extra}` stands for however many arguments a preset
-    /// adds, and sits where a worker wants them: before a positional prompt
-    /// for one that takes its message last.
+    /// Arguments, with `{prompt}`, `{dir}`, `{model}`, `{budget}` and
+    /// `{timeout}` filled in at dispatch. `{extra}` stands for however many
+    /// arguments a preset adds, and sits where a worker wants them: before a
+    /// positional prompt for one that takes its message last.
     pub args: Vec<String>,
     /// A flag and a rule template separated by a space, such as
     /// `--allowedTools Bash({cmd})`. The flag is emitted once, the rule once
@@ -243,9 +243,11 @@ impl Worker {
         model: Option<&str>,
         budget: f64,
         extra: &[String],
+        timeout: std::time::Duration,
     ) -> Command {
         let dir_text = dir.to_string_lossy().into_owned();
         let budget = budget.to_string();
+        let timeout = format!("{}s", timeout.as_secs());
         let mut args: Vec<String> = Vec::new();
         for arg in &self.args {
             // Zero or more arguments in one place, so a preset's effort flag
@@ -257,7 +259,8 @@ impl Worker {
             let filled = arg
                 .replace("{prompt}", prompt)
                 .replace("{dir}", &dir_text)
-                .replace("{budget}", &budget);
+                .replace("{budget}", &budget)
+                .replace("{timeout}", &timeout);
             let filled = match model {
                 Some(m) => filled.replace("{model}", m),
                 None if filled.contains("{model}") => {
@@ -365,6 +368,71 @@ impl Worker {
         }
     }
 
+    /// The same `claude`, in a disposable container. `sanduk` holds the API
+    /// key on the host and bind-mounts the worktree, so the container has the
+    /// files and never the credential.
+    ///
+    /// Four flags are not optional and are the reason this is a template
+    /// rather than a line in the README. `--work-at-host-path` mounts the
+    /// worktree at its own path, so a path in a diff or a stack trace resolves
+    /// for whoever reads it here. `--stream-json` passes the agent's own
+    /// output through, which is what `claude-json` reads a cost from -- without
+    /// it `sanduk` reformats the result into prose and the cost is lost.
+    /// `--no-report-instruction` keeps `REPORT.md` out of the worktree, where
+    /// it would land in the diff and in the scope check. `--timeout` bounds
+    /// the container from inside, so `sanduk` tears it down rather than
+    /// leaving it for its own sweep.
+    ///
+    /// `key-safe` over `sealed`: sealed blocks the fetch that `cargo`, `go`
+    /// and `pip` do mid-build, and a run that cannot fetch fails for a reason
+    /// that has nothing to do with the task. `pma agent set sanduk args` is
+    /// where a portfolio whose images carry their toolchains tightens it.
+    ///
+    /// No allowlist. The box is the bound, and a container that denies egress
+    /// does not also need a `Bash()` rule: shipping both means believing in
+    /// both.
+    pub fn sanduk() -> Worker {
+        Worker {
+            name: "sanduk".into(),
+            command: "sanduk".into(),
+            args: [
+                "run",
+                "{prompt}",
+                "-w",
+                "{dir}",
+                "--work-at-host-path",
+                "--agent",
+                "claude",
+                // Named beside the agent: `sanduk`'s default provider is
+                // openai, which `claude` cannot speak, so leaving it out
+                // fails every dispatch before the container starts.
+                "--provider",
+                "anthropic",
+                "--mode",
+                "key-safe",
+                "--model",
+                "{model}",
+                "--timeout",
+                "{timeout}",
+                "--stream-json",
+                "--no-report-instruction",
+                "{extra}",
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+            allow: None,
+            parse: Parser::ClaudeJson,
+            reports_cost: true,
+            // `--budget` reaches OpenRouter alone, so nothing here bounds an
+            // Anthropic run's spend. The timeout is the bound.
+            enforces_budget: false,
+            sandbox: true,
+            resumes: false,
+            env: BTreeMap::new(),
+        }
+    }
+
     pub fn omp() -> Worker {
         Worker {
             name: "omp".into(),
@@ -391,6 +459,10 @@ impl Worker {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::time::Duration;
+
+    /// A worker's own bound, as dispatch passes it.
+    const MINUTE: Duration = Duration::from_secs(60);
 
     fn args_of(cmd: &Command) -> Vec<String> {
         cmd.get_args()
@@ -401,7 +473,7 @@ mod tests {
     #[test]
     fn placeholders_are_filled_from_the_run() {
         let w = Worker::claude();
-        let cmd = w.build("do it", Path::new("/w/a"), Some("haiku"), 0.5, &[]);
+        let cmd = w.build("do it", Path::new("/w/a"), Some("haiku"), 0.5, &[], MINUTE);
         assert_eq!(
             args_of(&cmd),
             [
@@ -423,7 +495,7 @@ mod tests {
     /// `--model` with nothing after it.
     #[test]
     fn an_unset_model_takes_its_flag_with_it() {
-        let cmd = Worker::claude().build("do it", Path::new("/w/a"), None, 0.5, &[]);
+        let cmd = Worker::claude().build("do it", Path::new("/w/a"), None, 0.5, &[], MINUTE);
         let args = args_of(&cmd);
         assert!(!args.iter().any(|a| a.contains("{model}")), "{args:?}");
         assert!(!args.contains(&"--model".to_string()), "{args:?}");
@@ -443,7 +515,7 @@ mod tests {
             ..Worker::claude()
         };
         assert_eq!(
-            args_of(&w.build("do it", Path::new("/w/a"), None, 1.0, &[])),
+            args_of(&w.build("do it", Path::new("/w/a"), None, 1.0, &[], MINUTE)),
             ["exec", "-C", "/w/a", "do it"]
         );
     }
@@ -454,7 +526,7 @@ mod tests {
             allow: None,
             ..Worker::claude()
         };
-        let mut cmd = w.build("do it", Path::new("/w/a"), None, 1.0, &[]);
+        let mut cmd = w.build("do it", Path::new("/w/a"), None, 1.0, &[], MINUTE);
         let before = args_of(&cmd).len();
         w.allow_verify(&mut cmd, Some("make test"));
         assert_eq!(args_of(&cmd).len(), before);
@@ -463,7 +535,7 @@ mod tests {
     #[test]
     fn the_allowlist_names_one_rule_per_subcommand() {
         let w = Worker::claude();
-        let mut cmd = w.build("do it", Path::new("/w/a"), None, 1.0, &[]);
+        let mut cmd = w.build("do it", Path::new("/w/a"), None, 1.0, &[], MINUTE);
         w.allow_verify(&mut cmd, Some("make check && cargo test"));
         let args = args_of(&cmd);
         assert!(
@@ -552,7 +624,7 @@ mod tests {
             ("OPENAI_BASE_URL".into(), "http://localhost:11434/v1".into()),
             ("GH_TOKEN".into(), "sneaky".into()),
         ]);
-        let mut cmd = w.build("", &dir, None, 1.0, &[]);
+        let mut cmd = w.build("", &dir, None, 1.0, &[], MINUTE);
         crate::agent::restrict(&mut cmd, &dir);
         let out = cmd.output().unwrap();
         assert_eq!(
@@ -560,6 +632,90 @@ mod tests {
             "http://localhost:11434/v1 unset"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A worker that bounds itself is told when to stop, and is told sooner
+    /// than the pipeline's own deadline so it stops itself first.
+    #[test]
+    fn a_timeout_reaches_a_worker_that_takes_one() {
+        let cmd = Worker::sanduk().build(
+            "do it",
+            Path::new("/w/a"),
+            None,
+            1.0,
+            &[],
+            Duration::from_secs(870),
+        );
+        let args = args_of(&cmd);
+        assert_eq!(
+            args[args.iter().position(|a| a == "--timeout").unwrap() + 1],
+            "870s"
+        );
+    }
+
+    /// The container run is the same task in a box: the worktree at its own
+    /// path, the agent's own stream passed through so the cost survives, and
+    /// no REPORT.md written into the tree the diff is taken from.
+    #[test]
+    fn the_container_template_mounts_the_worktree_where_the_host_has_it() {
+        let w = Worker::sanduk();
+        let cmd = w.build(
+            "fix the test",
+            Path::new("/w/a"),
+            Some("opus"),
+            1.0,
+            &[],
+            MINUTE,
+        );
+        let args = args_of(&cmd);
+
+        assert_eq!(w.command, "sanduk");
+        assert_eq!(
+            args[args.iter().position(|a| a == "-w").unwrap() + 1],
+            "/w/a"
+        );
+        for flag in [
+            "--work-at-host-path",
+            "--stream-json",
+            "--no-report-instruction",
+        ] {
+            assert!(args.contains(&flag.to_string()), "{flag} is not passed");
+        }
+        assert_eq!(
+            args[args.iter().position(|a| a == "--model").unwrap() + 1],
+            "opus"
+        );
+        assert_eq!(args[1], "fix the test", "the task is sanduk's positional");
+    }
+
+    /// The box is the bound. A container that denies egress does not also need
+    /// a `Bash()` rule, and shipping both would mean believing in both.
+    #[test]
+    fn the_container_template_carries_no_allowlist() {
+        let w = Worker::sanduk();
+        let mut cmd = w.build("do it", Path::new("/w/a"), None, 1.0, &[], MINUTE);
+        let before = args_of(&cmd);
+        w.allow_verify(&mut cmd, Some("cargo test"));
+        assert_eq!(args_of(&cmd), before);
+    }
+
+    /// `sanduk` reformats a run's result into a prose line of its own, which
+    /// carries no cost. `--stream-json` passes the agent's records through
+    /// instead, and `claude-json` reads the last of them.
+    #[test]
+    fn the_container_template_still_reads_a_cost_from_the_agents_own_stream() {
+        let stream = concat!(
+            "sanduk: sanduk-ab12 -> /w/a\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"fixed","total_cost_usd":0.42}"#,
+            "\n",
+            "sanduk: 41.2s wall\n",
+        );
+        let report = Worker::sanduk().parse.report(stream, true);
+        assert!(report.ok);
+        assert_eq!(report.cost_usd, Some(0.42));
+        assert_eq!(report.summary, "fixed");
     }
 
     /// The templates are records too: nothing in the pipeline knows their
@@ -571,7 +727,7 @@ mod tests {
             (Worker::opencode(), "openai/gpt-5.2"),
             (Worker::omp(), "openrouter/anthropic/claude-sonnet-4.5"),
         ] {
-            let cmd = w.build("do it", Path::new("/w/a"), Some(expect), 1.0, &[]);
+            let cmd = w.build("do it", Path::new("/w/a"), Some(expect), 1.0, &[], MINUTE);
             let args = args_of(&cmd);
             assert!(args.contains(&expect.to_string()), "{args:?}");
             assert!(args.contains(&"/w/a".to_string()), "{args:?}");

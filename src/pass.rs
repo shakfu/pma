@@ -1512,20 +1512,18 @@ fn stage(
 /// The agent itself. No store and no `&Ctx`: this is the half that runs on a
 /// worker thread.
 fn work(cfg: &Config, worker: &crate::worker::Worker, chosen: &Chosen, job: &Staged) -> Ran {
+    let timeout = std::time::Duration::from_secs(cfg.timeout as u64 * 60);
     let mut cmd = worker.build(
         &job.run.prompt,
         &job.tree,
         chosen.model.as_deref(),
         cfg.agent_budget,
         &chosen.args,
+        timeout.saturating_sub(crate::dispatch::INNER_GRACE),
     );
     cmd.current_dir(&job.tree);
     crate::agent::restrict(&mut cmd, &job.empty);
-    let finished = match crate::agent::run_limited(
-        cmd,
-        &job.log,
-        std::time::Duration::from_secs(cfg.timeout as u64 * 60),
-    ) {
+    let finished = match crate::agent::run_limited(cmd, &job.log, timeout) {
         Ok(f) => f,
         Err(e) => {
             return Ran {

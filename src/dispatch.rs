@@ -594,6 +594,11 @@ pub fn verify_command(cfg: &Config, project: &str, worktree: &Path) -> Option<St
     }
 }
 
+/// How much sooner a worker that bounds itself is told to stop. A worker given
+/// the same deadline as this process is killed by it first, and one that runs a
+/// container then leaves the container for its own sweep to find.
+pub const INNER_GRACE: Duration = Duration::from_secs(30);
+
 /// Runs queued runs, at most `max_parallel` at once, starting a run only while
 /// the batch stays within `batch_budget`. `done` sees each run as it finishes.
 pub fn execute(
@@ -777,6 +782,7 @@ fn attempt(
         run.model.as_deref(),
         cfg.agent_budget,
         &run.extra_args,
+        timeout.saturating_sub(INNER_GRACE),
     );
     worker.allow_verify(&mut cmd, run.verify.as_deref());
     cmd.current_dir(&run.worktree);

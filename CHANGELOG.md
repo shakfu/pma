@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+**A `sanduk` worker, so a dispatch can run in a container.** Seeded like the other templates and selected the same way -- `pma config agent sanduk`, or `agent` on a route -- it runs the same `claude` inside a disposable container with the API key held on the host. Four of its flags are why it is a template rather than a line in the README: `--work-at-host-path` mounts the worktree where the host has it, so a path in a diff or a stack trace resolves; `--stream-json` passes the agent's own records through, which is what `claude-json` reads the cost from; `--no-report-instruction` keeps `REPORT.md` out of the tree the diff is taken from; and `--provider anthropic` is named beside `--agent claude`, because sanduk's default provider is openai and the mismatch fails the run before the container starts. It carries no allowlist: a container that denies egress does not also need a `Bash()` rule.
+
+`key-safe` rather than `sealed`, because sealed blocks the fetch `cargo`, `go` and `pip` do mid-build and a run that cannot fetch fails for a reason unrelated to its task. Verify still runs on the host: containing the agent and not the build is stage (a) of [docs/dev/using-containers.md](docs/dev/using-containers.md), not the end of it. Proved as far as the `docker run` argv sanduk prints for it; not yet run in a container.
+
+**`{timeout}` in a worker's arguments**, filled with the run's own deadline less 30 seconds. A worker that bounds itself has to stop first: given the same deadline it is killed by `pma` instead, and one that runs a container leaves the container for sanduk's sweep to find.
+
 **`pma workflow run` executes all five primitives.** Agent `map` and `reduce` nodes run one model per unit, reading `in.json` and writing `out.json` under `<data>/artifacts/<instance>/<node>/<n>/`, numbered per run; what comes back is checked against the declared type, the node's `max_units`, and, for `out: 1` and `out: 0..1`, that the id is one it was given and no field outside `writes` changed. A node that is not an `edit` works in a detached worktree, so a model that writes cannot reach the clone. An `edit` node goes through `dispatch::prepare` and the phase 1 gates and leaves a run to review, as a dispatch does. The four remaining `check` rules -- `verify`, `scope-clean`, `ci-green`, `pr-merged` -- read the run an `edit` recorded against the unit; with no run they are `unknown`, which takes the default edge rather than passing or failing.
 
 Iteration is not included. `retry`, a lap edge and a self-edge parse, bound and cost as they always did, and the runtime takes none of the three: a document using them runs its forward path once. A node's `publish` is parsed and ignored for the same kind of reason -- an agent node's worktree is discarded after the run. `docs/dev/workflows.md` marks both at the point it specifies them.
@@ -23,6 +29,9 @@ Iteration is not included. `retry`, a lap edge and a self-edge parse, bound and 
 **`pma scan` draws a progress bar.** `[########------------] 38/95 alpha` on stderr, redrawn as each project lands, cleared before the summary. A scan of 95 repositories takes about 15 seconds and printed nothing until it was over. Silent when stderr is not a terminal, so a pipe or a CI log holds the bytes it held before.
 
 ### Fixed
+
+**Two integration tests shared a scratch directory.** `Scratch::new` keyed the path on the test's label and the process id, and `ship_resumes_after_a_partial_failure` and `an_instance_resumes_under_its_own_revision` both passed `"resume"`. Tests in one binary share a pid and run in parallel, so each wiped the directory on the way in and deleted it on the way out, under the other: whichever lost the race failed with `git init: cannot change to .../root/alpha`. The path now carries a counter, so a repeated label cannot collide.
+
 
 **An instance now resumes under the revision it started with.** `--instance` read whichever revision was active, so activating another between passes walked old units with a different graph: moves are keyed by edge index, so the units could route through unrelated edges or reach a changed sink. The instance is loaded first, the name on the command line must be the one it runs, and its own recorded revision is what the pass walks. An instance that stopped short records why and is not resumed into the same wall; a finished one still re-derives to nothing, because readiness is evidence rather than a cursor (W9).
 

@@ -50,10 +50,10 @@ Every item is class B: `Class::of` gives B to an item with no class tag, and `#a
 | 12 | pkgdb | import packages from `pyproject.toml` | one-liner | 2 | | | | | |
 | 13 | pkgdb | report CI failures as `pkgdb check` events | one-liner | 3 | | | | | |
 | 14 | pkgdb | track packages you don't own | one-liner | 3 | | | | | |
-| 15 | pkgdb | auto-discover packages from your repos | one-liner | 4 | | | | | |
+| 15 | pkgdb | auto-discover packages from your repos | one-liner | 3 | | | | | |
 | 16 | margo | 11.5 untested packages | described | 2 | | | | | |
 | 17 | margo | 10.4 Ollama / local model support | described | 3 | | | | | |
-| 18 | margo | 10.3 OpenRouter live model fetch | one-liner | 4 | | | | | |
+| 18 | margo | 10.3 OpenRouter live model fetch | one-liner | 3 | | | | | |
 | 19 | margo | 10.2 per-workspace MCP server scoping | one-liner | 5 | | | | | |
 
 19 items rather than 20: the rest of `pkgdb` and `margo` failed the exclusions below.

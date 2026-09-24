@@ -1,29 +1,33 @@
 //! One pass over a workflow instance: write the argument bag, derive what is
-//! runnable, say what it would cost, and advance only what was approved.
+//! ready, run what a rule decides, and run an agent only under a plan the
+//! developer approved by its id.
 //!
 //! A pass holds no state of its own. What has run is the units a node wrote and
 //! the moves recorded against them, so the frontier is re-derived on every
 //! invocation and a killed pass resumes by recomputing rather than by trusting
 //! a cursor.
 //!
-//! Nothing here spends money without being told to. A node backed by a rule is
-//! free and deterministic, and runs as soon as its units arrive; a node backed
-//! by an agent is planned, priced and left for the developer to approve.
-//! Design: `docs/dev/workflows.md`.
+//! A node is ready once every node before it has finished, so a node always
+//! sees its whole bag: a `reduce` joins every branch, and a plan names every
+//! unit it will spend on. Design: `docs/dev/workflows.md`.
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde_json::Value;
 
 use crate::config::Config;
 use crate::dispatch::{Chosen, Overrides};
+use crate::route::{Approval, Policy};
 use crate::store::{Result, Store, WorkflowUnit};
 use crate::todo;
-use crate::workflow::{Action, Document, From, Node, Op, Out, Sink, To, Via, Workflow};
+use crate::workflow::{
+    Action, Document, FieldType, From, Node, Op, Out, Sink, To, Type, Via, Workflow,
+};
 
 /// What a pass reads while it runs one node: the store it records into, the
-/// settings, and the graph it is walking.
+/// settings, the graph it is walking, and what it has learnt this pass.
 struct Ctx<'a> {
     store: &'a Store,
     cfg: &'a Config,
@@ -32,41 +36,126 @@ struct Ctx<'a> {
     instance: i64,
     /// Where artifacts, logs and the scratch trees a node works in live.
     home: &'a Path,
-    /// The flags this pass was given, which an `edit` resolves its worker
-    /// with exactly as a dispatch does.
+    /// The flags this pass was given, which override any route.
     over: &'a Overrides,
     /// Every parameter's value for this instance: the declared default,
     /// replaced by the argument the run was given. What `{$name}` reads.
     params: BTreeMap<String, Value>,
+    /// The routing policy in effect, if any.
+    policy: Option<Active>,
+    /// Units a node refused this pass, each with its reason, for the report.
+    refused: RefCell<Vec<String>>,
+    /// Units a check found not ready this pass. They wait for the next one.
+    deferred: RefCell<BTreeSet<(String, String)>>,
+    /// The fetched head of each project's default branch, which the read
+    /// nodes of a workflow that edits work from.
+    bases: RefCell<BTreeMap<String, std::result::Result<String, String>>>,
 }
 
-/// What one node's turn did: the batch budget it committed, and whether it
-/// moved any unit. A turn that committed nothing and moved nothing is the
-/// budget saying stop, not a node that has finished, so the pass leaves the
-/// node on the frontier and the next invocation picks it up.
-struct Turn {
-    spent: f64,
-    advanced: bool,
+/// A policy revision in effect: its number, whether it is in shadow, and the
+/// policy itself.
+pub struct Active {
+    revision: i64,
+    shadow: bool,
+    policy: Policy,
+}
+
+/// The routing policy in effect, if any.
+pub fn active_policy(store: &Store) -> Result<Option<Active>> {
+    Ok(match store.active_route()? {
+        None => None,
+        Some(rev) => Some(Active {
+            revision: rev.revision,
+            shadow: rev.shadow,
+            policy: rev.policy()?,
+        }),
+    })
+}
+
+/// A warning per agent node that the policy in effect would refuse, because
+/// no route names it. Under a policy, a node is never sent to the settings.
+pub fn unrouted(store: &Store, w: &Workflow) -> Result<Vec<String>> {
+    let Some(active) = active_policy(store)? else {
+        return Ok(Vec::new());
+    };
+    Ok(w.nodes
+        .iter()
+        .filter(|n| !free(n))
+        .filter(|n| {
+            !active
+                .policy
+                .names_node(&n.name, matches!(n.op, Op::Edit(_)))
+        })
+        .map(|n| {
+            format!(
+                "node `{}`: no route in policy revision {} names it, so it would be refused; \
+                 add {{\"match\": {{\"node\": \"*/{}\"}}, ...}}",
+                n.name,
+                active.revision,
+                n.name.rsplit('/').next().unwrap_or(&n.name)
+            )
+        })
+        .collect())
+}
+
+/// A cap an instance hit. `advance` records it on the instance outside any
+/// transaction a node was writing in, so the record survives the rollback.
+#[derive(Debug)]
+pub struct Capped(pub String);
+
+impl std::fmt::Display for Capped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Capped {}
+
+/// What a guard and a prompt may read about a unit beyond its fields: the
+/// verdicts written against it, and the run an `edit` recorded for it.
+#[derive(Debug, Clone, Default)]
+struct Known {
+    verdicts: BTreeMap<(String, String), String>,
+    runs: BTreeMap<String, i64>,
+}
+
+impl Known {
+    fn load(store: &Store, instance: i64) -> Result<Known> {
+        let verdicts = store
+            .workflow_verdicts(instance)?
+            .into_iter()
+            .map(|(u, c, v)| ((u, c), v))
+            .collect();
+        // Oldest first, so a later run for the same unit replaces an earlier.
+        let runs = store
+            .runs()?
+            .into_iter()
+            .filter(|r| r.workflow_instance == Some(instance))
+            .filter_map(|r| Some((r.unit?, r.id)))
+            .collect();
+        Ok(Known { verdicts, runs })
+    }
 }
 
 /// What one invocation of a pass was told: where to work, the arguments the
-/// instance was given, and whether its spend was approved.
+/// instance was given, and the plan the developer approved, if any.
 pub struct Invocation<'a> {
     pub home: &'a Path,
     pub args: &'a Value,
-    pub approved: bool,
+    pub approve: Option<&'a str>,
 }
 
-/// What one node of the frontier would do.
+/// What one node of a plan would spend on.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Planned {
     pub node: String,
     pub op: String,
-    pub units: usize,
+    /// The units it would run over, by id.
+    pub units: Vec<String>,
     /// `None` for a node a rule decides, which costs nothing.
     pub agent: Option<String>,
     pub model: Option<String>,
-    /// Upper bound on what running it now would spend.
+    /// Upper bound on what running it would spend.
     pub cost: f64,
 }
 
@@ -76,11 +165,60 @@ impl Planned {
     }
 }
 
-/// The argument bag, from the targets the command line named. Frozen when the
-/// instance starts: a rescan must not move work under a pass already running.
-///
-/// A target's element type must be the one the workflow reads, which is the
-/// type error section 4.3 names at the call site.
+/// The agent runs a pass would make, which is what an approval names.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Plan {
+    pub steps: Vec<Planned>,
+}
+
+impl Plan {
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    pub fn cost(&self) -> f64 {
+        self.steps.iter().map(|p| p.cost).sum()
+    }
+
+    /// A short hash of what the plan runs: each node, its units, its worker
+    /// and its model. Approving by id means a pass runs what was printed and
+    /// nothing else; a frontier that changed has another id.
+    pub fn id(&self) -> String {
+        let mut text = String::new();
+        for p in &self.steps {
+            text.push_str(&format!(
+                "{}\u{0}{}\u{0}{}\u{0}{}\n",
+                p.node,
+                p.units.join(","),
+                p.agent.as_deref().unwrap_or(""),
+                p.model.as_deref().unwrap_or("")
+            ));
+        }
+        // FNV-1a: stable across builds and machines, unlike `DefaultHasher`.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in text.bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        format!("{h:016x}")[..12].to_string()
+    }
+}
+
+/// What a pass did and where it stopped.
+#[derive(Debug, Default)]
+pub struct Outcome {
+    /// The agent runs the next pass would make, priced. Empty when no agent
+    /// node is ready.
+    pub plan: Plan,
+    /// Nodes holding units that cannot move yet, with how many: a check
+    /// waiting on the world, and every node after it.
+    pub waiting: Vec<(String, usize)>,
+    /// Units a node refused this pass, each with its reason.
+    pub refused: Vec<String>,
+    /// Whether an approved plan ran.
+    pub ran: bool,
+}
+
 pub fn root_units(
     store: &Store,
     doc: &Document,
@@ -223,7 +361,7 @@ fn item_data(t: &crate::store::TaskRow) -> Value {
 /// Derived, so a dry run can price a bag it never wrote.
 pub fn entry_moves(w: &Workflow, unit: &WorkflowUnit) -> Vec<(usize, bool, Option<String>)> {
     let data: Value = serde_json::from_str(&unit.data).unwrap_or(Value::Null);
-    let system = system_fields(unit, &BTreeMap::new());
+    let system = system_fields(unit, &Known::default());
     w.edges
         .iter()
         .enumerate()
@@ -246,22 +384,191 @@ pub fn enter(store: &Store, instance: i64, w: &Workflow, unit: &WorkflowUnit) ->
     Ok(())
 }
 
-/// The frontier, priced, without running anything.
-pub fn plan(
+/// Nodes that may run now, in dependency order, each with the units waiting
+/// at it. A node is ready once every node before it has finished: it holds
+/// nothing and everything before it has finished. A node therefore sees its
+/// whole bag, which a `reduce` joining several branches depends on.
+fn frontier(
+    w: &Workflow,
+    units: &[WorkflowUnit],
+    moves: &[(String, usize, bool)],
+    deferred: &BTreeSet<(String, String)>,
+) -> Vec<(String, Vec<WorkflowUnit>)> {
+    let waiting = waiting(w, units, moves);
+    let mut finished: BTreeSet<String> = BTreeSet::new();
+    let mut ready = Vec::new();
+    for name in crate::workflow::topological(w) {
+        if !w.predecessors(&name).iter().all(|p| finished.contains(*p)) {
+            continue;
+        }
+        let held = waiting.get(&name).cloned().unwrap_or_default();
+        if held.is_empty() {
+            finished.insert(name);
+            continue;
+        }
+        let here: Vec<WorkflowUnit> = held
+            .into_iter()
+            .filter(|u| !deferred.contains(&(name.clone(), u.id.clone())))
+            .collect();
+        if !here.is_empty() {
+            ready.push((name, here));
+        }
+    }
+    ready
+}
+
+/// Nodes holding units, with how many. What a pass reports when it stops with
+/// work that cannot move yet.
+fn holding(
+    w: &Workflow,
+    units: &[WorkflowUnit],
+    moves: &[(String, usize, bool)],
+) -> Vec<(String, usize)> {
+    let waiting = waiting(w, units, moves);
+    crate::workflow::topological(w)
+        .into_iter()
+        .filter_map(|n| waiting.get(&n).map(|u| (n.clone(), u.len())))
+        .filter(|(_, n)| *n > 0)
+        .collect()
+}
+
+/// The units one agent run takes: one per unit, or one per group for a
+/// `reduce`, which is what the worst case prices.
+fn batches(node: &Node, units: &[WorkflowUnit]) -> Vec<Vec<WorkflowUnit>> {
+    match &node.op {
+        Op::Reduce(r) => {
+            let mut groups: Vec<(String, Vec<WorkflowUnit>)> = Vec::new();
+            for unit in units {
+                let key = group_key(r, unit);
+                match groups.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, bag)) => bag.push(unit.clone()),
+                    None => groups.push((key, vec![unit.clone()])),
+                }
+            }
+            groups.into_iter().map(|(_, bag)| bag).collect()
+        }
+        _ => units.iter().map(|u| vec![u.clone()]).collect(),
+    }
+}
+
+/// The worker a plan shows for a node. An `edit` is routed at dispatch, where
+/// its class and complexity are known, so under a policy it shows the route.
+fn shown_worker(
     store: &Store,
     cfg: &Config,
     over: &Overrides,
-    w: &Workflow,
-    instance: i64,
-) -> Result<Vec<Planned>> {
-    let units = store.workflow_units(instance)?;
-    let moves = store.workflow_moves(instance)?;
-    plan_over(store, cfg, over, w, &units, &moves)
+    policy: &Option<Active>,
+    node: &Node,
+    unit: &WorkflowUnit,
+) -> Result<(String, Option<String>)> {
+    if matches!(node.op, Op::Edit(_)) && policy.as_ref().is_some_and(|p| !p.shadow) {
+        let chosen = crate::dispatch::choose_worker(store, cfg, over, None)?;
+        let flagged = over.agent.is_some() || over.model.is_some() || over.preset.is_some();
+        return Ok(match flagged {
+            true => (chosen.agent, chosen.model),
+            false => ("by route".into(), None),
+        });
+    }
+    let tier = tier_of(store, unit)?;
+    Ok(match resolve(store, cfg, over, policy, node, unit, tier)? {
+        Ok(r) => (r.chosen.agent, r.chosen.model),
+        Err(_) => ("no route".into(), None),
+    })
 }
 
-/// The frontier of a bag, priced, whether or not the store holds it. What a
-/// dry run reads: it plans and prices without starting an instance, because
-/// the help says it runs nothing and an abandoned instance is something.
+fn tier_of(store: &Store, unit: &WorkflowUnit) -> Result<Option<u8>> {
+    Ok(match &unit.project {
+        Some(p) => store.project(p)?.and_then(|r| r.tier),
+        None => None,
+    })
+}
+
+/// A worker and a model for one run of a node that edits nothing, and the
+/// route that chose them. The flags win, then the route, then the settings,
+/// exactly as a dispatch resolves. Under a policy, a node no route serves is
+/// refused rather than sent to the settings.
+struct Resolved {
+    chosen: Chosen,
+    route: Option<(i64, String, Approval)>,
+}
+
+fn resolve(
+    store: &Store,
+    cfg: &Config,
+    over: &Overrides,
+    policy: &Option<Active>,
+    node: &Node,
+    unit: &WorkflowUnit,
+    tier: Option<u8>,
+) -> Result<std::result::Result<Resolved, String>> {
+    let mut applied = None;
+    let mut route = None;
+    if let Some(active) = policy {
+        let Some(r) = active.policy.route_read(&node.name, unit.lap, tier) else {
+            return Ok(Err(format!(
+                "node `{}` matches no route in policy revision {}; add a route naming it",
+                node.name, active.revision
+            )));
+        };
+        route = Some((active.revision, r.name.clone(), r.approval));
+        if !active.shadow {
+            applied = Some((r.agent.clone(), r.model.clone()));
+        }
+    }
+    let chosen = crate::dispatch::choose_worker(store, cfg, over, applied)?;
+    Ok(Ok(Resolved { chosen, route }))
+}
+
+/// The agent runs the ready nodes would make, in dependency order, as many as
+/// `batch_budget` admits at `agent_budget` each. What `--approve` names.
+fn plan_of(
+    store: &Store,
+    cfg: &Config,
+    over: &Overrides,
+    policy: &Option<Active>,
+    w: &Workflow,
+    ready: &[(String, Vec<WorkflowUnit>)],
+) -> Result<Plan> {
+    let mut room = match cfg.agent_budget > 0.0 {
+        true => (cfg.batch_budget / cfg.agent_budget).floor().max(0.0) as usize,
+        false => usize::MAX,
+    };
+    let mut steps = Vec::new();
+    for (name, units) in ready {
+        let Some(node) = w.node(name) else { continue };
+        if free(node) {
+            continue;
+        }
+        if room == 0 {
+            if steps.is_empty() {
+                return Err(format!(
+                    "batch_budget of ${:.2} admits no run at agent_budget of ${:.2}",
+                    cfg.batch_budget, cfg.agent_budget
+                )
+                .into());
+            }
+            break;
+        }
+        let all = batches(node, units);
+        let take = all.len().min(room);
+        room -= take;
+        let taken: Vec<WorkflowUnit> = all[..take].concat();
+        let (agent, model) = shown_worker(store, cfg, over, policy, node, &taken[0])?;
+        steps.push(Planned {
+            node: name.clone(),
+            op: node.op.name().to_string(),
+            units: taken.iter().map(|u| u.id.clone()).collect(),
+            agent: Some(agent),
+            model,
+            cost: take as f64 * cfg.agent_budget,
+        });
+    }
+    Ok(Plan { steps })
+}
+
+/// The ready nodes of a bag, priced, whether or not the store holds it. What
+/// a dry run reads. A node a rule decides is listed as free, and the agent
+/// nodes form the plan a first pass would print.
 pub fn plan_over(
     store: &Store,
     cfg: &Config,
@@ -269,53 +576,64 @@ pub fn plan_over(
     w: &Workflow,
     units: &[WorkflowUnit],
     moves: &[(String, usize, bool)],
-) -> Result<Vec<Planned>> {
-    let chosen = crate::dispatch::choose_worker(store, cfg, over, None)?;
-    let (agent, model) = (chosen.agent, chosen.model);
-    Ok(waiting(w, units, moves)
-        .into_iter()
+) -> Result<(Vec<Planned>, Plan)> {
+    let policy = active_policy(store)?;
+    let ready = frontier(w, units, moves, &BTreeSet::new());
+    let rules = ready
+        .iter()
         .filter_map(|(name, units)| {
-            let node = w.node(&name)?;
-            let free = free(node);
-            Some(Planned {
+            let node = w.node(name)?;
+            free(node).then(|| Planned {
                 node: name.clone(),
                 op: node.op.name().to_string(),
-                units: units.len(),
-                agent: (!free).then(|| agent.clone()),
-                model: (!free).then(|| model.clone()).flatten(),
-                cost: if free {
-                    0.0
-                } else {
-                    units.len() as f64 * cfg.agent_budget
-                },
+                units: units.iter().map(|u| u.id.clone()).collect(),
+                agent: None,
+                model: None,
+                cost: 0.0,
             })
         })
-        .collect())
+        .collect();
+    let plan = plan_of(store, cfg, over, &policy, w, &ready)?;
+    Ok((rules, plan))
 }
 
-/// One line per node of the frontier, priced. What the developer approves.
-pub fn describe(plan: &[Planned], lead: &str) -> String {
-    if plan.is_empty() {
+/// The frontier of a stored instance, priced, without running anything.
+pub fn plan(
+    store: &Store,
+    cfg: &Config,
+    over: &Overrides,
+    w: &Workflow,
+    instance: i64,
+) -> Result<(Vec<Planned>, Plan)> {
+    let units = store.workflow_units(instance)?;
+    let moves = store.workflow_moves(instance)?;
+    plan_over(store, cfg, over, w, &units, &moves)
+}
+
+/// One line per node, priced. What the developer approves.
+pub fn describe(steps: &[Planned], lead: &str) -> String {
+    if steps.is_empty() {
         return "nothing is runnable\n".to_string();
     }
-    let mut rows = Vec::new();
-    for p in plan {
-        rows.push(vec![
-            format!("{lead}{}", p.node),
-            p.op.clone(),
-            format!("{} unit(s)", p.units),
-            match (&p.agent, &p.model) {
-                (None, _) => "a rule, free".to_string(),
-                (Some(a), None) => a.clone(),
-                (Some(a), Some(m)) => format!("{a}/{m}"),
-            },
-            if p.free() {
-                "$0.00".to_string()
-            } else {
-                format!("<= ${:.2}", p.cost)
-            },
-        ]);
-    }
+    let rows: Vec<Vec<String>> = steps
+        .iter()
+        .map(|p| {
+            vec![
+                format!("{lead}{}", p.node),
+                p.op.clone(),
+                format!("{} unit(s)", p.units.len()),
+                match (&p.agent, &p.model) {
+                    (None, _) => "a rule, free".to_string(),
+                    (Some(a), None) => a.clone(),
+                    (Some(a), Some(m)) => format!("{a}/{m}"),
+                },
+                match p.free() {
+                    true => "$0.00".to_string(),
+                    false => format!("<= ${:.2}", p.cost),
+                },
+            ]
+        })
+        .collect();
     crate::report::table(&rows, "")
 }
 
@@ -330,7 +648,7 @@ fn free(node: &Node) -> bool {
 }
 
 /// Units waiting at each node: those an incoming edge admitted and this node
-/// has not consumed. A node whose units have all been consumed is done, which
+/// has not handled. A node whose units have all been handled is done, which
 /// is how a second pass advances nothing.
 fn waiting(
     w: &Workflow,
@@ -369,10 +687,10 @@ fn route_unit(
     w: &Workflow,
     from: &str,
     unit: &WorkflowUnit,
-    verdicts: &BTreeMap<(String, String), String>,
+    known: &Known,
 ) -> Result<()> {
     let data: Value = serde_json::from_str(&unit.data).unwrap_or(Value::Null);
-    let system = system_fields(unit, verdicts);
+    let system = system_fields(unit, known);
     let mut matched = false;
     let mut defaults = Vec::new();
     for (i, e) in w.edges.iter().enumerate() {
@@ -416,12 +734,48 @@ fn route_unit(
     Ok(())
 }
 
-/// The `@` fields a guard may read: the unit's own, plus every verdict written
-/// against it. A guard reads what is recorded rather than recomputing it.
-fn system_fields(
-    unit: &WorkflowUnit,
-    verdicts: &BTreeMap<(String, String), String>,
-) -> BTreeMap<String, Value> {
+/// Where a unit goes when its node did not run cleanly for it: a default edge
+/// alone, and only one that carries the unit's own type, else nowhere. An
+/// unguarded edge is for units the node produced; taking it here would pass
+/// on an unconfirmed claim, or a unit of the wrong type (section 10).
+fn route_failed(ctx: &Ctx<'_>, node: &Node, unit: &WorkflowUnit, why: &str) -> Result<()> {
+    let Ctx {
+        store, w, instance, ..
+    } = *ctx;
+    store.add_workflow_verdict(instance, &unit.id, &node.name, "failed", Some(why))?;
+    ctx.refused
+        .borrow_mut()
+        .push(format!("{}: {}: {why}", node.name, unit.id));
+    let carries = w.output_of(node) == unit.ty;
+    let mut taken = false;
+    for (i, e) in w.edges.iter().enumerate() {
+        if e.from != From::Node(node.name.clone()) {
+            continue;
+        }
+        if e.default && carries {
+            store.add_workflow_move(instance, &unit.id, i, true, Some("the node failed"))?;
+            taken = true;
+        } else {
+            let reason = format!("the node failed: {why}");
+            store.add_workflow_move(instance, &unit.id, i, false, Some(&reason))?;
+        }
+    }
+    if !taken {
+        let reason = format!("failed: {why}");
+        store.add_workflow_move(
+            instance,
+            &unit.id,
+            settled_at(w, &node.name),
+            false,
+            Some(&reason),
+        )?;
+    }
+    Ok(())
+}
+
+/// The `@` fields a guard may read: the unit's own, every verdict written
+/// against it, and `@run` once an `edit` has recorded one.
+fn system_fields(unit: &WorkflowUnit, known: &Known) -> BTreeMap<String, Value> {
     let mut out = BTreeMap::new();
     out.insert("id".into(), Value::from(unit.id.clone()));
     out.insert("type".into(), Value::from(unit.ty.clone()));
@@ -435,7 +789,10 @@ fn system_fields(
     if let Some(project) = &unit.project {
         out.insert("project".into(), Value::from(project.clone()));
     }
-    for ((u, check), verdict) in verdicts {
+    if let Some(run) = known.runs.get(&unit.id) {
+        out.insert("run".into(), Value::from(run.to_string()));
+    }
+    for ((u, check), verdict) in &known.verdicts {
         if *u == unit.id {
             out.insert(check.clone(), Value::from(verdict.clone()));
         }
@@ -474,19 +831,16 @@ fn next_id(units: &[WorkflowUnit], node: &str, n: usize) -> String {
 /// it. `held` is the instance's unit count, which this advances.
 ///
 /// The caps are what `activate` weighed against the budget, so the runtime has
-/// to hold them or the approved figure bounds nothing. Exhaustion stops the
-/// pass and is recorded on the instance: a bag silently short of its input
-/// cannot be told from a complete one by anything downstream.
+/// to hold them or the approved figure bounds nothing.
 fn mint(
     ctx: &Ctx<'_>,
     node: &Node,
     unit: WorkflowUnit,
     held: &mut i64,
-    verdicts: &BTreeMap<(String, String), String>,
+    known: &Known,
 ) -> Result<()> {
     if *held >= ctx.w.caps.max_units {
         return Err(capped(
-            ctx,
             &node.name,
             format!(
                 "instance {} holds {held} units, its `caps.max_units`",
@@ -495,28 +849,16 @@ fn mint(
         ));
     }
     *held += 1;
-    let id = unit.id.clone();
     ctx.store.add_workflow_unit(ctx.instance, &unit)?;
-    let child = ctx
-        .store
-        .workflow_units(ctx.instance)?
-        .into_iter()
-        .find(|u| u.id == id)
-        .expect("just written");
-    route_unit(ctx.store, ctx.instance, ctx.w, &node.name, &child, verdicts)
+    route_unit(ctx.store, ctx.instance, ctx.w, &node.name, &unit, known)
 }
 
-/// Stops the pass at a cap, naming the node and what it exceeded, and records
-/// the instance as capped so a resume does not walk into the same wall.
-fn capped(ctx: &Ctx<'_>, node: &str, why: String) -> Box<dyn std::error::Error> {
-    if let Err(e) = ctx.store.note_instance_outcome(ctx.instance, "capped") {
-        return e;
-    }
-    format!(
-        "node `{node}`: {why}. Nothing further was written; raise the cap and \
-         propose another revision."
-    )
-    .into()
+/// Stops the pass at a cap, naming the node and what it exceeded.
+fn capped(node: &str, why: String) -> Box<dyn std::error::Error> {
+    Box::new(Capped(format!(
+        "node `{node}`: {why}. Nothing further was written; resume with a higher \
+         cap, `--cap max_units=<n>` or `--cap max_edits=<n>`"
+    )))
 }
 
 /// What one input unit may yield at a `0..n` map: the declared width, read at
@@ -530,8 +872,10 @@ fn width(w: &Workflow, node: &Node) -> Option<i64> {
     }
 }
 
-/// Runs every node of the frontier a rule decides, and plans the rest. The
-/// plan is what the developer approves before anything is spent.
+/// Runs every ready node a rule decides, then either reports the plan for the
+/// agent nodes that are ready or, when `approve` names that plan, runs it.
+/// An approval runs one plan: nodes that become ready after it are priced for
+/// the next invocation, never run under an approval that did not name them.
 pub fn advance(
     store: &Store,
     cfg: &Config,
@@ -540,99 +884,100 @@ pub fn advance(
     w: &Workflow,
     instance: i64,
     given: &Invocation<'_>,
-) -> Result<Vec<Planned>> {
-    let Invocation {
-        home,
-        args,
-        approved,
-    } = *given;
-    let chosen = crate::dispatch::choose_worker(store, cfg, over, None)?;
-    let (agent, model) = (chosen.agent.clone(), chosen.model.clone());
-    let mut plan = Vec::new();
-    // One iteration per node run. A graph's worst case bounds the units, so a
-    // pass that exceeds this is a bug rather than a long job, and saying so is
-    // better than spinning.
-    let ceiling = (w.caps.max_units.max(1) as usize + 1) * (w.nodes.len() + 1);
-    // What this pass has committed against `batch_budget`, over every node it
-    // has run. Held here because a pass is the unit the budget bounds, not a
-    // node's turn: `advance` re-enters a node as its frontier refills.
-    let mut committed = 0.0;
+) -> Result<Outcome> {
+    let result = advance_inner(store, cfg, over, doc, w, instance, given);
+    if let Err(e) = &result
+        && e.downcast_ref::<Capped>().is_some()
+    {
+        store.note_instance_outcome(instance, "capped")?;
+    }
+    result
+}
+
+fn advance_inner(
+    store: &Store,
+    cfg: &Config,
+    over: &Overrides,
+    doc: &Document,
+    w: &Workflow,
+    instance: i64,
+    given: &Invocation<'_>,
+) -> Result<Outcome> {
     let ctx = Ctx {
         store,
         cfg,
         doc,
         w,
         instance,
-        home,
+        home: given.home,
         over,
-        params: w.arguments(args),
+        params: w.arguments(given.args),
+        policy: active_policy(store)?,
+        refused: RefCell::new(Vec::new()),
+        deferred: RefCell::new(BTreeSet::new()),
+        bases: RefCell::new(BTreeMap::new()),
     };
+    let mut approve = given.approve.map(String::from);
+    let mut ran = false;
+    // One iteration per node run. A graph's worst case bounds the units, so a
+    // pass that exceeds this is a bug rather than a long job.
+    let ceiling = (w.caps.max_units.max(1) as usize + 1) * (w.nodes.len() + 1);
     for _ in 0..ceiling {
         let units = store.workflow_units(instance)?;
         let moves = store.workflow_moves(instance)?;
-        let verdicts: BTreeMap<(String, String), String> = store
-            .workflow_verdicts(instance)?
-            .into_iter()
-            .map(|(u, c, v)| ((u, c), v))
-            .collect();
-        let frontier = waiting(w, &units, &moves);
-        let mut ran = false;
-        plan.clear();
-        // Free nodes first, every time: a rule costs nothing and may settle
-        // units an agent node would otherwise be priced for.
-        for free_first in [true, false] {
-            for (name, waiting) in &frontier {
-                let Some(node) = w.node(name) else { continue };
-                if free(node) != free_first {
-                    continue;
-                }
-                if free_first {
-                    run_free(&ctx, node, waiting, &verdicts)?;
-                    ran = true;
-                    break;
-                }
-                let priced = Planned {
-                    node: name.clone(),
-                    op: node.op.name().to_string(),
-                    units: waiting.len(),
-                    agent: Some(agent.clone()),
-                    model: model.clone(),
-                    cost: waiting.len() as f64 * cfg.agent_budget,
-                };
-                if !approved {
-                    plan.push(priced);
-                    continue;
-                }
-                let turn = match node.op {
-                    Op::Edit(_) => {
-                        run_edit(&ctx, node, waiting, &verdicts, cfg.batch_budget - committed)?
+        let known = Known::load(store, instance)?;
+        let ready = frontier(w, &units, &moves, &ctx.deferred.borrow());
+
+        // Free nodes first, every time: a rule costs nothing and needs no
+        // approval.
+        if let Some((name, waiting)) = ready.iter().find(|(n, _)| w.node(n).is_some_and(free)) {
+            let node = w.node(name).expect("found above");
+            run_free(&ctx, node, waiting, &known)?;
+            continue;
+        }
+        let plan = plan_of(store, cfg, over, &ctx.policy, w, &ready)?;
+        let id = plan.id();
+        match approve.take() {
+            Some(given) if !plan.is_empty() && given == id => {
+                for step in &plan.steps {
+                    let node = w.node(&step.node).expect("planned from the graph");
+                    let waiting = &ready
+                        .iter()
+                        .find(|(n, _)| *n == step.node)
+                        .expect("planned from the frontier")
+                        .1;
+                    let units: Vec<WorkflowUnit> = waiting
+                        .iter()
+                        .filter(|u| step.units.contains(&u.id))
+                        .cloned()
+                        .collect();
+                    match node.op {
+                        Op::Edit(_) => run_edit(&ctx, node, &units, &known)?,
+                        _ => run_agent(&ctx, node, &units, &known)?,
                     }
-                    _ => run_agent(
-                        &ctx,
-                        node,
-                        waiting,
-                        &verdicts,
-                        &chosen,
-                        cfg.batch_budget - committed,
-                    )?,
-                };
-                committed += turn.spent;
-                // The batch budget admitted nothing, so the node keeps its
-                // place: the pass ends and the next one resumes here. A pass
-                // is not a daemon, and stopping at a budget is not an error.
-                if !turn.advanced {
-                    plan.push(priced);
-                    continue;
                 }
                 ran = true;
-                break;
+                continue;
             }
-            if ran {
-                break;
+            Some(given) if plan.is_empty() => {
+                return Err(format!("plan {given} is not ready: no agent node is").into());
             }
-        }
-        if !ran {
-            return Ok(plan);
+            Some(given) => {
+                return Err(format!(
+                    "plan {given} is not the plan for this pass, which is {id}:\n{}\
+                     Nothing was spent.",
+                    describe(&plan.steps, "")
+                )
+                .into());
+            }
+            None => {
+                return Ok(Outcome {
+                    plan,
+                    waiting: holding(w, &units, &moves),
+                    refused: ctx.refused.take(),
+                    ran,
+                });
+            }
         }
     }
     Err(format!(
@@ -643,13 +988,9 @@ pub fn advance(
 }
 
 /// A node a rule decides. It reads what is already recorded, writes units or a
-/// verdict or a file `pma` owns, and costs nothing.
-fn run_free(
-    ctx: &Ctx<'_>,
-    node: &Node,
-    waiting: &[WorkflowUnit],
-    verdicts: &BTreeMap<(String, String), String>,
-) -> Result<()> {
+/// verdict or a file `pma` owns, and costs nothing. A unit the rule cannot
+/// take is refused on its own; the pass goes on.
+fn run_free(ctx: &Ctx<'_>, node: &Node, waiting: &[WorkflowUnit], known: &Known) -> Result<()> {
     let Ctx {
         store,
         doc,
@@ -657,20 +998,26 @@ fn run_free(
         instance,
         ..
     } = *ctx;
-    let mut verdicts = verdicts.clone();
+    let mut known = known.clone();
     match &node.op {
         Op::Map(m) => {
             let rule = m.rule.as_deref().unwrap_or_default();
             let all = store.workflow_units(instance)?;
             let mut held = all.len() as i64;
             let mut minted = 0;
+            let mut seen = unique_seen(ctx, node, &m.emits)?;
             for unit in waiting {
-                let produced = rule_map(store, doc, rule, m.out, unit)?;
+                let produced = match rule_map(store, doc, rule, &m.emits, m.out, unit) {
+                    Ok(p) => p,
+                    Err(why) => {
+                        store.atomically(|| route_failed(ctx, node, unit, &why.to_string()))?;
+                        continue;
+                    }
+                };
                 if let Some(width) = width(w, node)
                     && produced.len() as i64 > width
                 {
                     return Err(capped(
-                        ctx,
                         &node.name,
                         format!(
                             "`{}` yielded {} units from `{}`, over its `max_units` of {width}",
@@ -682,6 +1029,12 @@ fn run_free(
                 }
                 store.atomically(|| {
                     for data in produced {
+                        if let Some(why) = duplicate(ctx, &m.emits, &data, unit, &mut seen)? {
+                            ctx.refused
+                                .borrow_mut()
+                                .push(format!("{}: {}: dropped: {why}", node.name, unit.id));
+                            continue;
+                        }
                         let id = next_id(&all, &node.name, minted);
                         minted += 1;
                         mint(
@@ -699,7 +1052,7 @@ fn run_free(
                                 data: data.to_string(),
                             },
                             &mut held,
-                            &verdicts,
+                            &known,
                         )?;
                     }
                     // The unit itself stops here: its children carry on.
@@ -720,16 +1073,9 @@ fn run_free(
             let mut minted = 0;
             // A reduce decides per group, so the groups are formed first and
             // the rule says which of each group's units carry on.
-            let mut groups: Vec<(String, Vec<&WorkflowUnit>)> = Vec::new();
-            for unit in waiting {
-                let key = group_key(r, unit);
-                match groups.iter_mut().find(|(k, _)| *k == key) {
-                    Some((_, bag)) => bag.push(unit),
-                    None => groups.push((key, vec![unit])),
-                }
-            }
-            for (_, bag) in &groups {
-                let (kept, dropped) = rule_reduce(rule, bag)?;
+            for bag in batches(node, waiting) {
+                let bag: Vec<&WorkflowUnit> = bag.iter().collect();
+                let (kept, dropped) = rule_reduce(rule, &bag)?;
                 for unit in dropped {
                     store.add_workflow_move(
                         instance,
@@ -761,7 +1107,7 @@ fn run_free(
                                 data: unit.data.clone(),
                             },
                             &mut held,
-                            &verdicts,
+                            &known,
                         )?;
                         // The input stops here and its replacement carries
                         // on. Without this the node would be offered the same
@@ -779,8 +1125,18 @@ fn run_free(
         }
         Op::Check { rule } => {
             for unit in waiting {
-                let (verdict, detail) = run_check(ctx, rule, unit, waiting.len())?;
-                verdicts.insert((unit.id.clone(), rule.clone()), verdict.clone());
+                let (verdict, detail) = match run_check(ctx, rule, unit)? {
+                    Checked::NotReady(_) => {
+                        ctx.deferred
+                            .borrow_mut()
+                            .insert((node.name.clone(), unit.id.clone()));
+                        continue;
+                    }
+                    Checked::Verdict(v, d) => (v, d),
+                };
+                known
+                    .verdicts
+                    .insert((unit.id.clone(), rule.clone()), verdict.clone());
                 store.atomically(|| {
                     store.add_workflow_verdict(
                         instance,
@@ -789,7 +1145,7 @@ fn run_free(
                         &verdict,
                         detail.as_deref(),
                     )?;
-                    route_unit(store, instance, w, &node.name, unit, &verdicts)?;
+                    route_unit(store, instance, w, &node.name, unit, &known)?;
                     mark_handled(store, instance, w, &node.name, &unit.id)
                 })?;
             }
@@ -797,10 +1153,15 @@ fn run_free(
         Op::Emit(e) => {
             for unit in waiting {
                 let data: Value = serde_json::from_str(&unit.data).unwrap_or(Value::Null);
-                store.atomically(|| {
-                    emit(ctx, e, unit, &data, &verdicts)?;
-                    route_unit(store, instance, w, &node.name, unit, &verdicts)?;
-                    mark_handled(store, instance, w, &node.name, &unit.id)
+                // The file and the moves are written together: a refusal
+                // writes nothing to the file, and a unit already written is
+                // found there on a resumed pass rather than written twice.
+                store.atomically(|| match emit(ctx, e, unit, &data, &known)? {
+                    Ok(()) => {
+                        route_unit(store, instance, w, &node.name, unit, &known)?;
+                        mark_handled(store, instance, w, &node.name, &unit.id)
+                    }
+                    Err(why) => route_failed(ctx, node, unit, &why),
                 })?;
             }
         }
@@ -817,11 +1178,13 @@ fn mark_handled(store: &Store, instance: i64, w: &Workflow, node: &str, unit: &s
     store.add_workflow_move(instance, unit, settled_at(w, node), false, Some("handled"))
 }
 
-/// The rules a `map` may name. Each reads what `pma` already knows.
+/// The rules a `map` may name. Each reads what `pma` already knows. An error
+/// is the reason the unit is refused.
 fn rule_map(
     store: &Store,
     doc: &Document,
     rule: &str,
+    emits: &str,
     out: Out,
     unit: &WorkflowUnit,
 ) -> Result<Vec<Value>> {
@@ -902,34 +1265,28 @@ fn rule_map(
                 .map(|l| serde_json::json!({"kind": "deps", "detail": l}))
                 .collect())
         }
-        // The document declares the shape it wants back, so the fields are
-        // `gh`'s own names and the projection is the document's job.
+        // `gh`'s fields under the names the built-in `item` uses, projected
+        // onto the type the node emits and checked against it.
         "open-issues" => {
             let row = row()?;
-            let out = std::process::Command::new("gh")
-                .args(["issue", "list", "--state", "open", "--limit", "100"])
+            let mut cmd = std::process::Command::new("gh");
+            cmd.args(["issue", "list", "--state", "open", "--limit", "100"])
                 .args(["--json", "number,title,body,labels"])
-                .current_dir(&row.path)
-                .output()
-                .map_err(|e| format!("gh: {e}"))?;
-            if !out.status.success() {
-                return Err(String::from_utf8_lossy(&out.stderr)
-                    .lines()
-                    .map(str::trim)
-                    .find(|l| !l.is_empty())
-                    .unwrap_or("gh issue list failed")
-                    .to_string()
-                    .into());
-            }
-            let listed: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+                .current_dir(&row.path);
+            let listed = crate::scan::call(cmd, crate::scan::CALL_TIMEOUT)
                 .map_err(|e| format!("gh issue list: {e}"))?;
-            Ok(listed
+            let listed: Value =
+                serde_json::from_str(&listed).map_err(|e| format!("gh issue list: {e}"))?;
+            let ty = doc
+                .resolve(emits)
+                .ok_or_else(|| format!("unknown type `{emits}`"))?;
+            listed
                 .as_array()
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
                 .map(|v| {
-                    serde_json::json!({
+                    let issue = serde_json::json!({
                         "gh": v.get("number").map(|n| n.to_string()).unwrap_or_default(),
                         "text": v.get("title").and_then(Value::as_str).unwrap_or_default(),
                         "description": v.get("body").and_then(Value::as_str).unwrap_or_default(),
@@ -943,12 +1300,398 @@ fn rule_map(
                                     .join(" ")
                             })
                             .unwrap_or_default(),
-                    })
+                    });
+                    // An empty value, such as an issue with no labels, is an
+                    // absent field rather than a `line` of no characters.
+                    let projected: serde_json::Map<String, Value> = ty
+                        .fields
+                        .keys()
+                        .filter_map(|f| Some((f.clone(), issue.get(f)?.clone())))
+                        .filter(|(_, v)| v.as_str() != Some(""))
+                        .collect();
+                    let projected = Value::Object(projected);
+                    if !crate::workflow::BUILTIN_TYPES.contains(&emits) {
+                        ty.check(&projected)
+                            .map_err(|e| format!("issue {}: {e}", issue["gh"]))?;
+                    }
+                    Ok(projected)
                 })
-                .collect())
+                .collect()
         }
         other => Err(format!("rule `{other}` is not built yet").into()),
     }
+}
+
+/// The values of every `unique: "normalised"` field already in the node's
+/// bag, keyed by field, so a repeat is dropped rather than minted.
+fn unique_seen(ctx: &Ctx<'_>, node: &Node, emits: &str) -> Result<BTreeSet<String>> {
+    let Some(ty) = ctx.doc.resolve(emits) else {
+        return Ok(BTreeSet::new());
+    };
+    let mut seen = BTreeSet::new();
+    for u in ctx.store.workflow_units(ctx.instance)? {
+        if u.node != node.name {
+            continue;
+        }
+        let data: Value = serde_json::from_str(&u.data).unwrap_or(Value::Null);
+        for key in unique_keys(&ty, &data) {
+            seen.insert(key);
+        }
+    }
+    Ok(seen)
+}
+
+fn unique_keys(ty: &Type, data: &Value) -> Vec<String> {
+    ty.fields
+        .iter()
+        .filter(|(_, f)| matches!(f.ty, FieldType::Line { unique: true, .. }))
+        .filter_map(|(name, _)| {
+            let v = data.get(name)?.as_str()?;
+            Some(format!("{name}\u{0}{}", todo::normal_text(v)))
+        })
+        .collect()
+}
+
+/// Why a produced unit repeats one already in the bag or an open item of its
+/// project, by a `unique: "normalised"` field. `None` when it does not.
+fn duplicate(
+    ctx: &Ctx<'_>,
+    emits: &str,
+    data: &Value,
+    source: &WorkflowUnit,
+    seen: &mut BTreeSet<String>,
+) -> Result<Option<String>> {
+    let Some(ty) = ctx.doc.resolve(emits) else {
+        return Ok(None);
+    };
+    let keys = unique_keys(&ty, data);
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    let open: Vec<String> = match &source.project {
+        Some(p) => ctx
+            .store
+            .tasks()?
+            .into_iter()
+            .filter(|t| &t.project == p)
+            .map(|t| todo::normal_text(&t.text))
+            .collect(),
+        None => Vec::new(),
+    };
+    for key in &keys {
+        let (field, value) = key.split_once('\u{0}').expect("built above");
+        if open.iter().any(|t| t == value) {
+            return Ok(Some(format!("`{field}` repeats an open item: {value}")));
+        }
+        if seen.contains(key) {
+            return Ok(Some(format!(
+                "`{field}` repeats a unit already in the bag: {value}"
+            )));
+        }
+    }
+    seen.extend(keys);
+    Ok(None)
+}
+
+/// A check's result for one unit: a verdict, or not ready yet, which leaves
+/// the unit waiting at the check for a later pass.
+enum Checked {
+    Verdict(String, Option<String>),
+    NotReady(String),
+}
+
+fn verdict(v: &str, detail: Option<String>) -> Checked {
+    Checked::Verdict(v.to_string(), detail)
+}
+
+/// A check writes `passed`, `failed` or `unknown`. An unknown is a result: a
+/// check that could not run is not evidence either way.
+fn run_check(ctx: &Ctx<'_>, rule: &str, unit: &WorkflowUnit) -> Result<Checked> {
+    let store = ctx.store;
+    match rule {
+        "lint-todo" => {
+            let Some(project) = &unit.project else {
+                return Ok(verdict("unknown", Some("the unit names no project".into())));
+            };
+            let Some(row) = store.project(project)? else {
+                return Ok(verdict("unknown", Some(format!("no project `{project}`"))));
+            };
+            let Ok(text) = std::fs::read_to_string(row.path.join("TODO.md")) else {
+                return Ok(verdict("unknown", Some("no TODO.md".into())));
+            };
+            Ok(match todo::parse(&text).has_errors() {
+                true => verdict("failed", Some("TODO.md has lint errors".into())),
+                false => verdict("passed", None),
+            })
+        }
+        "nonempty" => Ok(verdict("unknown", Some("`nonempty` is not built".into()))),
+        // The rest read a run. A unit that has none has no evidence either
+        // way, which is what `unknown` says.
+        other => match run_of(ctx, unit)? {
+            None => Ok(verdict(
+                "unknown",
+                Some(format!("`{other}` reads a run, and this unit has none")),
+            )),
+            Some(run) => Ok(verdict_of(&run, other)),
+        },
+    }
+}
+
+/// The run behind a unit: the latest an `edit` recorded against it, so a lap
+/// reads its own attempt, or the run a `run` unit names by its `id`. This is
+/// what `@run` names.
+fn run_of(ctx: &Ctx<'_>, unit: &WorkflowUnit) -> Result<Option<crate::store::Run>> {
+    let runs = ctx.store.runs()?;
+    if let Some(run) = runs
+        .iter()
+        .rev()
+        .find(|r| r.workflow_instance == Some(ctx.instance) && r.unit.as_deref() == Some(&unit.id))
+    {
+        return Ok(Some(run.clone()));
+    }
+    if unit.ty != "run" {
+        return Ok(None);
+    }
+    let data: Value = serde_json::from_str(&unit.data).unwrap_or(Value::Null);
+    let id = data
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<i64>().ok());
+    Ok(id.and_then(|id| runs.into_iter().find(|r| r.id == id)))
+}
+
+/// A check about a run. `ci-green` and `pr-merged` wait while the run is on
+/// its way: not yet published, or a pull request still open or still
+/// checking. They read the pull request by the URL ship recorded, since the
+/// worktree is gone by then.
+fn verdict_of(run: &crate::store::Run, rule: &str) -> Checked {
+    use crate::store::RunState;
+    let ok = |b: bool| verdict(if b { "passed" } else { "failed" }, None);
+    let pr = run
+        .outcome
+        .as_deref()
+        .filter(|o| o.contains("/pull/"))
+        .map(str::to_string);
+    let unpublished = || match run.state {
+        RunState::Rejected => verdict("failed", Some("the run was rejected".into())),
+        RunState::Failed => verdict("failed", Some("the run failed".into())),
+        _ => Checked::NotReady("the run is not published yet".into()),
+    };
+    match rule {
+        "verify" => match (&run.verify, run.verify_ok) {
+            (None, _) => verdict(
+                "unknown",
+                Some(format!("`{}` states no verify command", run.project)),
+            ),
+            (Some(_), None) => verdict(
+                "unknown",
+                Some(
+                    run.error
+                        .clone()
+                        .unwrap_or_else(|| "verify did not run".into()),
+                ),
+            ),
+            (Some(_), Some(true)) => ok(true),
+            (Some(_), Some(false)) => verdict("failed", Some("verify failed".into())),
+        },
+        "scope-clean" => {
+            let reasons = crate::accept::review_reasons(run);
+            let scope: Vec<&String> = reasons
+                .iter()
+                .filter(|r| r.contains("outside") || r.contains("scope"))
+                .collect();
+            match (&run.changed_paths, scope.as_slice()) {
+                (None, _) => verdict(
+                    "unknown",
+                    Some(
+                        run.scope_error
+                            .clone()
+                            .unwrap_or_else(|| "the changed paths are not known".into()),
+                    ),
+                ),
+                (Some(_), []) => ok(true),
+                (Some(_), why) => verdict(
+                    "failed",
+                    Some(
+                        why.iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    ),
+                ),
+            }
+        }
+        "pr-merged" => match (&pr, run.state) {
+            (None, RunState::Shipped) => ok(true),
+            (None, _) => unpublished(),
+            (Some(url), _) => match gh_json(&["pr", "view", url, "--json", "state"]) {
+                Err(e) => verdict("unknown", Some(e)),
+                Ok(v) => match v.get("state").and_then(Value::as_str) {
+                    Some("MERGED") => ok(true),
+                    Some("CLOSED") => verdict(
+                        "failed",
+                        Some("the pull request was closed without merging".into()),
+                    ),
+                    Some(other) => Checked::NotReady(format!("the pull request is {other}")),
+                    None => verdict("unknown", Some("gh reported no state".into())),
+                },
+            },
+        },
+        "ci-green" => match (&pr, run.state) {
+            (None, RunState::Shipped) => verdict(
+                "unknown",
+                Some("pushed without a pull request, so no checks are read".into()),
+            ),
+            (None, _) => unpublished(),
+            (Some(url), _) => match gh_json(&["pr", "view", url, "--json", "statusCheckRollup"]) {
+                Err(e) => verdict("unknown", Some(e)),
+                Ok(v) => {
+                    let checks = v
+                        .get("statusCheckRollup")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let decisive = |c: &Value| -> Option<bool> {
+                        let state = c
+                            .get("conclusion")
+                            .filter(|s| s.as_str().is_some_and(|s| !s.is_empty()))
+                            .or_else(|| c.get("state"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_ascii_uppercase();
+                        match state.as_str() {
+                            "SUCCESS" | "NEUTRAL" | "SKIPPED" => Some(true),
+                            "FAILURE" | "TIMED_OUT" | "STARTUP_FAILURE" | "ERROR" | "CANCELLED"
+                            | "ACTION_REQUIRED" => Some(false),
+                            _ => None,
+                        }
+                    };
+                    let verdicts: Vec<Option<bool>> = checks.iter().map(decisive).collect();
+                    if verdicts.contains(&Some(false)) {
+                        verdict("failed", Some("a check failed".into()))
+                    } else if verdicts.iter().any(Option::is_none) {
+                        Checked::NotReady("a check has not finished".into())
+                    } else if verdicts.is_empty() {
+                        verdict("unknown", Some("no checks are reported".into()))
+                    } else {
+                        ok(true)
+                    }
+                }
+            },
+        },
+        other => verdict("unknown", Some(format!("check `{other}` is not built yet"))),
+    }
+}
+
+/// `gh`, bounded like a scan's calls.
+fn gh_json(args: &[&str]) -> std::result::Result<Value, String> {
+    let mut cmd = std::process::Command::new("gh");
+    cmd.args(args);
+    let out = crate::scan::call(cmd, crate::scan::CALL_TIMEOUT).map_err(|e| e.to_string())?;
+    serde_json::from_str(&out).map_err(|e| format!("gh: {e}"))
+}
+
+/// Writes a unit where `pma` owns the file. A `todo` edit is uncommitted in the
+/// user's clone, as `pma sync` writes one: `scripts/commit_todo.py` commits it.
+/// The inner error refuses this unit alone.
+fn emit(
+    ctx: &Ctx<'_>,
+    e: &crate::workflow::EmitNode,
+    unit: &WorkflowUnit,
+    data: &Value,
+    known: &Known,
+) -> Result<std::result::Result<(), String>> {
+    let store = ctx.store;
+    let system = system_fields(unit, known);
+    let fill = |template: &str| -> String { fill(template, data, &system, &ctx.params, &[]) };
+    let mapped = |field: &str| e.map.get(field).map(|t| fill(t));
+    match e.sink {
+        Sink::Note => {
+            let text = mapped("text").unwrap_or_default();
+            if text.trim().is_empty() {
+                return Ok(Err("the note's text is empty".into()));
+            }
+            store.add_note(&text, crate::dates::now())?;
+            Ok(Ok(()))
+        }
+        Sink::Todo => {
+            let Some(project) = &unit.project else {
+                return Ok(Err("a todo sink needs a unit that names a project".into()));
+            };
+            let Some(row) = store.project(project)? else {
+                return Ok(Err(format!("no project `{project}`")));
+            };
+            let file = row.path.join("TODO.md");
+            let text = match std::fs::read_to_string(&file) {
+                Ok(t) => t,
+                Err(e) => return Ok(Err(format!("{}: {e}", file.display()))),
+            };
+            let parsed = todo::parse(&text);
+            if parsed.has_errors() {
+                return Ok(Err(format!(
+                    "{}: lint errors, so an item cannot be identified; `pma lint` first",
+                    file.display()
+                )));
+            }
+            let item = mapped("text").unwrap_or_default();
+            if item.trim().is_empty() || item.contains('\n') {
+                return Ok(Err(format!("an item is one non-empty line, not `{item}`")));
+            }
+            let key = todo::normal_text(&item);
+            let updated = match e.action {
+                Action::Add => {
+                    let Some(priority) =
+                        mapped("priority").and_then(|p| todo::Priority::parse(&p.to_lowercase()))
+                    else {
+                        return Ok(Err(
+                            "the priority is not critical, high, medium or low".into()
+                        ));
+                    };
+                    // Already open: a resumed pass finds its own write, and a
+                    // second copy would be a duplicate the linter refuses.
+                    if parsed
+                        .items
+                        .iter()
+                        .any(|i| !i.done && todo::normal_text(&i.text) == key)
+                    {
+                        return Ok(Ok(()));
+                    }
+                    let description = mapped("description");
+                    // `pma` writes the whole line, so it gives the item an id
+                    // at once: rewording it later keeps its age.
+                    let line = format!("{item} ^{}", todo::new_id(&text));
+                    match todo::insert(&text, priority, &line, description.as_deref()) {
+                        Some(t) => t,
+                        None => {
+                            return Ok(Err(format!(
+                                "{} has no `## {}` section",
+                                file.display(),
+                                capitalised(priority.name())
+                            )));
+                        }
+                    }
+                }
+                Action::Tick => match todo::mark_done(&text, &key, &item) {
+                    Some(t) => t,
+                    None => return Ok(Err(format!("no open item `{item}`"))),
+                },
+                Action::Remove => match todo::remove_done(&text, &key, &item) {
+                    Some(t) => t,
+                    None => return Ok(Err(format!("no finished item `{item}`"))),
+                },
+            };
+            todo::save(&file, &updated).map_err(|e| format!("{}: {e}", file.display()))?;
+            Ok(Ok(()))
+        }
+        Sink::Doc => Ok(Err("the `doc` sink is not built".into())),
+    }
+}
+
+fn capitalised(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
 }
 
 /// The rules a `reduce` may name, applied to one group: which units carry on,
@@ -1007,363 +1750,63 @@ fn walk(root: &Path, dir: &Path, glob: &str) -> bool {
     false
 }
 
-/// A check writes `passed`, `failed` or `unknown`. An unknown is a result: a
-/// check that could not run is not evidence either way.
-fn run_check(
-    ctx: &Ctx<'_>,
-    rule: &str,
-    unit: &WorkflowUnit,
-    bag: usize,
-) -> Result<(String, Option<String>)> {
-    let store = ctx.store;
-    match rule {
-        "nonempty" => Ok(if bag > 0 {
-            ("passed".into(), None)
-        } else {
-            ("failed".into(), None)
-        }),
-        "lint-todo" => {
-            let Some(project) = &unit.project else {
-                return Ok(("unknown".into(), Some("the unit names no project".into())));
-            };
-            let Some(row) = store.project(project)? else {
-                return Ok(("unknown".into(), Some(format!("no project `{project}`"))));
-            };
-            let Ok(text) = std::fs::read_to_string(row.path.join("TODO.md")) else {
-                return Ok(("unknown".into(), Some("no TODO.md".into())));
-            };
-            let parsed = todo::parse(&text);
-            Ok(if parsed.has_errors() {
-                ("failed".into(), Some("TODO.md has lint errors".into()))
-            } else {
-                ("passed".into(), None)
-            })
-        }
-        // The rest read a run an `edit` left. A unit that has none has no
-        // evidence either way, which is what `unknown` says.
-        other => match run_of(ctx, unit)? {
-            None => Ok((
-                "unknown".into(),
-                Some(format!("`{other}` reads a run, and this unit has none")),
-            )),
-            Some(run) => Ok(verdict_of(&run, other)),
-        },
-    }
-}
-
-/// The run an `edit` node recorded against this unit: the latest, so a lap
-/// reads its own attempt rather than the first. This is what `@run` names.
-fn run_of(ctx: &Ctx<'_>, unit: &WorkflowUnit) -> Result<Option<crate::store::Run>> {
-    Ok(ctx
-        .store
-        .runs()?
-        .into_iter()
-        .rev()
-        .find(|r| r.workflow_instance == Some(ctx.instance) && r.unit.as_deref() == Some(&unit.id)))
-}
-
-/// A check about a run. `passed`, `failed` or `unknown`, and `unknown` is a
-/// result: a check that could not run is not evidence either way.
-fn verdict_of(run: &crate::store::Run, rule: &str) -> (String, Option<String>) {
-    let verdict = |ok: bool| -> String {
-        match ok {
-            true => "passed".into(),
-            false => "failed".into(),
-        }
-    };
-    match rule {
-        "verify" => match (&run.verify, run.verify_ok) {
-            (None, _) => (
-                "unknown".into(),
-                Some(format!("`{}` states no verify command", run.project)),
-            ),
-            (Some(_), None) => (
-                "unknown".into(),
-                Some(
-                    run.error
-                        .clone()
-                        .unwrap_or_else(|| "verify did not run".into()),
-                ),
-            ),
-            (Some(_), Some(ok)) => (verdict(ok), (!ok).then(|| "verify failed".to_string())),
-        },
-        "scope-clean" => {
-            let reasons = crate::accept::review_reasons(run);
-            let scope: Vec<&String> = reasons
-                .iter()
-                .filter(|r| r.contains("outside") || r.contains("scope"))
-                .collect();
-            match (&run.changed_paths, scope.as_slice()) {
-                (None, _) => (
-                    "unknown".into(),
-                    Some(
-                        run.scope_error
-                            .clone()
-                            .unwrap_or_else(|| "the changed paths are not known".into()),
-                    ),
-                ),
-                (Some(_), []) => ("passed".into(), None),
-                (Some(_), why) => (
-                    "failed".into(),
-                    Some(
-                        why.iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join("; "),
-                    ),
-                ),
-            }
-        }
-        "ci-green" => match &run.outcome {
-            None => (
-                "unknown".into(),
-                Some("the run has not been published".into()),
-            ),
-            Some(_) => match gh_json(
-                &run.worktree,
-                &["pr", "view", "--json", "statusCheckRollup"],
-            ) {
-                Err(e) => ("unknown".into(), Some(e)),
-                Ok(v) => {
-                    let checks = v
-                        .get("statusCheckRollup")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    let decisive = |c: &Value| -> Option<bool> {
-                        let state = c
-                            .get("conclusion")
-                            .or_else(|| c.get("state"))
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_ascii_uppercase();
-                        match state.as_str() {
-                            "SUCCESS" | "NEUTRAL" | "SKIPPED" => Some(true),
-                            "FAILURE" | "TIMED_OUT" | "STARTUP_FAILURE" | "ERROR" => Some(false),
-                            _ => None,
-                        }
-                    };
-                    let verdicts: Vec<Option<bool>> = checks.iter().map(decisive).collect();
-                    if verdicts.contains(&Some(false)) {
-                        ("failed".into(), Some("a required check failed".into()))
-                    } else if verdicts.iter().any(Option::is_none) {
-                        ("unknown".into(), Some("a check has not finished".into()))
-                    } else if verdicts.is_empty() {
-                        ("unknown".into(), Some("no checks are reported".into()))
-                    } else {
-                        ("passed".into(), None)
-                    }
-                }
-            },
-        },
-        "pr-merged" => match &run.outcome {
-            None => (
-                "unknown".into(),
-                Some("the run has not been published".into()),
-            ),
-            Some(_) => match gh_json(&run.worktree, &["pr", "view", "--json", "state"]) {
-                Err(e) => ("unknown".into(), Some(e)),
-                Ok(v) => match v.get("state").and_then(Value::as_str) {
-                    Some("MERGED") => ("passed".into(), None),
-                    Some("CLOSED") => (
-                        "failed".into(),
-                        Some("the pull request was closed without merging".into()),
-                    ),
-                    Some(other) => (
-                        "unknown".into(),
-                        Some(format!("the pull request is {other}")),
-                    ),
-                    None => ("unknown".into(), Some("gh reported no state".into())),
-                },
-            },
-        },
-        other => (
-            "unknown".into(),
-            Some(format!("check `{other}` is not built yet")),
-        ),
-    }
-}
-
-/// `gh` in the run's tree, so it finds the repository from the git remote.
-fn gh_json(dir: &Path, args: &[&str]) -> std::result::Result<Value, String> {
-    if !dir.is_dir() {
-        return Err(format!("{} no longer exists", dir.display()));
-    }
-    let out = std::process::Command::new("gh")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .map_err(|e| format!("gh: {e}"))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr)
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("gh failed")
-            .to_string());
-    }
-    serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).map_err(|e| format!("gh: {e}"))
-}
-
-/// Writes a unit where `pma` owns the file. A `todo` edit is uncommitted in the
-/// user's clone, as `pma sync` writes one: `scripts/commit_todo.py` commits it.
-fn emit(
-    ctx: &Ctx<'_>,
-    e: &crate::workflow::EmitNode,
-    unit: &WorkflowUnit,
-    data: &Value,
-    verdicts: &BTreeMap<(String, String), String>,
-) -> Result<()> {
-    let store = ctx.store;
-    let system = system_fields(unit, verdicts);
-    let fill = |template: &str| -> String { fill(template, data, &system, &ctx.params, &[]) };
-    match e.sink {
-        Sink::Note => {
-            let text = fill(e.map.get("text").map(String::as_str).unwrap_or_default());
-            store.add_note(&text, crate::dates::now())?;
-            Ok(())
-        }
-        Sink::Todo => {
-            let Some(project) = &unit.project else {
-                return Err("a todo sink needs a unit that names a project".into());
-            };
-            let row = store
-                .project(project)?
-                .ok_or_else(|| format!("no project `{project}`"))?;
-            let file = row.path.join("TODO.md");
-            let text =
-                std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
-            if todo::parse(&text).has_errors() {
-                return Err(format!(
-                    "{}: lint errors, so an item cannot be identified; `pma lint` first",
-                    file.display()
-                )
-                .into());
-            }
-            let item = fill(e.map.get("text").map(String::as_str).unwrap_or_default());
-            let updated = match e.action {
-                Action::Add => {
-                    let priority = e
-                        .map
-                        .get("priority")
-                        .map(|p| fill(p))
-                        .and_then(|p| todo::Priority::parse(&p))
-                        .ok_or("adding an item needs a priority the sections name")?;
-                    let description = e.map.get("description").map(|d| fill(d));
-                    todo::insert(&text, priority, &item, description.as_deref())
-                }
-                Action::Tick => todo::mark_done(&text, &item, &item),
-                Action::Remove => Some(todo::prune(&text).text),
-            };
-            match updated {
-                Some(new) if new != text => {
-                    std::fs::write(&file, new).map_err(|e| format!("{}: {e}", file.display()))?;
-                    Ok(())
-                }
-                _ => Ok(()),
-            }
-        }
-        Sink::Doc => Ok(()),
-    }
-}
-
-/// A node a model decides. One run per unit for a `map`, one per group for a
-/// `reduce`, which is what the worst case prices.
+/// A node a model decides, over the units a plan named. One run per unit for a
+/// `map`, one per group for a `reduce`.
 ///
 /// The model reads `in.json` and writes `out.json` under the instance's
 /// artifact directory, and it works in a detached worktree rather than in the
-/// user's clone: a node that is not an `edit` may read the code and must not
-/// be able to change it (W14).
+/// user's clone.
 ///
 /// Runs go `max_parallel` at a time. The store is a single connection, so it
 /// stays on this thread: a worker is handed everything it needs as files and
 /// paths, and what comes back is recorded here, in the order it arrives.
-fn run_agent(
-    ctx: &Ctx<'_>,
-    node: &Node,
-    waiting: &[WorkflowUnit],
-    verdicts: &BTreeMap<(String, String), String>,
-    chosen: &Chosen,
-    left: f64,
-) -> Result<Turn> {
-    let batches: Vec<Vec<WorkflowUnit>> = match &node.op {
-        Op::Reduce(r) => {
-            let mut groups: Vec<(String, Vec<WorkflowUnit>)> = Vec::new();
-            for unit in waiting {
-                let key = group_key(r, unit);
-                match groups.iter_mut().find(|(k, _)| *k == key) {
-                    Some((_, bag)) => bag.push(unit.clone()),
-                    None => groups.push((key, vec![unit.clone()])),
+fn run_agent(ctx: &Ctx<'_>, node: &Node, units: &[WorkflowUnit], known: &Known) -> Result<()> {
+    let mut staged = Vec::new();
+    for batch in batches(node, units) {
+        match stage(ctx, node, &batch, known)? {
+            Ok(job) => staged.push(job),
+            Err(why) => {
+                for unit in &batch {
+                    ctx.store
+                        .atomically(|| route_failed(ctx, node, unit, &why))?;
                 }
             }
-            groups.into_iter().map(|(_, bag)| bag).collect()
         }
-        _ => waiting.iter().map(|u| vec![u.clone()]).collect(),
-    };
-    let worker = ctx
-        .store
-        .agents()?
-        .into_iter()
-        .find(|w| w.name == chosen.agent)
-        .ok_or_else(|| format!("unknown agent `{}`; see `pma agent`", chosen.agent))?;
-
-    // What the batch budget admits, decided before anything is staged: a run
-    // refused after its worktree exists would leave the worktree behind. The
-    // rest wait for the next pass, which is not an error.
-    let room = match ctx.cfg.agent_budget > 0.0 {
-        true => (left / ctx.cfg.agent_budget).floor().max(0.0) as usize,
-        false => batches.len(),
-    };
-    let mut staged = Vec::new();
-    for batch in batches.iter().take(room) {
-        staged.push(stage(ctx, node, batch, verdicts, chosen)?);
     }
     if staged.is_empty() {
-        return Ok(Turn {
-            spent: 0.0,
-            advanced: false,
-        });
+        return Ok(());
     }
-    // Each staged run is committed against the budget at its ceiling. What it
-    // actually cost is recorded on its row; the budget admits on the ceiling,
-    // as a dispatch does, because the cost is not known until it has run.
-    let committed = staged.len() as f64 * ctx.cfg.agent_budget;
-
     let queue = std::sync::Mutex::new(std::collections::VecDeque::from(staged));
     let (tx, rx) = std::sync::mpsc::channel::<(Staged, Ran)>();
     let mut held = ctx.store.workflow_units(ctx.instance)?.len() as i64;
     let mut failure = None;
-    // The store is one connection and is not shared between threads, so a
-    // worker is given the settings and nothing else.
     let cfg = ctx.cfg;
     std::thread::scope(|scope| {
         for _ in 0..(cfg.max_parallel as usize).max(1) {
             let tx = tx.clone();
             let queue = &queue;
-            let worker = &worker;
             scope.spawn(move || {
                 loop {
                     let Some(job) = queue.lock().unwrap().pop_front() else {
                         break;
                     };
-                    let ran = work(cfg, worker, chosen, &job);
+                    let ran = work(cfg, &job);
                     let _ = tx.send((job, ran));
                 }
             });
         }
         drop(tx);
         for (job, ran) in rx {
-            if let Err(e) = record(ctx, node, job, ran, &mut held, verdicts) {
-                failure.get_or_insert(e.to_string());
+            if let Err(e) = record(ctx, node, job, ran, &mut held, known)
+                && failure.is_none()
+            {
+                failure = Some(e);
             }
         }
     });
     match failure {
-        Some(e) => Err(e.into()),
-        None => Ok(Turn {
-            spent: committed,
-            advanced: true,
-        }),
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
@@ -1371,11 +1814,15 @@ fn run_agent(
 /// about it, so a worker thread needs nothing but the filesystem.
 struct Staged {
     run: crate::store::Run,
+    worker: crate::worker::Worker,
+    chosen: Chosen,
     batch: Vec<WorkflowUnit>,
     repo: std::path::PathBuf,
     tree: std::path::PathBuf,
     out: std::path::PathBuf,
     doc: Option<std::path::PathBuf>,
+    /// Where the run's files are kept once its tree is removed.
+    artifacts: std::path::PathBuf,
     log: std::path::PathBuf,
     /// A directory outside the worktree for `agent::restrict`. Inside the
     /// tree the agent could write credentials or hooks into it.
@@ -1391,52 +1838,141 @@ struct Ran {
     produced: std::result::Result<Vec<Value>, String>,
 }
 
-/// Everything a run needs before a thread can take it: the files it reads and
-/// writes, the worktree it works in, and the `runs` row that records it.
+/// The commit a read node works from. In a workflow that edits, the head of
+/// the fetched default branch, which is where its `edit` nodes start, so a
+/// finding names code the fix will see. Otherwise the clone's `HEAD`, which
+/// lets a review read local commits. Fetched once per project per pass.
+fn read_base(ctx: &Ctx<'_>, repo: &Path, project: &str) -> std::result::Result<String, String> {
+    if !ctx.w.effects.repo {
+        return Ok("HEAD".into());
+    }
+    if let Some(found) = ctx.bases.borrow().get(project) {
+        return found.clone();
+    }
+    let found = (|| {
+        crate::dispatch::git(repo, &["fetch", "--quiet", "origin"]).map_err(|e| e.to_string())?;
+        let branch = crate::scan::default_branch(repo)
+            .ok_or_else(|| crate::scan::DEFAULT_BRANCH_UNKNOWN.to_string())?;
+        crate::dispatch::git(
+            repo,
+            &["rev-parse", &format!("refs/remotes/origin/{branch}")],
+        )
+        .map(|s| s.trim().to_string())
+        .map_err(|e| e.to_string())
+    })();
+    ctx.bases
+        .borrow_mut()
+        .insert(project.to_string(), found.clone());
+    found
+}
+
+/// The output a step accepts, stated from the type it declares and the op
+/// it applies, and appended to its prompt. `accept` checks exactly this, so
+/// an agent is told the limits it will be held to rather than a prompt
+/// author restating them by hand.
+fn contract(doc: &Document, w: &Workflow, node: &Node, input: &Path, out: &Path) -> Option<String> {
+    let (emits, shape, writes) = match &node.op {
+        Op::Map(m) => (m.emits.as_str(), Some(m.out), m.writes.as_slice()),
+        Op::Reduce(r) => (r.emits.as_str(), None, &[][..]),
+        _ => return None,
+    };
+    let ty = doc.resolve(emits)?;
+    let (input, out) = (input.display(), out.display());
+    let mut text = String::from("Output, which pma checks before it accepts anything:\n");
+    text.push_str(&match shape {
+        Some(Out::Grows) => format!(
+            "- Put in {out} a JSON array of new objects, at most {}. Put [] there if there are none.\n",
+            width(w, node).unwrap_or(0)
+        ),
+        Some(Out::Same) => format!(
+            "- Put in {out} a JSON array holding every object of {input}, each with its `@id`.\n"
+        ),
+        Some(Out::Shrinks) => format!(
+            "- Put in {out} a JSON array holding the objects of {input} you keep, each with its \
+             `@id`. Leave out the ones you drop; put [] there to drop all.\n"
+        ),
+        None => format!(
+            "- Put in {out} a JSON array of at most one object, with `@from` listing the `@id` of \
+             every object of {input} it comes from.\n"
+        ),
+    });
+    let fields: Vec<(&String, &crate::workflow::Field)> = match shape {
+        // A kept or annotated object comes back as it was given, but for the
+        // fields the step may set.
+        Some(Out::Same) | Some(Out::Shrinks) => {
+            if writes.is_empty() {
+                text.push_str("- Change no field.\n");
+                return Some(text);
+            }
+            text.push_str("- Set only these fields; any other change is refused:\n");
+            ty.fields
+                .iter()
+                .filter(|(n, _)| writes.contains(n))
+                .collect()
+        }
+        _ => {
+            text.push_str("- Each object has these fields and no others:\n");
+            ty.fields.iter().collect()
+        }
+    };
+    for (name, field) in fields {
+        let required = match field.required {
+            true => ", required",
+            false => "",
+        };
+        text.push_str(&format!(
+            "  - `{name}`{required}: {}\n",
+            field.ty.describe()
+        ));
+    }
+    Some(text)
+}
+
+/// Everything a run needs before a thread can take it: the worker the route
+/// chose, the files it reads and writes, the worktree it works in, and the
+/// `runs` row that records it. The inner error refuses the batch.
 fn stage(
     ctx: &Ctx<'_>,
     node: &Node,
     batch: &[WorkflowUnit],
-    verdicts: &BTreeMap<(String, String), String>,
-    chosen: &Chosen,
-) -> Result<Staged> {
+    known: &Known,
+) -> Result<std::result::Result<Staged, String>> {
     let lead = batch.first().expect("a batch holds at least one unit");
-    let project = lead
-        .project
-        .clone()
-        .ok_or_else(|| format!("node `{}`: unit `{}` names no project", node.name, lead.id))?;
-    let row = ctx
+    let Some(project) = lead.project.clone() else {
+        return Ok(Err(format!("unit `{}` names no project", lead.id)));
+    };
+    let Some(row) = ctx.store.project(&project)? else {
+        return Ok(Err(format!("no project `{project}`; `pma scan` first")));
+    };
+    let resolved = match resolve(
+        ctx.store,
+        ctx.cfg,
+        ctx.over,
+        &ctx.policy,
+        node,
+        lead,
+        row.tier,
+    )? {
+        Ok(r) => r,
+        Err(why) => return Ok(Err(why)),
+    };
+    let Some(worker) = ctx
         .store
-        .project(&project)?
-        .ok_or_else(|| format!("no project `{project}`; `pma scan` first"))?;
+        .agents()?
+        .into_iter()
+        .find(|w| w.name == resolved.chosen.agent)
+    else {
+        return Ok(Err(format!(
+            "unknown agent `{}`; see `pma agent`",
+            resolved.chosen.agent
+        )));
+    };
+    let base = match read_base(ctx, &row.path, &project) {
+        Ok(b) => b,
+        Err(why) => return Ok(Err(format!("{project}: {why}"))),
+    };
 
     let dir = artifacts(ctx, node)?;
-    let input: Vec<Value> = batch.iter().map(|u| exported(u, verdicts)).collect();
-    let in_file = dir.join("in.json");
-    let out_file = dir.join("out.json");
-    let doc_file = node_doc(ctx, node).map(|name| dir.join(name));
-    write(&in_file, &serde_json::to_string_pretty(&input)?)?;
-
-    let data: Value = serde_json::from_str(&lead.data).unwrap_or(Value::Null);
-    let task = task_of(node).ok_or_else(|| format!("node `{}` states no task", node.name))?;
-    let prompt = fill(
-        task,
-        &data,
-        &system_fields(lead, verdicts),
-        &ctx.params,
-        &[
-            ("in", in_file.to_string_lossy().into_owned()),
-            ("out", out_file.to_string_lossy().into_owned()),
-            (
-                "doc",
-                doc_file
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            ),
-        ],
-    );
-
     // A read-only node still gets a tree of its own. An agent that writes to
     // the clone would put a change past every review this tool has. The trees
     // are added from this thread: two `git worktree add` in one repository
@@ -1445,6 +1981,7 @@ fn stage(
         .home
         .join("workflow-trees")
         .join(ctx.instance.to_string())
+        .join(node.name.replace('/', "-"))
         .join(dir.file_name().expect("a numbered directory"));
     let _ = std::fs::remove_dir_all(&tree);
     if let Some(parent) = tree.parent() {
@@ -1458,10 +1995,51 @@ fn stage(
             "--detach",
             "--quiet",
             &tree.to_string_lossy(),
-            "HEAD",
+            &base,
         ],
     )?;
 
+    // The files a run reads and writes sit inside its tree, where any worker
+    // may write: an agent allowed to edit its working directory is not always
+    // allowed to write outside it. `record` copies them to `dir` before the
+    // tree goes, so each run's files outlive it.
+    let io = tree.join(".pma");
+    std::fs::create_dir_all(&io).map_err(|e| format!("{}: {e}", io.display()))?;
+    let input: Vec<Value> = batch.iter().map(|u| exported(u, known)).collect();
+    let in_file = io.join("in.json");
+    let out_file = io.join("out.json");
+    let doc_file = node_doc(ctx, node).map(|name| io.join(name));
+    write(&in_file, &serde_json::to_string_pretty(&input)?)?;
+
+    let data: Value = serde_json::from_str(&lead.data).unwrap_or(Value::Null);
+    let task = task_of(node).ok_or_else(|| format!("node `{}` states no task", node.name))?;
+    let prompt = fill(
+        task,
+        &data,
+        &system_fields(lead, known),
+        &ctx.params,
+        &[
+            ("in", in_file.to_string_lossy().into_owned()),
+            ("out", out_file.to_string_lossy().into_owned()),
+            (
+                "doc",
+                doc_file
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ),
+        ],
+    );
+    let prompt = match contract(ctx.doc, ctx.w, node, &in_file, &out_file) {
+        Some(c) => format!("{prompt}\n\n{c}"),
+        None => prompt,
+    };
+
+    let chosen = resolved.chosen;
+    let (route_revision, route, approval) = match resolved.route {
+        Some((rev, name, approval)) => (Some(rev), Some(name), Some(approval)),
+        None => (None, None, None),
+    };
     let mut run = crate::store::Run {
         project: project.clone(),
         task_key: format!("workflow:{}:{}", ctx.instance, lead.root),
@@ -1477,6 +2055,9 @@ fn stage(
         agent_budget: Some(ctx.cfg.agent_budget),
         timeout_minutes: Some(ctx.cfg.timeout),
         tier: row.tier,
+        route_revision,
+        route,
+        approval,
         workflow_instance: Some(ctx.instance),
         node: Some(node.name.clone()),
         unit: Some(lead.id.clone()),
@@ -1495,28 +2076,31 @@ fn stage(
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
     let agent_env = ctx.home.join("agent-env");
-    Ok(Staged {
+    Ok(Ok(Staged {
         run,
+        worker,
+        chosen,
         batch: batch.to_vec(),
         repo: row.path,
         tree,
         out: out_file,
         doc: doc_file,
+        artifacts: dir,
         log,
         agent_env,
-    })
+    }))
 }
 
 /// The agent itself. No store and no `&Ctx`: this is the half that runs on a
 /// worker thread.
-fn work(cfg: &Config, worker: &crate::worker::Worker, chosen: &Chosen, job: &Staged) -> Ran {
+fn work(cfg: &Config, job: &Staged) -> Ran {
     let timeout = std::time::Duration::from_secs(cfg.timeout as u64 * 60);
-    let mut cmd = worker.build(
+    let mut cmd = job.worker.build(
         &job.run.prompt,
         &job.tree,
-        chosen.model.as_deref(),
+        job.chosen.model.as_deref(),
         cfg.agent_budget,
-        &chosen.args,
+        &job.chosen.args,
         timeout.saturating_sub(crate::dispatch::INNER_GRACE),
     );
     cmd.current_dir(&job.tree);
@@ -1529,11 +2113,11 @@ fn work(cfg: &Config, worker: &crate::worker::Worker, chosen: &Chosen, job: &Sta
                 seconds: 0,
                 cost_usd: None,
                 summary: String::new(),
-                produced: Err(format!("{}: {e}", worker.command)),
+                produced: Err(format!("{}: {e}", job.worker.command)),
             };
         }
     };
-    let report = worker.parse.report(
+    let report = job.worker.parse.report(
         &std::fs::read_to_string(&job.log).unwrap_or_default(),
         finished.success == Some(true),
     );
@@ -1554,20 +2138,26 @@ fn work(cfg: &Config, worker: &crate::worker::Worker, chosen: &Chosen, job: &Sta
 }
 
 /// What a finished run leaves behind: the row, the units it wrote, and the
-/// worktree it no longer needs. Every store write of a pass happens here.
+/// worktree it no longer needs.
+///
+/// The row is written first, so its cost is recorded whatever follows. The
+/// units and the moves that settle the batch are one transaction: a pass
+/// killed part way leaves the batch waiting, not half minted, and a cap hit
+/// part way rolls back what the batch had minted.
 fn record(
     ctx: &Ctx<'_>,
     node: &Node,
     job: Staged,
     ran: Ran,
     held: &mut i64,
-    verdicts: &BTreeMap<(String, String), String>,
+    known: &Known,
 ) -> Result<()> {
     let Staged {
         mut run,
         batch,
         repo,
         tree,
+        artifacts,
         ..
     } = job;
     run.seconds = Some(ran.seconds);
@@ -1582,26 +2172,22 @@ fn record(
     ctx.store.update_run(&run)?;
     // The tree was the agent's scratch space, and a node that is not an
     // `edit` publishes nothing from it.
+    keep_files(&tree.join(".pma"), &artifacts);
     let _ = crate::dispatch::remove_worktree(&repo, &tree, "");
-    match ran.produced {
-        Ok(units) => accept(ctx, node, &batch, units, held, verdicts),
-        // A run that was not clean settles its input by the guards, which is
-        // where a default edge catches it. Nothing is minted.
+    let before = *held;
+    let recorded = ctx.store.atomically(|| match ran.produced {
+        Ok(units) => accept(ctx, node, &batch, units, held, known),
         Err(why) => {
             for unit in &batch {
-                ctx.store.add_workflow_verdict(
-                    ctx.instance,
-                    &unit.id,
-                    &node.name,
-                    "failed",
-                    Some(&why),
-                )?;
-                route_unit(ctx.store, ctx.instance, ctx.w, &node.name, unit, verdicts)?;
-                mark_handled(ctx.store, ctx.instance, ctx.w, &node.name, &unit.id)?;
+                route_failed(ctx, node, unit, &why)?;
             }
             Ok(())
         }
+    });
+    if recorded.is_err() {
+        *held = before;
     }
+    recorded
 }
 
 fn group_key(r: &crate::workflow::ReduceNode, unit: &WorkflowUnit) -> String {
@@ -1613,14 +2199,26 @@ fn group_key(r: &crate::workflow::ReduceNode, unit: &WorkflowUnit) -> String {
         .join("\u{0}")
 }
 
-/// `out.json` as a list of units, or why it could not be read. An agent that
-/// wrote nothing produced nothing, which is a clean empty result for a filter
-/// and a failure for nothing else to distinguish here.
-fn read_out(file: &Path) -> std::result::Result<Vec<Value>, String> {
-    let text = match std::fs::read_to_string(file) {
-        Ok(t) => t,
-        Err(_) => return Ok(Vec::new()),
+/// Copies what a run read and wrote out of its tree before the tree goes.
+/// A file that will not copy is left: the run's row already says what it did.
+fn keep_files(io: &Path, artifacts: &Path) {
+    let Ok(entries) = std::fs::read_dir(io) else {
+        return;
     };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            let _ = std::fs::copy(&path, artifacts.join(entry.file_name()));
+        }
+    }
+}
+
+/// `out.json` as a list of units, or why it could not be read. A run that
+/// wrote no file failed: an agent that found nothing writes `[]`, and one that
+/// could not write at all must not read as one that found nothing.
+fn read_out(file: &Path) -> std::result::Result<Vec<Value>, String> {
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| format!("the agent wrote no {}: {e}", file.display()))?;
     let v: Value =
         serde_json::from_str(&text).map_err(|e| format!("{}: not JSON: {e}", file.display()))?;
     match v {
@@ -1644,13 +2242,19 @@ fn doc_written(file: &Path) -> std::result::Result<(), String> {
 
 /// What a model returned, admitted into the graph only where it matches the
 /// declared type and the node's own contract (section 10).
+///
+/// An annotation or a filter returns the units it was given. What is minted is
+/// the unit it was given with only the `writes` fields taken from the model,
+/// so a model can neither rewrite nor drop a field it was not asked for (W17).
+/// A `reduce` names the units each output came from in `@from`, and writes at
+/// most one unit per group.
 fn accept(
     ctx: &Ctx<'_>,
     node: &Node,
     batch: &[WorkflowUnit],
     produced: Vec<Value>,
     held: &mut i64,
-    verdicts: &BTreeMap<(String, String), String>,
+    known: &Known,
 ) -> Result<()> {
     let (emits, out, writes) = match &node.op {
         Op::Map(m) => (m.emits.clone(), Some(m.out), m.writes.clone()),
@@ -1681,57 +2285,84 @@ fn accept(
             batch.len()
         ));
     }
-    for (i, v) in produced.iter().enumerate() {
-        if let Err(e) = ty.check(v) {
-            reasons.push(format!("unit {}: {e}", i + 1));
-        }
+    if out.is_none() && produced.len() > 1 {
+        reasons.push(format!(
+            "a reduce writes at most one unit per group, and returned {}",
+            produced.len()
+        ));
     }
-    // An annotation and a filter return the unit they were given, so the id
-    // has to be one of them and every field outside `writes` has to be
-    // untouched. A model that could rewrite the text could launder work past
-    // whoever reads it (W17).
-    if matches!(out, Some(Out::Same) | Some(Out::Shrinks)) {
-        for v in &produced {
-            match kept_id(v).and_then(|id| batch.iter().find(|u| u.id == id)) {
-                None => reasons.push("a returned unit names no `@id` it was given".into()),
-                Some(source) => {
-                    if let Err(e) = unchanged(source, v, &writes) {
-                        reasons.push(e);
-                    }
+
+    // Each output with the unit it descends from and the data to mint.
+    let mut minted: Vec<(&WorkflowUnit, Value)> = Vec::new();
+    let mut returned_ids = BTreeSet::new();
+    for (i, v) in produced.iter().enumerate() {
+        let n = i + 1;
+        let (source, data) = match out {
+            Some(Out::Same) | Some(Out::Shrinks) => {
+                let Some(source) = kept_id(v).and_then(|id| batch.iter().find(|u| u.id == id))
+                else {
+                    reasons.push(format!("unit {n} names no `@id` it was given"));
+                    continue;
+                };
+                if !returned_ids.insert(source.id.clone()) {
+                    reasons.push(format!("unit {n} repeats `@id` {}", source.id));
+                    continue;
                 }
+                if let Err(e) = unchanged(source, v, &writes) {
+                    reasons.push(format!("unit {n}: {e}"));
+                    continue;
+                }
+                (source, merged(source, v, &writes))
             }
+            Some(Out::Grows) => (&batch[0], stripped(v)),
+            None => {
+                let from: Vec<&str> = v
+                    .get("@from")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let sources: Vec<&WorkflowUnit> = from
+                    .iter()
+                    .filter_map(|id| batch.iter().find(|u| u.id == *id))
+                    .collect();
+                if from.is_empty() || sources.len() != from.len() {
+                    reasons.push(format!(
+                        "unit {n}: `@from` must list the ids of the units it came from"
+                    ));
+                    continue;
+                }
+                (sources[0], stripped(v))
+            }
+        };
+        if let Err(e) = ty.check(&data) {
+            reasons.push(format!("unit {n}: {e}"));
+            continue;
         }
+        minted.push((source, data));
     }
     if !reasons.is_empty() {
         let why = reasons.join("; ");
         for unit in batch {
-            ctx.store.add_workflow_verdict(
-                ctx.instance,
-                &unit.id,
-                &node.name,
-                "failed",
-                Some(&why),
-            )?;
-            route_unit(ctx.store, ctx.instance, ctx.w, &node.name, unit, verdicts)?;
-            mark_handled(ctx.store, ctx.instance, ctx.w, &node.name, &unit.id)?;
+            route_failed(ctx, node, unit, &why)?;
         }
         return Ok(());
     }
 
     let all = ctx.store.workflow_units(ctx.instance)?;
-    for (i, v) in produced.into_iter().enumerate() {
-        let source = kept_id(&v)
-            .and_then(|id| batch.iter().find(|u| u.id == id))
-            .unwrap_or(&batch[0]);
-        let mut data = v;
-        if let Value::Object(map) = &mut data {
-            map.retain(|k, _| !k.starts_with('@'));
+    let mut seen = unique_seen(ctx, node, &emits)?;
+    let mut n = 0;
+    for (source, data) in minted {
+        if let Some(why) = duplicate(ctx, &emits, &data, source, &mut seen)? {
+            ctx.refused
+                .borrow_mut()
+                .push(format!("{}: {}: dropped: {why}", node.name, source.id));
+            continue;
         }
         mint(
             ctx,
             node,
             WorkflowUnit {
-                id: next_id(&all, &node.name, i),
+                id: next_id(&all, &node.name, n),
                 ty: emits.clone(),
                 node: node.name.clone(),
                 parent: Some(source.id.clone()),
@@ -1745,8 +2376,9 @@ fn accept(
                 data: data.to_string(),
             },
             held,
-            verdicts,
+            known,
         )?;
+        n += 1;
     }
     // The input stops here whatever it produced: its children carry on, and a
     // filter's dropped units are answerable for by the moves recorded.
@@ -1766,7 +2398,38 @@ fn kept_id(v: &Value) -> Option<String> {
     v.get("@id").and_then(Value::as_str).map(String::from)
 }
 
+/// A returned unit without the `@` fields, which are `pma`'s.
+fn stripped(v: &Value) -> Value {
+    let mut data = v.clone();
+    if let Value::Object(map) = &mut data {
+        map.retain(|k, _| !k.starts_with('@'));
+    }
+    data
+}
+
+/// The unit a node was given, with the fields in `writes` taken from what the
+/// model returned.
+fn merged(source: &WorkflowUnit, returned: &Value, writes: &[String]) -> Value {
+    let mut data = match serde_json::from_str::<Value>(&source.data) {
+        Ok(Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    for field in writes {
+        match returned.get(field) {
+            Some(v) if !v.is_null() => {
+                data.insert(field.clone(), v.clone());
+            }
+            _ => {
+                data.remove(field);
+            }
+        }
+    }
+    Value::Object(data)
+}
+
 /// Whether a returned unit changed only what the node declared it may write.
+/// A field left out is not a change: the unit is rebuilt from what it was
+/// given.
 fn unchanged(
     source: &WorkflowUnit,
     returned: &Value,
@@ -1799,12 +2462,12 @@ fn unchanged(
 
 /// The unit as an agent reads it: its declared fields, plus the `@` fields of
 /// section 4, so a prompt and a returned unit can name the same identity.
-fn exported(unit: &WorkflowUnit, verdicts: &BTreeMap<(String, String), String>) -> Value {
+fn exported(unit: &WorkflowUnit, known: &Known) -> Value {
     let mut map = match serde_json::from_str::<Value>(&unit.data) {
         Ok(Value::Object(m)) => m,
         _ => serde_json::Map::new(),
     };
-    for (k, v) in system_fields(unit, verdicts) {
+    for (k, v) in system_fields(unit, known) {
         map.insert(format!("@{k}"), v);
     }
     Value::Object(map)
@@ -1834,8 +2497,8 @@ fn node_doc(ctx: &Ctx<'_>, node: &Node) -> Option<String> {
     )
 }
 
-/// The next numbered directory for this node, so a lap and a retry each keep
-/// their own files rather than overwriting the last.
+/// The next numbered directory for this node, so each run keeps its own files
+/// rather than overwriting the last.
 fn artifacts(ctx: &Ctx<'_>, node: &Node) -> Result<std::path::PathBuf> {
     let base = ctx
         .home
@@ -1856,7 +2519,8 @@ fn write(file: &Path, text: &str) -> Result<()> {
 
 /// The three placeholder namespaces of W5, plus the file names a run works
 /// with. Each is checked against its declaration where the document is read,
-/// so anything left unreplaced here is a field the unit does not carry.
+/// so anything left unreplaced here is a field the unit does not carry. A list
+/// is written one entry per line.
 fn fill(
     template: &str,
     data: &Value,
@@ -1865,9 +2529,15 @@ fn fill(
     files: &[(&str, String)],
 ) -> String {
     let text = |v: &Value| -> String {
-        v.as_str()
-            .map(String::from)
-            .unwrap_or_else(|| v.to_string())
+        match v {
+            Value::String(s) => s.clone(),
+            Value::Array(items) if items.iter().all(Value::is_string) => items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            other => other.to_string(),
+        }
     };
     let mut out = template.to_string();
     for (name, value) in files {
@@ -1888,42 +2558,24 @@ fn fill(
 }
 
 /// An `edit` node: the only op that changes a repository. It goes through
-/// `dispatch::prepare` and the phase 1 gates like any other dispatch, so a
-/// workflow chooses order, prompts and parameters, never authority (W14). The
-/// runs it leaves are reviewed and shipped the way every other run is.
+/// `dispatch::prepare` and the phase 1 gates like any other dispatch, and the
+/// routing policy sees its node and lap, so a workflow chooses order, prompts
+/// and parameters, never authority (W14). The runs it leaves are reviewed and
+/// shipped the way every other run is.
 ///
 /// Every unit is prepared before any is run, because `dispatch::execute`
-/// admits runs against `batch_budget` across the set it is given and spreads
-/// them over `max_parallel`. Handing it one run at a time would make both
-/// settings mean nothing here while they mean something to `pma dispatch`.
-fn run_edit(
-    ctx: &Ctx<'_>,
-    node: &Node,
-    waiting: &[WorkflowUnit],
-    verdicts: &BTreeMap<(String, String), String>,
-    left: f64,
-) -> Result<Turn> {
+/// spreads runs over `max_parallel`.
+fn run_edit(ctx: &Ctx<'_>, node: &Node, units: &[WorkflowUnit], known: &Known) -> Result<()> {
     let Op::Edit(e) = &node.op else {
         return Err(format!("node `{}` is not an edit", node.name).into());
     };
-    let mut verdicts = verdicts.clone();
+    let mut known = known.clone();
     let mut edits = edits_made(ctx)?;
     let mut queued: Vec<crate::store::Run> = Vec::new();
     let mut driving: BTreeMap<i64, WorkflowUnit> = BTreeMap::new();
-    let mut refused = 0;
-    // `execute` admits against the budget too, but a run it refuses already
-    // has a worktree. Preparing only what fits leaves none to clean up.
-    let room = match ctx.cfg.agent_budget > 0.0 {
-        true => (left / ctx.cfg.agent_budget).floor().max(0.0) as usize,
-        false => waiting.len(),
-    };
-    for unit in waiting {
-        if queued.len() >= room {
-            break;
-        }
+    for unit in units {
         if edits >= ctx.w.caps.max_edits {
             return Err(capped(
-                ctx,
                 &node.name,
                 format!(
                     "instance {} has made {edits} edits, its `caps.max_edits`",
@@ -1931,19 +2583,31 @@ fn run_edit(
                 ),
             ));
         }
-        let project = unit
-            .project
-            .clone()
-            .ok_or_else(|| format!("node `{}`: unit `{}` names no project", node.name, unit.id))?;
-        let row = ctx
-            .store
-            .project(&project)?
-            .ok_or_else(|| format!("no project `{project}`; `pma scan` first"))?;
+        let Some(project) = unit.project.clone() else {
+            ctx.store
+                .atomically(|| route_failed(ctx, node, unit, "the unit names no project"))?;
+            continue;
+        };
+        let Some(row) = ctx.store.project(&project)? else {
+            let why = format!("no project `{project}`; `pma scan` first");
+            ctx.store
+                .atomically(|| route_failed(ctx, node, unit, &why))?;
+            continue;
+        };
+        // One counter per lineage, whatever node or lap spends it (W23).
+        let key = format!("workflow:{}:{}", ctx.instance, unit.root);
+        let spent = ctx.store.consumed_attempts(&project, &key)?;
+        if spent >= crate::dispatch::ATTEMPT_LIMIT {
+            let why = format!("{spent} attempts on this unit's lineage were used");
+            ctx.store
+                .atomically(|| route_failed(ctx, node, unit, &why))?;
+            continue;
+        }
         let data: Value = serde_json::from_str(&unit.data).unwrap_or(Value::Null);
         let task = fill(
             &e.task,
             &data,
-            &system_fields(unit, &verdicts),
+            &system_fields(unit, &known),
             &ctx.params,
             &[],
         );
@@ -1956,9 +2620,7 @@ fn run_edit(
             }),
             project: project.clone(),
             repo: row.path.clone(),
-            // The exhaustion counter keys on the root, so a retry and a lap
-            // draw from one budget (W23).
-            key: format!("workflow:{}:{}", ctx.instance, unit.root),
+            key,
             text: summary(&task),
             gh: None,
             tier: row.tier,
@@ -1968,16 +2630,8 @@ fn run_edit(
         };
         match crate::dispatch::prepare(ctx.store, ctx.home, ctx.cfg, ctx.over, &pick)? {
             crate::dispatch::Prepared::Refused(why) => {
-                ctx.store.add_workflow_verdict(
-                    ctx.instance,
-                    &unit.id,
-                    &node.name,
-                    "failed",
-                    Some(&why),
-                )?;
-                route_unit(ctx.store, ctx.instance, ctx.w, &node.name, unit, &verdicts)?;
-                mark_handled(ctx.store, ctx.instance, ctx.w, &node.name, &unit.id)?;
-                refused += 1;
+                ctx.store
+                    .atomically(|| route_failed(ctx, node, unit, &why))?;
             }
             crate::dispatch::Prepared::Queued(run) => {
                 edits += 1;
@@ -1987,20 +2641,16 @@ fn run_edit(
         }
     }
     if queued.is_empty() {
-        return Ok(Turn {
-            spent: 0.0,
-            advanced: refused > 0,
-        });
+        return Ok(());
     }
-    let committed = queued.len() as f64 * ctx.cfg.agent_budget;
     let done = crate::dispatch::execute(ctx.store, ctx.home, ctx.cfg, ctx.over, queued, |_| {})?;
     for run in done {
         let Some(unit) = driving.get(&run.id) else {
             continue;
         };
         // A run the batch budget refused never reached the agent, so its unit
-        // keeps its place in the frontier and the next pass prepares it
-        // again. Its worktree goes, or the branch would be in the way.
+        // keeps its place in the frontier and the next plan names it again.
+        // Its worktree goes, or the branch would be in the way.
         if run
             .error
             .as_deref()
@@ -2009,36 +2659,47 @@ fn run_edit(
             let _ = crate::dispatch::remove_worktree(&run.repo, &run.worktree, &run.branch);
             continue;
         }
-        // The node's own check writes its verdict against the unit, under the
-        // rule's name, so a guard reads `@verify` rather than the run.
-        if let Some(rule) = &e.check {
-            let (verdict, detail) = verdict_of(&run, rule);
-            ctx.store.add_workflow_verdict(
-                ctx.instance,
-                &unit.id,
-                rule,
-                &verdict,
-                detail.as_deref(),
-            )?;
-            verdicts.insert((unit.id.clone(), rule.clone()), verdict);
-        }
-        route_unit(ctx.store, ctx.instance, ctx.w, &node.name, unit, &verdicts)?;
-        mark_handled(ctx.store, ctx.instance, ctx.w, &node.name, &unit.id)?;
+        known.runs.insert(unit.id.clone(), run.id);
+        ctx.store.atomically(|| {
+            // The node's own check writes its verdict against the unit, under
+            // the rule's name, so a guard reads `@verify` rather than the run.
+            if let Some(rule) = &e.check {
+                let (verdict, detail) = match verdict_of(&run, rule) {
+                    Checked::Verdict(v, d) => (v, d),
+                    Checked::NotReady(why) => ("unknown".to_string(), Some(why)),
+                };
+                ctx.store.add_workflow_verdict(
+                    ctx.instance,
+                    &unit.id,
+                    rule,
+                    &verdict,
+                    detail.as_deref(),
+                )?;
+                known
+                    .verdicts
+                    .insert((unit.id.clone(), rule.clone()), verdict);
+            }
+            route_unit(ctx.store, ctx.instance, ctx.w, &node.name, unit, &known)?;
+            mark_handled(ctx.store, ctx.instance, ctx.w, &node.name, &unit.id)
+        })?;
     }
-    Ok(Turn {
-        spent: committed,
-        advanced: true,
-    })
+    Ok(())
 }
 
-/// Edits this instance has already made, which is what `caps.max_edits`
-/// bounds. Counted from the runs recorded, because a pass holds no state.
+/// Edits this instance has made, which is what `caps.max_edits` bounds.
+/// Counted from the runs recorded, because a pass holds no state. A run the
+/// batch budget never started made no edit.
 fn edits_made(ctx: &Ctx<'_>) -> Result<i64> {
     Ok(ctx
         .store
         .runs()?
         .iter()
         .filter(|r| r.workflow_instance == Some(ctx.instance))
+        .filter(|r| {
+            !r.error
+                .as_deref()
+                .is_some_and(|e| e.starts_with(crate::dispatch::NOT_STARTED))
+        })
         .filter(|r| {
             r.node
                 .as_deref()
@@ -2057,4 +2718,62 @@ fn summary(task: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DOC: &str = r#"{
+      "types": {"finding": {"fields": {
+        "severity": {"type": "enum", "required": true, "values": ["high", "low"]},
+        "title": {"type": "line", "required": true, "max": 120},
+        "reason": {"type": "lines", "max": 30}
+      }}},
+      "workflow": [{"name": "w", "in": "project", "out": "finding", "effects": [],
+        "caps": {"max_units": 20, "max_edits": 0},
+        "nodes": [
+          {"name": "review", "op": "map", "out": "0..n", "in": "project", "emits": "finding",
+           "max_units": 7, "task": "Review {name} into {out}."},
+          {"name": "confirm", "op": "map", "out": "0..1", "in": "finding", "emits": "finding",
+           "writes": ["reason"], "task": "Confirm {in} into {out}."}],
+        "edges": [{"from": "@input", "to": "review"}, {"from": "review", "to": "confirm"},
+                  {"from": "confirm", "to": "@output"}]}]}"#;
+
+    /// The contract states what `accept` checks: the shape by op, and each
+    /// field's limits, from the declared type.
+    #[test]
+    fn a_step_is_told_the_output_it_is_held_to() {
+        let doc = Document::parse(DOC).unwrap();
+        let w = doc.flatten("w").unwrap();
+        let (input, out) = (Path::new("/t/in.json"), Path::new("/t/out.json"));
+        let review = contract(&doc, &w, w.node("review").unwrap(), input, out).unwrap();
+        assert!(
+            review.contains("Put in /t/out.json a JSON array of new objects, at most 7."),
+            "{review}"
+        );
+        assert!(
+            review.contains("- `severity`, required: one of high, low\n"),
+            "{review}"
+        );
+        assert!(
+            review.contains("- `title`, required: one line of text, at most 120 characters\n"),
+            "{review}"
+        );
+        assert!(
+            review.contains("- `reason`: a JSON array of at most 30 strings, one line each\n"),
+            "{review}"
+        );
+
+        let confirm = contract(&doc, &w, w.node("confirm").unwrap(), input, out).unwrap();
+        assert!(
+            confirm.contains("the objects of /t/in.json you keep, each with its `@id`"),
+            "{confirm}"
+        );
+        assert!(confirm.contains("Set only these fields"), "{confirm}");
+        assert!(
+            confirm.contains("`reason`") && !confirm.contains("`title`"),
+            "only what it may set: {confirm}"
+        );
+    }
 }

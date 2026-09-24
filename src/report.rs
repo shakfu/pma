@@ -3,7 +3,7 @@
 use crate::accept;
 use crate::class::Class;
 use crate::config::Config;
-use crate::rank::{self, Placed, Project, Quadrant, Urgency};
+use crate::rank::{self, Placed, Project, Quadrant, State, Urgency};
 use crate::scan::Ci;
 use crate::store::{Attempt, Run, RunState};
 
@@ -153,27 +153,36 @@ pub struct StatusRow<'a> {
     pub scan_error: Option<&'a str>,
 }
 
+/// Projects worst first: by the worst state each is in, then by tier, then by
+/// name. The state column names the worst, with a count of any others;
+/// `explain` lists every state and what put the project in it.
 pub fn status(cfg: &Config, rows: &[StatusRow], explain: bool) -> String {
-    let mut scored: Vec<(f64, Vec<rank::Component>, &StatusRow)> = rows
+    let mut placed: Vec<(Vec<(State, String)>, &StatusRow)> = rows
         .iter()
         .map(|r| {
-            let (score, parts) = rank::health(cfg, r.project);
-            (score, parts, r)
+            let facts = rank::Facts {
+                lint_errors: r.lint_errors,
+                scan_error: r.scan_error,
+            };
+            (rank::states(cfg, r.project, facts), r)
         })
         .collect();
-    scored.sort_by(|a, b| {
-        b.0.total_cmp(&a.0)
-            .then_with(|| a.2.project.name.cmp(&b.2.project.name))
+    placed.sort_by(|a, b| {
+        a.0[0]
+            .0
+            .cmp(&b.0[0].0)
+            .then(a.1.project.tier.cmp(&b.1.project.tier))
+            .then_with(|| a.1.project.name.cmp(&b.1.project.name))
     });
 
     let mut cells = vec![
         [
-            "project", "tier", "health", "open", "idle", "ci", "deps", "local", "todo",
+            "project", "tier", "state", "open", "idle", "ci", "deps", "local", "todo",
         ]
         .map(String::from)
         .to_vec(),
     ];
-    for (score, _, r) in &scored {
+    for (states, r) in &placed {
         let p = r.project;
         let local = [
             (p.dirty > 0).then(|| format!("{} changed", p.dirty)),
@@ -191,16 +200,18 @@ pub fn status(cfg: &Config, rows: &[StatusRow], explain: bool) -> String {
             } else {
                 "-".into()
             },
-            format!("{score:.2}"),
+            match states.len() {
+                1 => states[0].0.name().to_string(),
+                n => format!("{} +{}", states[0].0.name(), n - 1),
+            },
             p.open.len().to_string(),
             p.idle_days.map_or("-".into(), |d| format!("{d}d")),
             match &p.ci {
-                Ci::Failing(_) => "failing",
-                Ci::Passing => "passing",
-                Ci::NoRuns => "none",
-                Ci::Unknown(_) => "unknown",
-            }
-            .into(),
+                Ci::Failing(_) => "failing".to_string(),
+                Ci::Passing => "passing".into(),
+                Ci::NoRuns => "none".into(),
+                Ci::Unknown(_) => "unknown".into(),
+            },
             p.deps.map_or("-".into(), |(n, _)| n.to_string()),
             if local.is_empty() {
                 "clean".into()
@@ -208,7 +219,7 @@ pub fn status(cfg: &Config, rows: &[StatusRow], explain: bool) -> String {
                 local
             },
             match (r.has_todo, r.lint_errors, r.scan_error) {
-                (_, _, Some(e)) => format!("scan error: {e}"),
+                (_, _, Some(_)) => "scan error".into(),
                 (false, _, _) => "missing".into(),
                 (true, 0, _) => "ok".into(),
                 (true, n, _) => format!("{n} lint errors"),
@@ -218,35 +229,25 @@ pub fn status(cfg: &Config, rows: &[StatusRow], explain: bool) -> String {
     let mut out = table(&cells, "");
 
     if explain {
-        for (score, parts, r) in &scored {
+        for (states, r) in &placed {
             let p = r.project;
             out.push_str(&format!(
-                "\n{}  tier {}{} (x{})  health {score:.2}\n",
+                "\n{}  tier {}{}\n",
                 p.name,
                 p.tier,
                 if r.tiered { "" } else { ", untiered" },
-                cfg.tier(p.tier)
             ));
-            let lines: Vec<Vec<String>> = parts
+            let lines: Vec<Vec<String>> = states
                 .iter()
-                .map(|c| match c.score {
-                    Some(s) => vec![
-                        c.signal.into(),
-                        format!("s={s:.2}"),
-                        format!("w={}", c.weight),
-                        format!("+{:.2}", c.contribution),
-                        c.detail.clone(),
-                    ],
-                    None => vec![
-                        c.signal.into(),
-                        "n/a".into(),
-                        format!("w={}", c.weight),
-                        String::new(),
-                        c.detail.clone(),
-                    ],
-                })
+                .map(|(state, why)| vec![state.name().to_string(), why.clone()])
                 .collect();
             out.push_str(&table(&lines, "  "));
+            if let Ci::Unknown(why) = &p.ci {
+                out.push_str(&format!("  CI not measured: {why}\n"));
+            }
+            if p.deps.is_none() {
+                out.push_str("  deps not measured; `pma scan --deps`\n");
+            }
         }
     }
     out
@@ -542,7 +543,7 @@ mod tests {
             "Q1 Do right away: 2, top 1\n  alpha:5  T1  high  overdue 3d  text of alpha\n\
              \nQ2 Schedule for later: 2, top 1\n  gamma:9  T1  high  due in 30d  text of gamma\n\
              \nQ3 Delegate or avoid: 0\n\
-             \nQ4 Remove: 0\n"
+             \nQ4 Later: 0\n"
         );
         let q2 = matrix(&rows, None, Some(Quadrant::Q2), 100);
         assert!(q2.starts_with("Q2 Schedule for later: 2\n"), "{q2}");
@@ -584,8 +585,11 @@ mod tests {
         assert!(out.contains(&format!("{}...\n", "x".repeat(97))), "{out}");
     }
 
+    /// Worst state first, then tier: a tier-2 project with failing CI comes
+    /// before a tier-1 project with unpublished work, which comes before a
+    /// clear one. The state column names the worst and counts the rest.
     #[test]
-    fn status_sorts_by_health_and_explains() {
+    fn status_sorts_by_the_worst_state_then_tier() {
         let cfg = Config::default();
         let quiet = Project {
             name: "quiet".into(),
@@ -607,44 +611,39 @@ mod tests {
             deps: Some((3, 0)),
             ..quiet.clone()
         };
-        let rows = [
-            StatusRow {
-                project: &quiet,
-                tiered: true,
-                has_todo: true,
-                lint_errors: 0,
-                scan_error: None,
-            },
-            StatusRow {
-                project: &busy,
-                tiered: true,
-                has_todo: true,
-                lint_errors: 3,
-                scan_error: None,
-            },
-        ];
-        let out = status(&cfg, &rows, true);
+        let red = Project {
+            name: "red".into(),
+            tier: 2,
+            ci: Ci::Failing(vec!["test".into()]),
+            ..quiet.clone()
+        };
+        let row = |project| StatusRow {
+            project,
+            tiered: true,
+            has_todo: true,
+            lint_errors: 0,
+            scan_error: None,
+        };
+        let out = status(&cfg, &[row(&quiet), row(&busy), row(&red)], true);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(
-            lines[0],
-            "project  tier  health  open  idle  ci       deps  local               todo"
+            lines[..4],
+            [
+                "project  tier  state           open  idle  ci       deps  local               todo",
+                "red      2     failing CI      0     1d    failing  -     clean               ok",
+                "busy     1     unpublished +2  1     1d    unknown  3     2 changed, 1 ahead  ok",
+                "quiet    1     clear           0     1d    passing  -     clean               ok",
+            ]
         );
         assert!(
-            lines[1].starts_with("busy     1     0.")
-                && lines[1].ends_with("2 changed, 1 ahead  3 lint errors"),
+            out.contains(
+                "\nbusy  tier 1\n  unpublished  1 unpushed commit\n  critical     1 open item\n  \
+                 stale deps   3 outdated, measured today\n  CI not measured: offline\n"
+            ),
             "{out}"
         );
-        assert_eq!(
-            lines[2],
-            "quiet    1     0.00    0     1d    passing  -     clean               ok"
-        );
-        assert!(out.contains("\nbusy  tier 1 (x1)  health"), "{out}");
         assert!(
-            out.contains("\n  ci        n/a     w=3         unknown: offline\n"),
-            "{out}"
-        );
-        assert!(
-            out.contains("last code commit 1 day ago, horizon 30"),
+            out.contains("\nquiet  tier 1\n  clear\n  deps not measured; `pma scan --deps`\n"),
             "{out}"
         );
     }

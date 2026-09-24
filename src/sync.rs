@@ -32,6 +32,8 @@ pub enum Action {
     Link {
         line: usize,
         number: u64,
+        /// The item's text, checked again before `gh:N` is written.
+        title: String,
     },
     /// The issue is closed: mark the item done.
     Close {
@@ -124,6 +126,7 @@ pub fn plan(parsed: &Parsed, issues: &[Issue], me: &str) -> Vec<Action> {
                     Action::Link {
                         line: item.line,
                         number: issue.number,
+                        title: item.text.clone(),
                     }
                 }
                 None => Action::Create {
@@ -269,14 +272,16 @@ pub fn apply(repo: &str, todo_path: &Path, actions: &[Action]) -> Result<usize, 
         let text = std::fs::read_to_string(todo_path).map_err(io)?;
         let edited = f(&text)
             .ok_or_else(|| format!("{} changed during sync; run it again", todo_path.display()))?;
-        std::fs::write(todo_path, edited).map_err(io)
+        todo::save(todo_path, &edited).map_err(io)
     };
-    let link = |line: usize, number: u64| {
+    // The planned line must still hold the planned item, unlinked. A line
+    // added above it while `gh issue create` ran would put `gh:N` on another
+    // item, and the next sync would retitle that issue and open a second one.
+    let link = |line: usize, number: u64, title: &str| {
         edit(&|t| {
-            let unlinked = todo::parse(t)
-                .items
-                .iter()
-                .any(|i| i.line == line && i.gh.is_none());
+            let unlinked = todo::parse(t).items.iter().any(|i| {
+                i.line == line && i.gh.is_none() && normal_text(&i.text) == normal_text(title)
+            });
             unlinked
                 .then(|| todo::add_token(t, line, &format!("gh:{number}")))
                 .flatten()
@@ -319,9 +324,13 @@ pub fn apply(repo: &str, todo_path: &Path, actions: &[Action]) -> Result<usize, 
                     .ok_or_else(|| {
                         format!("gh issue create: unexpected output `{}`", url.trim())
                     })?;
-                link(*line, number)?;
+                link(*line, number, title)?;
             }
-            Action::Link { line, number } => link(*line, *number)?,
+            Action::Link {
+                line,
+                number,
+                title,
+            } => link(*line, *number, title)?,
             Action::Close { number, .. } => {
                 edit(&|t| todo::mark_done(t, &format!("gh:{number}"), ""))?;
             }
@@ -423,7 +432,11 @@ mod tests {
                     body: "on empty input\n\nOpened by pma from a `## Critical` item in TODO.md."
                         .into()
                 },
-                Action::Link { line: 7, number: 6 },
+                Action::Link {
+                    line: 7,
+                    number: 6,
+                    title: "half synced".into()
+                },
                 Action::Retitle {
                     number: 2,
                     title: "renamed text".into()
@@ -446,6 +459,45 @@ mod tests {
             ]
         );
         assert_eq!(actions.iter().filter(|a| a.is_change()).count(), 6);
+    }
+
+    /// A line added above the item between plan and write moves it. The write
+    /// is refused rather than landing `gh:N` on the item now at that line.
+    #[test]
+    fn a_link_is_refused_when_the_planned_line_holds_another_item() {
+        let dir = std::env::temp_dir().join(format!("pma-sync-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("TODO.md");
+        let planned = "# TODO\n\n## Critical\n\n- [ ] crash\n";
+        let actions = plan(
+            &todo::parse(planned),
+            &[issue(6, "crash", true, "me", &[LABEL])],
+            "me",
+        );
+        assert_eq!(
+            actions,
+            [Action::Link {
+                line: 5,
+                number: 6,
+                title: "crash".into()
+            }]
+        );
+
+        let moved = "# TODO\n\n## Critical\n\n- [ ] added meanwhile\n- [ ] crash\n";
+        std::fs::write(&path, moved).unwrap();
+        let err = apply("me/repo", &path, &actions).unwrap_err();
+        assert!(err.contains("changed during sync"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), moved);
+
+        std::fs::write(&path, planned).unwrap();
+        assert_eq!(apply("me/repo", &path, &actions), Ok(1));
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("- [ ] crash gh:6")
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

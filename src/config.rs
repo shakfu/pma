@@ -1,5 +1,5 @@
 //! Configuration: built-in defaults plus overrides stored in the database,
-//! addressed by flat keys such as `tiers.2`, `weights.ci` or
+//! addressed by flat keys such as `tiers.2`, `signals.ci` or
 //! `projects.cyllama.verify`.
 
 use std::collections::BTreeMap;
@@ -16,7 +16,6 @@ pub struct Config {
     pub tiers: [f64; 5],
     /// Weight per priority, in `Priority::ALL` order.
     pub priorities: [f64; 4],
-    pub weights: Weights,
     /// Priority of each signal task.
     pub signals: SignalPriorities,
     /// Globs for paths whose commits do not count as activity.
@@ -70,15 +69,6 @@ pub struct ProjectSettings {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Weights {
-    pub tasks: f64,
-    pub activity: f64,
-    pub ci: f64,
-    pub deps: f64,
-    pub hygiene: f64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct SignalPriorities {
     pub ci: Priority,
     pub deps: Priority,
@@ -94,13 +84,6 @@ impl Default for Config {
             quadrant_limit: 10,
             tiers: [1.0, 0.8, 0.6, 0.4, 0.2],
             priorities: [1.0, 0.5, 0.2, 0.05],
-            weights: Weights {
-                tasks: 5.0,
-                activity: 1.0,
-                ci: 3.0,
-                deps: 1.0,
-                hygiene: 2.0,
-            },
             signals: SignalPriorities {
                 ci: Priority::High,
                 deps: Priority::Medium,
@@ -162,10 +145,10 @@ fn parse_publish(s: &str) -> Result<Publish, String> {
 /// stays here so `pma config <old>` explains it. `with_overrides` skips a
 /// stored row for one, because an unknown key is a hard error on every
 /// command and an upgrade must not brick a store that set it.
-pub const RETIRED: [(&str, &str); 8] = [
+pub const RETIRED: [(&str, &str); 13] = [
     (
         "model",
-        "a model belongs to the worker that understands it: `pma agent set <name> model <m>`",
+        "a model belongs to a preset: `pma preset set <name> <agent> <model>`",
     ),
     (
         "dispatch_quadrants",
@@ -195,7 +178,15 @@ pub const RETIRED: [(&str, &str); 8] = [
         "stale_after.5",
         "age no longer makes a task urgent; see `pma stale`",
     ),
+    ("weights.tasks", WEIGHTS),
+    ("weights.activity", WEIGHTS),
+    ("weights.ci", WEIGHTS),
+    ("weights.deps", WEIGHTS),
+    ("weights.hygiene", WEIGHTS),
 ];
+
+const WEIGHTS: &str =
+    "the health score is gone; `pma status` sorts by the worst state a project is in";
 
 pub fn retired(key: &str) -> Option<&'static str> {
     RETIRED
@@ -212,7 +203,6 @@ impl Config {
         let per_tier = |prefix: &'static str| (1..=5).map(move |t| format!("{prefix}.{t}"));
         keys.extend(per_tier("tiers"));
         keys.extend(Priority::ALL.map(|p| format!("priorities.{}", p.name())));
-        keys.extend(["tasks", "activity", "ci", "deps", "hygiene"].map(|w| format!("weights.{w}")));
         keys.extend(["ci", "deps", "activity", "hygiene"].map(|s| format!("signals.{s}")));
         keys.push("activity.ignore".into());
         keys.extend(per_tier("activity.horizon"));
@@ -376,17 +366,6 @@ impl Config {
                 let i = Priority::ALL.iter().position(|x| x.name() == p)?;
                 Slot::Number(&mut self.priorities[i], 0.0)
             }
-            Some(("weights", w)) => Slot::Number(
-                match w {
-                    "tasks" => &mut self.weights.tasks,
-                    "activity" => &mut self.weights.activity,
-                    "ci" => &mut self.weights.ci,
-                    "deps" => &mut self.weights.deps,
-                    "hygiene" => &mut self.weights.hygiene,
-                    _ => return None,
-                },
-                0.0,
-            ),
             Some(("signals", s)) => Slot::Priority(match s {
                 "ci" => &mut self.signals.ci,
                 "deps" => &mut self.signals.deps,
@@ -440,7 +419,7 @@ mod tests {
     #[test]
     fn every_key_reads_and_round_trips() {
         let keys = Config::keys();
-        assert_eq!(keys.len(), 37);
+        assert_eq!(keys.len(), 32);
         let defaults = Config::default();
         let mut copy = Config::default();
         for key in &keys {
@@ -458,14 +437,12 @@ mod tests {
         let mut cfg = Config::default();
         cfg.set("tiers.3", "0.5").unwrap();
         cfg.set("priorities.high", "0.7").unwrap();
-        cfg.set("weights.ci", "10").unwrap();
         cfg.set("default_tier", "3").unwrap();
         cfg.set("signals.ci", "critical").unwrap();
         cfg.set("activity.ignore", " docs/** , ,*.md").unwrap();
         cfg.set("activity.horizon.2", "14").unwrap();
         assert_eq!(cfg.tiers[2], 0.5);
         assert_eq!(cfg.priority(Priority::High), 0.7);
-        assert_eq!(cfg.weights.ci, 10.0);
         assert_eq!(cfg.default_tier, Some(3));
         assert_eq!(cfg.signals.ci, Priority::Critical);
         assert_eq!(cfg.activity_ignore, ["docs/**", "*.md"]);
@@ -527,7 +504,7 @@ mod tests {
             ("default_tier", "0"),
             ("default_tier", "6"),
             ("signals.ci", "urgent"),
-            ("weights.nope", "1"),
+            ("weights.ci", "1"),
             ("activity.horizon.1", "0"),
             ("agent", ""),
             ("publish", "merge"),

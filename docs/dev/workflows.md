@@ -1,8 +1,10 @@
 # pma workflows (draft)
 
-Status: 2026-09-20. Built: the document in both its forms with its refusals and cost bound, migration 20, `node` and `lap` on a route, `pma workflow check|propose|activate|show|run`, call flattening at propose time, all five primitives including `edit`, the rules of section 8, typed targets and `--set`, and the caps enforced where units and runs are written. Runs go `max_parallel` at a time within a node's bag, and `batch_budget` bounds the pass.
+Status: 2026-09-24. Built: the document in both its forms with its refusals and cost bound, migration 20, `node` and `lap` on a route, applied to every agent node, `pma workflow check|propose|activate|show|run|stop`, call flattening at propose time, all five primitives including `edit`, the rules of section 8, typed targets and `--set`, `unique: "normalised"`, and the caps enforced where units and runs are written. A node runs once every node before it has finished. A pass prints a plan and runs agents only under `--approve <plan id>`; `max_parallel` bounds a node's runs and `batch_budget` sizes the plan. A `check` about a pull request waits (W10).
 
-Not built: section 7's iteration. `retry`, a lap edge and a self-edge are parsed, bounded and costed, and none of the three is taken -- nothing increments `@lap`, and `handled` cannot tell a unit a node routed onward from one an edge routed back in. A document using them runs its forward path once. Also not built: a reason per drop at `map out: 0..1` (section 10), which the runtime records against the move rather than taking from the model; and `publish` on a node, which is parsed and ignored -- an agent node's worktree is discarded after the run, so there is nothing for its document to be committed from (W19).
+Not built, and refused at `propose` with the construct named: section 7's iteration (`retry`, a lap edge, a self-edge), `@children`, `publish`, the `doc` sink and the `nonempty` check. `check` still parses and prices them. Recursion is priced over every level to `max_depth`. Also not built: a reason per drop at `map out: 0..1` (section 10), which the runtime records against the move rather than taking from the model.
+
+Where the runtime departs from the text below: a node that did not run cleanly sends a unit only down a default edge that carries its type, else settles it; `workflow_budget` is weighed per unit at activation only, since `batch_budget` and the approved plan bound a pass; a read node of a workflow with `repo` effects works from the fetched default branch, where its `edit` nodes start, and otherwise from the clone's `HEAD`.
 
 Two decisions below were corrected by the implementation rather than by review: an `edit` preserves its unit's type (section 3), and a lap mints a unit while a retry does not (section 11).
 
@@ -248,7 +250,23 @@ A document may also be built by a Rhai script, which is a second way to write th
         "detail":   {"type": "lines", "max": 40},
         "paths":    {"type": "list"},
         "class":    {"type": "enum",  "values": ["A", "A-", "B", "C", "D"]},
-        "reason":   {"type": "line",  "max": 200}
+        "reason":   {"type": "line",  "max": 200},
+        "verdict":  {"type": "enum",  "values": ["accept", "reject"]}
+      }
+    },
+    "task": {
+      "fields": {
+        "text": {"type": "line", "required": true, "max": 200},
+        "spec": {"type": "line", "max": 200}
+      }
+    },
+    "issue": {
+      "fields": {
+        "gh":       {"type": "line", "required": true, "max": 20},
+        "text":     {"type": "line", "required": true, "max": 256},
+        "tags":     {"type": "line", "max": 200},
+        "severity": {"type": "enum", "values": ["critical", "high", "medium", "low"]},
+        "reason":   {"type": "line", "max": 200}
       }
     }
   },
@@ -394,7 +412,7 @@ A script does not write nodes and edges. It applies combinators to a graph value
 ```rhai
 let graph = source("project")
     .expand("review", "finding", "{$breadth}", "Review `{name}`. Write findings to {out}.")
-    .filter("confirm", ["reason"], "Confirm each unit in {in}; drop what you cannot prove.")
+    .filter("confirm", ["reason"], "Confirm the finding in {in}. Write it to {out} with a `reason` if you can prove it, else an empty list.")
     .join("dedupe", ["title"])
     .output();
 ```
@@ -746,7 +764,9 @@ Notes on shape:
 
 ## 15. A library, and three compositions
 
-Nine small workflows and three that call them. `->` is an edge, `[...]` a guard, `=>` a sink.
+Nine small workflows and three that call them. `->` is an edge, `[...]` a guard, `=>` a sink. Types are the ones section 6 declares: `finding`, `task` and `issue`.
+
+Runnable today: 15.1, 15.2, 15.4, 15.5, 15.8, 15.9 and 15.12. The rest use `retry`, a lap edge or recursion, which `propose` refuses until section 7 is built; `pma workflow check` still prices them and names the construct. A step that is an agent `map` runs once per unit, so its `{in}` holds one unit.
 
 ### 15.1 `find-issues(in: [Project], review_doc = "REVIEW.md", breadth = 20) -> [Finding] !pure`
 
@@ -771,7 +791,7 @@ Review, then confirm what the review claimed, then drop duplicates. Called by 15
      "task": "Review `{name}`. Write your prose to {doc} and at most {$breadth} findings to {out}."},
     {"name": "confirm", "op": "map", "out": "0..1", "in": "finding", "emits": "finding",
      "writes": ["reason"],
-     "task": "Each unit in {in} is a claim. Confirm it against the code. Keep what you can prove; drop the rest with a `reason`. Change nothing else."},
+     "task": "The unit in {in} is a claim. Confirm it against the code. If you can prove it, write it to {out} with a one-line `reason`; otherwise write an empty list. Change nothing else."},
     {"name": "dedupe", "op": "reduce", "via": "rule", "rule": "dedupe",
      "group_by": ["title"], "in": "finding", "emits": "finding"}
   ],
@@ -818,7 +838,7 @@ Three reviewers at three models, joined. The shape a sequence cannot express. Dr
      "group_by": ["title"], "in": "finding", "emits": "finding"},
     {"name": "confirm", "op": "map", "out": "0..1", "in": "finding", "emits": "finding",
      "writes": ["reason"],
-     "task": "Confirm each unit in {in} against the code. Drop what you cannot prove, with a `reason`."}
+     "task": "Confirm the finding in {in} against the code. Write it to {out} with a `reason` if you can prove it, else an empty list."}
   ],
   "edges": [
     {"from": "@input", "to": "bugs"},
@@ -851,7 +871,7 @@ let graph = source("project")
     ])
     .join("merge", ["title"])
     .filter("confirm", ["reason"],
-            "Confirm each unit in {in} against the code. Drop what you cannot prove, with a `reason`.")
+            "Confirm the finding in {in} against the code. Write it to {out} with a `reason` if you can prove it, else an empty list.")
     .output();
 
 document(#{
@@ -918,7 +938,7 @@ Fix, audit the fix, and hand back what would not converge.
 
 `audit` writes only `verdict` and `reason`, so it cannot restate the finding it is judging. `handoff` catches two cases -- laps exhausted, and a verdict left unreadable -- and both end with the human holding the task, which is the truthful outcome. `effects` names `writes` because of that sink, and a caller sees it in the signature.
 
-### 15.4 `triage-issues(in: [Project]) -> [Finding] !pure`
+### 15.4 `triage-issues(in: [Project]) -> [Issue] !pure`
 
 The read costs nothing: `open-issues` is a rule. Only the classification spends a model.
 
@@ -929,15 +949,15 @@ The read costs nothing: `open-issues` is a rule. Only the classification spends 
 ```json
 {
   "name": "triage-issues",
-  "in": "project", "out": "finding", "effects": [],
+  "in": "project", "out": "issue", "effects": [],
   "params": {},
   "caps": {"max_units": 120, "max_edits": 0},
   "nodes": [
     {"name": "issues", "op": "map", "out": "0..n", "via": "rule", "rule": "open-issues",
-     "in": "project", "emits": "finding", "max_units": 50},
-    {"name": "classify", "op": "map", "out": "1", "in": "finding", "emits": "finding",
-     "writes": ["severity", "class", "reason"],
-     "task": "For each unit in {in}, set `severity`, a class, and a one-line `reason`. Set `severity` to low for anything that is not actionable."}
+     "in": "project", "emits": "issue", "max_units": 50},
+    {"name": "classify", "op": "map", "out": "1", "in": "issue", "emits": "issue",
+     "writes": ["severity", "reason"],
+     "task": "The issue in {in} is #{gh}, `{text}`. Judge it against the code; the agent has no GitHub access. Write it back to {out} with `severity` set and a one-line `reason`; `low` for anything that is not actionable."}
   ],
   "edges": [
     {"from": "@input", "to": "issues"},
@@ -947,7 +967,7 @@ The read costs nothing: `open-issues` is a rule. Only the classification spends 
 }
 ```
 
-A `low` unit is settled at `classify` with the guard recorded, so why it was not passed on is readable later. Because the output type is `finding`, this composes with `apply-fixes` exactly as `find-issues` does.
+A `low` unit is settled at `classify` with the guard recorded, so why it was not passed on is readable later. `open-issues` yields each issue as `gh`, `text`, `description` and `tags`, projected onto the type the node emits, so `issue` declares the names it keeps; the body is left out, since a `line` holds one line. An `issue` is not a `finding`, so this does not feed `apply-fixes` without a step that writes a `title`.
 
 ### 15.5 `specify(in: [Item], spec_doc = "SPEC.md") -> [Task] !pure`
 
@@ -1026,7 +1046,7 @@ Per-node worst case is 1 + 8 + 64 units at the declared maxima, so `caps.max_uni
   "nodes": [
     {"name": "build", "op": "edit", "in": "task", "check": "verify",
      "retry": {"max": "{$retries}", "while": "@verify != passed"},
-     "task": "Implement `{text}`.\n\n{description}\n\n{spec}"}
+     "task": "Implement `{text}`.\n\n{spec}"}
   ],
   "edges": [
     {"from": "@input", "to": "build"},
@@ -1081,13 +1101,13 @@ Waiting with no loop and no model. Every node is a rule or a check, so the worst
   "edges": [
     {"from": "@input", "to": "open-runs"},
     {"from": "open-runs", "to": "merged"},
-    {"from": "merged", "to": "close", "when": {"@merged": ["passed"]}},
+    {"from": "merged", "to": "close", "when": {"@pr-merged": ["passed"]}},
     {"from": "close", "to": "@output"}
   ]
 }
 ```
 
-A run whose pull request is still open settles at `merged`, because `@merged` is then `failed` or `unknown` and no edge accepts it. The next pass picks it up.
+A check writes its verdict under its rule's name, so the guard reads `@pr-merged`. A run whose pull request is still open, or that is not published yet, waits at `merged`: the check is not ready, the instance stays open, and the next pass asks again. A pull request closed without merging fails the check and settles there.
 
 ### 15.10 `review-fix-critical(in: [Project], severity = "critical") -> [Finding] !repo !writes`
 
@@ -1185,7 +1205,7 @@ Across a tag rather than one project: `pma workflow run portfolio-sweep --tag ru
 }
 ```
 
-No `edit`, so `effects` is `writes` alone and this runs before phase 4b's gate. With 12 tagged projects the worst case is 36 review runs and up to 192 confirms, which is the number `propose` prints and the reason `workflow_budget` exists.
+No `edit`, so `effects` is `writes` alone and this runs before phase 4b's gate. With 12 tagged projects the worst case is 36 review runs and up to 288 confirms -- 12 projects, three reviewers, 8 findings each at the `breadth` the call site pins -- which is the number `check --units 12` prints and the reason `workflow_budget` exists. A constant a call site pins bounds the estimate, since nothing can change it afterwards.
 
 ### 15.13 Where the human is
 

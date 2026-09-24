@@ -159,6 +159,35 @@ impl Policy {
         self.routes.iter().find(|r| r.matches(s))
     }
 
+    /// Whether any route names this node. A read node needs one that states
+    /// no class or complexity; an `edit` needs one of any kind. Tier and lap
+    /// are left out: whether a route can serve a node at all is the question.
+    pub fn names_node(&self, node: &str, edits: bool) -> bool {
+        self.routes.iter().any(|r| {
+            r.nodes
+                .as_ref()
+                .is_some_and(|names| names.iter().any(|n| node_matches(n, node)))
+                && (edits || (r.classes.is_none() && r.complexity.is_none()))
+        })
+    }
+
+    /// The first route serving a workflow node that changes no repository.
+    /// Class and complexity describe a change, so a route stating either
+    /// serves only `edit` nodes and tasks.
+    pub fn route_read(&self, node: &str, lap: i64, tier: Option<u8>) -> Option<&Route> {
+        let subject = Subject {
+            class: Class::Specified,
+            complexity: 0,
+            tier,
+            node: Some(node),
+            lap,
+        };
+        self.routes
+            .iter()
+            .filter(|r| r.classes.is_none() && r.complexity.is_none())
+            .find(|r| r.matches(&subject))
+    }
+
     /// Reads a policy document, refusing anything it cannot apply exactly.
     /// A route that silently does nothing is worse than one that is refused.
     pub fn parse(text: &str) -> Result<Policy, String> {
@@ -495,6 +524,57 @@ mod tests {
         assert_eq!(named(at_node("other/fix", 1)), None, "no route serves it");
         // Lap narrows: the first attempt at `repair/fix` matches nothing.
         assert_eq!(named(at_node("repair/fix", 0)), None);
+    }
+
+    /// A node that edits nothing has no class or complexity, so only a node
+    /// route that states neither serves it, and a task route never does.
+    #[test]
+    fn a_read_node_takes_a_node_route_that_states_no_class() {
+        let policy = Policy::parse(
+            r#"{"route": [
+            {"name": "edits", "match": {"node": "*/review", "class": "B"}, "model": "opus", "approval": "each"},
+            {"name": "reads", "match": {"node": "*/review", "lap": "0"}, "model": "haiku", "approval": "each"},
+            {"name": "tasks", "approval": "each"}
+        ]}"#,
+        )
+        .unwrap();
+        let named = |node: &str, lap: i64| {
+            policy
+                .route_read(node, lap, Some(1))
+                .map(|r| r.name.clone())
+        };
+        assert_eq!(named("look/review", 0).as_deref(), Some("reads"));
+        assert_eq!(named("look/review", 1), None, "outside the lap range");
+        assert_eq!(
+            named("look/confirm", 0),
+            None,
+            "the catch-all serves tasks only"
+        );
+    }
+
+    #[test]
+    fn a_node_is_named_by_a_route_that_can_serve_it() {
+        let policy = Policy::parse(
+            r#"{"route": [
+            {"match": {"node": "*/fix", "class": "B"}, "approval": "each"},
+            {"match": {"node": "look/review"}, "approval": "each"},
+            {"approval": "each"}
+        ]}"#,
+        )
+        .unwrap();
+        assert!(policy.names_node("look/review", false));
+        assert!(
+            policy.names_node("repair/fix", true),
+            "an edit takes a class route"
+        );
+        assert!(
+            !policy.names_node("repair/fix", false),
+            "a read node does not"
+        );
+        assert!(
+            !policy.names_node("look/confirm", false),
+            "the catch-all names no node"
+        );
     }
 
     #[test]

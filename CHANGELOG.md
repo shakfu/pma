@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+**Each agent step's prompt ends with the output it is held to**, generated from the type it declares and the op it applies: the array's shape, `@id` and `@from` where they apply, the fields it may set, and each field's limits. A prompt author restated these by hand, and in a trial a confirm wrote a `reason` longer than the type allowed and two true findings were refused.
+
+**`pma next`, and `pma` alone runs it: what should happen next, and who does it.** One list of tasks for agents, in the order `pma dispatch --auto` takes them, and one of what waits on you: runs to review, then to ship, then pull requests to merge, then critical or urgent tasks no agent may take or may take no more. The order is the matrix's and what an agent may take is dispatch's, so the view and `--auto` cannot disagree. `pma tui` opens on it; `m` switches to the 2x2. Each list shows `quadrant_limit` rows; `--all` shows every row.
+
+**Stable item ids: a trailing `^k3f9q`.** An item's identity was its text, so rewording one reset its age and hid a run it had. An id is 5 random characters of lowercase Crockford base32 (no `i`, `l`, `o`, `u`) after a caret, which is how Obsidian marks a block id and which GitHub renders as text; `<<id>>` was rejected because CommonMark reads `<k3f9q>` as an HTML tag, which GitHub strips. Identity is now the id, else `gh:N`, else the text. `pma lint --ids` lists the open items without one and `--apply` writes them, moving any open run onto the id; the workflow `todo` sink gives one to each item it adds. A scan carries an item's age by key, including the date git gave its old text. Not minted at dispatch: ship ticks that line on origin, and an uncommitted id in the clone would then conflict on every pull.
+
+```markdown
+- [ ] accept a trailing comma #parser ^7hq2m
+```
+
 **`pma status --all` includes untiered projects**, ranked as tier 5 and shown with tier `-`. Without it, a portfolio with no tiers had no rows, so the CI state `pma scan` records could not be read from `pma`. Scoped to `status` rather than set through `default_tier`, which also moves untiered tasks into `matrix` and `dispatch`.
 
 **`pma verify <project>`: the check a dispatch would run, before one does.** It checks out the head of the remote default branch in a fresh worktree and runs the verify command there under the agent's environment, then records the result as that commit's base. The first pilot dispatch paid an agent to discover that `pma`'s own check could not pass in that environment; a check run in a plain shell had passed. Exits 1 when any named project's check does not pass.
@@ -42,6 +52,60 @@ Iteration is not included. `retry`, a lap edge and a self-edge parse, bound and 
 
 ### Fixed
 
+**An agent step's files sit inside its own scratch tree, and a step that writes no output failed.** `in.json` and `out.json` were outside the tree, where Claude Code in `-p` mode may not write, and a missing `out.json` read as an empty result: a review that could not write reported no findings, and a confirm dropped every claim. The files are copied to `artifacts/` before the tree is removed. Found before the first trial on real repositories, which then wrote its output.
+
+**A value a call site pins bounds the estimate, and one over the callee's maximum is refused.** The estimate read the callee's declared maximum even for a constant the caller passed, which `--set` can no longer change: `portfolio-sweep` priced 400 confirms where 288 can run. A constant above the callee's maximum was accepted.
+
+**`open-issues` treats an empty field as absent.** An issue with no labels projected `tags: ""`, which a declared `line` refuses, so every unlabelled issue was refused.
+
+**The library in `docs/dev/workflows.md` reads as it is written, and a test holds it there.** Five of its twelve examples did not parse: `task` was never declared, `apply-fixes` wrote an undeclared `verdict`, and `settle` guarded on `@merged` where the check writes `@pr-merged`. `triage-issues` parsed and would have refused every issue at run time. Prompts that said "each unit in {in}" now say one, since an agent `map` runs once per unit. The section names which examples `propose` accepts today.
+
+**A count of leftover `pma/` branches reads "branches"**, not "branchs".
+
+**A failed read of the attempt counter is an error, not zero attempts.** Any database error read as "no attempts", which lifted the limit it guards.
+
+**A callee's parameter is renamed once when calls are inlined.** Renames were applied in sequence, so with `a -> b` and `b -> x` a prompt's `{$a}` became `{$x}` while the bound read `b`.
+
+**`--set` sets only the workflow's own parameters.** A value a call site pinned became a flat parameter such as `issues/breadth`, which `--set` could override. A parameter name may no longer contain `/`.
+
+**A GitHub slug is read only from the host `github.com`.** Any URL containing the text matched, so `notgithub.com/a/b` read as `a/b`. `user@` and an explicit port are accepted.
+
+**Help and error text names the current commands**: `pma project forget`, `pma project tag add`, absent rather than forgotten projects, and `pma preset set` for the retired `model` setting.
+
+**A workflow node runs once every node before it has finished.** A node ran as soon as any unit reached it, so a `reduce` joining several branches ran once per branch: two readings of the same three items deduplicated to six.
+
+**A unit a node failed to handle no longer travels on as if it had succeeded.** A failed or refused agent run, an output the type check refused, an `edit` that `prepare` refused and a sink that could not write each routed the node's input along every unguarded edge. An unconfirmed finding reached the output, and a node that changes type passed a unit of the wrong type downstream. Such a unit now takes a default edge that carries its type, or settles, and is named on stderr.
+
+**Routes by `node` and `lap` apply at run time.** A read node never consulted the policy, and an `edit` was dispatched with no node, so the node-less catch-all served it. Under a policy, a read node that no route names is refused rather than sent to the settings.
+
+**A workflow `edit` counts against the attempt limit, keyed on its lineage.** `run_edit` never checked the limit, and the counter was keyed on the prompt text rather than on `workflow:<instance>:<root>` (W23).
+
+**An agent node's results are recorded in one transaction per batch**, after the run's own row. A pass killed part way, or a cap hit part way, left some of a batch's units minted and the batch waiting, so the next pass minted them again. `workflow run` also fails runs an ended session left running, as `dispatch` does. A crash between the agent's exit and the record still runs that agent again.
+
+**A cap is recorded on the instance whichever node hits it.** The mark was written inside the transaction the cap rolled back, so rule and reduce nodes hit the same cap on every pass.
+
+**`ci-green` and `pr-merged` wait while the run is on its way**, and read the pull request by the URL ship recorded. They read the worktree, which ship removes, so both returned `unknown` after shipping, and a check never waited. A `run` unit from `open-runs` now reaches the run it names.
+
+**The `todo` sink refuses one unit rather than aborting the pass**, and no longer loses data silently. A missing section wrote nothing and routed the unit on as written; an item already open was added again, which the linter refuses; `remove` pruned every finished item in the file; a list field reached `TODO.md` as JSON text.
+
+**An annotation or a filter can no longer drop a field it was not asked to write.** The minted unit is the one it was given with only its `writes` fields taken from the model. An agent `reduce` names its inputs in `@from` and writes at most one unit per group. `unique: "normalised"` drops a repeat within the bag or of an open item, as section 16 states. A rule node must emit the type its rule writes, and `open-issues` is checked against the type it projects onto.
+
+**`workflow check` prices recursion over every level.** A self-edge was refused as a cycle, so the decompose example in `docs/dev/workflows.md` could not be read, and the cost bound counted one level of runs.
+
+**A scan that cannot read `TODO.md` keeps the project's tasks.** A read error other than a missing file deleted every task row, so the next good scan gave each item `first_seen = now`.
+
+**A task keeps its age when `sync` writes `gh:N` into it.** `first_seen` was looked up by key, and `gh:N` changes an item's key from its text to the issue number. It is now matched by key or by text.
+
+**`TODO.md` is rewritten atomically** by `prune`, `sync` and the workflow `todo` sink: written to a temporary file, flushed, then renamed. `std::fs::write` truncated first, so a crash could leave the uncommitted file empty. A symlinked `TODO.md` is written through, and keeps its mode.
+
+**A code fence closes only on a line of its own character, at least as long as its opening**, as CommonMark has it. A fence never closed is a lint error at its opening line. Before, three backticks closed four, backticks closed tildes, and an unclosed fence hid every later item while `lint` exited 0.
+
+**`sync` checks an item's text before writing `gh:N`.** It checked only that the planned line held an unlinked item, so a line added above it while `gh issue create` ran put the number on the wrong item.
+
+**`scan` bounds each `git` and `gh` call at 60 seconds** and kills its process group. One hung `gh run list` held the whole scan. A timeout is recorded in the project's scan error.
+
+**The CI signal judges only enabled workflows.** A deleted workflow's runs stay in `gh run list`, so its last failure read as failing CI until 50 newer runs pushed it out. A workflow with no decisive run among the latest 100 is queried on its own rather than dropped.
+
 **`##Critical` is a lint error.** Without the space it is not a Markdown heading, so the parser skipped it silently, and its items were filed under the section above. It still opens the section it names. `##Notes` and other names stay ignored.
 
 **`pma`'s own tests pass under its verify.** Their fixtures push to local repositories, and inherited the `GIT_CONFIG_*` settings with which `agent::restrict` blocks every push, so `make check` failed at the base and at the head of every `pma` dispatch. The tests now start git and `pma` without them.
@@ -74,6 +138,26 @@ Iteration is not included. `retry`, a lap edge and a self-edge parse, bound and 
 **A declaration is checked where it is written.** `parse_params` checked an enum's members and nothing else, and a field's `max`, `min` and `unique` were read with `as_i64` and `as_str`, so `"max": "ten"` silently meant 200 and `"unique": true` silently meant not unique. A default is now checked against its parameter's own type and maximum, `max` is refused on a parameter that is not an int, and a field option that does not apply to its type is refused by name.
 
 ### Changed
+
+**Q4 is labelled "Later", not "Remove".** Under the default weights no `Medium` or `Low` item is ever important, so every such item that is not urgent lands in Q4, and "Remove" was the wrong advice for most of a backlog.
+
+**`pma status` sorts projects by the worst state each is in, and the health score is gone.** Worst first: failing CI, broken `TODO.md` or scan, unpublished work, critical items, stale deps, idle; tier breaks ties. The score prompted no action, its five weights were never calibrated, it counted again signals the matrix already lists as tasks, and `status` was its only reader. The `health` column is now `state`, naming the worst state and counting the others; `--explain` lists each with what put the project there. The `weights.*` settings are retired, and migration 27 drops stored ones.
+
+**`workflow check`, `workflow activate` and `workflow run --dry-run` name each agent node the routing policy would refuse**, since no route names it. A policy stating no node routes refuses every agent node, and that surfaced only when a pass ran.
+
+**`pma workflow run --approve <plan>` replaces `--yes`.** A pass prints a plan -- each agent node, its units, worker, model and ceiling -- with an id, and an approval runs that plan and stops. `--yes` approved a budget: the pass went on to nodes that became ready after the printed ones and were never shown. `--dry-run` prints the id a first pass would print.
+
+**A workflow document that states a construct the runtime does not take is refused at `propose`**, naming it: `retry`, lap edges, self-edges, `@children`, `publish`, the `doc` sink and `nonempty`. They parsed and priced, and a pass ran as if they were absent. `check` still prices them. A sink's mapping must name fields the sink writes, and `todo add` must map `priority`.
+
+**`pma workflow stop <instance>`, and `--cap max_units=N` to resume a capped instance.** A capped instance could not be resumed, so the agent output it had paid for was abandoned. A raised cap is recorded on the instance and may only go up.
+
+**`workflow_budget` is weighed at activation only, per unit of input.** A pass also compared the total over its argument bag against the same setting, so a revision that activated could not run over two projects. `batch_budget` and the approved plan bound what a pass spends.
+
+**A read node of a workflow that edits works from the fetched default branch**, where its `edit` nodes start, so a finding names code the fix will see. A workflow that edits nothing still reads the clone's `HEAD`.
+
+**Worktrees, logs and artifacts moved to `~/.local/state/pma`** (`$XDG_STATE_HOME/pma`, or `$PMA_HOME/state` when `PMA_HOME` is set; `PMA_STATE` overrides both). The database directory holds only `projects.db` and `session.lock`. The README and design no longer say the database can be shared between machines through git: nothing detected two copies diverging, and git cannot merge them. Worktrees of open runs stay where they were made, since each run records its path.
+
+**`lint` and `prune` skip a directory argument that holds no `TODO.md`**, printing a note. A glob over a root names every repository, and one without a list failed the command. A file named outright must still exist.
 
 **`pma project tier` takes the tier first and any number of projects:** `pma project tier 1 alpha beta gamma`. The tier is the argument shared across a run of projects, so it goes first and the list follows, as `pma project tag add` already reads. Setting a tier no longer resolves one project at a time: every name is checked before any is written. The form that printed one project's tier is gone, since `pma project` lists every name beside its tier.
 

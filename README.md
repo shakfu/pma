@@ -12,7 +12,7 @@ Nothing is published without you. An agent runs with no push credentials, `pma` 
 pma root add ~/projects        # git repos directly under it are projects
 pma project tier 1 myproject   # 1 is most important, 5 least
 pma scan                       # TODO.md, git state, CI
-pma matrix                     # every project's tasks, ranked, in one view
+pma                            # next: tasks for agents, and what waits on you
 pma dispatch myproject:31      # hand line 31 to an agent
 pma review 1                   # the diff, the test result, the cost
 pma review 1 --approve
@@ -23,11 +23,13 @@ pma ship                       # commit, push or open a pull request
 
 **One view of everything**
 
+- `pma next`, or `pma` alone: one list of tasks for agents, in the order `pma dispatch --auto` takes them, and one of what waits on you: runs to review, ship or merge, then critical or urgent tasks no agent may take.
+
 - Every task in every project in one Eisenhower matrix, ranked by project importance and item priority.
 
 - Failing CI, outdated dependencies, idle repositories and dirty working trees appear as tasks beside the written ones.
 
-- A terminal browser (`pma tui`), a per-project health ranking (`pma status`), and an oldest-first list to prune (`pma stale`).
+- A terminal browser (`pma tui`) of `next` and the matrix, projects worst first by what needs attention (`pma status`), and an oldest-first list to prune (`pma stale`).
 
 - Portfolio notes that belong to no single project.
 
@@ -69,9 +71,11 @@ pma ship                       # commit, push or open a pull request
 
 - A workflow is a graph of agents over a project: review, then validate the review, then fix what it confirmed. Written as JSON or as a script, and costed before it runs.
 
-- `pma workflow run` prints what it would run, the worker, the model and a ceiling, and spends nothing until you approve it. Its target is `dispatch`'s: a project, a `TODO.md` line, a heading or a signal, whichever type the workflow reads.
+- `pma workflow run` prints a plan: each agent node it would run, over which units, with the worker, the model and a ceiling. Nothing is spent until you approve that plan by its id, and an approval runs that plan and nothing else. Its target is `dispatch`'s: a project, a `TODO.md` line, a heading or a signal, whichever type the workflow reads.
 
-- One run of a workflow is an instance. It is frozen at the revision it started under, so activating a new one does not change work already under way, and `--instance <id>` resumes it where the last pass stopped. A node that edits a repository leaves a run in `pma review` like any other.
+- One run of a workflow is an instance. It is frozen at the revision it started under, so activating a new one does not change work already under way, and `--instance <id>` resumes it where the last pass stopped. A node runs once every node before it has finished, so a join sees every branch. A node that edits a repository leaves a run in `pma review` like any other.
+
+- Each node can run on its own worker and model: a route that names the node, such as `{"match": {"node": "*/review"}, "model": "haiku"}`, picks them.
 
 ## Install
 
@@ -79,8 +83,7 @@ pma ship                       # commit, push or open a pull request
 cargo install pma
 ```
 
-From a clone: `make install`, which builds the release binary and copies it to
-`~/.local/bin`. Set `PREFIX` to install elsewhere: `make install PREFIX=/usr/local`.
+From a clone: `make install`, which builds the release binary and copies it to `~/.local/bin`. Set `PREFIX` to install elsewhere: `make install PREFIX=/usr/local`.
 
 Requirements:
 
@@ -129,13 +132,13 @@ The rules, which `pma lint` checks:
 
 - A `###` heading groups the items below it, until the next heading.
 
-- Trailing tokens, read from the end of the line: `#tag`, `due:YYYY-MM-DD`, and `gh:N` for a linked issue. A token-shaped word earlier in the line is text.
+- Trailing tokens, read from the end of the line: `#tag`, `due:YYYY-MM-DD`, `gh:N` for a linked issue, and an optional id, `^k3f9q`: five characters of `0-9` and `a-z` without `i`, `l`, `o` or `u`. A token-shaped word earlier in the line is text, and so is a caret word that is not an id, such as `^1.2`.
 
 - `#urgent` makes an item urgent whatever its date. `#agent` marks one an agent may take. `#manual` keeps agents off it entirely.
 
 - A finished item is ticked where it stands. `pma prune` removes it.
 
-Two open items with the same text, or two items with the same `gh:N`, are errors. An item is identified by its text until an issue number is written into it.
+Two open items with the same text, or two items with the same `gh:N` or id, are errors. An item is identified by its id, else its issue number, else its text. Ids are optional and `pma` writes them: `pma lint --ids --apply` gives one to every open item, and an item a workflow adds gets one. With an id, rewording an item keeps its age and any run it has.
 
 ## Commands
 
@@ -155,15 +158,16 @@ pma project forget gone         # an absent project's record
 pma scan                        # TODO.md, git state, CI via gh
 pma scan --offline myproject    # one project, without GitHub
 pma scan --deps                 # also count outdated cargo, uv and go deps
-pma matrix                      # the ranked view; -q q1 for one quadrant
-pma status --explain            # projects by health, with each signal's share
+pma next                        # for agents and for you; --all for every row
+pma matrix                      # the ranked 2x2; -q q1 for one quadrant
+pma status --explain            # projects worst first, with what placed each
 pma status --all                # untiered projects too, e.g. to find failing CI
 pma stale                       # open items by age, oldest first
-pma tui                         # browse the matrix; q quits
+pma tui                         # browse next; m for the matrix, q quits
 pma note add "move CI to a reusable workflow"
 ```
 
-`matrix`, `status` and `tui` read the last scan. They do not rescan.
+`next`, `matrix`, `status` and `tui` read the last scan. They do not rescan.
 
 Agents, models and presets:
 
@@ -198,7 +202,7 @@ pma report --by project         # also class or agent
 
 A target naming one task fails if that task cannot run. A target naming many passes over each with its reason, and dispatches the rest.
 
-Each run gets a worktree of the remote default branch under `~/.config/pma/worktrees`, on a `pma/` branch. The item must be open in the remote `TODO.md`, so commit and push before dispatching. Set the test command with `pma config projects.myproject.verify "make check"`, or let it be detected. `publish` is `pr` by default; `pma config publish push` pushes to the default branch instead.
+Each run gets a worktree of the remote default branch under `~/.local/state/pma/worktrees`, on a `pma/` branch. The item must be open in the remote `TODO.md`, so commit and push before dispatching. Set the test command with `pma config projects.myproject.verify "make check"`, or let it be detected. `publish` is `pr` by default; `pma config publish push` pushes to the default branch instead.
 
 Repeating work:
 
@@ -214,11 +218,13 @@ pma workflow activate 1         # refused if its worst case is over budget
 pma workflow run review myproject --dry-run   # plan and price, starting nothing
 pma workflow run review myproject -p claude-haiku
 pma workflow run triage myproject:critical --set severity=high
-pma workflow run triage --instance 3 --yes    # approve the spend it printed
+pma workflow run triage --instance 3 --approve 3fa2c1e09b7d   # the plan it printed
+pma workflow run triage --instance 3 --cap max_units=80   # resume a capped instance
+pma workflow stop 3             # no further node; its runs stand
 pma workflow                    # revisions, and every instance with its state
 ```
 
-A pass runs every node a rule decides, then stops at the first an agent decides and prices it. `--yes` approves that spend; the pass then runs `max_parallel` agents at a time until `batch_budget` is reached, and the next invocation resumes from there.
+A pass runs every node a rule decides, then stops and prints a plan for the agent nodes that are ready: as many runs as `batch_budget` admits at `agent_budget` each. `--approve <plan>` runs exactly that plan, `max_parallel` agents at a time, then stops at the next plan. A plan that changed since it was printed has another id and is refused. A unit a node could not handle is named on stderr and goes no further than a default edge; a check waiting on a pull request keeps its unit until the next pass.
 
 GitHub Issues:
 
@@ -231,9 +237,9 @@ Each `## Critical` item gets an issue labelled `pma:critical`, and `gh:N` is wri
 
 ## Where things live
 
-- The database is `~/.config/pma/projects.db`, or `$PMA_HOME/projects.db`. That directory can be a git repository, which is how two machines share it.
+- The database is `~/.config/pma/projects.db`, or `$PMA_HOME/projects.db`. It serves one machine: two copies cannot be merged.
 
-- Worktrees sit under the same directory and are removed when a run ships or is rejected. A workflow's agent nodes read the code in a worktree of their own and leave nothing behind; what they read and wrote stays in `artifacts/<instance>/<node>/<n>/`, numbered per run.
+- Worktrees, logs and artifacts sit under `~/.local/state/pma` (`$XDG_STATE_HOME/pma`), or `$PMA_HOME/state` when `PMA_HOME` is set; `PMA_STATE` overrides both. Worktrees are removed when a run ships or is rejected. A workflow's agent nodes read the code in a worktree of their own and leave nothing behind; what they read and wrote stays in `artifacts/<instance>/<node>/<n>/`, numbered per run.
 
 - Settings live in the database rather than a file. `pma config` lists them, `pma config <key> <value>` sets one, and `--reset` clears one.
 

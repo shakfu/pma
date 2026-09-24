@@ -1074,7 +1074,7 @@ mod tests {
                 .retrying("{$laps}", "@verify != passed")
                 .transform("audit", ["verdict"], "Judge {title}.")
                 .lap("fix", #{ verdict: ["reject"] }, "{$laps}")
-                .otherwise(|g| g.emit_todo("handoff", "add", #{ text: "{title}" }))
+                .otherwise(|g| g.emit_todo("handoff", "add", #{ text: "{title}", priority: "high" }))
                 .when(#{ verdict: ["accept"] })
                 .output();
 

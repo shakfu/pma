@@ -137,12 +137,14 @@ fn errors_in_any_file_exit_one_and_every_file_is_checked() {
     let good = s.project("good", "# TODO\n");
     let missing = s.0.join("missing");
     fs::create_dir_all(&missing).unwrap();
+    let named = s.0.join("gone.md");
 
     let out = pma(&[
         "lint".as_ref(),
         bad.as_os_str(),
         good.as_os_str(),
         missing.as_os_str(),
+        named.as_os_str(),
     ]);
     assert_eq!(out.status.code(), Some(1));
     let text = stdout(&out);
@@ -151,14 +153,36 @@ fn errors_in_any_file_exit_one_and_every_file_is_checked() {
         "{text}"
     );
     assert!(
-        text.contains(&format!("{}: error:", missing.join("TODO.md").display())),
-        "{text}"
+        text.contains(&format!("{}: error:", named.display())),
+        "a file named outright must exist: {text}"
     );
     assert!(!text.contains(&good.display().to_string()), "{text}");
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
         "2 errors, 0 warnings\n"
     );
+}
+
+/// `pma lint <root>/*/` names every repository, and not every one keeps a
+/// list, so a directory without TODO.md is passed over rather than failed.
+#[test]
+fn a_directory_without_a_todo_is_skipped() {
+    let s = Scratch::new("no-todo");
+    let good = s.project("good", "# TODO\n");
+    let missing = s.0.join("missing");
+    fs::create_dir_all(&missing).unwrap();
+    for command in ["lint", "prune"] {
+        let out = pma(&[command.as_ref(), good.as_os_str(), missing.as_os_str()]);
+        assert_eq!(out.status.code(), Some(0), "{command}");
+        assert!(
+            stdout(&out).contains(&format!(
+                "{}: skipped: no TODO.md",
+                missing.join("TODO.md").display()
+            )),
+            "{command}: {}",
+            stdout(&out)
+        );
+    }
 }
 
 const DAY: i64 = 86_400;
@@ -207,6 +231,17 @@ fn ok(home: &std::path::Path, args: &[&str]) -> String {
     let (out, err, success) = pma_in(home, args);
     assert!(success, "pma {args:?} failed\nstdout: {out}\nstderr: {err}");
     out
+}
+
+/// The id in `--approve <id>`, as a pass or a dry run prints it.
+fn plan_id(out: &str) -> String {
+    let at = out
+        .find("--approve ")
+        .unwrap_or_else(|| panic!("no plan to approve: {out}"));
+    out[at + "--approve ".len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect()
 }
 
 #[test]
@@ -278,7 +313,7 @@ Q2 Schedule for later: 2
 
 Q3 Delegate or avoid: 0
 
-Q4 Remove: 3
+Q4 Later: 3
   alpha     T1  medium  open 0d    resolve local changes: 1 changed file, 1 leftover pma branch
   alpha:12  T1  low     open 100d  old low
   alpha     T1  low     open 70d   review project: no code commits in 100 days
@@ -290,23 +325,41 @@ Q4 Remove: 3
     );
     assert_eq!(body, expected);
 
+    // Placed by its worst state, a leftover `pma/` branch, with its idleness
+    // counted beside it. CI was not measured, which places it nowhere.
     let status = ok(&home, &["status", "--explain"]);
-    assert!(status.contains("\nalpha    1     0."), "{status}");
     assert!(
-        status.contains("  ci        n/a     w=3         unknown: offline"),
+        status.contains("\nalpha    1     unpublished +1"),
         "{status}"
     );
-    assert!(status.contains("open: 2 high, 1 low"), "{status}");
+    assert!(
+        status.contains("\nalpha  tier 1\n  unpublished  1 leftover pma branch\n"),
+        "{status}"
+    );
+    assert!(
+        status.contains("  idle         no code commit in 100 days, horizon 30\n"),
+        "{status}"
+    );
+    assert!(status.contains("  CI not measured: offline"), "{status}");
     assert!(!status.contains("beta"), "{status}");
 
-    // `--all` ranks the untiered project as tier 5 and marks it so.
+    // `--all` ranks the untiered project as tier 5 and marks it so. It has no
+    // commit at all, so it is idle, which sorts after unpublished work.
     let status = ok(&home, &["status", "--all", "--explain"]);
     assert!(
         status.starts_with("last scan just now; 2 projects, 1 untiered ranked as tier 5\n"),
         "{status}"
     );
-    assert!(status.contains("\nbeta     -     0."), "{status}");
-    assert!(status.contains("\nbeta  tier 5, untiered (x0.2)"), "{status}");
+    let rows: Vec<&str> = status.lines().skip(3).take(2).collect();
+    assert!(
+        rows[0].starts_with("alpha    1     unpublished +1")
+            && rows[1].starts_with("beta     -     idle"),
+        "{status}"
+    );
+    assert!(
+        status.contains("\nbeta  tier 5, untiered\n  idle  no code commits found\n"),
+        "{status}"
+    );
 
     // Lowering tier 1's multiplier makes its high items unimportant.
     ok(&home, &["config", "tiers.1", "0.3"]);
@@ -576,12 +629,12 @@ fn dispatch_review_rework_and_ship() {
         !success && err.contains("commit and push it first"),
         "{err}"
     );
-    assert!(!env.home.join("worktrees/alpha/local-only").exists());
+    assert!(!env.home.join("state/worktrees/alpha/local-only").exists());
 
     // A rejected run leaves no worktree or branch.
     env.ok(&["dispatch", "alpha:8"]);
     env.ok(&["review", "3", "--reject"]);
-    assert!(!env.home.join("worktrees/alpha/third-task").exists());
+    assert!(!env.home.join("state/worktrees/alpha/third-task").exists());
     assert_eq!(git_out(&alpha, &["branch", "--list", "pma/third-task"]), "");
 
     let out = env.ok(&["ship"]);
@@ -598,7 +651,7 @@ fn dispatch_review_rework_and_ship() {
     );
     assert_eq!(git_out(&origin, &["show", "main:second.txt"]), "two\n");
     assert_eq!(git_out(&origin, &["branch", "--list", "agent"]), "");
-    assert!(!env.home.join("worktrees/alpha/add-greeting").exists());
+    assert!(!env.home.join("state/worktrees/alpha/add-greeting").exists());
     assert_eq!(git_out(&alpha, &["branch", "--list", "pma/*"]), "");
     assert_eq!(env.ok(&["review"]), "no runs to review\n");
     assert_eq!(env.ok(&["ship"]), "nothing approved\n");
@@ -734,7 +787,7 @@ fn ship_resumes_after_a_partial_failure() {
     // The push succeeds and removing the worktree fails.
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
-    let worktree = env.home.join("worktrees/alpha/add-greeting");
+    let worktree = env.home.join("state/worktrees/alpha/add-greeting");
     git(
         &alpha,
         &["worktree", "lock", worktree.to_str().unwrap()],
@@ -839,7 +892,7 @@ fn auto_dispatch_passes_over_refused_tasks_and_names_the_cause() {
         !success && err.contains("`guarded task` is class D and is not dispatched"),
         "{err}"
     );
-    assert!(!env.home.join("worktrees/alpha/guarded-task").exists());
+    assert!(!env.home.join("state/worktrees/alpha/guarded-task").exists());
     assert_eq!(
         git_out(&alpha, &["branch", "--list", "pma/guarded-task"]),
         ""
@@ -1085,7 +1138,7 @@ fn an_approval_is_evidence_about_a_tree_not_a_state() {
     // A worktree edited after approval is not published.
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
-    let worktree = env.home.join("worktrees/alpha/add-greeting");
+    let worktree = env.home.join("state/worktrees/alpha/add-greeting");
     fs::write(worktree.join("sneaked.txt"), "later\n").unwrap();
     let (out, err, success) = env.run(&["ship"]);
     assert!(!success, "{out}{err}");
@@ -1701,8 +1754,9 @@ fn a_worker_no_longer_names_a_model() {
         err.contains("pma preset set"),
         "it says where it went: {err}"
     );
+    // The retired setting points at the place a model now lives.
     let (_, err, ok) = env.run(&["config", "model", "haiku"]);
-    assert!(!ok && err.contains("pma agent set"), "{err}");
+    assert!(!ok && err.contains("pma preset set"), "{err}");
 
     // With no preset and no flag, the worker is run without a model at all and
     // uses its own.
@@ -2110,12 +2164,37 @@ fn an_agent_node_is_priced_then_run_on_approval() {
         "the cheap model it would use: {out}"
     );
     assert!(out.contains("Nothing was spent"), "{out}");
-    assert!(out.contains("--yes"), "it says how to approve: {out}");
+    assert!(out.contains("--approve"), "it says how to approve: {out}");
     assert!(!log.exists(), "the worker must not have run");
+    let id = plan_id(&out);
 
-    // Approval is what unlocks it. The finding the model wrote enters the
-    // graph as a unit and reaches the sink downstream of it.
-    let (out, err, success) = run(&["workflow", "run", "review", "--instance", "1", "--yes"]);
+    // An approval names the plan it was shown. Without `-m haiku` the plan
+    // would run another model, so it is another plan and nothing runs.
+    let (_, err, success) = run(&[
+        "workflow",
+        "run",
+        "review",
+        "--instance",
+        "1",
+        "--approve",
+        &id,
+    ]);
+    assert!(!success && err.contains("not the plan"), "{err}");
+    assert!(!log.exists(), "a refused approval spends nothing");
+
+    // The plan it was shown is what unlocks it. The finding the model wrote
+    // enters the graph as a unit and reaches the sink downstream of it.
+    let (out, err, success) = run(&[
+        "workflow",
+        "run",
+        "review",
+        "--instance",
+        "1",
+        "-m",
+        "haiku",
+        "--approve",
+        &id,
+    ]);
     assert!(success, "{err}");
     assert!(out.contains("nothing left to run"), "{out}");
     assert_eq!(
@@ -2409,7 +2488,16 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","t
 
     // Approved: one run, in a worktree of its own, verified and waiting for a
     // decision.
-    let (out, err, success) = env.run(&["workflow", "run", "greet", "--instance", "1", "--yes"]);
+    let id = plan_id(&out);
+    let (out, err, success) = env.run(&[
+        "workflow",
+        "run",
+        "greet",
+        "--instance",
+        "1",
+        "--approve",
+        &id,
+    ]);
     assert!(success, "{err}\n{out}");
     let review = env.ok(&["review"]);
     assert!(
@@ -2453,7 +2541,8 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","t
     env.ok(&["config", "workflow_budget", "20"]);
     env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
     env.ok(&["workflow", "activate", "1"]);
-    let (_, err, success) = env.run(&["workflow", "run", "greet", "alpha", "--yes"]);
+    let id = plan_id(&env.ok(&["workflow", "run", "greet", "alpha", "--dry-run"]));
+    let (_, err, success) = env.run(&["workflow", "run", "greet", "alpha", "--approve", &id]);
     assert!(!success, "an instance with no edit budget must not edit");
     assert!(err.contains("max_edits"), "{err}");
     assert!(
@@ -2557,10 +2646,10 @@ fn a_target_yields_the_type_the_workflow_reads() {
 }
 
 /// A sink writes outside the database, so each unit's write and the moves
-/// that record it commit together. A pass that fails on the second project
-/// leaves the first one's work recorded and does not repeat it on resume.
+/// that record it commit together. A unit the sink cannot write is refused on
+/// its own and named; the others are written once.
 #[test]
-fn a_sink_that_fails_part_way_does_not_repeat_what_it_wrote() {
+fn a_sink_refuses_a_unit_alone_and_does_not_repeat_what_it_wrote() {
     let s = Scratch::new("sink");
     let home = s.0.join("home");
     let root = s.0.join("root");
@@ -2593,9 +2682,14 @@ fn a_sink_that_fails_part_way_does_not_repeat_what_it_wrote() {
     ok(&home, &["workflow", "activate", "1"]);
 
     // `beta`'s file has lint errors, so an item cannot be identified in it.
-    let (_, err, success) = pma_in(&home, &["workflow", "run", "stamp", "alpha", "beta"]);
-    assert!(!success, "the pass must report the sink it could not write");
-    assert!(err.contains("lint errors"), "{err}");
+    // That refuses `beta`'s unit alone, and says so; `alpha` is written.
+    let (out, err, success) = pma_in(&home, &["workflow", "run", "stamp", "alpha", "beta"]);
+    assert!(success, "{err}");
+    assert!(
+        err.contains("refused: stamp: u2") && err.contains("lint errors"),
+        "{err}"
+    );
+    assert!(out.contains("nothing left to run"), "{out}");
 
     let alpha = root.join("alpha").join("TODO.md");
     let written = fs::read_to_string(&alpha).unwrap();
@@ -2604,32 +2698,20 @@ fn a_sink_that_fails_part_way_does_not_repeat_what_it_wrote() {
         1,
         "the first project's write committed: {written}"
     );
-
-    // Resuming does not write it a second time, and still names `beta`.
-    let (_, err, success) = pma_in(&home, &["workflow", "run", "stamp", "--instance", "1"]);
-    assert!(!success && err.contains("lint errors"), "{err}");
-    assert_eq!(
-        fs::read_to_string(&alpha)
+    assert!(
+        written.contains("- [ ] reviewed alpha ^"),
+        "pma wrote the line, so it gave the item an id: {written}"
+    );
+    assert!(
+        !fs::read_to_string(root.join("beta").join("TODO.md"))
             .unwrap()
-            .matches("reviewed alpha")
-            .count(),
-        1,
-        "a resumed pass does not repeat a sink it already wrote"
+            .contains("reviewed beta"),
+        "a refused unit writes nothing"
     );
 
-    // Fixed, `beta` goes through and the pass settles.
-    fs::write(
-        root.join("beta").join("TODO.md"),
-        "# TODO\n\n## High\n\n- [ ] something\n",
-    )
-    .unwrap();
+    // The instance is finished, and running it again writes nothing twice.
     let out = ok(&home, &["workflow", "run", "stamp", "--instance", "1"]);
     assert!(out.contains("nothing left to run"), "{out}");
-    assert!(
-        fs::read_to_string(root.join("beta").join("TODO.md"))
-            .unwrap()
-            .contains("reviewed beta")
-    );
     assert_eq!(
         fs::read_to_string(&alpha)
             .unwrap()
@@ -2637,6 +2719,28 @@ fn a_sink_that_fails_part_way_does_not_repeat_what_it_wrote() {
             .count(),
         1,
         "still once"
+    );
+
+    // A second instance finds the item it would add already open, and adds
+    // no duplicate the linter would refuse.
+    fs::write(
+        root.join("beta").join("TODO.md"),
+        "# TODO\n\n## High\n\n- [ ] something\n",
+    )
+    .unwrap();
+    ok(&home, &["workflow", "run", "stamp", "alpha", "beta"]);
+    assert_eq!(
+        fs::read_to_string(&alpha)
+            .unwrap()
+            .matches("reviewed alpha")
+            .count(),
+        1,
+        "an item already open is not added again"
+    );
+    assert!(
+        fs::read_to_string(root.join("beta").join("TODO.md"))
+            .unwrap()
+            .contains("reviewed beta")
     );
 }
 
@@ -2917,7 +3021,16 @@ fn agent_runs_go_in_parallel_and_the_batch_budget_bounds_the_pass() {
 
     // Two projects, two threads, room for both.
     run(&["config", "max_parallel", "2"]);
-    let (out, err, success) = run(&["workflow", "run", "review", "alpha", "beta", "--yes"]);
+    let id = plan_id(&run(&["workflow", "run", "review", "alpha", "beta", "--dry-run"]).0);
+    let (out, err, success) = run(&[
+        "workflow",
+        "run",
+        "review",
+        "alpha",
+        "beta",
+        "--approve",
+        &id,
+    ]);
     assert!(success, "{err}\n{out}");
     let order: Vec<String> = fs::read_to_string(&log)
         .unwrap()
@@ -2935,7 +3048,20 @@ fn agent_runs_go_in_parallel_and_the_batch_budget_bounds_the_pass() {
     // is left, and the next pass takes the other.
     fs::remove_file(&log).unwrap();
     run(&["config", "batch_budget", "1"]);
-    let (out, err, success) = run(&["workflow", "run", "review", "alpha", "beta", "--yes"]);
+    let dry = run(&["workflow", "run", "review", "alpha", "beta", "--dry-run"]).0;
+    assert!(
+        dry.contains("1 unit(s)"),
+        "the plan holds what the budget admits: {dry}"
+    );
+    let (out, err, success) = run(&[
+        "workflow",
+        "run",
+        "review",
+        "alpha",
+        "beta",
+        "--approve",
+        &plan_id(&dry),
+    ]);
     assert!(success, "{err}\n{out}");
     assert!(out.contains("next: review"), "the rest is priced: {out}");
     assert_eq!(
@@ -2944,7 +3070,15 @@ fn agent_runs_go_in_parallel_and_the_batch_budget_bounds_the_pass() {
         "the batch budget admitted one run"
     );
 
-    let (out, err, success) = run(&["workflow", "run", "review", "--instance", "2", "--yes"]);
+    let (out, err, success) = run(&[
+        "workflow",
+        "run",
+        "review",
+        "--instance",
+        "2",
+        "--approve",
+        &plan_id(&out),
+    ]);
     assert!(success, "{err}\n{out}");
     assert!(out.contains("nothing left to run"), "{out}");
     assert_eq!(
@@ -2979,7 +3113,7 @@ fn a_replaced_git_dir_is_refused_before_pma_runs_git_in_it() {
         "{out}{err}"
     );
     env.ok(&["review", "1", "--reject"]);
-    assert!(!env.home.join("worktrees/alpha/add-greeting").exists());
+    assert!(!env.home.join("state/worktrees/alpha/add-greeting").exists());
     assert_eq!(git_out(&alpha, &["branch", "--list", "pma/*"]), "");
     assert!(!s.0.join("pwned").exists(), "the monitor ran");
 }
@@ -3057,7 +3191,7 @@ fn a_refused_dispatch_leaves_no_worktree_behind() {
     env.ok(&["route", "activate", "1", "--by", "me"]);
     let (_, err, success) = env.run(&["dispatch", "alpha:5"]);
     assert!(!success && err.contains("matches no route"), "{err}");
-    assert!(!env.home.join("worktrees/alpha/add-greeting").exists());
+    assert!(!env.home.join("state/worktrees/alpha/add-greeting").exists());
     assert_eq!(git_out(&alpha, &["branch", "--list", "pma/*"]), "");
 }
 
@@ -3140,8 +3274,648 @@ fn verify_runs_the_check_where_a_dispatch_would() {
     env.ok(&["config", "projects.alpha.verify", "true"]);
     let out = env.ok(&["verify", "alpha"]);
     assert!(out.starts_with("alpha: `true` passed at "), "{out}");
-    assert!(!env.home.join("verify-trees/alpha").exists());
+    assert!(!env.home.join("state/verify-trees/alpha").exists());
     assert_eq!(git_out(&alpha, &["worktree", "list"]).lines().count(), 1);
     let (_, err, success) = env.run(&["verify"]);
     assert!(!success && err.contains("name a project"), "{err}");
+}
+
+/// A stand-in for `claude -p` that plays a workflow's agent nodes. `Review`
+/// writes the findings listed in `$PMA_HOME/../findings`, one title per
+/// line; `Confirm` keeps each unit it reads with a `reason`, and fails when
+/// `$PMA_HOME/../fail-confirm` exists. Every invocation is logged.
+const NODE_CLAUDE: &str = r#"#!/usr/bin/env python3
+import json, os, re, sys
+home = os.path.dirname(os.environ["PMA_HOME"])
+prompt = sys.argv[2]
+with open(os.path.join(home, "worker.log"), "a") as f:
+    f.write(" ".join(sys.argv[1:]) + "\n")
+out = re.search(r"write (\S+)", prompt).group(1)
+if prompt.startswith("Review"):
+    titles = open(os.path.join(home, "findings")).read().split("\n")
+    json.dump([{"title": t} for t in titles if t], open(out, "w"))
+elif prompt.startswith("Confirm"):
+    if os.path.exists(os.path.join(home, "fail-confirm")):
+        sys.exit(1)
+    units = json.load(open(re.search(r"read (\S+)", prompt).group(1)))
+    json.dump([{"@id": u["@id"], "reason": "proved"} for u in units], open(out, "w"))
+print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                  "result": "ok", "total_cost_usd": 0.1}))
+"#;
+
+/// A review, then a confirm that keeps what it can prove, then a note.
+const REVIEW_CONFIRM: &str = r#"
+let graph = source("project")
+    .expand("review", "finding", 3, "Review {name}. write {out}")
+    .filter("confirm", ["reason"], "Confirm: read {in} write {out}")
+    .emit_note("record", #{ text: "confirmed: {title}: {reason}" })
+    .output();
+document(#{ finding: #{ fields: #{ title: req(line(200)), reason: line(200) }}}, [
+    workflow("look", graph, #{ caps: #{ max_units: 10, max_edits: 0 }}),
+])
+"#;
+
+/// Runs a pass and approves whatever it prints, once. Returns the output of
+/// the approving pass.
+fn approve_next(env: &Env, name: &str, instance: &str) -> String {
+    let out = env.ok(&["workflow", "run", name, "--instance", instance]);
+    env.ok(&[
+        "workflow",
+        "run",
+        name,
+        "--instance",
+        instance,
+        "--approve",
+        &plan_id(&out),
+    ])
+}
+
+/// Each node runs on the worker and model its route names. A validator that
+/// fails passes nothing on, and one that succeeds cannot drop a field it was
+/// not asked to write: the title the model left out is still minted.
+#[test]
+fn nodes_are_routed_apart_and_a_failed_validator_passes_nothing_on() {
+    let s = Scratch::new("routed");
+    let (env, _, _) = dispatch_env(&s, &[("claude", NODE_CLAUDE)]);
+    fs::write(s.0.join("findings"), "a finding\n").unwrap();
+    let wf = s.0.join("look.rhai");
+    fs::write(&wf, REVIEW_CONFIRM).unwrap();
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+
+    let policy = s.0.join("policy.json");
+    fs::write(
+        &policy,
+        r#"{"route": [
+            {"name": "reviewers", "match": {"node": "*/review"}, "model": "opus", "approval": "each"},
+            {"name": "confirmers", "match": {"node": "confirm"}, "model": "haiku", "approval": "each"},
+            {"name": "tasks", "approval": "each"}
+        ]}"#,
+    )
+    .unwrap();
+    env.ok(&["route", "propose", policy.to_str().unwrap()]);
+    env.ok(&["route", "activate", "1"]);
+
+    let out = env.ok(&["workflow", "run", "look", "alpha"]);
+    assert!(
+        out.contains("next: review") && out.contains("claude/opus"),
+        "{out}"
+    );
+    env.ok(&[
+        "workflow",
+        "run",
+        "look",
+        "--instance",
+        "1",
+        "--approve",
+        &plan_id(&out),
+    ]);
+    let out = env.ok(&["workflow", "run", "look", "--instance", "1"]);
+    assert!(
+        out.contains("next: confirm") && out.contains("claude/haiku"),
+        "{out}"
+    );
+    let out = approve_next(&env, "look", "1");
+    assert!(out.contains("nothing left to run"), "{out}");
+    let log = fs::read_to_string(s.0.join("worker.log")).unwrap();
+    assert!(log.contains("opus") && log.contains("haiku"), "{log}");
+    assert!(
+        env.ok(&["note"]).contains("confirmed: a finding: proved"),
+        "the title the confirm left out is the one it was given"
+    );
+
+    // The confirm fails: the finding it was given stops there.
+    fs::write(s.0.join("fail-confirm"), "").unwrap();
+    let out = env.ok(&["workflow", "run", "look", "alpha"]);
+    env.ok(&[
+        "workflow",
+        "run",
+        "look",
+        "--instance",
+        "2",
+        "--approve",
+        &plan_id(&out),
+    ]);
+    let out = env.ok(&["workflow", "run", "look", "--instance", "2"]);
+    let (out, err, success) = env.run(&[
+        "workflow",
+        "run",
+        "look",
+        "--instance",
+        "2",
+        "--approve",
+        &plan_id(&out),
+    ]);
+    assert!(success, "{err}");
+    assert!(err.contains("refused: confirm"), "{err}");
+    assert!(out.contains("nothing left to run"), "{out}");
+    assert_eq!(
+        env.ok(&["note"]).matches("confirmed:").count(),
+        1,
+        "an unconfirmed finding does not reach the sink"
+    );
+}
+
+/// A node runs once everything before it has finished, so a `reduce` joining
+/// two branches sees both: two readings of the same three items dedupe to
+/// three, not six.
+#[test]
+fn a_reduce_waits_for_every_branch() {
+    let s = Scratch::new("barrier");
+    let home = s.0.join("home");
+    let root = s.0.join("root");
+    let alpha = root.join("alpha");
+    fs::create_dir_all(&alpha).unwrap();
+    git(&alpha, &["init", "-q"], None);
+    fs::write(
+        alpha.join("TODO.md"),
+        "# TODO\n\n## High\n\n- [ ] alpha\n- [ ] beta\n- [ ] gamma\n",
+    )
+    .unwrap();
+    ok(&home, &["root", "add", root.to_str().unwrap()]);
+    ok(&home, &["scan", "--offline"]);
+    let wf = s.0.join("join.rhai");
+    fs::write(
+        &wf,
+        r#"
+        let graph = source("project")
+            .fan([
+                |g| g.rule_expand("first", "item", "todo-items", 10),
+                |g| g.rule_expand("second", "item", "todo-items", 10),
+            ])
+            .join("a-join", ["text"])
+            .emit_note("record", #{ text: "kept: {text}" })
+            .output();
+        document(#{}, [
+            workflow("join", graph, #{ caps: #{ max_units: 50, max_edits: 0 }}),
+        ])
+        "#,
+    )
+    .unwrap();
+    ok(&home, &["workflow", "propose", wf.to_str().unwrap()]);
+    ok(&home, &["workflow", "activate", "1"]);
+    let out = ok(&home, &["workflow", "run", "join", "alpha"]);
+    assert!(out.contains("nothing left to run"), "{out}");
+    assert_eq!(ok(&home, &["note"]).matches("kept:").count(), 3);
+}
+
+/// A check about a pull request waits while the run is on its way: the unit
+/// stays at the check, the instance stays open, and the pass says so. Once
+/// the run is rejected, the check fails and the instance finishes.
+#[test]
+fn a_check_waits_until_the_run_is_decided() {
+    let s = Scratch::new("waiting");
+    let worker = r#"#!/bin/sh
+echo hi > hello.txt
+echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","total_cost_usd":0.1}'
+"#;
+    let (env, _, _) = dispatch_env(&s, &[("claude", worker)]);
+    let wf = s.0.join("merge.rhai");
+    fs::write(
+        &wf,
+        r#"
+        let graph = source("project")
+            .edit("greet", "verify", "Say hello in hello.txt for `{name}`.")
+            .check("merged", "pr-merged")
+            .when(#{ "@pr-merged": ["passed"] })
+            .emit_note("done", #{ text: "merged: {name}" })
+            .output();
+        document(#{}, [
+            workflow("greet", graph, #{ caps: #{ max_units: 10, max_edits: 1 }}),
+        ])
+        "#,
+    )
+    .unwrap();
+    env.ok(&["config", "workflow_budget", "20"]);
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+    let out = env.ok(&["workflow", "run", "greet", "alpha"]);
+    let out = env.ok(&[
+        "workflow",
+        "run",
+        "greet",
+        "--instance",
+        "1",
+        "--approve",
+        &plan_id(&out),
+    ]);
+    assert!(out.contains("waiting at merged: 1 unit(s)"), "{out}");
+    let out = env.ok(&["workflow", "run", "greet", "--instance", "1"]);
+    assert!(out.contains("waiting at merged"), "still waiting: {out}");
+    assert!(!env.ok(&["workflow"]).contains("finished"));
+
+    env.ok(&["review", "1", "--reject"]);
+    let out = env.ok(&["workflow", "run", "greet", "--instance", "1"]);
+    assert!(out.contains("nothing left to run"), "{out}");
+    assert!(
+        env.ok(&["note"]).contains("no notes"),
+        "a rejected run never merged"
+    );
+}
+
+/// A cap hit while a batch is recorded rolls the batch back whole, records
+/// the cap on the instance, and a raised cap resumes it.
+#[test]
+fn a_cap_rolls_the_batch_back_and_a_raised_cap_resumes() {
+    let s = Scratch::new("capped");
+    let (env, _, _) = dispatch_env(&s, &[("claude", NODE_CLAUDE)]);
+    fs::write(s.0.join("findings"), "one\ntwo\n").unwrap();
+    let wf = s.0.join("review.rhai");
+    fs::write(
+        &wf,
+        r#"
+        let graph = source("project")
+            .expand("review", "finding", 3, "Review {name}. write {out}")
+            .emit_note("record", #{ text: "found: {title}" })
+            .output();
+        document(#{ finding: #{ fields: #{ title: req(line(200)) }}}, [
+            workflow("look", graph, #{ caps: #{ max_units: 2, max_edits: 0 }}),
+        ])
+        "#,
+    )
+    .unwrap();
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+    let out = env.ok(&["workflow", "run", "look", "alpha"]);
+    let (_, err, success) = env.run(&[
+        "workflow",
+        "run",
+        "look",
+        "--instance",
+        "1",
+        "--approve",
+        &plan_id(&out),
+    ]);
+    assert!(!success && err.contains("max_units"), "{err}");
+    assert!(env.ok(&["workflow"]).contains("capped"));
+    assert!(
+        env.ok(&["note"]).contains("no notes"),
+        "no finding was half minted"
+    );
+
+    let (_, err, success) = env.run(&["workflow", "run", "look", "--instance", "1"]);
+    assert!(!success && err.contains("--cap max_units"), "{err}");
+    let (_, err, success) = env.run(&[
+        "workflow",
+        "run",
+        "look",
+        "--instance",
+        "1",
+        "--cap",
+        "max_units=1",
+    ]);
+    assert!(!success && err.contains("must be higher"), "{err}");
+
+    let out = env.ok(&[
+        "workflow",
+        "run",
+        "look",
+        "--instance",
+        "1",
+        "--cap",
+        "max_units=5",
+    ]);
+    assert!(
+        out.contains("next: review"),
+        "the batch is waiting again: {out}"
+    );
+    let out = env.ok(&[
+        "workflow",
+        "run",
+        "look",
+        "--instance",
+        "1",
+        "--approve",
+        &plan_id(&out),
+    ]);
+    assert!(out.contains("nothing left to run"), "{out}");
+    let notes = env.ok(&["note"]);
+    assert!(
+        notes.contains("found: one") && notes.contains("found: two"),
+        "{notes}"
+    );
+}
+
+/// `workflow stop` ends an instance: nothing further runs under it.
+#[test]
+fn a_stopped_instance_runs_nothing_more() {
+    let s = Scratch::new("stop");
+    let (env, _, _) = dispatch_env(&s, &[("claude", NODE_CLAUDE)]);
+    let wf = s.0.join("look.rhai");
+    fs::write(&wf, REVIEW_CONFIRM).unwrap();
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+    env.ok(&["workflow", "run", "look", "alpha"]);
+    env.ok(&["workflow", "stop", "1"]);
+    let (_, err, success) = env.run(&["workflow", "run", "look", "--instance", "1"]);
+    assert!(!success && err.contains("was stopped"), "{err}");
+    assert!(!s.0.join("worker.log").exists());
+}
+
+/// A revision is what runs, so one stating a construct the runtime does not
+/// take is refused at propose. `check` still prices it and says why.
+#[test]
+fn a_document_the_runtime_cannot_take_is_refused_at_propose() {
+    let s = Scratch::new("unbuilt");
+    let home = s.0.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let wf = s.0.join("split.json");
+    fs::write(
+        &wf,
+        r#"{"types": {"task": {"fields": {"text": {"type": "line", "required": true}}}},
+        "workflow": [{"name": "decompose", "in": "task", "out": "task", "effects": [],
+          "params": {"depth": {"type": "int", "default": 2, "max": 3}},
+          "caps": {"max_units": 20, "max_edits": 0},
+          "nodes": [{"name": "split", "op": "map", "out": "0..n", "in": "task", "emits": "task",
+                     "max_units": 2, "max_depth": "{$depth}", "task": "split {text} into {out}"}],
+          "edges": [{"from": "@input", "to": "split"},
+                    {"from": "split", "to": "split", "when": {"@depth": {"<": "{$depth}"}}},
+                    {"from": "split", "to": "@output"}]}]}"#,
+    )
+    .unwrap();
+    // One unit, split three levels deep at two apiece: 1 + 2 + 4 + 8 runs.
+    let out = ok(&home, &["workflow", "check", wf.to_str().unwrap()]);
+    assert!(out.contains("worst case: 15 agent runs"), "{out}");
+    assert!(
+        out.contains("recursion (a self-edge) is not taken yet"),
+        "{out}"
+    );
+    let (_, err, success) = pma_in(&home, &["workflow", "propose", wf.to_str().unwrap()]);
+    assert!(!success && err.contains("not runnable yet"), "{err}");
+}
+
+/// Under a policy, an agent node no route names is refused when it runs. A
+/// dry run says so first, naming the node.
+#[test]
+fn a_dry_run_names_a_node_the_policy_would_refuse() {
+    let s = Scratch::new("unrouted");
+    let (env, _, _) = dispatch_env(&s, &[("claude", NODE_CLAUDE)]);
+    let wf = s.0.join("look.rhai");
+    fs::write(&wf, REVIEW_CONFIRM).unwrap();
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+    let policy = s.0.join("policy.json");
+    fs::write(
+        &policy,
+        r#"{"route": [
+            {"name": "reviewers", "match": {"node": "*/review"}, "approval": "each"},
+            {"name": "tasks", "approval": "each"}
+        ]}"#,
+    )
+    .unwrap();
+    env.ok(&["route", "propose", policy.to_str().unwrap()]);
+    env.ok(&["route", "activate", "1"]);
+    let (_, err, success) = env.run(&["workflow", "run", "look", "alpha", "--dry-run"]);
+    assert!(success, "{err}");
+    assert!(err.contains("node `confirm`: no route"), "{err}");
+    assert!(
+        !err.contains("node `review`"),
+        "a named node is not warned about: {err}"
+    );
+}
+
+/// An id keeps an item's identity when its text is reworded: its age, and
+/// the run it already has.
+#[test]
+fn an_id_keeps_an_items_age_and_its_run_across_a_reword() {
+    let s = Scratch::new("ids");
+    let (env, _, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    let alpha_dir = alpha.to_str().unwrap();
+
+    // Listed, then written, then there is nothing left to write.
+    let out = env.ok(&["lint", "--ids", alpha_dir]);
+    assert!(
+        out.contains(":5: ^") && out.contains("4 items without an id"),
+        "{out}"
+    );
+    let before = fs::read_to_string(alpha.join("TODO.md")).unwrap();
+    assert!(!before.contains(" ^"), "a listing writes nothing");
+
+    // A run on line 5 before its id exists moves to the id when it is written.
+    env.ok(&["dispatch", "alpha:5"]);
+    let out = env.ok(&["lint", "--ids", "--apply", alpha_dir]);
+    assert!(out.contains("4 ids written"), "{out}");
+    assert!(
+        env.ok(&["lint", "--ids", alpha_dir])
+            .contains("every open item has an id")
+    );
+    let written = fs::read_to_string(alpha.join("TODO.md")).unwrap();
+    assert_eq!(written.matches(" ^").count(), 4, "{written}");
+    assert!(
+        env.ok(&["lint", alpha_dir]).is_empty(),
+        "the file stays clean"
+    );
+
+    // Reworded in the clone, the item keeps its id, so its run still holds it.
+    let reworded = written.replace(
+        "- [ ] add greeting #agent",
+        "- [ ] add a friendly greeting #agent",
+    );
+    assert_ne!(reworded, written, "the item was reworded");
+    fs::write(alpha.join("TODO.md"), reworded).unwrap();
+    env.ok(&["scan", "--offline"]);
+    let (_, err, success) = env.run(&["dispatch", "alpha:5"]);
+    assert!(
+        !success && err.contains("already has a run"),
+        "the reworded item is the task the run holds: {err}"
+    );
+}
+
+/// An item keeps the age git gave it when its text is reworded, because the
+/// id carries it from one scan to the next.
+#[test]
+fn an_id_keeps_the_age_git_gave_an_item() {
+    let s = Scratch::new("idage");
+    let home = s.0.join("home");
+    let root = s.0.join("root");
+    let alpha = root.join("alpha");
+    fs::create_dir_all(&alpha).unwrap();
+    git(&alpha, &["init", "-q"], None);
+    fs::write(
+        alpha.join("TODO.md"),
+        "# TODO\n\n## High\n\n- [ ] old thing\n",
+    )
+    .unwrap();
+    git(&alpha, &["add", "."], None);
+    git(&alpha, &["commit", "-qm", "init"], Some(now() - 100 * DAY));
+    ok(&home, &["root", "add", root.to_str().unwrap()]);
+    ok(&home, &["project", "tier", "1", "alpha"]);
+    ok(
+        &home,
+        &["lint", "--ids", "--apply", alpha.to_str().unwrap()],
+    );
+    ok(&home, &["scan", "--offline"]);
+    assert!(ok(&home, &["stale"]).contains("open 100d  old thing"));
+
+    let text = fs::read_to_string(alpha.join("TODO.md")).unwrap();
+    fs::write(
+        alpha.join("TODO.md"),
+        text.replace("old thing", "renamed thing"),
+    )
+    .unwrap();
+    ok(&home, &["scan", "--offline"]);
+    let stale = ok(&home, &["stale"]);
+    assert!(stale.contains("open 100d  renamed thing"), "{stale}");
+}
+
+/// `pma next`, and `pma` alone: tasks for agents in the order `--auto` takes
+/// them, then what waits on you. A task with a run leaves the agents' list and
+/// comes back as the run to review.
+#[test]
+fn next_lists_work_for_agents_and_for_you() {
+    let s = Scratch::new("next");
+    let (env, _, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    // A critical item no agent may take, written in the clone the scan reads.
+    let text = fs::read_to_string(alpha.join("TODO.md")).unwrap();
+    fs::write(
+        alpha.join("TODO.md"),
+        text.replace(
+            "# TODO\n",
+            "# TODO\n\n## Critical\n\n- [ ] rotate the signing key\n",
+        ),
+    )
+    .unwrap();
+    env.ok(&["scan", "--offline"]);
+
+    let out = env.ok(&["next"]);
+    assert!(out.contains("For agents: 3\n"), "{out}");
+    assert!(
+        out.contains("add greeting") && out.contains("third task"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("guarded task"),
+        "#manual is not for agents: {out}"
+    );
+    assert!(
+        out.contains("For you: 1\n  tasks: 1\n")
+            && out.contains("not #agent  rotate the signing key"),
+        "{out}"
+    );
+    assert_eq!(env.ok(&[]), out, "`pma` alone is `pma next`");
+
+    env.ok(&["dispatch", "alpha:9"]);
+    let out = env.ok(&["next"]);
+    assert!(
+        out.contains("For agents: 2\n"),
+        "the dispatched task is held: {out}"
+    );
+    assert!(
+        out.contains("runs: 1\n    #1  ready  to review  alpha  add greeting  pma review 1"),
+        "{out}"
+    );
+}
+
+/// The library in `docs/dev/workflows.md` section 15 is what a reader copies,
+/// so each example must read and price, and `propose` must take exactly the
+/// ones the text lists as runnable. Types come from section 6's document.
+#[test]
+fn the_documented_workflow_library_reads_as_documented() {
+    let doc = fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/dev/workflows.md"),
+    )
+    .unwrap();
+    let blocks = |text: &str| -> Vec<serde_json::Value> {
+        text.split("```json\n")
+            .skip(1)
+            .map(|b| serde_json::from_str(b.split("\n```").next().unwrap()).unwrap())
+            .collect()
+    };
+    let section = |from: &str, to: &str| {
+        let start = doc.find(from).unwrap();
+        doc[start..start + doc[start..].find(to).unwrap()].to_string()
+    };
+    let types = blocks(&section("## 6. The document", "### 6.1"))[0]["types"].clone();
+    let library = section("## 15. A library", "## 16. Acceptance");
+    let workflows: Vec<serde_json::Value> = blocks(&library);
+    assert_eq!(workflows.len(), 12, "the library's twelve examples");
+    let named = |name: &str| {
+        workflows
+            .iter()
+            .find(|w| w["name"] == name)
+            .unwrap()
+            .clone()
+    };
+
+    let s = Scratch::new("library");
+    let home = s.0.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let runnable = [
+        "find-issues",
+        "ensemble-review",
+        "triage-issues",
+        "specify",
+        "record",
+        "settle",
+        "portfolio-sweep",
+    ];
+    for w in &workflows {
+        let name = w["name"].as_str().unwrap();
+        // A caller's document carries its callees, as a revision would.
+        let mut members = vec![w.clone()];
+        let mut i = 0;
+        while i < members.len() {
+            for node in members[i]["nodes"].as_array().unwrap().clone() {
+                if node["op"] == "call" {
+                    let callee = named(node["workflow"].as_str().unwrap());
+                    if !members.iter().any(|m| m["name"] == callee["name"]) {
+                        members.push(callee);
+                    }
+                }
+            }
+            i += 1;
+        }
+        let file = s.0.join(format!("{name}.json"));
+        fs::write(
+            &file,
+            serde_json::json!({"types": types, "workflow": members}).to_string(),
+        )
+        .unwrap();
+        let (_, err, success) = pma_in(&home, &["workflow", "check", file.to_str().unwrap()]);
+        assert!(success, "{name} does not read: {err}");
+        let (_, err, success) = pma_in(&home, &["workflow", "propose", file.to_str().unwrap()]);
+        assert_eq!(
+            success,
+            runnable.contains(&name),
+            "{name}: the text says it is {}runnable: {err}",
+            if runnable.contains(&name) { "" } else { "not " }
+        );
+    }
+}
+
+/// A review that writes no `out.json` failed; it did not find nothing. Its
+/// files are kept under `artifacts/` after its tree is gone.
+#[test]
+fn a_node_that_writes_no_output_failed() {
+    let s = Scratch::new("silent");
+    let silent = r#"#!/bin/sh
+echo '{"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.1}'
+"#;
+    let (env, _, _) = dispatch_env(&s, &[("claude", silent)]);
+    let wf = s.0.join("look.rhai");
+    fs::write(&wf, REVIEW_CONFIRM).unwrap();
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+    let out = env.ok(&["workflow", "run", "look", "alpha"]);
+    let (out, err, success) = env.run(&[
+        "workflow",
+        "run",
+        "look",
+        "--instance",
+        "1",
+        "--approve",
+        &plan_id(&out),
+    ]);
+    assert!(success, "{err}");
+    assert!(
+        err.contains("refused: review") && err.contains("wrote no"),
+        "{err}"
+    );
+    assert!(out.contains("nothing left to run"), "{out}");
+    let kept = env.home.join("state/artifacts/1/review/1/in.json");
+    assert!(kept.exists(), "the run's input is kept: {}", kept.display());
+    assert!(
+        !env.home.join("state/workflow-trees/1").exists(),
+        "the scratch trees are gone"
+    );
 }

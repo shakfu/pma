@@ -11,6 +11,7 @@ mod config;
 mod dates;
 mod deps;
 mod dispatch;
+mod next;
 mod pass;
 mod progress;
 mod projects;
@@ -44,7 +45,7 @@ use todo::Priority;
 const GROUPS: [(&str, &[&str]); 6] = [
     (
         "The loop",
-        &["scan", "matrix", "dispatch", "review", "ship"],
+        &["next", "scan", "matrix", "dispatch", "review", "ship"],
     ),
     ("Tasks", &["lint", "prune", "stale", "sync", "note"]),
     ("Reading", &["status", "report", "tui"]),
@@ -97,8 +98,9 @@ fn grouped_commands(cmd: &clap::Command) -> String {
 #[derive(Parser)]
 #[command(name = "pma", version, about = "Maintain many projects from one place")]
 struct Cli {
+    /// With no command, `pma next`.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -110,6 +112,14 @@ enum Command {
     Lint {
         /// Files or directories; defaults to the current directory.
         paths: Vec<PathBuf>,
+        /// List the open items with no id, which keeps an item's identity
+        /// when its text changes. With --apply, write one at the end of each,
+        /// as `- [ ] text ^k3f9q`.
+        #[arg(long)]
+        ids: bool,
+        /// With --ids, write the ids. Edits stay uncommitted.
+        #[arg(long, requires = "ids")]
+        apply: bool,
     },
     /// Remove finished items and `Done` sections.
     ///
@@ -134,7 +144,7 @@ enum Command {
     },
     /// List a setting, show one, or set one.
     Config {
-        /// A setting such as `tiers.2` or `weights.ci`; omit to list all.
+        /// A setting such as `tiers.2` or `signals.ci`; omit to list all.
         key: Option<String>,
         /// The new value; omit to show the current one.
         value: Option<String>,
@@ -144,7 +154,8 @@ enum Command {
     },
     /// Read TODO.md, git state and CI into the database.
     ///
-    /// With no names, scans every project and forgets projects no longer found.
+    /// With no names, scans every project and marks those no longer found as
+    /// absent, keeping their records.
     Scan {
         /// Project names; defaults to every project.
         projects: Vec<String>,
@@ -159,6 +170,21 @@ enum Command {
         /// project. Without it, the last measurement is kept.
         #[arg(long, conflicts_with = "offline")]
         deps: bool,
+    },
+    /// Tasks for agents, and what waits on you. The default.
+    ///
+    /// Agents' tasks are listed in the order `pma dispatch --auto` takes
+    /// them. Yours are runs to review, ship or merge, then critical or urgent
+    /// tasks no agent may take. `pma` alone runs this.
+    Next {
+        /// Limit to these projects.
+        projects: Vec<String>,
+        /// Also select every project carrying this tag; repeatable.
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+        /// Show every row instead of the top `quadrant_limit` of each list.
+        #[arg(long)]
+        all: bool,
     },
     /// Every tiered project's tasks, ranked, in one view.
     Matrix {
@@ -175,7 +201,11 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// Rank tiered projects by health.
+    /// Projects worst first, by what needs attention.
+    ///
+    /// Each tiered project is placed by the worst state it is in: failing CI,
+    /// broken TODO.md or scan, unpublished work, critical items, stale deps,
+    /// then idle. Tier breaks ties.
     Status {
         /// Limit to these projects.
         projects: Vec<String>,
@@ -183,7 +213,7 @@ enum Command {
         #[arg(long = "tag", value_name = "TAG")]
         tags: Vec<String>,
 
-        /// Show each signal's contribution.
+        /// Name every state each project is in, and what put it there.
         #[arg(long)]
         explain: bool,
         /// Include untiered projects, ranked as tier 5.
@@ -315,7 +345,7 @@ enum Command {
         #[command(subcommand)]
         action: Option<NoteAction>,
     },
-    /// Browse the matrix in the terminal.
+    /// Browse `pma next`, or the matrix, in the terminal.
     Tui,
     /// Mirror `Critical` items to GitHub Issues.
     ///
@@ -431,7 +461,7 @@ enum RootAction {
     /// Add a directory: the git repos directly under it, or the directory
     /// itself if it is one, become projects.
     Add { dir: PathBuf },
-    /// Remove a directory; its projects are forgotten at the next full scan.
+    /// Remove a directory; the next full scan marks its projects absent.
     Rm { dir: PathBuf },
 }
 
@@ -542,10 +572,11 @@ enum WorkflowAction {
     Show { revision: Option<i64> },
     /// Advance one pass of a workflow over a target, then exit. Nodes a rule
     /// decides run; nodes an agent decides are planned, priced and left for
-    /// you to approve with `--yes`.
+    /// you to approve by the plan's id.
     ///
     /// An instance is frozen at the revision it started under, so activating
-    /// another does not change a pass already under way.
+    /// another does not change a pass already under way. A node runs once
+    /// every node before it has finished, so it sees its whole bag.
     Run {
         /// A workflow named by the revision in effect.
         name: String,
@@ -566,9 +597,14 @@ enum WorkflowAction {
         /// Plan and price the pass without running anything at all.
         #[arg(long)]
         dry_run: bool,
-        /// Approve the spend this pass plans.
-        #[arg(long)]
-        yes: bool,
+        /// Run the plan with this id, as the last pass or `--dry-run` printed
+        /// it. A plan that has changed since is refused.
+        #[arg(long, value_name = "PLAN")]
+        approve: Option<String>,
+        /// Raise a cap of a capped instance and resume it: `--cap
+        /// max_units=80`. Repeatable; recorded on the instance.
+        #[arg(long = "cap", value_name = "NAME=N", requires = "instance")]
+        cap: Vec<String>,
         /// Run agent nodes with this worker, whatever a route names.
         #[arg(short = 'a', long)]
         agent: Option<String>,
@@ -578,6 +614,11 @@ enum WorkflowAction {
         /// A named preset; `-a` or `-m` beside it wins.
         #[arg(short = 'p', long)]
         preset: Option<String>,
+    },
+    /// Stop an instance: no further node runs. Runs it already made stand.
+    Stop {
+        /// The instance, as `pma workflow` lists it.
+        instance: i64,
     },
     /// Read a document and print the worst case each workflow can cost.
     /// Nothing is stored and nothing runs.
@@ -621,8 +662,23 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(e) => e.exit(),
     };
-    let result = match cli.command {
-        Command::Lint { paths } => return lint(&paths),
+    let command = cli.command.unwrap_or(Command::Next {
+        projects: Vec::new(),
+        tags: Vec::new(),
+        all: false,
+    });
+    let result = match command {
+        Command::Next {
+            projects,
+            tags,
+            all,
+        } => show_next(&projects, &tags, all),
+        Command::Lint { paths, ids, apply } => {
+            return match ids {
+                true => add_ids(&paths, apply),
+                false => lint(&paths),
+            };
+        }
         Command::Prune { paths, apply } => return prune(&paths, apply),
         Command::Root { action } => root(action),
         Command::Project { action } => project_command(action),
@@ -695,27 +751,39 @@ fn main() -> ExitCode {
 }
 
 /// The TODO.md each path names: the file itself, or the one in a directory.
-fn todo_files(paths: &[PathBuf]) -> Vec<PathBuf> {
+/// The flag says the path was a directory, where a missing file is skipped: a
+/// glob over a root names every repository, and not every one keeps a list.
+fn todo_files(paths: &[PathBuf]) -> Vec<(PathBuf, bool)> {
     if paths.is_empty() {
-        return vec![PathBuf::from("./TODO.md")];
+        return vec![(PathBuf::from("./TODO.md"), false)];
     }
     paths
         .iter()
-        .map(|p| {
-            if p.is_dir() {
-                p.join("TODO.md")
-            } else {
-                p.clone()
-            }
+        .map(|p| match p.is_dir() {
+            true => (p.join("TODO.md"), true),
+            false => (p.clone(), false),
         })
         .collect()
 }
 
+/// Reads a TODO.md. `Ok(None)` for one a directory argument does not hold.
+fn read_todo(file: &Path, from_dir: bool) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(file) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if from_dir && e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 fn lint(paths: &[PathBuf]) -> ExitCode {
     let (mut errors, mut warnings, mut failed) = (0, 0, false);
-    for file in todo_files(paths) {
-        let text = match std::fs::read_to_string(&file) {
-            Ok(text) => text,
+    for (file, from_dir) in todo_files(paths) {
+        let text = match read_todo(&file, from_dir) {
+            Ok(Some(text)) => text,
+            Ok(None) => {
+                println!("{}: skipped: no TODO.md", file.display());
+                continue;
+            }
             Err(err) => {
                 println!("{}: error: {err}", file.display());
                 errors += 1;
@@ -751,12 +819,89 @@ fn lint(paths: &[PathBuf]) -> ExitCode {
     }
 }
 
+/// Writes an id, a trailing `^k3f9q`, into each open item that has none, so the item keeps its
+/// age and its open run when its text is reworded later. A file with lint
+/// errors is skipped: an item there cannot be told from its duplicate. Runs
+/// still open on an item move to its id, so the run check keeps finding them.
+fn add_ids(paths: &[PathBuf], apply: bool) -> ExitCode {
+    let store = Store::open_default().ok();
+    let projects = store
+        .as_ref()
+        .and_then(|s| s.projects().ok())
+        .unwrap_or_default();
+    let (mut count, mut failed) = (0, false);
+    for (file, from_dir) in todo_files(paths) {
+        let text = match read_todo(&file, from_dir) {
+            Ok(Some(text)) => text,
+            Ok(None) => {
+                println!("{}: skipped: no TODO.md", file.display());
+                continue;
+            }
+            Err(err) => {
+                println!("{}: error: {err}", file.display());
+                failed = true;
+                continue;
+            }
+        };
+        let parsed = todo::parse(&text);
+        if parsed.has_errors() {
+            println!("{}: skipped: lint errors; see `pma lint`", file.display());
+            continue;
+        }
+        let mut edited = text.clone();
+        let mut minted = Vec::new();
+        for item in parsed.items.iter().filter(|i| !i.done && i.id.is_none()) {
+            let key = item.key();
+            let Some((next, id)) = todo::mint_id(&edited, &key, &item.text) else {
+                continue;
+            };
+            println!("{}:{}: ^{id}  {}", file.display(), item.line, item.text);
+            minted.push((key, item.text.clone(), format!("id:{id}")));
+            edited = next;
+        }
+        count += minted.len();
+        if !apply || minted.is_empty() {
+            continue;
+        }
+        if let Err(err) = todo::save(&file, &edited) {
+            println!("{}: error: {err}", file.display());
+            failed = true;
+            continue;
+        }
+        let here = file.canonicalize().ok();
+        let project = projects
+            .iter()
+            .find(|p| p.path.join("TODO.md").canonicalize().ok() == here);
+        if let (Some(store), Some(project)) = (&store, project) {
+            for (old, text, new) in &minted {
+                if let Err(e) = store.rekey_runs(&project.name, old, text, new) {
+                    println!("{}: error: {e}", file.display());
+                    failed = true;
+                }
+            }
+        }
+    }
+    match (count, apply) {
+        (0, _) => println!("every open item has an id"),
+        (n, true) => println!("{n} ids written; TODO.md edits are uncommitted"),
+        (n, false) => println!("{n} items without an id; `pma lint --ids --apply` writes them"),
+    }
+    match failed {
+        true => ExitCode::FAILURE,
+        false => ExitCode::SUCCESS,
+    }
+}
+
 fn prune(paths: &[PathBuf], apply: bool) -> ExitCode {
     let (mut count, mut failed) = (0, false);
-    for file in todo_files(paths) {
+    for (file, from_dir) in todo_files(paths) {
         let fail = |why: String| println!("{}: error: {why}", file.display());
-        let text = match std::fs::read_to_string(&file) {
-            Ok(text) => text,
+        let text = match read_todo(&file, from_dir) {
+            Ok(Some(text)) => text,
+            Ok(None) => {
+                println!("{}: skipped: no TODO.md", file.display());
+                continue;
+            }
             Err(err) => {
                 fail(err.to_string());
                 failed = true;
@@ -789,7 +934,7 @@ fn prune(paths: &[PathBuf], apply: bool) -> ExitCode {
         let removals = pruned.done_sections.len() + pruned.items.len();
         if apply
             && removals > 0
-            && let Err(err) = std::fs::write(&file, pruned.text)
+            && let Err(err) = todo::save(&file, &pruned.text)
         {
             fail(err.to_string());
             failed = true;
@@ -873,7 +1018,7 @@ fn forget(name: &str, apply: bool) -> Result<()> {
         println!("{name}: {} finished runs are kept", f.runs);
     }
     if !apply {
-        println!("run `pma forget {name} --apply` to delete the record");
+        println!("run `pma project forget {name} --apply` to delete the record");
         return Ok(());
     }
     store.forget_project(name)?;
@@ -896,7 +1041,7 @@ fn tag(action: Option<TagAction>) -> Result<()> {
         None => {
             let pairs = store.project_tags()?;
             if pairs.is_empty() {
-                println!("no tags; add one with `pma tag add <tag> <project>...`");
+                println!("no tags; add one with `pma project tag add <tag> <project>...`");
                 return Ok(());
             }
             let mut counts: Vec<(String, usize)> = Vec::new();
@@ -1380,6 +1525,55 @@ fn show_matrix(
     Ok(())
 }
 
+/// The two lists `pma next` shows, from the last scan and the runs table.
+fn next_lists(p: &Portfolio) -> Result<next::Next> {
+    let store = Store::open_default()?;
+    let active = store.runs()?;
+    let absent: Vec<String> = store
+        .projects()?
+        .into_iter()
+        .filter(|r| r.absent_since.is_some())
+        .map(|r| r.name)
+        .collect();
+    let placed = rank::place(&p.cfg, p.tasks.clone(), p.today);
+    let mut spent = std::collections::HashMap::new();
+    for x in placed.iter().filter(|x| x.task.eligible) {
+        let revision = dispatch::revision(&x.task.text);
+        let n = store.consumed_attempts(&x.task.project, &revision)?;
+        spent.insert((x.task.project.clone(), revision), n);
+    }
+    // What `--auto` checks before it takes a task, in the order it checks.
+    let taken = |x: &rank::Placed| {
+        let t = &x.task;
+        if absent.contains(&t.project) {
+            return next::Taken::Absent;
+        }
+        if let Some(key) = &t.key
+            && has_run(&active, &t.project, key, &t.text)
+        {
+            return next::Taken::Held;
+        }
+        let used = spent
+            .get(&(t.project.clone(), dispatch::revision(&t.text)))
+            .copied()
+            .unwrap_or(0);
+        match used >= dispatch::ATTEMPT_LIMIT {
+            true => next::Taken::Exhausted(used),
+            false => next::Taken::Free,
+        }
+    };
+    Ok(next::build(&placed, &active, p.today, taken))
+}
+
+fn show_next(names: &[String], tags: &[String], all: bool) -> Result<()> {
+    let p = portfolio(names, tags)?;
+    header(&p);
+    let lists = next_lists(&p)?;
+    let limit = (!all).then_some(p.cfg.quadrant_limit as usize);
+    print!("{}", next::render(&lists, limit));
+    Ok(())
+}
+
 fn show_status(names: &[String], tags: &[String], explain: bool, all: bool) -> Result<()> {
     let p = portfolio_with(names, tags, all)?;
     header(&p);
@@ -1417,7 +1611,7 @@ fn run_dispatch(
     over: &dispatch::Overrides,
 ) -> Result<()> {
     let store = Store::open_default()?;
-    let home = store::home()?;
+    let home = store::state_home()?;
     if let Some(name) = &over.agent {
         let known = store.agents()?;
         if !known.iter().any(|w| &w.name == name) {
@@ -1432,7 +1626,7 @@ fn run_dispatch(
             .into());
         }
     }
-    let session = Session::acquire(&home)?;
+    let session = Session::acquire(&store::home()?)?;
     store.fail_interrupted_runs(&session)?;
     settle_prs(&store)?;
     let active = store.runs()?;
@@ -1841,9 +2035,10 @@ fn run_review(
     minutes: Option<u32>,
 ) -> Result<()> {
     let store = Store::open_default()?;
-    let home = store::home()?;
+    let home = store::state_home()?;
+    let lock = store::home()?;
     // Free, the lock proves that no session is running agents.
-    let session = Session::try_acquire(&home)?;
+    let session = Session::try_acquire(&lock)?;
     if let Some(s) = &session {
         store.fail_interrupted_runs(s)?;
     }
@@ -1851,7 +2046,7 @@ fn run_review(
     // release it now, so a starting dispatch does not wait on them.
     let session = match (session, reject || rework.is_some()) {
         (Some(s), true) => Some(s),
-        (None, true) => Some(Session::acquire(&home)?),
+        (None, true) => Some(Session::acquire(&lock)?),
         (_, false) => None,
     };
     if ids.is_empty() {
@@ -2008,8 +2203,8 @@ fn campaign_command(action: Option<CampaignAction>) -> Result<()> {
 /// failure does not open a second pull request for it.
 fn run_campaign(name: &str, count: Option<usize>) -> Result<()> {
     let store = Store::open_default()?;
-    let home = store::home()?;
-    let session = Session::acquire(&home)?;
+    let home = store::state_home()?;
+    let session = Session::acquire(&store::home()?)?;
     store.fail_interrupted_runs(&session)?;
     let cfg = load_config(&store)?;
     let campaign = store.campaign(name)?;
@@ -2385,12 +2580,35 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
             for w in &doc.workflows {
                 workflow_estimate(&doc, w, units, budget)?;
             }
+            if let Ok(store) = Store::open_default() {
+                for w in &doc.workflows {
+                    warn_unrouted(&store, &doc.flatten(&w.name)?)?;
+                }
+            }
+            let unbuilt = doc.unbuilt();
+            if !unbuilt.is_empty() {
+                println!("not runnable yet, so `propose` refuses it:");
+                for u in &unbuilt {
+                    println!("  {u}");
+                }
+            }
             Ok(())
         }
         WorkflowAction::Propose { file, by } => {
             let store = Store::open_default()?;
             let cfg = load_config(&store)?;
             let (doc, source) = workflow_document(&file)?;
+            // A revision is what runs. One that states a construct the
+            // runtime does not take would run as something other than its
+            // text, so it is refused here rather than ignored there.
+            let unbuilt = doc.unbuilt();
+            if !unbuilt.is_empty() {
+                return Err(format!(
+                    "not runnable yet:\n  {}\n`pma workflow check` still prices it",
+                    unbuilt.join("\n  ")
+                )
+                .into());
+            }
             // Over one unit of input: the argument bag is not known until a
             // pass names its target, so the stored figure is per unit and a
             // pass multiplies it.
@@ -2438,6 +2656,10 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
             }
             store.activate_workflow(revision, &by.unwrap_or_else(whoami))?;
             println!("revision {revision} is in effect");
+            let doc = found.document()?;
+            for w in &doc.workflows {
+                warn_unrouted(&store, &doc.flatten(&w.name)?)?;
+            }
             Ok(())
         }
         WorkflowAction::Run {
@@ -2447,7 +2669,8 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
             instance,
             set,
             dry_run,
-            yes,
+            approve,
+            cap,
             agent,
             model,
             preset,
@@ -2455,7 +2678,8 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
             let store = Store::open_default()?;
             // A pass runs agents and edits worktrees, so it holds the session
             // lock for its whole run, as `pma dispatch` does.
-            let _session = Session::acquire(&store::home()?)?;
+            let session = Session::acquire(&store::home()?)?;
+            store.fail_interrupted_runs(&session)?;
             let cfg = load_config(&store)?;
             // The flags cover the whole pass and are not stored: a pass
             // resolves its worker exactly as a dispatch does.
@@ -2475,14 +2699,18 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                         )
                         .into());
                     }
-                    // An instance that stopped short records why and has no
-                    // finish time. A finished one is re-derived like any
-                    // other: the frontier is evidence, not a cursor (W9).
-                    if let (Some(outcome), None) = (&found.outcome, found.finished_at) {
-                        return Err(format!(
-                            "instance {id} stopped: {outcome}. It cannot be resumed."
-                        )
-                        .into());
+                    match found.outcome.as_deref() {
+                        Some("stopped") => {
+                            return Err(format!("instance {id} was stopped").into());
+                        }
+                        Some("capped") if cap.is_empty() => {
+                            return Err(format!(
+                                "instance {id} stopped: capped. Resume it with a higher cap: \
+                                 `--cap max_units=<n>` or `--cap max_edits=<n>`"
+                            )
+                            .into());
+                        }
+                        _ => {}
                     }
                     if !projects.is_empty() || tag.is_some() || !set.is_empty() {
                         return Err(format!(
@@ -2511,14 +2739,20 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
             // A pass walks the flat graph: a call is resolved before anything
             // runs, so the frontier, the caps and the edge indexes a move is
             // keyed by are all one graph's.
-            let w = &doc.flatten(&name)?;
+            let mut w = doc.flatten(&name)?;
 
             let (instance, args) = match instance {
-                Some(id) => (
-                    id,
-                    serde_json::from_str(&store.workflow_instance(id)?.expect("loaded above").args)
-                        .unwrap_or(serde_json::Value::Null),
-                ),
+                Some(id) => {
+                    let found = store.workflow_instance(id)?.expect("loaded above");
+                    let mut args: serde_json::Value =
+                        serde_json::from_str(&found.args).unwrap_or(serde_json::json!({}));
+                    if !cap.is_empty() {
+                        raise_caps(&mut args, &w.caps, &cap)?;
+                        store.reopen_instance(id, &args.to_string())?;
+                        println!("instance {id}: caps raised, recorded on the instance");
+                    }
+                    (id, args)
+                }
                 None => {
                     let mut names = projects.clone();
                     if let Some(tag) = &tag {
@@ -2530,19 +2764,10 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                     }
                     let args = serde_json::to_value(w.bind(&set)?)?;
                     let units = pass::root_units(&store, &doc, &name, &names)?;
-                    // The total a pass may spend scales with the argument bag,
-                    // which is only known now.
+                    // The per-unit ceiling was weighed at activation. What a
+                    // pass spends is bounded by `batch_budget` and by the plan
+                    // approved for it.
                     let estimate = doc.estimate(&name, units.len() as i64, cfg.agent_budget)?;
-                    if estimate.cost > cfg.workflow_budget {
-                        return Err(format!(
-                            "over {} unit(s) this pass could cost ${:.2}, over workflow_budget \
-                             of ${:.2}",
-                            units.len(),
-                            estimate.cost,
-                            cfg.workflow_budget
-                        )
-                        .into());
-                    }
                     // A dry run plans and prices and writes nothing: an
                     // instance it left behind would be an open instance
                     // nobody meant to start.
@@ -2550,67 +2775,123 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
                         let moves: Vec<(String, usize, bool)> = units
                             .iter()
                             .flat_map(|u| {
-                                pass::entry_moves(w, u)
+                                pass::entry_moves(&w, u)
                                     .into_iter()
                                     .map(move |(edge, taken, _)| (u.id.clone(), edge, taken))
                             })
                             .collect();
-                        let plan = pass::plan_over(&store, &cfg, &over, w, &units, &moves)?;
+                        let (rules, plan) =
+                            pass::plan_over(&store, &cfg, &over, &w, &units, &moves)?;
                         println!(
-                            "`{name}` over {} unit(s), at most ${:.2}",
+                            "`{name}` over {} unit(s), at most ${:.2} in all",
                             units.len(),
                             estimate.cost
                         );
-                        print!("{}", pass::describe(&plan, "would run: "));
+                        warn_unrouted(&store, &w)?;
+                        print_dry_run(&rules, &plan);
                         return Ok(());
                     }
                     let target = match &tag {
                         Some(t) => format!("--tag {t}"),
                         None => names.join(" "),
                     };
-                    let id = store.add_workflow_instance(
-                        &name,
-                        revision.revision,
-                        &args.to_string(),
-                        &target,
-                    )?;
-                    for unit in &units {
-                        store.add_workflow_unit(id, unit)?;
-                        pass::enter(&store, id, w, unit)?;
-                    }
+                    // The instance and its argument bag are written together:
+                    // a half-entered bag would be a frozen target missing units.
+                    let id = store.atomically(|| {
+                        let id = store.add_workflow_instance(
+                            &name,
+                            revision.revision,
+                            &args.to_string(),
+                            &target,
+                        )?;
+                        for unit in &units {
+                            store.add_workflow_unit(id, unit)?;
+                            pass::enter(&store, id, &w, unit)?;
+                        }
+                        Ok(id)
+                    })?;
                     println!(
-                        "instance {id} of `{name}`: {} unit(s), at most ${:.2}",
+                        "instance {id} of `{name}`: {} unit(s), at most ${:.2} in all",
                         units.len(),
                         estimate.cost
                     );
                     (id, args)
                 }
             };
+            if let Some(caps) = args.get("@caps") {
+                w.caps.max_units = caps["max_units"].as_i64().unwrap_or(w.caps.max_units);
+                w.caps.max_edits = caps["max_edits"].as_i64().unwrap_or(w.caps.max_edits);
+            }
 
             if dry_run {
-                let plan = pass::plan(&store, &cfg, &over, w, instance)?;
-                print!("{}", pass::describe(&plan, "would run: "));
+                let (rules, plan) = pass::plan(&store, &cfg, &over, &w, instance)?;
+                warn_unrouted(&store, &w)?;
+                print_dry_run(&rules, &plan);
                 return Ok(());
             }
 
-            let home = store::home()?;
+            let home = store::state_home()?;
             let given = pass::Invocation {
                 home: &home,
                 args: &args,
-                approved: yes,
+                approve: approve.as_deref(),
             };
-            let plan = pass::advance(&store, &cfg, &over, &doc, w, instance, &given)?;
-            if plan.is_empty() {
-                store.finish_instance(instance, "finished")?;
-                println!("instance {instance}: nothing left to run");
+            let outcome = pass::advance(&store, &cfg, &over, &doc, &w, instance, &given)?;
+            for refused in &outcome.refused {
+                eprintln!("refused: {refused}");
+            }
+            if outcome.ran {
+                println!("the approved plan ran; `pma review` lists any edits it made");
+            }
+            if outcome.plan.is_empty() {
+                if outcome.waiting.is_empty() {
+                    store.finish_instance(instance, "finished")?;
+                    let _ = std::fs::remove_dir_all(
+                        home.join("workflow-trees").join(instance.to_string()),
+                    );
+                    println!("instance {instance}: nothing left to run");
+                } else {
+                    for (node, n) in &outcome.waiting {
+                        println!("waiting at {node}: {n} unit(s)");
+                    }
+                    println!(
+                        "instance {instance} is waiting on a check; run it again later with \
+                         `pma workflow run {name} --instance {instance}`"
+                    );
+                }
                 return Ok(());
             }
-            let cost: f64 = plan.iter().map(|p| p.cost).sum();
-            print!("{}", pass::describe(&plan, "next: "));
+            let plan = &outcome.plan;
+            print!("{}", pass::describe(&plan.steps, "next: "));
             println!(
-                "\nat most ${cost:.2}. Nothing was spent. Approve it with \
-                 `pma workflow run {name} --instance {instance} --yes`."
+                "\nplan {}: at most ${:.2}. Nothing was spent on it. Approve it with \
+                 `pma workflow run {name} --instance {instance} --approve {}`.",
+                plan.id(),
+                plan.cost(),
+                plan.id()
             );
+            Ok(())
+        }
+        WorkflowAction::Stop { instance } => {
+            let store = Store::open_default()?;
+            let _session = Session::acquire(&store::home()?)?;
+            let found = store
+                .workflow_instance(instance)?
+                .ok_or_else(|| format!("no workflow instance {instance}"))?;
+            if found.finished_at.is_some() {
+                return Err(format!(
+                    "instance {instance} is already {}",
+                    found.outcome.as_deref().unwrap_or("finished")
+                )
+                .into());
+            }
+            store.finish_instance(instance, "stopped")?;
+            let _ = std::fs::remove_dir_all(
+                store::state_home()?
+                    .join("workflow-trees")
+                    .join(instance.to_string()),
+            );
+            println!("instance {instance} stopped; runs it made stand in `pma review`");
             Ok(())
         }
         WorkflowAction::Show { revision } => {
@@ -2627,6 +2908,71 @@ fn workflow_command(action: Option<WorkflowAction>) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Names each agent node the routing policy in effect would refuse.
+fn warn_unrouted(store: &Store, w: &workflow::Workflow) -> Result<()> {
+    for warning in pass::unrouted(store, w)? {
+        eprintln!("warning: {warning}");
+    }
+    Ok(())
+}
+
+/// What a dry run shows: the rule nodes that would run, then the agent runs,
+/// with the plan's id when a first pass would print the same plan.
+fn print_dry_run(rules: &[pass::Planned], plan: &pass::Plan) {
+    let mut steps = rules.to_vec();
+    steps.extend(plan.steps.iter().cloned());
+    print!("{}", pass::describe(&steps, "would run: "));
+    if rules.is_empty() && !plan.is_empty() {
+        println!(
+            "plan {}: at most ${:.2}; `--approve {}` runs it",
+            plan.id(),
+            plan.cost(),
+            plan.id()
+        );
+    }
+}
+
+/// Records raised caps on an instance's arguments, under `@caps`, which no
+/// parameter can be named. A cap may only go up: lowering one under work
+/// already written would describe an instance that never existed.
+fn raise_caps(
+    args: &mut serde_json::Value,
+    declared: &workflow::Caps,
+    given: &[String],
+) -> Result<()> {
+    let mut caps = args
+        .get("@caps")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    for g in given {
+        let (key, value) = g
+            .split_once('=')
+            .ok_or_else(|| format!("`{g}`: expected max_units=N or max_edits=N"))?;
+        let current = match key {
+            "max_units" => declared.max_units,
+            "max_edits" => declared.max_edits,
+            _ => {
+                return Err(
+                    format!("`{key}` is not a cap; expected max_units or max_edits").into(),
+                );
+            }
+        };
+        let current = caps[key].as_i64().unwrap_or(current);
+        let n: i64 = value
+            .parse()
+            .map_err(|_| format!("`{g}`: expected a whole number"))?;
+        if n <= current {
+            return Err(format!("`{key}` is {current}; a raised cap must be higher").into());
+        }
+        caps[key] = serde_json::Value::from(n);
+    }
+    if !args.is_object() {
+        *args = serde_json::json!({});
+    }
+    args["@caps"] = caps;
+    Ok(())
 }
 
 fn policy_text(store: &Store, from: &str) -> Result<String> {
@@ -2949,9 +3295,9 @@ fn approve_many(store: &Store, ids: &[i64]) -> Result<()> {
 
 fn run_verify(projects: &[String], tags: &[String]) -> Result<()> {
     let store = Store::open_default()?;
-    let home = store::home()?;
+    let home = store::state_home()?;
     // It adds and removes a worktree, as a dispatch does.
-    let _session = Session::acquire(&home)?;
+    let _session = Session::acquire(&store::home()?)?;
     let cfg = load_config(&store)?;
     let names = select(&store, projects, tags)?;
     if names.is_empty() {
@@ -3012,7 +3358,7 @@ fn run_ship(projects: &[String], tags: &[String]) -> Result<()> {
     let mut failed = 0;
     ship::ship(
         &store,
-        &store::home()?,
+        &store::state_home()?,
         &cfg,
         runs,
         |run, outcome| match outcome {
@@ -3166,12 +3512,13 @@ fn note(action: Option<NoteAction>) -> Result<()> {
 fn run_tui() -> Result<()> {
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal() {
-        return Err("pma tui needs a terminal; use `pma matrix` otherwise".into());
+        return Err("pma tui needs a terminal; use `pma next` or `pma matrix` otherwise".into());
     }
     let p = portfolio(&[], &[])?;
     let header = header_text(&p);
+    let lists = next_lists(&p)?;
     let placed = rank::place(&p.cfg, p.tasks, p.today);
-    tui::run(tui::App::new(header, placed, p.today))?;
+    tui::run(tui::App::new(header, placed, p.today, lists))?;
     Ok(())
 }
 

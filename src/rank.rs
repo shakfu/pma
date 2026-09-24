@@ -1,4 +1,5 @@
-//! Places tasks in the Eisenhower matrix and scores project health.
+//! Places tasks in the Eisenhower matrix and orders projects by what needs
+//! attention.
 //!
 //! Importance is `tier multiplier * priority weight` against a threshold.
 //! Urgency is sequencing, not decay: a deadline, a signal that blocks other
@@ -30,7 +31,7 @@ impl Quadrant {
             Quadrant::Q1 => "Do right away",
             Quadrant::Q2 => "Schedule for later",
             Quadrant::Q3 => "Delegate or avoid",
-            Quadrant::Q4 => "Remove",
+            Quadrant::Q4 => "Later",
         }
     }
 
@@ -229,147 +230,133 @@ pub fn signal_tasks(cfg: &Config, p: &Project) -> Vec<Task> {
     tasks
 }
 
+/// `n` with the noun that agrees with it.
+fn count(n: i64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
 pub fn local_changes(p: &Project) -> String {
-    let plural = |n: i64, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
     let mut parts = Vec::new();
     if p.dirty > 0 {
-        parts.push(plural(p.dirty, "changed file"));
+        parts.push(count(p.dirty, "changed file", "changed files"));
     }
     if let Some(n) = p.ahead.filter(|n| *n > 0) {
-        parts.push(plural(n, "unpushed commit"));
+        parts.push(count(n, "unpushed commit", "unpushed commits"));
     }
     if p.leftover > 0 {
-        parts.push(plural(p.leftover, "leftover pma branch"));
+        parts.push(count(
+            p.leftover,
+            "leftover pma branch",
+            "leftover pma branches",
+        ));
     }
     parts.join(", ")
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Component {
-    pub signal: &'static str,
-    /// 0..1, where 1 needs attention; `None` when not measured.
-    pub score: Option<f64>,
-    pub weight: f64,
-    /// This component's share of the health score.
-    pub contribution: f64,
-    pub detail: String,
+/// What places a project in `pma status`, worst first. Each is a condition
+/// with an action, so the order says what to do first: a failing check blocks
+/// the repository, broken facts make the rest unreliable, unpublished work is
+/// at risk, then the work itself, then upkeep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum State {
+    /// CI fails on the default branch.
+    FailingCi,
+    /// `TODO.md` has lint errors, or the scan could not read the project.
+    Broken,
+    /// Commits not pushed, or `pma/` branches no open run owns.
+    Unpublished,
+    /// Open items under `## Critical`.
+    Critical,
+    /// Outdated dependencies at the last measurement.
+    StaleDeps,
+    /// No commit that counts as activity within the tier's horizon.
+    Idle,
+    /// None of the above.
+    Clear,
 }
 
-/// Saturation constant for the tasks signal: this much summed priority weight
-/// gives a score of 1 - 1/e.
-const TASKS_SCALE: f64 = 3.0;
+impl State {
+    pub fn name(self) -> &'static str {
+        match self {
+            State::FailingCi => "failing CI",
+            State::Broken => "broken",
+            State::Unpublished => "unpublished",
+            State::Critical => "critical",
+            State::StaleDeps => "stale deps",
+            State::Idle => "idle",
+            State::Clear => "clear",
+        }
+    }
+}
 
-/// Outdated dependencies at which the deps signal reaches 1.
-const DEPS_SCALE: f64 = 10.0;
+/// What the scan could not read about a project, which `rank::Project` does
+/// not carry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Facts<'a> {
+    pub lint_errors: i64,
+    pub scan_error: Option<&'a str>,
+}
 
-/// `tier * sum(w_i * s_i) / sum(w_i)` over the measured signals.
-pub fn health(cfg: &Config, p: &Project) -> (f64, Vec<Component>) {
-    let load: f64 = p.open.iter().map(|&pr| cfg.priority(pr)).sum();
-    let counts: Vec<String> = Priority::ALL
-        .iter()
-        .filter_map(|&pr| {
-            let n = p.open.iter().filter(|&&x| x == pr).count();
-            (n > 0).then(|| format!("{n} {}", pr.name()))
-        })
-        .collect();
+/// Every state a project is in, worst first, each with what put it there.
+/// `Clear` alone when it is in none. A signal that was not measured, such as
+/// CI offline or dependencies never counted, puts a project in no state.
+pub fn states(cfg: &Config, p: &Project, facts: Facts<'_>) -> Vec<(State, String)> {
+    let mut out = Vec::new();
+    if let Ci::Failing(workflows) = &p.ci {
+        out.push((State::FailingCi, workflows.join(", ")));
+    }
+    let mut broken = Vec::new();
+    if let Some(e) = facts.scan_error {
+        broken.push(format!("scan error: {e}"));
+    }
+    if facts.lint_errors > 0 {
+        broken.push(format!(
+            "{} in TODO.md",
+            count(facts.lint_errors, "lint error", "lint errors")
+        ));
+    }
+    if !broken.is_empty() {
+        out.push((State::Broken, broken.join("; ")));
+    }
+    let mut unpublished = Vec::new();
+    if let Some(n) = p.ahead.filter(|n| *n > 0) {
+        unpublished.push(count(n, "unpushed commit", "unpushed commits"));
+    }
+    if p.leftover > 0 {
+        unpublished.push(count(
+            p.leftover,
+            "leftover pma branch",
+            "leftover pma branches",
+        ));
+    }
+    if !unpublished.is_empty() {
+        out.push((State::Unpublished, unpublished.join(", ")));
+    }
+    let critical = p.open.iter().filter(|&&x| x == Priority::Critical).count() as i64;
+    if critical > 0 {
+        out.push((State::Critical, count(critical, "open item", "open items")));
+    }
+    if let Some((n, age)) = p.deps.filter(|(n, _)| *n > 0) {
+        let when = match age {
+            0 => "today".to_string(),
+            1 => "1 day ago".to_string(),
+            d => format!("{d} days ago"),
+        };
+        out.push((State::StaleDeps, format!("{n} outdated, measured {when}")));
+    }
     let horizon = cfg.activity_horizon[usize::from(p.tier) - 1];
-
-    let mut parts = vec![
-        (
-            "tasks",
-            Some(1.0 - (-load / TASKS_SCALE).exp()),
-            cfg.weights.tasks,
-            if counts.is_empty() {
-                "no open items".into()
-            } else {
-                format!("open: {}", counts.join(", "))
-            },
-        ),
-        (
-            "activity",
-            Some(
-                p.idle_days
-                    .map_or(1.0, |d| (d as f64 / horizon as f64).min(1.0)),
-            ),
-            cfg.weights.activity,
-            match p.idle_days {
-                Some(d) => format!(
-                    "last code commit {d} day{} ago, horizon {horizon}",
-                    if d == 1 { "" } else { "s" }
-                ),
-                None => "no code commits found".into(),
-            },
-        ),
-        match &p.ci {
-            Ci::Failing(w) => (
-                "ci",
-                Some(1.0),
-                cfg.weights.ci,
-                format!("failing: {}", w.join(", ")),
-            ),
-            Ci::Passing => ("ci", Some(0.0), cfg.weights.ci, "passing".into()),
-            Ci::NoRuns => (
-                "ci",
-                Some(0.5),
-                cfg.weights.ci,
-                "no runs on the default branch".into(),
-            ),
-            Ci::Unknown(why) => ("ci", None, cfg.weights.ci, format!("unknown: {why}")),
-        },
-        match p.deps {
-            Some((n, age)) => (
-                "deps",
-                Some((n as f64 / DEPS_SCALE).min(1.0)),
-                cfg.weights.deps,
-                format!(
-                    "{n} outdated, measured {}",
-                    match age {
-                        0 => "today".to_string(),
-                        1 => "1 day ago".to_string(),
-                        d => format!("{d} days ago"),
-                    }
-                ),
-            ),
-            None => (
-                "deps",
-                None,
-                cfg.weights.deps,
-                "not measured; `pma scan --deps`".into(),
-            ),
-        },
-        {
-            let local = local_changes(p);
-            let flags = [p.dirty > 0, p.ahead.unwrap_or(0) > 0, p.leftover > 0];
-            let score = (0.5 * flags.iter().filter(|f| **f).count() as f64).min(1.0);
-            (
-                "hygiene",
-                Some(score),
-                cfg.weights.hygiene,
-                if local.is_empty() {
-                    "clean".into()
-                } else {
-                    local
-                },
-            )
-        },
-    ];
-
-    let total_weight: f64 = parts.iter().filter(|p| p.1.is_some()).map(|p| p.2).sum();
-    let tier = cfg.tier(p.tier);
-    let components: Vec<Component> = parts
-        .drain(..)
-        .map(|(signal, score, weight, detail)| Component {
-            signal,
-            score,
-            weight,
-            contribution: match score {
-                Some(s) if total_weight > 0.0 => tier * weight * s / total_weight,
-                _ => 0.0,
-            },
-            detail,
-        })
-        .collect();
-    (components.iter().map(|c| c.contribution).sum(), components)
+    match p.idle_days {
+        Some(d) if d > horizon => out.push((
+            State::Idle,
+            format!("no code commit in {d} days, horizon {horizon}"),
+        )),
+        None => out.push((State::Idle, "no code commits found".into())),
+        Some(_) => {}
+    }
+    if out.is_empty() {
+        out.push((State::Clear, String::new()));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -589,65 +576,72 @@ mod tests {
     }
 
     #[test]
-    fn health_sums_contributions_and_skips_unmeasured_signals() {
+    fn a_project_is_in_each_state_it_meets_worst_first() {
         let cfg = Config::default();
         let p = Project {
-            open: vec![Priority::Critical, Priority::High, Priority::High],
-            idle_days: Some(15),
+            open: vec![Priority::Critical, Priority::High, Priority::Critical],
+            idle_days: Some(31),
             ci: Ci::Failing(vec!["test".into()]),
             dirty: 4,
-            ahead: None,
-            ..project(2)
-        };
-        let (score, parts) = health(&cfg, &p);
-
-        let tasks = 1.0 - (-2.0_f64 / 3.0).exp();
-        let activity = 15.0 / 60.0;
-        // deps is unmeasured, so its weight is left out: 5 + 1 + 3 + 2.
-        let expected = 0.8 * (5.0 * tasks + activity + 3.0 * 1.0 + 2.0 * 0.5) / 11.0;
-        assert!((score - expected).abs() < 1e-12, "{score} vs {expected}");
-        assert!((parts.iter().map(|c| c.contribution).sum::<f64>() - score).abs() < 1e-12);
-
-        let deps = parts.iter().find(|c| c.signal == "deps").unwrap();
-        assert_eq!((deps.score, deps.contribution), (None, 0.0));
-
-        let measured = Project {
-            deps: Some((4, 1)),
-            ..p.clone()
-        };
-        let (with_deps, parts) = health(&cfg, &measured);
-        let expected = 0.8 * (5.0 * tasks + activity + 3.0 + 2.0 * 0.5 + 0.4) / 12.0;
-        assert!(
-            (with_deps - expected).abs() < 1e-12,
-            "{with_deps} vs {expected}"
-        );
-        assert_eq!(parts[3].detail, "4 outdated, measured 1 day ago");
-        assert_eq!(parts[0].detail, "open: 1 critical, 2 high");
-        assert_eq!(parts[4].detail, "4 changed files");
-
-        let hygiene = |p: &Project| {
-            let (_, parts) = health(&cfg, p);
-            parts[4].score
-        };
-        let stray = Project {
+            ahead: Some(1),
             leftover: 2,
+            deps: Some((3, 1)),
             ..project(1)
         };
-        assert_eq!(hygiene(&stray), Some(0.5));
+        let facts = Facts {
+            lint_errors: 1,
+            scan_error: None,
+        };
+        let got = states(&cfg, &p, facts);
         assert_eq!(
-            hygiene(&Project {
-                dirty: 1,
-                ahead: Some(1),
-                ..stray
-            }),
-            Some(1.0),
-            "capped at 1"
+            got,
+            [
+                (State::FailingCi, "test".to_string()),
+                (State::Broken, "1 lint error in TODO.md".to_string()),
+                (
+                    State::Unpublished,
+                    "1 unpushed commit, 2 leftover pma branches".to_string()
+                ),
+                (State::Critical, "2 open items".to_string()),
+                (
+                    State::StaleDeps,
+                    "3 outdated, measured 1 day ago".to_string()
+                ),
+                (
+                    State::Idle,
+                    "no code commit in 31 days, horizon 30".to_string()
+                ),
+            ]
         );
+        assert!(got.windows(2).all(|w| w[0].0 < w[1].0), "worst first");
+    }
 
-        let (clean, _) = health(&cfg, &project(1));
+    /// A clean project is clear; changed files alone, CI not measured and
+    /// dependencies never counted place it nowhere worse.
+    #[test]
+    fn what_was_not_measured_places_a_project_in_no_state() {
+        let cfg = Config::default();
+        let quiet = Project {
+            dirty: 3,
+            ci: Ci::Unknown("offline".into()),
+            ..project(1)
+        };
         assert_eq!(
-            clean, 0.0,
-            "no tasks, recent activity, passing CI, clean tree"
+            states(&cfg, &quiet, Facts::default()),
+            [(State::Clear, String::new())]
         );
+        let scan = Facts {
+            lint_errors: 0,
+            scan_error: Some("git status failed"),
+        };
+        assert_eq!(
+            states(&cfg, &project(1), scan)[0],
+            (State::Broken, "scan error: git status failed".to_string())
+        );
+        let never = Project {
+            idle_days: None,
+            ..project(5)
+        };
+        assert_eq!(states(&cfg, &never, Facts::default())[0].0, State::Idle);
     }
 }

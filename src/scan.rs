@@ -6,9 +6,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::todo::{self, Priority, normal_text};
 
@@ -18,8 +19,11 @@ pub struct Facts {
     pub path: PathBuf,
     /// `owner/name` from the origin URL; `None` without a GitHub origin.
     pub slug: Option<String>,
-    /// `None` when the project has no TODO.md.
+    /// `None` when the project has no TODO.md, or when it could not be read.
     pub todo: Option<TodoFacts>,
+    /// TODO.md exists but could not be read. The store keeps the tasks the
+    /// last good scan recorded rather than taking the file as empty.
+    pub todo_unread: bool,
     pub dirty: i64,
     /// Local branches under `pma/`, each made for a run's worktree.
     pub pma_branches: Vec<String>,
@@ -182,6 +186,7 @@ pub fn scan_project(
         path: path.into(),
         slug: None,
         todo: None,
+        todo_unread: false,
         dirty: 0,
         pma_branches: Vec::new(),
         ahead: None,
@@ -191,42 +196,180 @@ pub fn scan_project(
         error: None,
     };
 
+    let git = Git::new(path);
     match std::fs::read_to_string(path.join("TODO.md")) {
-        Ok(text) => facts.todo = Some(todo_facts(&text, &added_times(path))),
+        Ok(text) => facts.todo = Some(todo_facts(&text, &added_times(&git))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => facts.error = Some(format!("TODO.md: {e}")),
+        Err(e) => {
+            facts.todo_unread = true;
+            facts.error = Some(format!("TODO.md: {e}"));
+        }
     }
 
-    facts.slug =
-        git(path, &["remote", "get-url", "origin"]).and_then(|url| github_slug(url.trim()));
+    facts.slug = git
+        .run(&["remote", "get-url", "origin"])
+        .and_then(|url| github_slug(url.trim()));
 
-    match git(path, &["status", "--porcelain"]) {
-        Some(out) => facts.dirty = out.lines().count() as i64,
-        None => {
-            facts.error = Some("git status failed".into());
+    match call(git.command(&["status", "--porcelain"]), CALL_TIMEOUT) {
+        Ok(out) => facts.dirty = out.lines().count() as i64,
+        Err(e) => {
+            facts.error = Some(git.noted(Some(format!("git status: {e}"))));
             return facts;
         }
     }
-    facts.pma_branches = git(
-        path,
-        &[
+    facts.pma_branches = git
+        .run(&[
             "for-each-ref",
             "--format=%(refname:lstrip=2)",
             "refs/heads/pma/",
-        ],
-    )
-    .map(|out| out.lines().map(String::from).collect())
-    .unwrap_or_default();
-    facts.ahead =
-        git(path, &["rev-list", "--count", "@{u}..HEAD"]).and_then(|s| s.trim().parse().ok());
-    facts.last_activity = last_activity(path, ignore);
+        ])
+        .map(|out| out.lines().map(String::from).collect())
+        .unwrap_or_default();
+    facts.ahead = git
+        .run(&["rev-list", "--count", "@{u}..HEAD"])
+        .and_then(|s| s.trim().parse().ok());
+    facts.last_activity = last_activity(&git, ignore);
     if !offline {
         facts.ci = ci_state(path);
         if deps {
             facts.deps = Some(crate::deps::measure(path));
         }
     }
+    let noted = git.noted(facts.error.take());
+    facts.error = (!noted.is_empty()).then_some(noted);
     facts
+}
+
+/// How long one `git` or `gh` call in a scan may take. One hung call would
+/// otherwise hold the whole scan.
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Why a bounded call produced no output.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallError {
+    TimedOut(Duration),
+    /// The first line of stderr, or why the program could not start.
+    Failed(String),
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallError::TimedOut(d) => write!(f, "timed out after {}s", d.as_secs()),
+            CallError::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+/// Runs `cmd` with no input and returns its stdout when it succeeds. At
+/// `timeout` its process group is killed, so a helper it started goes too.
+pub fn call(mut cmd: Command, timeout: Duration) -> Result<String, CallError> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|e| CallError::Failed(format!("{}: {e}", cmd.get_program().display())))?;
+    // Read on threads, so a child that fills a pipe is not stalled by it.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let started = Instant::now();
+    let mut pause = Duration::from_millis(1);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if started.elapsed() >= timeout => {
+                let group = format!("-{}", child.id());
+                let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Ok(None) => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(20));
+            }
+            Err(e) => return Err(CallError::Failed(e.to_string())),
+        }
+    };
+    let stdout = out.join().unwrap_or_default();
+    let stderr = err.join().unwrap_or_default();
+    match status {
+        None => Err(CallError::TimedOut(timeout)),
+        Some(s) if s.success() => Ok(String::from_utf8_lossy(&stdout).into_owned()),
+        Some(_) => Err(CallError::Failed(gh_error(&String::from_utf8_lossy(
+            &stderr,
+        )))),
+    }
+}
+
+/// `git -C dir` for one project's scan. A call that fails reads as absent, as
+/// it always has; one that times out is also remembered, so the project's
+/// detail says the facts are incomplete rather than that they are empty.
+struct Git<'a> {
+    dir: &'a Path,
+    timed_out: Mutex<Vec<String>>,
+}
+
+impl<'a> Git<'a> {
+    fn new(dir: &'a Path) -> Git<'a> {
+        Git {
+            dir,
+            timed_out: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(self.dir).args(args);
+        cmd
+    }
+
+    fn run(&self, args: &[&str]) -> Option<String> {
+        match call(self.command(args), CALL_TIMEOUT) {
+            Ok(out) => Some(out),
+            Err(e @ CallError::TimedOut(_)) => {
+                let what = args.first().copied().unwrap_or_default();
+                self.timed_out
+                    .lock()
+                    .unwrap()
+                    .push(format!("git {what}: {e}"));
+                None
+            }
+            Err(CallError::Failed(_)) => None,
+        }
+    }
+
+    /// `first`, then every timeout, joined for the project's detail.
+    fn noted(&self, first: Option<String>) -> String {
+        first
+            .into_iter()
+            .chain(self.timed_out.lock().unwrap().iter().cloned())
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 
 fn todo_facts(text: &str, added: &HashMap<String, i64>) -> TodoFacts {
@@ -270,38 +413,27 @@ fn todo_facts(text: &str, added: &HashMap<String, i64>) -> TodoFacts {
     }
 }
 
-/// Runs `git -C dir`; stdout when it succeeds.
+/// Runs `git -C dir`, bounded by `CALL_TIMEOUT`; stdout when it succeeds.
 pub fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    Git::new(dir).run(args)
 }
 
 /// Commit time at which each item text first appeared in TODO.md, keyed by
 /// `normalise`. Matching on text rather than on lines keeps an item's age when
 /// a later commit moves it, retags it, or changes the file's format, all of
 /// which `git blame` reports as a new line.
-fn added_times(dir: &Path) -> HashMap<String, i64> {
-    git(
-        dir,
-        &[
-            "log",
-            "--reverse",
-            "--no-merges",
-            "--no-color",
-            "--format=%x00%ct",
-            "-p",
-            "--unified=0",
-            "--",
-            "TODO.md",
-        ],
-    )
+fn added_times(git: &Git) -> HashMap<String, i64> {
+    git.run(&[
+        "log",
+        "--reverse",
+        "--no-merges",
+        "--no-color",
+        "--format=%x00%ct",
+        "-p",
+        "--unified=0",
+        "--",
+        "TODO.md",
+    ])
     .map(|log| parse_history(&log))
     .unwrap_or_default()
 }
@@ -362,18 +494,15 @@ fn normalise(line: &str) -> String {
     normal_text(&words.join(" "))
 }
 
-fn last_activity(dir: &Path, ignore: &[String]) -> Option<i64> {
-    let log = git(
-        dir,
-        &[
-            "log",
-            "-n",
-            "1000",
-            "--no-merges",
-            "--format=%x00%ct",
-            "--name-only",
-        ],
-    )?;
+fn last_activity(git: &Git, ignore: &[String]) -> Option<i64> {
+    let log = git.run(&[
+        "log",
+        "-n",
+        "1000",
+        "--no-merges",
+        "--format=%x00%ct",
+        "--name-only",
+    ])?;
     newest_counted_commit(&log, ignore)
 }
 
@@ -447,6 +576,9 @@ pub fn default_branch(dir: &Path) -> Option<String> {
     Some(full.trim().trim_start_matches("origin/").to_string())
 }
 
+/// Judged over the workflows that still exist and are enabled. `gh run list`
+/// keeps a deleted workflow's runs, whose last failure would otherwise read as
+/// failing CI until newer runs pushed it out of the window.
 fn ci_state(dir: &Path) -> Ci {
     let Some(url) = git(dir, &["remote", "get-url", "origin"]) else {
         return Ci::Unknown("no origin remote".into());
@@ -457,19 +589,62 @@ fn ci_state(dir: &Path) -> Ci {
     let Some(branch) = default_branch(dir) else {
         return Ci::Unknown(DEFAULT_BRANCH_UNKNOWN.into());
     };
-    let branch = branch.as_str();
-    let out = Command::new("gh")
-        .args([
-            "run", "list", "-R", &slug, "--branch", branch, "--limit", "50",
-        ])
-        .args(["--json", "workflowName,status,conclusion"])
-        .args(["--jq", ".[] | [.workflowName, .status, .conclusion] | @tsv"])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => parse_runs(&String::from_utf8_lossy(&o.stdout)),
-        Ok(o) => Ci::Unknown(gh_error(&String::from_utf8_lossy(&o.stderr))),
-        Err(e) => Ci::Unknown(format!("gh: {e}")),
-    }
+    let gh = |args: &[&str]| {
+        let mut cmd = Command::new("gh");
+        cmd.args(args);
+        call(cmd, CALL_TIMEOUT).map_err(|e| Ci::Unknown(format!("gh {}: {e}", args[..2].join(" "))))
+    };
+    let runs = |extra: &[&str]| {
+        let mut args = vec!["run", "list", "-R", &slug, "--branch", &branch];
+        args.extend_from_slice(extra);
+        args.extend([
+            "--json",
+            "workflowName,status,conclusion",
+            "--jq",
+            ".[] | [.workflowName, .status, .conclusion] | @tsv",
+        ]);
+        gh(&args).map(|tsv| latest_verdicts(&tsv))
+    };
+    let judged = (|| {
+        let listed = gh(&[
+            "workflow",
+            "list",
+            "-R",
+            &slug,
+            "--limit",
+            "200",
+            "--json",
+            "id,name,state",
+        ])?;
+        let active = active_workflows(&listed).map_err(Ci::Unknown)?;
+        let mut verdicts = runs(&["--limit", "100"])?;
+        // A workflow that runs rarely can fall outside that window, so it is
+        // asked about alone rather than read as having no runs.
+        for (id, name) in &active {
+            if !verdicts.contains_key(name) {
+                let id = id.to_string();
+                if let Some(&failed) = runs(&["--workflow", &id, "--limit", "20"])?.get(name) {
+                    verdicts.insert(name.clone(), failed);
+                }
+            }
+        }
+        Ok(ci_of(&active, &verdicts))
+    })();
+    judged.unwrap_or_else(|unknown| unknown)
+}
+
+/// Enabled workflows as `(id, name)`, from `gh workflow list --json id,name,state`.
+fn active_workflows(json: &str) -> Result<Vec<(u64, String)>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("gh workflow list: {e}"))?;
+    let rows = value
+        .as_array()
+        .ok_or("gh workflow list: expected an array")?;
+    Ok(rows
+        .iter()
+        .filter(|w| w["state"].as_str() == Some("active"))
+        .filter_map(|w| Some((w["id"].as_u64()?, w["name"].as_str()?.to_string())))
+        .collect())
 }
 
 /// The first line of `gh`'s stderr. It names the cause; later lines add
@@ -513,36 +688,68 @@ pub fn latest_failed_run(json: &str) -> Result<Option<u64>, String> {
 }
 
 /// Reads `gh run list` rows, newest first, as `workflow \t status \t conclusion`.
-/// Each workflow is judged by its latest run that succeeded or failed.
-fn parse_runs(tsv: &str) -> Ci {
-    let mut decided = HashSet::new();
-    let mut failing = Vec::new();
+/// Each workflow is judged by its latest run that succeeded or failed; the value
+/// is whether that run failed.
+fn latest_verdicts(tsv: &str) -> HashMap<String, bool> {
+    let mut verdicts = HashMap::new();
     for line in tsv.lines() {
         let mut f = line.split('\t');
         let (Some(name), Some(status), Some(conclusion)) = (f.next(), f.next(), f.next()) else {
             continue;
         };
-        if decided.contains(name) {
-            continue;
+        if let Some(failed) = failed(status, conclusion) {
+            verdicts.entry(name.to_string()).or_insert(failed);
         }
-        match failed(status, conclusion) {
-            None => continue,
-            Some(true) => failing.push(name.to_string()),
-            Some(false) => {}
-        }
-        decided.insert(name);
     }
+    verdicts
+}
+
+/// The project's CI state over its active workflows. A verdict for a workflow
+/// that is not active is ignored.
+fn ci_of(active: &[(u64, String)], verdicts: &HashMap<String, bool>) -> Ci {
+    let judged: Vec<(&String, bool)> = active
+        .iter()
+        .filter_map(|(_, name)| verdicts.get(name).map(|f| (name, *f)))
+        .collect();
+    let mut failing: Vec<String> = judged
+        .iter()
+        .filter(|(_, failed)| *failed)
+        .map(|(name, _)| (*name).clone())
+        .collect();
     failing.sort();
-    match (failing.is_empty(), decided.is_empty()) {
+    failing.dedup();
+    match (failing.is_empty(), judged.is_empty()) {
         (false, _) => Ci::Failing(failing),
         (true, false) => Ci::Passing,
         (true, true) => Ci::NoRuns,
     }
 }
 
+/// `owner/name` when the URL's host is exactly `github.com`, in the forms git
+/// accepts: `https://[user@]github.com/o/r`, `ssh://git@github.com[:port]/o/r`
+/// and `git@github.com:o/r`.
 pub fn github_slug(url: &str) -> Option<String> {
-    let rest = url.split_once("github.com")?.1;
-    let rest = rest.strip_prefix(':').or_else(|| rest.strip_prefix('/'))?;
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    // Drop userinfo: an `@` before the path's first `/`.
+    let path_at = rest.find('/').unwrap_or(rest.len());
+    let rest = match rest[..path_at].rfind('@') {
+        Some(at) => &rest[at + 1..],
+        None => rest,
+    };
+    let rest = rest.strip_prefix("github.com")?;
+    // An explicit port, as `ssh://git@github.com:22/o/r` writes it.
+    let rest = match rest.strip_prefix(':') {
+        Some(r)
+            if r.split('/')
+                .next()
+                .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            &r[r.find('/').unwrap_or(r.len())..]
+        }
+        Some(r) => r,
+        None => rest.strip_prefix('/')?,
+    };
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
     let rest = rest.trim_end_matches('/');
     let rest = rest.strip_suffix(".git").unwrap_or(rest);
     let mut parts = rest.split('/');
@@ -589,19 +796,54 @@ mod tests {
 
     #[test]
     fn ci_is_judged_by_each_workflows_latest_decisive_run() {
+        let active = |names: &[&str]| -> Vec<(u64, String)> {
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (i as u64, n.to_string()))
+                .collect()
+        };
         let tsv = "test\tin_progress\t\n\
                    test\tcompleted\tcancelled\n\
                    test\tcompleted\tfailure\n\
                    wheels\tcompleted\tsuccess\n\
                    wheels\tcompleted\tfailure\n\
                    test\tcompleted\tsuccess\n";
-        assert_eq!(parse_runs(tsv), Ci::Failing(vec!["test".into()]));
+        let verdicts = latest_verdicts(tsv);
         assert_eq!(
-            parse_runs("a\tcompleted\tsuccess\nb\tcompleted\tskipped\n"),
+            ci_of(&active(&["test", "wheels"]), &verdicts),
+            Ci::Failing(vec!["test".into()])
+        );
+        assert_eq!(
+            ci_of(
+                &active(&["a", "b"]),
+                &latest_verdicts("a\tcompleted\tsuccess\nb\tcompleted\tskipped\n")
+            ),
             Ci::Passing
         );
-        assert_eq!(parse_runs("a\tcompleted\tcancelled\n"), Ci::NoRuns);
-        assert_eq!(parse_runs(""), Ci::NoRuns);
+        assert_eq!(
+            ci_of(
+                &active(&["a"]),
+                &latest_verdicts("a\tcompleted\tcancelled\n")
+            ),
+            Ci::NoRuns
+        );
+        assert_eq!(ci_of(&active(&["a"]), &latest_verdicts("")), Ci::NoRuns);
+    }
+
+    /// A deleted or disabled workflow keeps its runs in `gh run list`; its last
+    /// failure is not the project's CI state.
+    #[test]
+    fn only_active_workflows_are_judged() {
+        let listed = r#"[{"id": 1, "name": "test", "state": "active"},
+                         {"id": 2, "name": "nightly", "state": "disabled_manually"}]"#;
+        let active = active_workflows(listed).unwrap();
+        assert_eq!(active, [(1, "test".to_string())]);
+        let verdicts = latest_verdicts(
+            "old\tcompleted\tfailure\nnightly\tcompleted\tfailure\ntest\tcompleted\tsuccess\n",
+        );
+        assert_eq!(ci_of(&active, &verdicts), Ci::Passing);
+        assert!(active_workflows("{}").is_err());
     }
 
     #[test]
@@ -630,6 +872,37 @@ mod tests {
         assert_eq!(latest_failed_run(&fixed), Ok(None), "fixed since");
         assert_eq!(latest_failed_run("[]"), Ok(None));
         assert!(latest_failed_run("{}").is_err());
+    }
+
+    /// A hung `git` or `gh` would hold the whole scan. It is killed at the
+    /// deadline, with anything it started, and the call reads as timed out.
+    #[test]
+    fn a_call_is_killed_at_its_deadline() {
+        let sh = |script: &str| {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", script]);
+            cmd
+        };
+        let started = Instant::now();
+        let limit = Duration::from_millis(300);
+        assert_eq!(
+            call(sh("sleep 30 & sleep 30"), limit),
+            Err(CallError::TimedOut(limit))
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(call(sh("echo out"), limit), Ok("out\n".into()));
+        assert_eq!(
+            call(sh("echo why >&2; exit 3"), limit),
+            Err(CallError::Failed("why".into()))
+        );
+        assert!(matches!(
+            call(Command::new("/no/such/program"), limit),
+            Err(CallError::Failed(_))
+        ));
     }
 
     #[test]
@@ -665,6 +938,10 @@ mod tests {
             ("https://github.com/shakfu/pma.git/", Some("shakfu/pma")),
             ("ssh://git@github.com/shakfu/pma.git", Some("shakfu/pma")),
             ("git@gitlab.com:shakfu/pma.git", None),
+            ("https://notgithub.com/shakfu/pma", None),
+            ("https://github.com.evil.io/shakfu/pma", None),
+            ("https://me@github.com/shakfu/pma.git", Some("shakfu/pma")),
+            ("ssh://git@github.com:22/shakfu/pma.git", Some("shakfu/pma")),
             ("https://github.com/shakfu", None),
         ] {
             assert_eq!(github_slug(url).as_deref(), want, "{url}");
@@ -684,6 +961,8 @@ mod tests {
             ("  - plain bullet", "plain bullet"),
             ("port C# #bindings", "port c#"),
             ("- [ ] **Bold** lead #bugs", "**bold** lead"),
+            ("- [ ] with an id #bug ^k3f9q", "with an id"),
+            ("- [ ] bump to ^1.2", "bump to ^1.2"),
             ("**Bold** paragraph", "**bold** paragraph"),
             ("-dash start", "-dash start"),
             ("", ""),

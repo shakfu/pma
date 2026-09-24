@@ -55,6 +55,8 @@ pub struct Item {
     /// `YYYY-MM-DD`, already validated.
     pub due: Option<String>,
     pub gh: Option<u64>,
+    /// `id:xxxxx`, minted by `pma`; already validated.
+    pub id: Option<String>,
     /// Text of the nearest `###` heading above the item in its section.
     pub group: Option<String>,
     /// Indented lines under the item, verbatim.
@@ -62,32 +64,40 @@ pub struct Item {
 }
 
 impl Item {
-    /// Identity across scans and edits: `gh:N`, or the text in comparable form.
-    /// Text that reads as another kind of task's key, such as an item named
-    /// `CI`, is prefixed with `item:`, so it cannot be taken for a signal, a
-    /// campaign or a workflow unit.
+    /// Identity across scans and edits: `id:`, else `gh:N`, else the text in
+    /// comparable form. Text that reads as another kind of task's key, such
+    /// as an item named `CI`, is prefixed with `item:`, so it cannot be taken
+    /// for a signal, a campaign, a workflow unit or an id.
     pub fn key(&self) -> String {
+        if let Some(id) = &self.id {
+            return format!("id:{id}");
+        }
         match self.gh {
             Some(n) => format!("gh:{n}"),
-            None => {
-                let text = normal_text(&self.text);
-                let reserved = matches!(text.as_str(), "ci" | "deps")
-                    || ["campaign:", "workflow:", "item:"]
-                        .iter()
-                        .any(|p| text.starts_with(p));
-                if reserved {
-                    format!("item:{text}")
-                } else {
-                    text
-                }
-            }
+            None => self.text_key(),
         }
     }
 
-    /// Whether this is the task known by `key` or by `text`. Sync adds `gh:N`
-    /// to an item, which changes its key but not its text.
+    fn text_key(&self) -> String {
+        let text = normal_text(&self.text);
+        let reserved = matches!(text.as_str(), "ci" | "deps")
+            || ["campaign:", "workflow:", "item:", "id:", "gh:"]
+                .iter()
+                .any(|p| text.starts_with(p));
+        match reserved {
+            true => format!("item:{text}"),
+            false => text,
+        }
+    }
+
+    /// Whether this is the task known by `key` or by `text`. Every name the
+    /// item has answers: its id, its issue and its text, since a key recorded
+    /// before an id or an issue was written into the line names it by one of
+    /// the others.
     pub fn is_task(&self, key: &str, text: &str) -> bool {
-        self.key() == key
+        self.id.as_ref().is_some_and(|id| key == format!("id:{id}"))
+            || self.gh.is_some_and(|n| key == format!("gh:{n}"))
+            || self.text_key() == key
             || (!text.trim().is_empty() && normal_text(&self.text) == normal_text(text))
     }
 }
@@ -171,7 +181,9 @@ pub fn parse(text: &str) -> Parsed {
     let mut seen_sections: HashMap<Priority, usize> = HashMap::new();
     let mut title_line: Option<usize> = None;
     let mut first_content = true;
-    let mut in_fence = false;
+    // The open fence: its character, its length and its line. It closes only on
+    // a line of the same character at least as long, as CommonMark has it.
+    let mut fence: Option<(u8, usize, usize)> = None;
     // Blank lines seen since the open item's last line. Kept so a description
     // that spans a blank line is carried verbatim.
     let mut blanks = 0;
@@ -198,7 +210,7 @@ pub fn parse(text: &str) -> Parsed {
                         .extend(std::iter::repeat_n(String::new(), blanks));
                     item.description.push(raw.to_string());
                 }
-                None if matches!(place, Place::Known(_)) && !in_fence => {
+                None if matches!(place, Place::Known(_)) && fence.is_none() => {
                     out.report(n, Severity::Warning, "indented line is not under an item");
                 }
                 None => {}
@@ -216,12 +228,23 @@ pub fn parse(text: &str) -> Parsed {
             }
         }
 
-        if line.starts_with("```") || line.starts_with("~~~") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
-            continue;
+        match fence {
+            Some((mark, len, _)) => {
+                if fence_run(line, mark).is_some_and(|n| n >= len && n == line.len()) {
+                    fence = None;
+                }
+                continue;
+            }
+            None => {
+                if let Some((mark, len)) = b"`~"
+                    .iter()
+                    .copied()
+                    .find_map(|m| fence_run(line, m).filter(|n| *n >= 3).map(|n| (m, n)))
+                {
+                    fence = Some((mark, len, n));
+                    continue;
+                }
+            }
         }
 
         if line.starts_with("# ") {
@@ -303,6 +326,13 @@ pub fn parse(text: &str) -> Parsed {
     }
     finish(&mut open, &mut out);
 
+    if let Some((_, _, line)) = fence {
+        out.report(
+            line,
+            Severity::Error,
+            "this code fence is never closed, so no line after it is read",
+        );
+    }
     if first_content {
         out.report(1, Severity::Error, "the file must start with `# TODO`");
     }
@@ -319,6 +349,12 @@ pub fn parse(text: &str) -> Parsed {
     }
     check_duplicates(&mut out);
     out
+}
+
+/// How many of `mark` the line starts with, if any.
+fn fence_run(line: &str, mark: u8) -> Option<usize> {
+    let n = line.bytes().take_while(|&b| b == mark).count();
+    (n > 0).then_some(n)
 }
 
 fn finish(open: &mut Option<Item>, out: &mut Parsed) {
@@ -429,6 +465,7 @@ fn item_line(line: &str, n: usize, priority: Priority, out: &mut Parsed) -> Opti
         tags: Vec::new(),
         due: None,
         gh: None,
+        id: None,
         group: None,
         description: Vec::new(),
     };
@@ -457,6 +494,10 @@ fn item_line(line: &str, n: usize, priority: Priority, out: &mut Parsed) -> Opti
                     format!("`{word}` is not an issue number"),
                 ),
             }
+        } else if let Some(id) = caret_id(word) {
+            if item.id.replace(id.to_string()).is_some() {
+                out.report(n, Severity::Error, "more than one id");
+            }
         } else if !item.tags.iter().any(|t| t == &word[1..]) {
             item.tags.push(word[1..].to_string());
         }
@@ -483,10 +524,11 @@ fn item_line(line: &str, n: usize, priority: Priority, out: &mut Parsed) -> Opti
     Some(item)
 }
 
-/// A trailing token: `#tag`, `due:...` or `gh:...`. Malformed `due:` and `gh:`
+/// A trailing token: `#tag`, `due:...`, `gh:...` or an id, `^k3f9q`. A caret
+/// word that is not an id, such as `^1.2`, is text. Malformed `due:` and `gh:`
 /// values still count, so they are reported rather than read as text.
 pub fn is_token(word: &str) -> bool {
-    if word.starts_with("due:") || word.starts_with("gh:") {
+    if word.starts_with("due:") || word.starts_with("gh:") || caret_id(word).is_some() {
         return true;
     }
     let Some(tag) = word.strip_prefix('#') else {
@@ -496,6 +538,70 @@ pub fn is_token(word: &str) -> bool {
         && tag
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Characters an id is written in: Crockford's base32, lowercase, without
+/// `i`, `l`, `o` and `u`, so an id is not misread as a digit or a word.
+const ID_ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+
+/// Characters in an id. 32^5 values keep a clash between two branches that
+/// each mint in one 200-item file near 1 in 1,600.
+const ID_LEN: usize = 5;
+
+fn is_id(s: &str) -> bool {
+    s.len() == ID_LEN && s.bytes().all(|b| ID_ALPHABET.contains(&b))
+}
+
+/// The id in a word written `^k3f9q`, as Obsidian marks a block, if it is one.
+fn caret_id(word: &str) -> Option<&str> {
+    word.strip_prefix('^').filter(|id| is_id(id))
+}
+
+/// A fresh id no item in `text` holds. Random rather than sequential, so two
+/// branches that each add an item do not mint the same one.
+pub fn new_id(text: &str) -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let taken: Vec<String> = parse(text).items.into_iter().filter_map(|i| i.id).collect();
+    let state = std::collections::hash_map::RandomState::new();
+    for n in 0u64.. {
+        let mut h = state.build_hasher();
+        h.write_u64(n);
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        );
+        let mut bits = h.finish();
+        let id: String = (0..ID_LEN)
+            .map(|_| {
+                let c = ID_ALPHABET[(bits & 31) as usize] as char;
+                bits >>= 5;
+                c
+            })
+            .collect();
+        if !taken.contains(&id) {
+            return id;
+        }
+    }
+    unreachable!("an unused id exists")
+}
+
+/// Writes a fresh `^id` at the end of the open item `is_task(key, task_text)`
+/// names, and returns the new text and the id. `None` when no open item
+/// matches, the item already has one, or the file has lint errors, where an
+/// item cannot be told apart from its duplicate.
+pub fn mint_id(text: &str, key: &str, task_text: &str) -> Option<(String, String)> {
+    let parsed = parse(text);
+    if parsed.has_errors() {
+        return None;
+    }
+    let item = parsed
+        .items
+        .into_iter()
+        .find(|i| !i.done && i.id.is_none() && i.is_task(key, task_text))?;
+    let id = new_id(text);
+    let edited = add_token(text, item.line, &format!("^{id}"))?;
+    Some((edited, id))
 }
 
 /// Ticks the open item that `is_task(key, task_text)` finished, where it
@@ -551,8 +657,25 @@ pub fn prune(text: &str) -> Pruned {
     }
 }
 
-/// Appends ` token` to the item on 1-based `line`, keeping the line ending.
-/// `None` when that line is not an item.
+/// Removes the finished item that `is_task(key, task_text)` names, with its
+/// description. `None` when no finished item matches.
+pub fn remove_done(text: &str, key: &str, task_text: &str) -> Option<String> {
+    let item = parse(text)
+        .items
+        .into_iter()
+        .find(|i| i.done && i.is_task(key, task_text))?;
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let span = item.line - 1..item.line + item.description.len();
+    Some(
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !span.contains(i))
+            .map(|(_, l)| *l)
+            .collect(),
+    )
+}
+
 /// Inserts an item into its priority section, with its description indented
 /// under it. `None` when the section heading is absent: `pma` adds items, not
 /// headings, so a file that does not declare the section is left alone.
@@ -607,6 +730,8 @@ pub fn insert(
     Some(out)
 }
 
+/// Appends ` token` to the item on 1-based `line`, keeping the line ending.
+/// `None` when that line is not an item.
 pub fn add_token(text: &str, line: usize, token: &str) -> Option<String> {
     if !parse(text).items.iter().any(|i| i.line == line) {
         return None;
@@ -619,11 +744,39 @@ pub fn add_token(text: &str, line: usize, token: &str) -> Option<String> {
     Some(lines.concat())
 }
 
+/// Replaces a TODO.md with `text` atomically: a temporary file in the same
+/// directory is written, flushed to disk and renamed over it, so a crash leaves
+/// the old file or the new one, never a truncated one. A symlink is followed,
+/// and the file keeps its permissions.
+pub fn save(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "TODO.md".into());
+    let tmp = target.with_file_name(format!(".{name}.pma-tmp"));
+    let written = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        if let Ok(meta) = std::fs::metadata(&target) {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        std::fs::rename(&tmp, &target)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
 /// Unsynced items are identified by their normalised text, and synced ones by
 /// `gh:N`, so either repeating breaks identity.
 fn check_duplicates(out: &mut Parsed) {
     let mut texts: HashMap<String, usize> = HashMap::new();
     let mut issues: HashMap<u64, usize> = HashMap::new();
+    let mut ids: HashMap<&str, usize> = HashMap::new();
     let mut found = Vec::new();
 
     for item in &out.items {
@@ -640,6 +793,11 @@ fn check_duplicates(out: &mut Parsed) {
             && let Some(first) = issues.insert(gh, item.line)
         {
             found.push((item.line, format!("`gh:{gh}` is also on line {first}")));
+        }
+        if let Some(id) = item.id.as_deref()
+            && let Some(first) = ids.insert(id, item.line)
+        {
+            found.push((item.line, format!("id `^{id}` is also on line {first}")));
         }
     }
     for (line, message) in found {
@@ -795,6 +953,31 @@ mod tests {
         );
         assert_eq!(parsed.items.len(), 1);
         assert_eq!(parsed.items[0].priority, Priority::High);
+    }
+
+    #[test]
+    fn a_fence_closes_only_on_its_own_kind_and_length() {
+        let item = |text: &str| parse(text).items.len();
+        // Three backticks do not close four, and backticks do not close tildes.
+        let four = "# TODO\n\n## High\n\n````\n```\n- [ ] hidden\n````\n\n- [ ] real\n";
+        assert_eq!(item(four), 1);
+        assert_clean(four);
+        let tilde = "# TODO\n\n## High\n\n~~~\n```\n- [ ] hidden\n~~~\n\n- [ ] real\n";
+        assert_eq!(item(tilde), 1);
+        assert_clean(tilde);
+        // A longer closing run closes; one followed by text does not.
+        let longer = "# TODO\n\n## High\n\n```\n- [ ] hidden\n```` x\n`````\n- [ ] real\n";
+        assert_eq!(item(longer), 1);
+        assert_clean(longer);
+    }
+
+    #[test]
+    fn an_unclosed_fence_is_an_error_at_its_opening_line() {
+        let text = "# TODO\n\n## High\n\n- [ ] seen\n\n```rust\n- [ ] hidden\n";
+        assert_reports(text, 7, Severity::Error, "never closed");
+        assert_eq!(parse(text).items.len(), 1);
+        let mismatched = "# TODO\n\n## High\n\n````\n```\n";
+        assert_reports(mismatched, 5, Severity::Error, "never closed");
     }
 
     #[test]
@@ -995,6 +1178,21 @@ mod tests {
     }
 
     #[test]
+    fn remove_done_takes_one_finished_item_and_its_description() {
+        let text = "# TODO\n\n## High\n\n- [x] done\n  why\n- [x] other\n- [ ] open\n";
+        assert_eq!(
+            remove_done(text, "done", "done").unwrap(),
+            "# TODO\n\n## High\n\n- [x] other\n- [ ] open\n"
+        );
+        assert_eq!(
+            remove_done(text, "open", "open"),
+            None,
+            "an open item stays"
+        );
+        assert_eq!(remove_done(text, "missing", "missing"), None);
+    }
+
+    #[test]
     fn add_token_appends_to_item_lines_only() {
         let text = "# TODO\r\n\r\n## Critical\r\n\r\n- [ ] crash #bug  \r\n- [ ] last";
         let out = add_token(text, 5, "gh:12").unwrap();
@@ -1010,6 +1208,132 @@ mod tests {
         );
         assert_eq!(add_token(text, 3, "gh:1"), None, "a heading is not an item");
         assert_eq!(add_token(text, 99, "gh:1"), None);
+    }
+
+    #[test]
+    fn save_replaces_the_file_and_keeps_its_mode_and_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pma-todo-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.md");
+        std::fs::write(&real, "# TODO\n\nold, and longer than the new text\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let link = dir.join("TODO.md");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        save(&link, "# TODO\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "# TODO\n");
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+            "the link is written through, not replaced"
+        );
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left.len(), 2, "no temporary file is left: {left:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An id, a trailing `^k3f9q`, names the item whatever its text or its
+    /// issue, and every name the item has still answers.
+    #[test]
+    fn an_id_is_the_items_identity() {
+        let parsed = assert_clean(
+            "# TODO\n\n## High\n\n- [ ] fix the lexer #bug ^7hq2m gh:4\n- [ ] other\n",
+        );
+        let item = &parsed.items[0];
+        assert_eq!(
+            (item.text.as_str(), item.id.as_deref(), item.gh),
+            ("fix the lexer", Some("7hq2m"), Some(4))
+        );
+        assert_eq!(item.key(), "id:7hq2m");
+        for (key, text) in [
+            ("id:7hq2m", ""),
+            ("gh:4", ""),
+            ("fix the lexer", ""),
+            ("x", "Fix The Lexer"),
+        ] {
+            assert!(item.is_task(key, text), "{key} {text}");
+        }
+        assert!(!item.is_task("id:7hq2n", ""));
+        assert_eq!(parsed.items[1].key(), "other");
+    }
+
+    /// Only a trailing caret word of five id characters is an id. Any other
+    /// caret word, such as a version constraint, is text.
+    #[test]
+    fn a_caret_word_is_text_unless_it_is_an_id() {
+        for (line, id, text) in [
+            ("- [ ] bump serde to ^1.2", None, "bump serde to ^1.2"),
+            ("- [ ] shout ^HELLO", None, "shout ^HELLO"),
+            ("- [ ] short ^7hq2", None, "short ^7hq2"),
+            ("- [ ] has an l ^7hqlm", None, "has an l ^7hqlm"),
+            (
+                "- [ ] ^7hq2m earlier is text",
+                None,
+                "^7hq2m earlier is text",
+            ),
+            ("- [ ] maybe ^maybe", Some("maybe"), "maybe"),
+            ("- [ ] real #bug ^7hq2m", Some("7hq2m"), "real"),
+        ] {
+            let parsed = assert_clean(&format!("# TODO\n\n## High\n\n{line}\n"));
+            let item = &parsed.items[0];
+            assert_eq!(
+                (item.id.as_deref(), item.text.as_str()),
+                (id, text),
+                "{line}"
+            );
+        }
+        assert_reports(
+            "# TODO\n\n## High\n\n- [ ] ^7hq2m\n",
+            5,
+            Severity::Error,
+            "no text",
+        );
+        assert_reports(
+            "# TODO\n\n## High\n\n- [ ] two ^7hq2m ^7hq2n\n",
+            5,
+            Severity::Error,
+            "more than one id",
+        );
+    }
+
+    #[test]
+    fn an_id_is_unique_in_its_file() {
+        assert_reports(
+            "# TODO\n\n## High\n\n- [ ] a ^7hq2m\n- [x] b ^7hq2m\n",
+            6,
+            Severity::Error,
+            "id `^7hq2m` is also on line 5",
+        );
+    }
+
+    /// `pma` writes an id at the end of the item a task names, once, and never
+    /// into a file whose items cannot be told apart.
+    #[test]
+    fn mint_id_writes_a_fresh_id_once() {
+        let text = "# TODO\n\n## High\n\n- [ ] first ^00000\n- [ ] second #bug\n  why\n";
+        let (edited, id) = mint_id(text, "second", "").unwrap();
+        assert!(is_id(&id) && id != "00000", "{id}");
+        assert_eq!(
+            edited,
+            format!("# TODO\n\n## High\n\n- [ ] first ^00000\n- [ ] second #bug ^{id}\n  why\n")
+        );
+        assert_eq!(parse(&edited).items[1].key(), format!("id:{id}"));
+        assert_eq!(mint_id(&edited, "second", ""), None, "it has one");
+        assert_eq!(mint_id(text, "first", ""), None, "it had one");
+        assert_eq!(mint_id(text, "missing", ""), None);
+        assert_eq!(
+            mint_id("# TODO\n\n## High\n\n- [ ] a\n- [ ] a\n", "a", ""),
+            None
+        );
+        let ids: std::collections::BTreeSet<String> = (0..200).map(|_| new_id(text)).collect();
+        assert!(ids.len() > 190, "ids are drawn at random: {}", ids.len());
+        assert!(ids.iter().all(|id| is_id(id)), "{ids:?}");
     }
 
     #[test]

@@ -123,6 +123,27 @@ const LIST_MAX: usize = 20;
 const LIST_ENTRY_MAX: usize = 200;
 
 impl FieldType {
+    /// What `check` accepts, in words an agent can follow.
+    pub fn describe(&self) -> String {
+        match self {
+            FieldType::Line { max, .. } => format!("one line of text, at most {max} characters"),
+            FieldType::Lines { max } => {
+                format!("a JSON array of at most {max} strings, one line each")
+            }
+            FieldType::Enum { values } => format!("one of {}", values.join(", ")),
+            FieldType::List => format!(
+                "a JSON array of at most {LIST_MAX} strings, each at most {LIST_ENTRY_MAX} characters"
+            ),
+            FieldType::Int { min, max } => match (min, max) {
+                (Some(lo), Some(hi)) => format!("a whole number from {lo} to {hi}"),
+                (Some(lo), None) => format!("a whole number, at least {lo}"),
+                (None, Some(hi)) => format!("a whole number, at most {hi}"),
+                (None, None) => "a whole number".into(),
+            },
+            FieldType::Bool => "true or false".into(),
+        }
+    }
+
     fn check(&self, name: &str, v: &Value) -> Result<(), String> {
         let at = |e: String| format!("`{name}`: {e}");
         match self {
@@ -573,6 +594,14 @@ pub struct Edge {
     pub max_laps: Option<Count>,
 }
 
+impl Edge {
+    /// Neither a lap edge nor a self-edge: an edge that orders the graph.
+    pub fn is_forward(&self) -> bool {
+        self.max_laps.is_none()
+            && !matches!((&self.from, &self.to), (From::Node(a), To::Node(b)) if a == b)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Workflow {
     pub name: String,
@@ -588,6 +617,27 @@ pub struct Workflow {
 impl Workflow {
     pub fn node(&self, name: &str) -> Option<&Node> {
         self.nodes.iter().find(|n| n.name == name)
+    }
+
+    /// The type a node's units carry when they leave it, in a flat graph.
+    pub fn output_of(&self, node: &Node) -> String {
+        match &node.op {
+            Op::Map(m) => m.emits.clone(),
+            Op::Reduce(r) => r.emits.clone(),
+            _ => node.input.clone(),
+        }
+    }
+
+    /// Nodes an edge that orders the graph leads from, into `node`.
+    pub fn predecessors(&self, node: &str) -> Vec<&str> {
+        self.edges
+            .iter()
+            .filter(|e| e.is_forward() && e.to == To::Node(node.to_string()))
+            .filter_map(|e| match &e.from {
+                From::Node(n) => Some(n.as_str()),
+                From::Input => None,
+            })
+            .collect()
     }
 }
 
@@ -799,6 +849,12 @@ fn parse_params(
         return Err(at("`params` must be an object".into()));
     };
     for (name, decl) in map {
+        // `/` qualifies a callee's parameter once calls are inlined.
+        if name.contains('/') {
+            return Err(at(format!(
+                "parameter `{name}`: a name may not contain `/`"
+            )));
+        }
         known(
             decl,
             &["type", "default", "values", "max", "min"],
@@ -1412,7 +1468,7 @@ impl Document {
                     _ => {}
                 }
                 if let Some(rule) = &m.rule {
-                    self.validate_map_rule(w, n, rule)?;
+                    self.validate_map_rule(w, n, rule, &m.emits)?;
                 }
                 if m.out == Out::Grows {
                     let units = m
@@ -1517,14 +1573,28 @@ impl Document {
                 }
             }
             Op::Emit(e) => {
+                // The fields each sink writes. A mapping to any other name
+                // would be read by nothing.
+                let (fields, needs): (&[&str], &[&str]) = match (e.sink, e.action) {
+                    (Sink::Todo, Action::Add) => {
+                        (&["text", "priority", "description"], &["text", "priority"])
+                    }
+                    (Sink::Todo, _) => (&["text"], &["text"]),
+                    (Sink::Note, Action::Add) => (&["text"], &["text"]),
+                    (Sink::Note, _) => return Err(at("a note is only added".into())),
+                    (Sink::Doc, _) => (&[], &[]),
+                };
                 for (field, placeholder) in &e.map {
                     self.placeholders(w, &input, placeholder, &at)?;
-                    if e.sink == Sink::Todo && e.action == Action::Add && field == "priority" {
-                        continue;
+                    if e.sink != Sink::Doc && !fields.contains(&field.as_str()) {
+                        return Err(at(format!(
+                            "the sink writes no field `{field}`; it takes {}",
+                            fields.join(", ")
+                        )));
                     }
                 }
-                if e.sink == Sink::Todo && e.action == Action::Add && !e.map.contains_key("text") {
-                    return Err(at("adding an item needs a `text` mapping".into()));
+                if let Some(missing) = needs.iter().find(|f| !e.map.contains_key(**f)) {
+                    return Err(at(format!("this sink needs a `{missing}` mapping")));
                 }
             }
             Op::Call(c) => {
@@ -1553,6 +1623,13 @@ impl Document {
                         return Err(at(format!(
                             "`{key}` is `{value}`, which is not one of its values"
                         )));
+                    } else if let (Some(max), Some(n)) = (param.max, value.as_i64())
+                        && n > max
+                    {
+                        return Err(at(format!(
+                            "`{key}` is {n}, over the maximum of {max} `{}` declares",
+                            c.workflow
+                        )));
                     }
                 }
             }
@@ -1560,8 +1637,31 @@ impl Document {
         Ok(())
     }
 
-    fn validate_map_rule(&self, w: &Workflow, n: &Node, rule: &str) -> Result<(), String> {
+    fn validate_map_rule(
+        &self,
+        w: &Workflow,
+        n: &Node,
+        rule: &str,
+        emits: &str,
+    ) -> Result<(), String> {
         let at = |e: String| format!("workflow `{}`: node `{}`: {e}", w.name, n.name);
+        // A rule writes units of one shape, so the node must say it emits that
+        // shape. Only `open-issues` projects onto a type the document declares.
+        let writes = match rule {
+            "todo-items" => Some("item".to_string()),
+            "open-runs" => Some("run".to_string()),
+            "outdated-deps" => Some("signal".to_string()),
+            _ if rule.starts_with("as:") => Some(rule["as:".len()..].to_string()),
+            _ if rule.starts_with("where:") || rule.starts_with("path-") => Some(n.input.clone()),
+            _ => None,
+        };
+        if let Some(ty) = writes
+            && ty != emits
+        {
+            return Err(at(format!(
+                "rule `{rule}` writes `{ty}`, and the node emits `{emits}`"
+            )));
+        }
         if MAP_RULES.contains(&rule) {
             return Ok(());
         }
@@ -1741,10 +1841,11 @@ impl Document {
         }
     }
 
-    /// Every cycle must be a declared lap edge. Kahn's algorithm over the
-    /// graph with lap edges removed: what remains must be a DAG.
+    /// Every cycle must be a declared lap edge or a self-edge, which
+    /// `max_depth` bounds. Kahn's algorithm over the graph with both removed:
+    /// what remains must be a DAG.
     fn validate_acyclic(&self, w: &Workflow) -> Result<(), String> {
-        let forward: Vec<&Edge> = w.edges.iter().filter(|e| e.max_laps.is_none()).collect();
+        let forward: Vec<&Edge> = w.edges.iter().filter(|e| e.is_forward()).collect();
         let mut indegree: BTreeMap<&str, usize> =
             w.nodes.iter().map(|n| (n.name.as_str(), 0)).collect();
         for e in &forward {
@@ -2261,7 +2362,69 @@ impl Document {
         while flat.nodes.iter().any(|n| matches!(n.op, Op::Call(_))) {
             flat = self.inline(&flat)?;
         }
+        check_flat(&flat)?;
         Ok(flat)
+    }
+
+    /// Constructs a document may state and the runtime does not take yet. A
+    /// revision holding any is refused at propose; `check` still costs it.
+    pub fn unbuilt(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for w in &self.workflows {
+            let at = |what: String| format!("workflow `{}`: {what}", w.name);
+            for (i, e) in w.edges.iter().enumerate() {
+                if e.max_laps.is_some() {
+                    out.push(at(format!("edge {}: a lap edge is not taken yet", i + 1)));
+                } else if !e.is_forward() {
+                    out.push(at(format!(
+                        "edge {}: recursion (a self-edge) is not taken yet",
+                        i + 1
+                    )));
+                }
+                let reads_children = e.when.as_ref().is_some_and(|g| {
+                    g.0.iter()
+                        .any(|(k, _)| *k == Key::System("children".into()))
+                });
+                if reads_children {
+                    out.push(at(format!(
+                        "edge {}: `@children` is not recorded yet",
+                        i + 1
+                    )));
+                }
+            }
+            for n in &w.nodes {
+                let at = |what: &str| at(format!("node `{}`: {what}", n.name));
+                let texts: Vec<&String> = match &n.op {
+                    Op::Map(m) => m.task.iter().chain(m.doc.iter()).collect(),
+                    Op::Reduce(r) => r.task.iter().collect(),
+                    Op::Edit(e) => vec![&e.task],
+                    Op::Emit(e) => e.map.values().collect(),
+                    _ => Vec::new(),
+                };
+                if texts.iter().any(|t| t.contains("{@children}")) {
+                    out.push(at("`@children` is not recorded yet"));
+                }
+                match &n.op {
+                    Op::Map(m) if m.retry.is_some() => out.push(at("`retry` is not taken yet")),
+                    Op::Edit(e) if e.retry.is_some() => out.push(at("`retry` is not taken yet")),
+                    _ => {}
+                }
+                match &n.op {
+                    Op::Map(m) if m.publish => out.push(at("`publish` is not built yet")),
+                    Op::Emit(e) if e.sink == Sink::Doc => {
+                        out.push(at("the `doc` sink is not built yet"))
+                    }
+                    Op::Check { rule } if rule == "nonempty" => out.push(at(
+                        "`nonempty` is not built: a check writes a verdict per unit, and an empty bag has none",
+                    )),
+                    Op::Edit(EditNode { check: Some(c), .. }) if c == "nonempty" => {
+                        out.push(at("`nonempty` is not built"))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out
     }
 
     /// Replaces the first call site with its callee.
@@ -2305,7 +2468,13 @@ impl Document {
                         Param {
                             ty: decl.ty.clone(),
                             default: passed.cloned().unwrap_or_else(|| decl.default.clone()),
-                            max: decl.max,
+                            // A constant the call site pins cannot be changed
+                            // afterwards (`bind` refuses a callee's name), so
+                            // it is the bound, not the callee's maximum.
+                            max: match passed.and_then(Value::as_i64) {
+                                Some(n) if decl.max.is_some() => Some(n),
+                                _ => decl.max,
+                            },
                         },
                     );
                     rename.insert(p.clone(), qualified);
@@ -2374,6 +2543,33 @@ impl Document {
         }
         Ok(out)
     }
+}
+
+/// Inlining joins edges pairwise, so it can produce what validation of each
+/// document alone would refuse: two edges for one pair, or two default edges
+/// out of one node.
+fn check_flat(w: &Workflow) -> Result<(), String> {
+    let mut pairs = BTreeSet::new();
+    let mut defaults = BTreeSet::new();
+    for e in &w.edges {
+        let from = match &e.from {
+            From::Input => "@input".to_string(),
+            From::Node(n) => n.clone(),
+        };
+        if !pairs.insert((e.from.clone(), e.to.clone())) {
+            return Err(format!(
+                "workflow `{}`: after calls are inlined, `{from}` has two edges to one target",
+                w.name
+            ));
+        }
+        if e.default && !defaults.insert(from.clone()) {
+            return Err(format!(
+                "workflow `{}`: after calls are inlined, `{from}` has two default edges",
+                w.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One edge from two, where a call site's edge meets the callee's. Guards
@@ -2485,12 +2681,30 @@ fn rename_count(c: &mut Count, rename: &BTreeMap<String, String>) {
     }
 }
 
+/// In one pass over the text, so a renamed reference is not renamed again:
+/// with `a -> b` and `b -> x`, `{$a}` becomes `{$b}`, not `{$x}`.
 fn rename_text(s: &mut String, rename: &BTreeMap<String, String>) {
-    for (from, to) in rename {
-        if from != to {
-            *s = s.replace(&format!("{{${from}}}"), &format!("{{${to}}}"));
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s.as_str();
+    while let Some(start) = rest.find("{$") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                let name = &after[..end];
+                out.push_str("{$");
+                out.push_str(rename.get(name).map_or(name, String::as_str));
+                out.push('}');
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[start..]);
+                rest = "";
+            }
         }
     }
+    out.push_str(rest);
+    *s = out;
 }
 
 fn rename_guard(e: &mut Edge, rename: &BTreeMap<String, String>) {
@@ -2521,13 +2735,25 @@ impl Workflow {
             let (name, text) = arg
                 .split_once('=')
                 .ok_or_else(|| format!("`{arg}`: expected name=value"))?;
+            // A qualified name belongs to a callee, and its value is the call
+            // site's to state: `--set` reaches only the workflow's own.
+            if let Some((site, _)) = name.split_once('/') {
+                return Err(format!(
+                    "`{name}` is set by the call site `{site}`, not on the command line"
+                ));
+            }
+            let own: Vec<&String> = self.params.keys().filter(|k| !k.contains('/')).collect();
             let param = self.params.get(name).ok_or_else(|| {
                 format!(
                     "`{}` declares no parameter `{name}`; it takes {}",
                     self.name,
-                    match self.params.is_empty() {
+                    match own.is_empty() {
                         true => "none".to_string(),
-                        false => self.params.keys().cloned().collect::<Vec<_>>().join(", "),
+                        false => own
+                            .iter()
+                            .map(|k| k.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
                     }
                 )
             })?;
@@ -2641,14 +2867,36 @@ impl Document {
             // A lap mints a new unit, so a lapped node's successor sees
             // one per lap. A retry does not: it is another attempt on the
             // same run, against the same unit.
-            let units_seen = times(units_in, 1 + laps);
+            // A self-edge re-runs the node on its own output, one level per
+            // `max_depth`, so it sees every level's units. The instance cap
+            // holds what compounding would otherwise reach.
+            let recursive = w
+                .edges
+                .iter()
+                .any(|e| e.from == From::Node(name.clone()) && e.to == To::Node(name.clone()));
+            let mut units_seen = times(units_in, 1 + laps);
+            if recursive && let Op::Map(m) = &node.op {
+                let width = m.max_units.as_ref().map_or(0, |c| c.ceiling(&w.params));
+                let depth = m.max_depth.as_ref().map_or(0, |c| c.ceiling(&w.params));
+                let (mut level, mut total) = (units_seen, units_seen);
+                for _ in 0..depth {
+                    level = times(level, width);
+                    total = total.saturating_add(level);
+                }
+                units_seen = total.min(units_seen.saturating_add(w.caps.max_units));
+            }
             let node_runs = times(units_seen, 1 + retry);
             let (units_out, node_agent_runs, node_edits, node_cost) = match &node.op {
                 Op::Map(m) => {
                     let out = match m.out {
                         Out::Grows => {
                             let width = m.max_units.as_ref().map_or(0, |c| c.ceiling(&w.params));
-                            let depth = m.max_depth.as_ref().map_or(0, |c| c.ceiling(&w.params));
+                            // A recursive node's levels are already in
+                            // `units_seen`.
+                            let depth = match recursive {
+                                true => 0,
+                                false => m.max_depth.as_ref().map_or(0, |c| c.ceiling(&w.params)),
+                            };
                             // Each level multiplies by the width; the caps
                             // truncate what compounding would otherwise reach.
                             let mut total = 0i64;
@@ -2727,40 +2975,46 @@ impl Document {
     /// Node names in dependency order, ignoring lap edges. The graph is a DAG
     /// without them, which validation already established.
     fn topological(&self, w: &Workflow) -> Vec<String> {
-        let forward: Vec<&Edge> = w.edges.iter().filter(|e| e.max_laps.is_none()).collect();
-        let mut indegree: BTreeMap<&str, usize> =
-            w.nodes.iter().map(|n| (n.name.as_str(), 0)).collect();
+        topological(w)
+    }
+}
+
+/// Node names in dependency order, ignoring lap edges and self-edges. The
+/// graph is a DAG without them, which validation already established.
+pub fn topological(w: &Workflow) -> Vec<String> {
+    let forward: Vec<&Edge> = w.edges.iter().filter(|e| e.is_forward()).collect();
+    let mut indegree: BTreeMap<&str, usize> =
+        w.nodes.iter().map(|n| (n.name.as_str(), 0)).collect();
+    for e in &forward {
+        if let (From::Node(_), To::Node(to)) = (&e.from, &e.to)
+            && let Some(d) = indegree.get_mut(to.as_str())
+        {
+            *d += 1;
+        }
+    }
+    let mut ready: Vec<&str> = w
+        .nodes
+        .iter()
+        .map(|n| n.name.as_str())
+        .filter(|n| indegree[n] == 0)
+        .collect();
+    ready.reverse();
+    let mut order = Vec::new();
+    while let Some(n) = ready.pop() {
+        order.push(n.to_string());
         for e in &forward {
-            if let (From::Node(_), To::Node(to)) = (&e.from, &e.to)
+            if e.from == From::Node(n.to_string())
+                && let To::Node(to) = &e.to
                 && let Some(d) = indegree.get_mut(to.as_str())
             {
-                *d += 1;
-            }
-        }
-        let mut ready: Vec<&str> = w
-            .nodes
-            .iter()
-            .map(|n| n.name.as_str())
-            .filter(|n| indegree[n] == 0)
-            .collect();
-        ready.reverse();
-        let mut order = Vec::new();
-        while let Some(n) = ready.pop() {
-            order.push(n.to_string());
-            for e in &forward {
-                if e.from == From::Node(n.to_string())
-                    && let To::Node(to) = &e.to
-                    && let Some(d) = indegree.get_mut(to.as_str())
-                {
-                    *d -= 1;
-                    if *d == 0 {
-                        ready.insert(0, to.as_str());
-                    }
+                *d -= 1;
+                if *d == 0 {
+                    ready.insert(0, to.as_str());
                 }
             }
         }
-        order
     }
+    order
 }
 
 #[cfg(test)]
@@ -2808,6 +3062,92 @@ mod tests {
 
     fn doc() -> Document {
         Document::parse(FIND_ISSUES).expect("the library document parses")
+    }
+
+    /// Renaming is one pass: a reference renamed once is not renamed again.
+    #[test]
+    fn a_parameter_is_renamed_once() {
+        let rename: BTreeMap<String, String> = [("a", "b"), ("b", "x")]
+            .into_iter()
+            .map(|(f, t)| (f.to_string(), t.to_string()))
+            .collect();
+        let mut text = "{$a} and {$b}, {$c} and {name} and {$".to_string();
+        rename_text(&mut text, &rename);
+        assert_eq!(text, "{$b} and {$x}, {$c} and {name} and {$");
+    }
+
+    /// A value a call site pins cannot be changed from the command line.
+    #[test]
+    fn a_callee_parameter_is_not_set_on_the_command_line() {
+        let d = Document::parse(COMPOSED).unwrap();
+        let flat = d.flatten("sweep").unwrap();
+        let e = flat.bind(&["issues/breadth=40".into()]).unwrap_err();
+        assert!(e.contains("set by the call site `issues`"), "{e}");
+        let e = flat.bind(&["nope=1".into()]).unwrap_err();
+        assert!(
+            !e.contains("issues/"),
+            "a callee's parameter is not offered: {e}"
+        );
+    }
+
+    /// A sink writes named fields. A mapping to any other name, or a sink
+    /// missing one it needs, is refused where the document is read.
+    #[test]
+    fn a_sink_takes_only_the_fields_it_writes() {
+        let with_sink = |node: &str| {
+            FIND_ISSUES
+                .replace(
+                    r#"{"from": "dedupe", "to": "@output"}"#,
+                    r#"{"from": "dedupe", "to": "keep"}, {"from": "keep", "to": "@output"}"#,
+                )
+                .replace(
+                    r#""group_by": ["title"], "in": "finding", "emits": "finding"}"#,
+                    &format!(
+                        r#""group_by": ["title"], "in": "finding", "emits": "finding"}}, {node}"#
+                    ),
+                )
+                .replace(r#""effects": []"#, r#""effects": ["writes"]"#)
+        };
+        let ok = with_sink(
+            r#"{"name": "keep", "op": "emit", "in": "finding", "sink": "todo", "map": {"text": "{title}", "priority": "high"}}"#,
+        );
+        assert!(Document::parse(&ok).is_ok(), "{:?}", Document::parse(&ok));
+        let typo = with_sink(
+            r#"{"name": "keep", "op": "emit", "in": "finding", "sink": "todo", "map": {"txet": "{title}", "priority": "high"}}"#,
+        );
+        let e = Document::parse(&typo).unwrap_err();
+        assert!(e.contains("writes no field `txet`"), "{e}");
+        let unprioritised = with_sink(
+            r#"{"name": "keep", "op": "emit", "in": "finding", "sink": "todo", "map": {"text": "{title}"}}"#,
+        );
+        let e = Document::parse(&unprioritised).unwrap_err();
+        assert!(e.contains("needs a `priority`"), "{e}");
+    }
+
+    /// A rule writes units of one shape, so a node must emit that shape.
+    #[test]
+    fn a_rule_node_emits_the_type_its_rule_writes() {
+        let wrong = FIND_ISSUES.replace(
+            r#""max_units": "{$breadth}", "doc": "{$review_doc}",
+             "task": "Review `{name}`. Write prose to {doc} and findings to {out}."}"#,
+            r#""max_units": "{$breadth}", "via": "rule", "rule": "todo-items"}"#,
+        );
+        let e = Document::parse(&wrong).unwrap_err();
+        assert!(
+            e.contains("rule `todo-items` writes `item`, and the node emits `finding`"),
+            "{e}"
+        );
+    }
+
+    /// `unbuilt` names what the runtime does not take, and the library
+    /// document states none of it.
+    #[test]
+    fn unbuilt_constructs_are_named() {
+        assert!(doc().unbuilt().is_empty(), "{:?}", doc().unbuilt());
+        let d = Document::parse(WITH_EDIT).unwrap();
+        let unbuilt = d.unbuilt().join("\n");
+        assert!(unbuilt.contains("a lap edge is not taken yet"), "{unbuilt}");
+        assert!(unbuilt.contains("`retry` is not taken yet"), "{unbuilt}");
     }
 
     /// A revision is stored as `pma` read it, so the stored form must read
@@ -3071,7 +3411,7 @@ mod tests {
            "writes": ["verdict", "reason"],
            "task": "Judge the diff for `{title}`. Set `verdict` and `reason`."},
           {"name": "handoff", "op": "emit", "in": "finding", "sink": "todo", "action": "add",
-           "map": {"text": "{title}", "description": "{reason}"}}
+           "map": {"text": "{title}", "priority": "high", "description": "{reason}"}}
         ],
         "edges": [
           {"from": "@input", "to": "fix"},
@@ -3223,15 +3563,16 @@ mod tests {
                 writes: true
             }
         );
-        // The callee's bound composes into the caller's: 3 projects, 10 each
-        // at the maximum, then one emit per finding and no model.
+        // The callee's bound composes into the caller's: 3 projects, 4 each,
+        // the value the call site pins, then one emit per finding and no
+        // model.
         let e = d.estimate("sweep", 3, 1.0).unwrap();
         let issues = e
             .per_node
             .iter()
             .find(|b| b.node == "issues/review")
             .unwrap();
-        assert_eq!(issues.units_out, 30);
+        assert_eq!(issues.units_out, 12);
         assert_eq!(e.agent_runs, 3, "one review run per project");
     }
 
@@ -3256,8 +3597,8 @@ mod tests {
         assert_eq!(breadth.default, Value::from(4), "`with` set the default");
         assert_eq!(
             breadth.max,
-            Some(10),
-            "the callee's maximum still bounds it"
+            Some(4),
+            "a pinned constant is the bound, since nothing can change it"
         );
         let Op::Map(m) = &flat.node("issues/review").unwrap().op else {
             panic!("the callee's node")
@@ -3284,6 +3625,13 @@ mod tests {
         );
         let e = Document::parse(&broken).unwrap_err();
         assert!(e.contains("reads `project`"), "{e}");
+    }
+
+    #[test]
+    fn a_call_may_not_pass_a_value_over_the_callees_maximum() {
+        let broken = COMPOSED.replace(r#""with": {"breadth": 4}"#, r#""with": {"breadth": 11}"#);
+        let e = Document::parse(&broken).unwrap_err();
+        assert!(e.contains("`breadth` is 11, over the maximum of 10"), "{e}");
     }
 
     #[test]

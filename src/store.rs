@@ -3,7 +3,7 @@
 //!
 //! One user and one session at a time is assumed. The rollback journal
 //! (`journal_mode=DELETE`) keeps the file complete between transactions, so
-//! the directory can be tracked in git.
+//! a copy of it is a usable backup.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::class::Class;
 use crate::complexity::Features;
@@ -23,7 +23,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 26;
+const VERSION: i64 = 27;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -307,6 +307,13 @@ CREATE TABLE campaign_members (
 );
 ";
 
+/// Version 27. Drops the health score's weights. `pma status` sorts by the
+/// worst state a project is in, which needs no weight, and a stored row for a
+/// key nothing reads is one `pma config` would have to explain forever.
+const RETIRE_WEIGHTS: &str = "
+DELETE FROM config WHERE key LIKE 'weights.%';
+";
+
 /// Version 26. What makes git run a program in a run's repository, or push
 /// elsewhere, as it stood at dispatch: hooks and the settings that name a
 /// command or rewrite a URL. Ship refuses when it has changed, since neither
@@ -510,7 +517,7 @@ pub struct ProjectRow {
     pub deps_at: Option<i64>,
 }
 
-/// What a project's record consists of, for `pma forget`.
+/// What a project's record consists of, for `pma project forget`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Footprint {
     pub tasks: i64,
@@ -602,6 +609,24 @@ pub fn home() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".config").join("pma"))
 }
 
+/// Where worktrees, artifacts and logs go: `PMA_STATE`, else `$PMA_HOME/state`
+/// when `PMA_HOME` is set, else `$XDG_STATE_HOME/pma` or `~/.local/state/pma`.
+/// Kept apart from the database, whose directory holds nothing else.
+pub fn state_home() -> Result<PathBuf> {
+    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    if let Some(dir) = var("PMA_STATE") {
+        return Ok(PathBuf::from(dir));
+    }
+    if let Some(dir) = var("PMA_HOME") {
+        return Ok(PathBuf::from(dir).join("state"));
+    }
+    if let Some(dir) = var("XDG_STATE_HOME") {
+        return Ok(PathBuf::from(dir).join("pma"));
+    }
+    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".local").join("state").join("pma"))
+}
+
 impl Store {
     pub fn open_default() -> Result<Store> {
         let dir = home()?;
@@ -647,6 +672,7 @@ impl Store {
                     PRESETS_REPLACE_WORKER_MODEL,
                     SANDUK_WORKER,
                     GIT_SNAPSHOT,
+                    RETIRE_WEIGHTS,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -845,7 +871,9 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT (name) DO UPDATE SET
                     path = excluded.path, scanned_at = excluded.scanned_at,
-                    has_todo = excluded.has_todo, lint_errors = excluded.lint_errors,
+                    has_todo = CASE WHEN ?14 THEN projects.has_todo ELSE excluded.has_todo END,
+                    lint_errors = CASE WHEN ?14 THEN projects.lint_errors
+                                       ELSE excluded.lint_errors END,
                     dirty = excluded.dirty, ahead = excluded.ahead,
                     last_activity = excluded.last_activity, ci = excluded.ci,
                     ci_detail = excluded.ci_detail, scan_error = excluded.scan_error,
@@ -855,7 +883,7 @@ impl Store {
                     f.name,
                     path_str(&f.path)?,
                     now,
-                    f.todo.is_some(),
+                    f.todo.is_some() || f.todo_unread,
                     f.todo.as_ref().map_or(0, |t| t.lint_errors),
                     f.dirty,
                     f.ahead,
@@ -865,6 +893,7 @@ impl Store {
                     f.error,
                     leftover,
                     f.slug,
+                    f.todo_unread,
                 ],
             )?;
 
@@ -875,14 +904,47 @@ impl Store {
                 )?;
             }
 
-            let first_seen: HashMap<String, i64> = {
-                let mut stmt =
-                    tx.prepare("SELECT key, first_seen FROM tasks WHERE project = ?1")?;
-                let rows = stmt.query_map([&f.name], |r| Ok((r.get(0)?, r.get(1)?)))?;
-                rows.collect::<rusqlite::Result<_>>()?
+            // An unreadable file says nothing about the tasks; the last good
+            // scan's rows and their ages stand.
+            if f.todo_unread {
+                continue;
+            }
+            // By key, else by text: `sync` adding `gh:N` changes an item's key
+            // but not its text, and an `id:` keeps an item's key when its text
+            // is reworded. Either way the item keeps its age: when it was first
+            // seen, and when its text first appeared in git, which a reworded
+            // text no longer finds in the history.
+            type Seen = (i64, Option<i64>);
+            let (by_key, by_text): (HashMap<String, Seen>, HashMap<String, Seen>) = {
+                let mut stmt = tx.prepare(
+                    "SELECT key, text, first_seen, added_at FROM tasks WHERE project = ?1",
+                )?;
+                let rows: Vec<(String, String, i64, Option<i64>)> = stmt
+                    .query_map([&f.name], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                let by_text = rows
+                    .iter()
+                    .map(|(_, text, seen, added)| (crate::todo::normal_text(text), (*seen, *added)))
+                    .collect();
+                (
+                    rows.into_iter()
+                        .map(|(k, _, seen, added)| (k, (seen, added)))
+                        .collect(),
+                    by_text,
+                )
             };
             tx.execute("DELETE FROM tasks WHERE project = ?1", [&f.name])?;
             for item in f.todo.iter().flat_map(|t| &t.items) {
+                let before = by_key
+                    .get(&item.key)
+                    .or_else(|| by_text.get(&crate::todo::normal_text(&item.text)));
+                let first_seen = before.map_or(now, |(seen, _)| *seen);
+                let added_at = match (item.added_at, before.and_then(|(_, added)| *added)) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
                 tx.execute(
                     "INSERT INTO tasks (project, key, line, priority, text, tags, due, gh, added_at, first_seen, heading)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -895,8 +957,8 @@ impl Store {
                         item.tags.join(" "),
                         item.due,
                         item.gh,
-                        item.added_at,
-                        first_seen.get(&item.key).copied().unwrap_or(now),
+                        added_at,
+                        first_seen,
                         item.group,
                     ],
                 )?;
@@ -1564,6 +1626,16 @@ impl Store {
         Ok(())
     }
 
+    /// Records new arguments on an instance and clears the outcome that
+    /// stopped it, so a raised cap resumes it.
+    pub fn reopen_instance(&self, instance: i64, args: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE workflow_instances SET args = ?2, outcome = NULL WHERE id = ?1",
+            params![instance, args],
+        )?;
+        Ok(())
+    }
+
     pub fn finish_instance(&self, instance: i64, outcome: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE workflow_instances SET finished_at = ?2, outcome = ?3 WHERE id = ?1",
@@ -1795,6 +1867,25 @@ impl Store {
         Ok((decided, accepted))
     }
 
+    /// Moves the runs still holding a task onto its new key, once `pma` has
+    /// written an id into its line: those keyed by its old key or by its text.
+    /// A finished run keeps the key it was dispatched under.
+    pub fn rekey_runs(&self, project: &str, old: &str, text: &str, new: &str) -> Result<()> {
+        let text = crate::todo::normal_text(text);
+        for run in self.runs()? {
+            if run.project == project
+                && !run.state.is_final()
+                && (run.task_key == old || crate::todo::normal_text(&run.text) == text)
+            {
+                self.conn.execute(
+                    "UPDATE runs SET task_key = ?2 WHERE id = ?1",
+                    params![run.id, new],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Attempts consumed against a task revision, across every run of it.
     pub fn consumed_attempts(&self, project: &str, revision: &str) -> Result<i64> {
         Ok(self
@@ -1804,6 +1895,9 @@ impl Store {
                 params![project, revision],
                 |r| r.get(0),
             )
+            // No row is no attempt; any other error is an error, since the
+            // limit it guards would otherwise be lifted.
+            .optional()?
             .unwrap_or(0))
     }
 
@@ -2389,6 +2483,7 @@ mod tests {
             ci: Ci::Failing(vec!["test".into(), "wheels".into()]),
             deps: None,
             error: None,
+            todo_unread: false,
         }
     }
 
@@ -3126,6 +3221,62 @@ mod tests {
             (Some("2026-10-01"), Some(4), Some(100))
         );
         assert_eq!(store.last_scan().unwrap(), Some(4000));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A file that could not be read is not an empty file: the tasks and their
+    /// ages stand until a scan can read it again.
+    #[test]
+    fn an_unreadable_todo_keeps_the_tasks() {
+        let dir = scratch("unread");
+        let mut store = Store::open(&dir.join("p.db")).unwrap();
+        store
+            .save_scan(&[facts("one", vec![item("x", 5)])], true, 1000)
+            .unwrap();
+        let unread = Facts {
+            todo: None,
+            todo_unread: true,
+            error: Some("TODO.md: permission denied".into()),
+            ..facts("one", vec![])
+        };
+        store.save_scan(&[unread], true, 2000).unwrap();
+        let kept: Vec<_> = store
+            .tasks()
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.key, t.first_seen))
+            .collect();
+        assert_eq!(kept, [("x".to_string(), 1000)]);
+        let p = store.project("one").unwrap().unwrap();
+        assert_eq!((p.has_todo, p.lint_errors), (true, 1));
+        assert_eq!(p.scan_error.as_deref(), Some("TODO.md: permission denied"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `sync` writes `gh:N` into an item, which changes its key from its text
+    /// to the issue number. Its age is the item's, not the key's.
+    #[test]
+    fn a_task_keeps_its_first_seen_when_its_key_changes() {
+        let dir = scratch("rekey");
+        let mut store = Store::open(&dir.join("p.db")).unwrap();
+        let unlinked = ScannedItem {
+            gh: None,
+            ..item("fix it", 5)
+        };
+        store
+            .save_scan(&[facts("one", vec![unlinked])], true, 1000)
+            .unwrap();
+        let linked = ScannedItem {
+            key: "gh:9".into(),
+            text: "Fix  it".into(),
+            gh: Some(9),
+            ..item("fix it", 5)
+        };
+        store
+            .save_scan(&[facts("one", vec![linked])], true, 2000)
+            .unwrap();
+        let tasks = store.tasks().unwrap();
+        assert_eq!((tasks[0].key.as_str(), tasks[0].first_seen), ("gh:9", 1000));
         let _ = std::fs::remove_dir_all(dir);
     }
 

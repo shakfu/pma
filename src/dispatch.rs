@@ -142,6 +142,16 @@ pub fn revision(text: &str) -> String {
     todo::normal_text(text)
 }
 
+/// What a run's attempts count against. A workflow unit counts against its
+/// lineage, `workflow:<instance>:<root>`, so a retry and a lap draw from one
+/// budget (W23); anything else counts against its task text.
+pub fn attempt_key(run: &Run) -> String {
+    match run.task_key.starts_with("workflow:") {
+        true => run.task_key.clone(),
+        false => revision(&run.text),
+    }
+}
+
 /// Whether this attempt counts against the limit. A run that never reached
 /// the agent, or whose agent could not start or was killed at the timeout,
 /// says nothing about the task's suitability.
@@ -556,9 +566,9 @@ fn queue(
         complexity,
         tier: pick.tier,
         // A task dispatched on its own names no node, which is what a route
-        // stating no node condition serves.
-        node: None,
-        lap: 0,
+        // stating no node condition serves; a workflow unit names its node.
+        node: pick.workflow.as_ref().map(|u| u.node.as_str()),
+        lap: pick.workflow.as_ref().map_or(0, |u| u.lap),
     };
     let active = store.active_route()?;
     let mut routed = (None, None, None, None, class.scope());
@@ -915,7 +925,7 @@ pub fn execute(
                 // Escalation counts like any other attempt: each refused
                 // check is one negative signal about the task.
                 if a.verify_ok == Some(false)
-                    && let Err(e) = store.consume_attempt(&run.project, &revision(&run.text))
+                    && let Err(e) = store.consume_attempt(&run.project, &attempt_key(&run))
                 {
                     save_error.get_or_insert(e.to_string());
                 }
@@ -1359,7 +1369,7 @@ pub fn reject(store: &Store, run: &mut Run) -> Result<()> {
     store.update_run(run)?;
     // A reviewer who refuses the work has judged the task, whatever verify
     // made of it.
-    store.consume_attempt(&run.project, &revision(&run.text))?;
+    store.consume_attempt(&run.project, &attempt_key(run))?;
     Ok(())
 }
 
@@ -1400,7 +1410,7 @@ pub fn rework(
     store.update_run(run)?;
     store.insert_attempt(&a)?;
     if consumes(run) {
-        store.consume_attempt(&run.project, &revision(&run.text))?;
+        store.consume_attempt(&run.project, &attempt_key(run))?;
     }
     Ok(())
 }
@@ -1593,6 +1603,25 @@ mod tests {
             };
             assert!(!consumes(&run), "{error}");
         }
+    }
+
+    /// A workflow unit's attempts count against its lineage, so every node and
+    /// lap spending on it draws from one counter; a task's count against its
+    /// text.
+    #[test]
+    fn a_workflow_unit_counts_attempts_against_its_lineage() {
+        let unit = Run {
+            task_key: "workflow:3:u1".into(),
+            text: "Fix the parser".into(),
+            ..Run::default()
+        };
+        assert_eq!(attempt_key(&unit), "workflow:3:u1");
+        let task = Run {
+            task_key: "fix the parser".into(),
+            text: "Fix  the Parser".into(),
+            ..Run::default()
+        };
+        assert_eq!(attempt_key(&task), "fix the parser");
     }
 
     /// An item named like a signal, a campaign or a workflow unit is still an

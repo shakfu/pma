@@ -42,7 +42,7 @@ Goal 5 is not built. The manager is deterministic today, in scoring formulas and
 | Thresholds and weights | Configurable; the defaults below are the starting point |
 | Agent quadrants | Q1 and Q2; Q3 optional once Q1 and Q2 are exhausted |
 | Signal tasks | In the matrix alongside written tasks |
-| Portfolio store | SQLite at `~/.config/pma/projects.db`, optionally git-tracked; one user, one session |
+| Portfolio store | SQLite at `~/.config/pma/projects.db`; one user, one machine, one session |
 | Agents | `claude`, `codex`, `cursor-agent`, `opencode` |
 | Agent output | Uncommitted changes, reviewed, then committed and pushed by `pma` |
 | Publish | Configurable: push to the default branch, or push a branch and open a PR |
@@ -169,11 +169,13 @@ Rules. `pma lint` reports errors (E), which exit 1, and warnings (W), which do n
 
   - `gh:N`: a positive issue number (E), at most one (E).
 
+  - `^k3f9q`: an optional id, five characters of lowercase Crockford base32 without `i`, `l`, `o` or `u`, unique in the file (E), at most one (E). The caret is Obsidian's mark for a block id, and GitHub renders it as text. A caret word that is not an id, such as `^1.2`, is text. `pma` writes ids, at random so two branches do not mint the same one: `pma lint --ids --apply` for every open item, and the workflow `todo` sink for an item it adds. Not at dispatch: ship ticks the same line on origin, so an uncommitted id in the clone would conflict on every pull.
+
   - A token-shaped word earlier in the line is text. A trailing `#42` is text, with a hint to write `gh:42` (W).
 
 - An item needs text besides tokens (E).
 
-- No per-item ids. `gh:N` is the durable id for synced items. Unsynced items are identified by file and text, compared case-insensitively. Two open items with the same text (E), or two items with the same `gh:N` (E), break that identity. An agent that rewords an item is caught at review, where the diff is shown.
+- Identity is the id, else `gh:N`, else the text, compared case-insensitively. A scan carries an item's age by key, so a reworded item with an id keeps it. The attempt counter stays keyed on the text: a reworded task is a new specification. Two open items with the same text (E), or two items with the same `gh:N` (E), break that identity. An agent that rewords an item is caught at review, where the diff is shown.
 
 Headings over inline priority markers (todo.txt `(A)`): a human moves an item by cut and paste, and the file renders cleanly on GitHub.
 
@@ -214,41 +216,39 @@ The deps signal counts outdated dependencies as each tool reports them. The tool
 | uv | `uv.lock` | `uv tree --frozen --outdated --depth 1` | direct dependencies with a newer release |
 | go | `go.mod` | `go list -u -m all`, direct modules | modules with a newer version |
 
-The counts are not comparable across ecosystems: cargo's includes transitive crates. On 2026-09-15 across 52 repos, cargo projects reached 147 while uv projects stayed under 15. The score saturates at 10 outdated, so the difference does not dominate health.
+The counts are not comparable across ecosystems: cargo's includes transitive crates. On 2026-09-15 across 52 repos, cargo projects reached 147 while uv projects stayed under 15. Any count above zero places a project in the stale-deps state, so the difference does not change its place.
 
 Measuring takes 0.6s (uv) to 10s (go) per project, and 44s for the 52 repos. It runs only with `pma scan --deps`. Other scans keep the last measurement and its date, which `status --explain` shows. A project with none of the three files, or whose tools all fail, is unmeasured. A tool's failure is kept in the detail. A deps task is dispatched with that detail as the list to update.
 
-### Project health
+### Project state
 
-**Under review; see the cut list in `implementation-plan.md`.** Five weights and a saturation curve yield a number with no action attached. Removal waits on a replacement for what it alone covers: `pma report` (plan 1.10) describes runs that were attempted, whereas this view also describes repositories where nothing was ever dispatched.
+`pma status` ranks projects rather than tasks. Each project is placed by the worst state it is in, then by tier, then by name:
 
-A separate per-project view ranks projects rather than tasks:
+| Order | State | When |
+|-|-|-|
+| 1 | failing CI | a workflow's latest decisive run on the default branch failed |
+| 2 | broken | `TODO.md` has lint errors, or the scan could not read the project |
+| 3 | unpublished | commits not pushed, or `pma/` branches no open run owns |
+| 4 | critical | open items under `## Critical` |
+| 5 | stale deps | outdated dependencies at the last `--deps` measurement |
+| 6 | idle | no counted commit within the tier's horizon, or none at all |
+| 7 | clear | none of the above |
 
-`health = tier[t] * sum(w_i * s_i) / sum(w_i)`, each `s_i` in 0..1 (1 = needs attention). The sums run over measured signals only, so an unmeasured signal neither lowers nor raises the score.
+The order is what to do first: a failing check blocks the repository, broken facts make the rest unreliable, unpublished work is at risk, then the work itself, then upkeep. A signal not measured, such as CI offline or dependencies never counted, places a project in no state. Changed files alone place it nowhere either, since an uncommitted `TODO.md` edit is routine. `pma status --explain` lists every state a project is in and what put it there.
 
-| Signal | `s` |
-|-|-|
-| tasks | `1 - exp(-x / 3)`, `x` the summed priority weights of open items |
-| activity | days idle / tier horizon, capped at 1; 1 when no counted commit exists |
-| ci | failing 1, passing 0, no runs 0.5; unmeasured when unknown or `--offline` |
-| deps | outdated count / 10, capped at 1; unmeasured when never measured |
-| hygiene | 0.5 each for changed files, unpushed commits and leftover `pma/` branches, capped at 1 |
-
-`pma status --explain` prints each signal's contribution. Weights cannot be calibrated without it.
+It replaces a health score, `tier * sum(w_i * s_i) / sum(w_i)` over five signals. The score prompted no action, its five weights were never calibrated, it counted again signals the matrix already lists as tasks, and `status` was its only reader. Migration 27 drops the stored `weights.*` settings.
 
 ## Storage
 
-SQLite at `~/.config/pma/projects.db`, via `rusqlite`. It holds projects, tiers, weights, notes, the scanned task index, the dispatch queue, and agent run history. The directory may be a git repo for sync between machines.
+SQLite at `~/.config/pma/projects.db`, via `rusqlite`. It holds projects, tiers, settings, notes, the scanned task index, the dispatch queue, and agent run history. Worktrees, logs and artifacts live apart from it, under `~/.local/state/pma`, so the database directory holds only the database and the session lock.
 
 This assumes one user. Commands that run agents or change worktrees (`dispatch`, `ship`, `review --reject`, `review --rework`) hold an exclusive `flock` on `session.lock` for their whole run. A second one refuses to start and names the holder's pid. The kernel releases the lock when the process exits, so a crash leaves no stale lock, unlike a pid file. Other commands run alongside, and SQLite waits up to 5s for a write lock. `pma review` holds the lock for milliseconds to fail runs of an ended session, so a command that needs the lock waits up to 2s before refusing.
 
-- `journal_mode=DELETE`, not WAL. The file on disk is complete whenever no transaction is open, so it can be committed as is. WAL lets readers run during a write; here writes are single rows, and the busy timeout covers them.
+- `journal_mode=DELETE`, not WAL. The file on disk is complete whenever no transaction is open, so it can be copied as a backup. WAL lets readers run during a write; here writes are single rows, and the busy timeout covers them.
 
-- `pma store sync` commits and pushes the database, and pulls before the session writes. Scans do not commit, so the repo gains a blob only on an explicit sync.
+- Sharing the database between machines is not supported. Git cannot merge two copies of it, and nothing detects that they diverged.
 
-- A session refuses to write when the remote has a newer database than the last one pulled. This catches a sync forgotten on another machine before the two copies diverge. Git cannot merge them afterwards.
-
-Tiers, weights and notes are edited through `pma` commands, not a text editor.
+Tiers, settings and notes are edited through `pma` commands, not a text editor.
 
 Notes are portfolio-wide, with no project field: a note about one project belongs in its repo. `pma note add`, `pma note edit <id>`, `pma note rm <id>`, and `pma note` to list.
 
@@ -282,13 +282,6 @@ high     = 0.5
 medium   = 0.2
 low      = 0.05
 
-[weights]                                # project health
-tasks    = 5
-activity = 1
-ci       = 3
-deps     = 1
-hygiene  = 2
-
 [stale_after]                            # days open without due: before urgent
 1 = 30
 2 = 60
@@ -316,7 +309,7 @@ Shown as TOML for readability. The values are stored in `projects.db` and set wi
 
 A glob without `/` matches a file name in any directory. `*` matches within one path segment, and `**` matches any number of segments.
 
-Projects are the git repos directly under each root, named by directory. A project under a root with no tier is listed as untiered and left out of the matrix. A full `pma scan` marks projects it no longer finds as absent and says so, keeping the row, its tier and its tasks; commands that need a working tree refuse an absent project. `pma forget` deletes an absent project's record when the repository is gone for good; it refuses one with an unsettled run, whose worktree may still exist. Leaving a root is usually a move, and a rescan cannot rebuild a tier or a task's `first_seen`. Tags group projects for selection: a project carries several, and `--tag` on a name-taking command adds every project carrying it. They are private to the database, since GitHub topics describe a repository for search rather than organise a portfolio. `PMA_HOME` overrides `~/.config/pma`.
+Projects are the git repos directly under each root, named by directory. A project under a root with no tier is listed as untiered and left out of the matrix. A full `pma scan` marks projects it no longer finds as absent and says so, keeping the row, its tier and its tasks; commands that need a working tree refuse an absent project. `pma project forget` deletes an absent project's record when the repository is gone for good; it refuses one with an unsettled run, whose worktree may still exist. Leaving a root is usually a move, and a rescan cannot rebuild a tier or a task's `first_seen`. Tags group projects for selection: a project carries several, and `--tag` on a name-taking command adds every project carrying it. They are private to the database, since GitHub topics describe a repository for search rather than organise a portfolio. `PMA_HOME` overrides `~/.config/pma`.
 
 ## Agents
 
@@ -389,7 +382,7 @@ An agent and its verify run under a `sh` watchdog holding a pipe from `pma`. Whe
 
 `pma dispatch cynn:31` names a TODO.md line from the last scan, and `pma dispatch cynn:ci` names failing CI. `pma dispatch --auto -n N` takes the top N dispatchable tasks of tiered projects, as ordered in the matrix. A task with a run that is not shipped or rejected is skipped.
 
-1. `git fetch`, then `git worktree add` from the remote default branch into `<data>/worktrees/<project>/<slug>`, on branch `pma/<slug>`. The user's working tree is never touched, so a dirty tree does not block dispatch. The slug is the task text's first words, up to 40 bytes, with `-2`, `-3` on collision with a worktree, a local branch, or a remote `pma/` branch left by a pull request. The item must be open in the remote `TODO.md`, checked before the worktree exists; otherwise ship could not mark it done. A refusal names the cause: not in the remote file (commit and push it), or already done there (pull the clone). With `--auto`, a refused task gives its place to the next one in matrix order. A project-level failure, such as a failed fetch, skips that project's other tasks.
+1. `git fetch`, then `git worktree add` from the remote default branch into `<state>/worktrees/<project>/<slug>`, on branch `pma/<slug>`. The user's working tree is never touched, so a dirty tree does not block dispatch. The slug is the task text's first words, up to 40 bytes, with `-2`, `-3` on collision with a worktree, a local branch, or a remote `pma/` branch left by a pull request. The item must be open in the remote `TODO.md`, checked before the worktree exists; otherwise ship could not mark it done. A refusal names the cause: not in the remote file (commit and push it), or already done there (pull the clone). With `--auto`, a refused task gives its place to the next one in matrix order. A project-level failure, such as a failed fetch, skips that project's other tasks.
 
 2. Run the agent template with a timeout and, where supported, a budget, allowed to run the verify command (see Agents).
 

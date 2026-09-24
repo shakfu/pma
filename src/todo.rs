@@ -237,13 +237,21 @@ pub fn parse(text: &str) -> Parsed {
             continue;
         }
 
-        if let Some(name) = line.strip_prefix("## ") {
+        // `##Critical` is not a Markdown heading, but its author meant one.
+        let heading = match line.strip_prefix("## ") {
+            Some(name) => Some((name, true)),
+            None => line
+                .strip_prefix("##")
+                .filter(|rest| is_priority_name(rest.trim()))
+                .map(|name| (name, false)),
+        };
+        if let Some((name, spaced)) = heading {
             if matches!(place, Place::Done)
                 && let Some(section) = out.done_sections.last_mut()
             {
                 section.last = n - 1;
             }
-            place = section_heading(name.trim(), n, &mut seen_sections, &mut out);
+            place = section_heading(name.trim(), spaced, n, &mut seen_sections, &mut out);
             if matches!(place, Place::Done) {
                 out.done_sections.push(DoneSection {
                     first: n,
@@ -319,8 +327,15 @@ fn finish(open: &mut Option<Item>, out: &mut Parsed) {
     }
 }
 
+fn is_priority_name(name: &str) -> bool {
+    SECTIONS
+        .iter()
+        .any(|(known, _)| known.eq_ignore_ascii_case(name))
+}
+
 fn section_heading(
     name: &str,
+    spaced: bool,
     n: usize,
     seen: &mut HashMap<Priority, usize>,
     out: &mut Parsed,
@@ -334,7 +349,7 @@ fn section_heading(
     else {
         return Place::Other;
     };
-    if name != *canonical {
+    if !spaced || name != *canonical {
         out.report(
             n,
             Severity::Error,
@@ -819,6 +834,13 @@ mod tests {
             Severity::Error,
             "`## Critical`",
         );
+        for bad in ["##Critical", "##critical", "##High "] {
+            let text = format!("# TODO\n\n{bad}\n\n- [ ] item\n");
+            assert_eq!(messages(&text).len(), 1, "{bad} is reported once");
+            assert_reports(&text, 3, Severity::Error, "write the heading as `## ");
+            assert_eq!(parse(&text).items.len(), 1, "{bad} opens its section");
+        }
+        assert_clean("# TODO\n\n##Notes\n\n## Low\n");
         assert_reports(
             "# TODO\n\n## High\n\n## High\n",
             5,

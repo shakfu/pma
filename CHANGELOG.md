@@ -40,6 +40,8 @@ Iteration is not included. `retry`, a lap edge and a self-edge parse, bound and 
 
 ### Fixed
 
+**`##Critical` is a lint error.** Without the space it is not a Markdown heading, so the parser skipped it silently, and its items were filed under the section above. It still opens the section it names. `##Notes` and other names stay ignored.
+
 **`pma`'s own tests pass under its verify.** Their fixtures push to local repositories, and inherited the `GIT_CONFIG_*` settings with which `agent::restrict` blocks every push, so `make check` failed at the base and at the head of every `pma` dispatch. The tests now start git and `pma` without them.
 
 **An agent no longer outlives its session.** Agents ran in their own process group, so Ctrl-C killed `pma` and not the agent, and freed the session lock. The next `pma review` then failed the run as interrupted while the agent still wrote to it, and `--reject` could delete the worktree under it. Each agent and verify now runs under a `sh` watchdog that kills the group when `pma`'s end of a pipe closes. That covers every way `pma` can exit, with no signal handler, on Linux and macOS alike. The group is also killed after a normal exit, so a background process the agent started does not keep writing to the worktree.

@@ -2933,3 +2933,163 @@ fn agent_runs_go_in_parallel_and_the_batch_budget_bounds_the_pass() {
         "the next pass took the other"
     );
 }
+
+/// An agent that swaps its worktree's `.git` for a repository of its own,
+/// whose config names a filesystem monitor that would run in pma's own git
+/// calls, credentials and all.
+const REPLACING_CLAUDE: &str = r#"#!/bin/sh
+printf '#!/bin/sh\ntouch "%s"\n' "$PMA_HOME/../pwned" > "$PMA_HOME/../payload"
+chmod +x "$PMA_HOME/../payload"
+echo hi > hello.txt
+rm .git
+git init -q .
+git config core.fsmonitor "$PMA_HOME/../payload"
+echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","total_cost_usd":0.1}'
+"#;
+
+#[test]
+fn a_replaced_git_dir_is_refused_before_pma_runs_git_in_it() {
+    let s = Scratch::new("gitdir");
+    let (env, _, alpha) = dispatch_env(&s, &[("claude", REPLACING_CLAUDE)]);
+    let out = env.ok(&["dispatch", "alpha:5"]);
+    assert!(out.contains("0 ready, 1 failed"), "{out}");
+    let (out, err, _) = env.run(&["review", "1"]);
+    assert!(
+        format!("{out}{err}").contains("is not the file `git worktree add` wrote"),
+        "{out}{err}"
+    );
+    env.ok(&["review", "1", "--reject"]);
+    assert!(!env.home.join("worktrees/alpha/add-greeting").exists());
+    assert_eq!(git_out(&alpha, &["branch", "--list", "pma/*"]), "");
+    assert!(!s.0.join("pwned").exists(), "the monitor ran");
+}
+
+/// An agent that reaches from its worktree into the clone's hooks on the
+/// second task, and behaves on the first.
+const HOOKING_CLAUDE: &str = r#"#!/bin/sh
+case "$2" in
+  *"add greeting"*) echo hi > hello.txt ;;
+  *"second task"*)
+    echo hi > hello.txt
+    hooks="$(git rev-parse --git-common-dir)/hooks"
+    printf '#!/bin/sh\ntouch "%s"\n' "$PMA_HOME/../hooked" > "$hooks/pre-commit"
+    chmod +x "$hooks/pre-commit" ;;
+esac
+echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","total_cost_usd":0.1}'
+"#;
+
+/// The user's own hooks run at ship. One a run added does not: nothing in
+/// the diff shows it, and ship commits and pushes with the user's
+/// credentials.
+#[test]
+fn a_hook_added_during_a_run_stops_its_ship() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let s = Scratch::new("hooks");
+    let (env, origin, alpha) = dispatch_env(&s, &[("claude", HOOKING_CLAUDE)]);
+    env.ok(&["config", "publish", "push"]);
+    let own = alpha.join(".git/hooks/post-commit");
+    fs::write(
+        &own,
+        format!("#!/bin/sh\necho ran >> {}\n", s.0.join("own.log").display()),
+    )
+    .unwrap();
+    fs::set_permissions(&own, fs::Permissions::from_mode(0o755)).unwrap();
+
+    env.ok(&["dispatch", "alpha:5"]);
+    env.ok(&["review", "1", "--approve"]);
+    assert!(env.ok(&["ship"]).contains("#1 alpha: pushed "));
+    assert!(s.0.join("own.log").exists(), "the user's hook did not run");
+
+    env.ok(&["dispatch", "alpha:7"]);
+    env.ok(&["review", "2", "--approve"]);
+    let (out, _, success) = env.run(&["ship"]);
+    assert!(!success, "{out}");
+    assert!(
+        out.contains("hooks or git settings changed since run #2 was dispatched")
+            && out.contains("  + hook pre-commit "),
+        "{out}"
+    );
+    assert!(!s.0.join("hooked").exists(), "the added hook ran");
+    assert_eq!(
+        git_out(&origin, &["log", "--format=%s", "main"]),
+        "add greeting\ninit\n"
+    );
+
+    // Restoring the hooks is enough.
+    fs::remove_file(alpha.join(".git/hooks/pre-commit")).unwrap();
+    assert!(env.ok(&["ship"]).contains("#2 alpha: pushed "));
+}
+
+/// A refusal that comes after the worktree exists, here a policy with no
+/// route for the task's class, takes the worktree and its branch with it.
+#[test]
+fn a_refused_dispatch_leaves_no_worktree_behind() {
+    let s = Scratch::new("refused");
+    let (env, _, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    let doc = s.0.join("policy.json");
+    fs::write(
+        &doc,
+        r#"{"route":[{"name":"chores","match":{"class":"A"},"approval":"each"}]}"#,
+    )
+    .unwrap();
+    env.ok(&["route", "propose", doc.to_str().unwrap(), "--by", "me"]);
+    env.ok(&["route", "activate", "1", "--by", "me"]);
+    let (_, err, success) = env.run(&["dispatch", "alpha:5"]);
+    assert!(!success && err.contains("matches no route"), "{err}");
+    assert!(!env.home.join("worktrees/alpha/add-greeting").exists());
+    assert_eq!(git_out(&alpha, &["branch", "--list", "pma/*"]), "");
+}
+
+/// An agent that records its pid, then waits.
+const LINGERING_CLAUDE: &str = r#"#!/bin/sh
+echo $$ > "$PMA_HOME/agent.pid"
+exec sleep 60
+"#;
+
+/// A session killed mid-run, as by Ctrl-C or a closed terminal, takes its
+/// agent with it. Otherwise the lock would be free while the agent still
+/// wrote to a worktree the next session may reject.
+#[test]
+fn an_agent_does_not_outlive_a_killed_session() {
+    let s = Scratch::new("killed");
+    let (env, _, _) = dispatch_env(&s, &[("claude", LINGERING_CLAUDE)]);
+    let pid_file = env.home.join("agent.pid");
+    let mut dispatch = env
+        .command(&["dispatch", "alpha:5"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    let pid = loop {
+        if let Ok(pid) = fs::read_to_string(&pid_file)
+            && !pid.trim().is_empty()
+        {
+            break pid.trim().to_string();
+        }
+        if started.elapsed().as_secs() >= 30 {
+            let _ = dispatch.kill();
+            panic!("the agent never started");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    dispatch.kill().unwrap();
+    dispatch.wait().unwrap();
+    let alive = || {
+        Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    let killed = std::time::Instant::now();
+    while alive() && killed.elapsed().as_secs() < 5 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!alive(), "agent {pid} outlived its session");
+    // The next session fails the interrupted run, and rejecting it is safe.
+    assert!(env.ok(&["review"]).contains("#1  failed"));
+    env.ok(&["review", "1", "--reject"]);
+}

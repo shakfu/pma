@@ -28,7 +28,23 @@ Iteration is not included. `retry`, a lap edge and a self-edge parse, bound and 
 
 **`pma scan` draws a progress bar.** `[########------------] 38/95 alpha` on stderr, redrawn as each project lands, cleared before the summary. A scan of 95 repositories takes about 15 seconds and printed nothing until it was over. Silent when stderr is not a terminal, so a pipe or a CI log holds the bytes it held before.
 
+### Security
+
+**`pma`'s git calls refuse a worktree whose `.git` was replaced.** `pma` runs `git add`, `diff`, `commit` and `push` in the agent's worktree with the user's credentials. An agent could swap the worktree's `.git` file for a repository of its own whose `core.fsmonitor` named a program, and the next `pma` git call ran it. Each call now checks the `.git` file first, and runs with `core.fsmonitor=false`. A run caught this way fails, and `--reject` removes its directory directly, since git refuses to.
+
+**An agent's push is refused on every remote.** `remote.origin.pushurl` was added to a remote's push URLs, not substituted for them: a remote with its own `pushurl`, another remote, or a URL on the command line still took the push. An empty-prefix `pushInsteadOf` now rewrites every push URL, and a `pre-push` hook covers a remote with an explicit `pushurl`, which git exempts from `pushInsteadOf`. `restrict` also appends its settings after any `GIT_CONFIG_*` the user set, which a fixed count overwrote.
+
+**Ship refuses a repository whose hooks or git settings changed since dispatch.** A hook, or a setting that runs a program or redirects a push, added during a run would run at ship with the user's credentials, and neither is in the diff. The run records its hooks and those settings at dispatch, before base verify, and ship compares them before it commits and again before it pushes. The user's own hooks keep running. The alternative, disabling hooks for ship, would have dropped them too. Schema 26.
+
 ### Fixed
+
+**An agent no longer outlives its session.** Agents ran in their own process group, so Ctrl-C killed `pma` and not the agent, and freed the session lock. The next `pma review` then failed the run as interrupted while the agent still wrote to it, and `--reject` could delete the worktree under it. Each agent and verify now runs under a `sh` watchdog that kills the group when `pma`'s end of a pipe closes. That covers every way `pma` can exit, with no signal handler, on Linux and macOS alike. The group is also killed after a normal exit, so a background process the agent started does not keep writing to the worktree.
+
+**A dispatch refused after its worktree existed left the worktree behind.** A route refusal, or an error from base verify or worker choice, came after `git worktree add`, with no run row to release the worktree and branch. They are now removed.
+
+**An item named like a signal is dispatched as an item.** An item whose text was `CI` or `deps` had the signal's key, and one starting `Workflow:` or `campaign:` read as a unit or campaign task, which skipped the origin check and was never ticked at ship. Such keys are now prefixed with `item:`.
+
+**`default_tier` accepts 1 to 5.** Any number from 0 was accepted, and every ranking command then panicked: `9` indexed past the tier weights and `0` underflowed.
 
 **Two integration tests shared a scratch directory.** `Scratch::new` keyed the path on the test's label and the process id, and `ship_resumes_after_a_partial_failure` and `an_instance_resumes_under_its_own_revision` both passed `"resume"`. Tests in one binary share a pid and run in parallel, so each wiped the directory on the way in and deleted it on the way out, under the other: whichever lost the race failed with `git init: cannot change to .../root/alpha`. The path now carries a counter, so a repeated label cannot collide.
 

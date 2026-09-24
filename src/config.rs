@@ -17,7 +17,7 @@ pub struct Config {
     /// Weight per priority, in `Priority::ALL` order.
     pub priorities: [f64; 4],
     pub weights: Weights,
-    /// Days open without `due:` before a task is urgent; `None` is never.
+    /// Priority of each signal task.
     pub signals: SignalPriorities,
     /// Globs for paths whose commits do not count as activity.
     pub activity_ignore: Vec<String>,
@@ -131,7 +131,8 @@ enum Slot<'a> {
     /// A finite number of at least the given minimum.
     Number(&'a mut f64, f64),
     Count(&'a mut i64, i64),
-    Never(&'a mut Option<i64>),
+    /// 1 to 5, or `never` for none.
+    Tier(&'a mut Option<i64>),
     Priority(&'a mut Priority),
     List(&'a mut Vec<String>),
     Publish(&'a mut Publish),
@@ -256,7 +257,7 @@ impl Config {
         Some(match copy.slot(key)? {
             Slot::Number(v, _) => v.to_string(),
             Slot::Count(v, _) => v.to_string(),
-            Slot::Never(v) => v.map_or("never".into(), |n| n.to_string()),
+            Slot::Tier(v) => v.map_or("never".into(), |n| n.to_string()),
             Slot::Priority(p) => p.name().into(),
             Slot::List(v) => v.join(","),
             Slot::Publish(p) => publish_name(*p).into(),
@@ -299,15 +300,15 @@ impl Config {
                     .filter(|n| *n >= min)
                     .ok_or_else(|| format!("expected a whole number >= {min}"))?;
             }
-            Slot::Never(v) => {
+            Slot::Tier(v) => {
                 *v = match value {
                     "never" => None,
                     _ => Some(
                         value
                             .parse::<i64>()
                             .ok()
-                            .filter(|n| *n >= 0)
-                            .ok_or("expected a number of days or `never`")?,
+                            .filter(|n| (1..=5).contains(n))
+                            .ok_or("expected a tier from 1 to 5, or `never`")?,
                     ),
                 };
             }
@@ -360,7 +361,7 @@ impl Config {
                 "quadrant_limit" => Slot::Count(&mut self.quadrant_limit, 1),
                 "agent" => Slot::Text(&mut self.agent),
                 "preset" => Slot::OptText(&mut self.preset),
-                "default_tier" => Slot::Never(&mut self.default_tier),
+                "default_tier" => Slot::Tier(&mut self.default_tier),
                 "publish" => Slot::Publish(&mut self.publish),
                 "attribution" => Slot::Attribution(&mut self.attribution),
                 "max_parallel" => Slot::Count(&mut self.max_parallel, 1),
@@ -523,6 +524,8 @@ mod tests {
             ("urgent_within", "1.5"),
             ("quadrant_limit", "0"),
             ("default_tier", "-1"),
+            ("default_tier", "0"),
+            ("default_tier", "6"),
             ("signals.ci", "urgent"),
             ("weights.nope", "1"),
             ("activity.horizon.1", "0"),

@@ -153,11 +153,13 @@ fn consumes(run: &Run) -> bool {
 const CI_LOG_LINES: usize = 200;
 
 /// Runs `git -C dir args`, returning trimmed stdout or an error naming the
-/// command and its stderr.
+/// command and its stderr. With no filesystem monitor: one names a program,
+/// and these calls carry the user's credentials.
 pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
+        .args(["-c", "core.fsmonitor=false"])
         .args(args)
         .output()
         .map_err(|e| format!("git: {e}"))?;
@@ -165,6 +167,174 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
         return Err(format!(
             "git {}: {}",
             args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// `git` in the run's worktree, once its `.git` is still the one `git
+/// worktree add` wrote. An agent that replaced it would hand these calls,
+/// which carry the user's credentials, a config and hooks of its own.
+pub fn wt_git(run: &Run, args: &[&str]) -> Result<String> {
+    own_gitdir(run)?;
+    git(&run.worktree, args)
+}
+
+/// Refuses a worktree whose `.git` is not a file naming this worktree's
+/// entry under the clone's `worktrees/`.
+pub fn own_gitdir(run: &Run) -> Result<()> {
+    let dot_git = run.worktree.join(".git");
+    let replaced = || -> Box<dyn std::error::Error> {
+        format!(
+            "{} is not the file `git worktree add` wrote; the run's worktree was \
+             tampered with, so pma runs no git in it. Reject the run.",
+            dot_git.display()
+        )
+        .into()
+    };
+    let is_file = std::fs::symlink_metadata(&dot_git).is_ok_and(|m| m.is_file());
+    let named = is_file
+        .then(|| std::fs::read_to_string(&dot_git).ok())
+        .flatten()
+        .and_then(|t| Some(PathBuf::from(t.strip_prefix("gitdir: ")?.trim_end())))
+        .and_then(|p| p.canonicalize().ok())
+        .ok_or_else(replaced)?;
+    let common = git(
+        &run.repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let expected = Path::new(&common)
+        .canonicalize()
+        .map_err(|e| format!("{common}: {e}"))?
+        .join("worktrees");
+    // The entry names its worktree back, so `.git` cannot borrow another's.
+    let back = std::fs::read_to_string(named.join("gitdir"))
+        .ok()
+        .and_then(|t| Path::new(t.trim_end()).canonicalize().ok());
+    if named.parent() != Some(expected.as_path()) || back != dot_git.canonicalize().ok() {
+        return Err(replaced());
+    }
+    Ok(())
+}
+
+/// What makes git run a program in the worktree, or push somewhere else,
+/// that the diff does not show: each hook by content and executable bit, and
+/// each repository setting that names a command or rewrites a URL, by a hash
+/// of its value, since a URL may carry a token. Ship compares it with the one
+/// taken at dispatch. Hooks that run tracked files, such as husky's scripts or
+/// a `.pre-commit-config.yaml`, run what the reviewer approved in the diff.
+/// Global and system settings are the user's, so they are left out.
+pub fn git_snapshot(run: &Run) -> Result<String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut lines = Vec::new();
+    let hooks = wt_git(
+        run,
+        &["rev-parse", "--path-format=absolute", "--git-path", "hooks"],
+    )?;
+    let mut files: Vec<(String, PathBuf, bool)> = std::fs::read_dir(&hooks)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let meta = std::fs::metadata(e.path()).ok()?;
+            (meta.is_file() && !name.ends_with(".sample"))
+                .then(|| (name, e.path(), meta.permissions().mode() & 0o111 != 0))
+        })
+        .collect();
+    files.sort();
+    if !files.is_empty() {
+        let mut args = vec!["hash-object", "--no-filters", "--"];
+        args.extend(files.iter().filter_map(|(_, p, _)| p.to_str()));
+        let hashes = git(&run.repo, &args)?;
+        for ((name, _, executable), hash) in files.iter().zip(hashes.lines()) {
+            let x = if *executable {
+                "executable"
+            } else {
+                "not executable"
+            };
+            lines.push(format!("hook {name} {hash} {x}"));
+        }
+    }
+    // NUL-separated scope and entry, each entry `key\nvalue`.
+    let listing = wt_git(run, &["config", "--list", "--show-scope", "-z"])?;
+    let mut settings: Vec<(String, String)> = Vec::new();
+    let mut fields = listing.split('\0');
+    while let (Some(scope), Some(entry)) = (fields.next(), fields.next()) {
+        let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
+        if matches!(scope, "local" | "worktree") && runs_or_redirects(key) {
+            settings.push((key.to_string(), value.to_string()));
+        }
+    }
+    settings.sort();
+    for (key, value) in settings {
+        lines.push(format!("config {key} {}", hash_text(&run.repo, &value)?));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// A setting that names a program for git to run, or changes where a push
+/// goes. Keys arrive with section and name lowercased.
+fn runs_or_redirects(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "core.hookspath",
+        "core.fsmonitor",
+        "core.sshcommand",
+        "core.editor",
+        "core.pager",
+        "core.askpass",
+        "core.gitproxy",
+        "diff.external",
+        "sequence.editor",
+        "remote.origin.url",
+        "remote.origin.pushurl",
+        "remote.pushdefault",
+    ]
+    .contains(&key.as_str())
+        || [
+            "filter.",
+            "credential.",
+            "url.",
+            "include.",
+            "includeif.",
+            "gpg.",
+        ]
+        .iter()
+        .any(|p| key.starts_with(p))
+        || [".textconv", ".command", ".driver"]
+            .iter()
+            .any(|s| key.ends_with(s))
+}
+
+/// Git's object id for `text`, so a value is compared without being stored.
+fn hash_text(dir: &Path, text: &str) -> Result<String> {
+    use std::io::Write;
+
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["hash-object", "--no-filters", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("git hash-object: no stdin")?
+        .write_all(text.as_bytes())
+        .map_err(|e| format!("git hash-object: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("git hash-object: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git hash-object: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )
         .into());
@@ -320,17 +490,61 @@ pub fn prepare(
             &base,
         ],
     )?;
+    // Anything short of a queued run releases the worktree and its branch
+    // here: no run row exists to release them later.
+    let prepared = queue(
+        store,
+        home,
+        cfg,
+        over,
+        pick,
+        &worktree,
+        &branch,
+        class,
+        default_branch,
+        base,
+        details,
+    );
+    if !matches!(prepared, Ok(Prepared::Queued(_))) {
+        let _ = remove_worktree(repo, &worktree, &branch);
+    }
+    prepared
+}
 
-    let verify = verify_command(cfg, &pick.project, &worktree);
+/// The part of `prepare` that runs once the worktree exists.
+#[allow(clippy::too_many_arguments)]
+fn queue(
+    store: &Store,
+    home: &Path,
+    cfg: &Config,
+    over: &Overrides,
+    pick: &Pick,
+    worktree: &Path,
+    branch: &str,
+    class: Class,
+    default_branch: String,
+    base: String,
+    details: String,
+) -> Result<Prepared> {
+    let repo = &pick.repo;
+    let refuse = |why: String| Ok(Prepared::Refused(format!("{}: {why}", pick.project)));
+    // Before base verify, which runs the project's code and could install a
+    // hook of its own.
+    let git_snapshot = git_snapshot(&Run {
+        repo: repo.clone(),
+        worktree: worktree.to_path_buf(),
+        ..Run::default()
+    })?;
+    let verify = verify_command(cfg, &pick.project, worktree);
     // The worktree is a clean checkout of the base, so this is the base
     // tree. One verify at the head alone cannot tell a regression from a
     // repository that was already failing.
     let (verify_base_ok, verify_base_seconds) = match &verify {
-        Some(v) => base_verify(store, home, cfg, &pick.project, &base, v, &worktree)?,
+        Some(v) => base_verify(store, home, cfg, &pick.project, &base, v, worktree)?,
         None => (None, None),
     };
     let mut features = Features::of(&pick.text, &details);
-    features.repo_files = tracked_files(&worktree);
+    features.repo_files = tracked_files(worktree);
     features.verify_seconds = verify_base_seconds.filter(|_| verify.is_some());
     (features.prior_decided, features.prior_accepted) = store.decided_runs(&pick.project)?;
     let complexity = complexity::estimate(class, &features);
@@ -378,8 +592,8 @@ pub fn prepare(
         quadrant: pick.quadrant.clone(),
         agent,
         repo: repo.clone(),
-        branch,
-        worktree,
+        branch: branch.to_string(),
+        worktree: worktree.to_path_buf(),
         default_branch,
         base,
         prompt: String::new(),
@@ -426,6 +640,7 @@ pub fn prepare(
         lap: pick.workflow.as_ref().map_or(0, |u| u.lap),
         preset: chosen.preset.clone(),
         extra_args: chosen.args.clone(),
+        git_snapshot: Some(git_snapshot),
     };
     run.prompt = prompt(&run, &details, verify.as_deref());
     store.insert_run(&mut run)?;
@@ -758,8 +973,8 @@ fn attempt(
         return a;
     };
     let logs = home.join("runs").join(run.id.to_string());
-    let empty = home.join("empty");
-    if let Err(e) = std::fs::create_dir_all(&logs).and_then(|_| std::fs::create_dir_all(&empty)) {
+    let agent_env = home.join("agent-env");
+    if let Err(e) = std::fs::create_dir_all(&logs) {
         fail(run, &mut a, format!("{}: {e}", logs.display()));
         return a;
     }
@@ -786,7 +1001,10 @@ fn attempt(
     );
     worker.allow_verify(&mut cmd, run.verify.as_deref());
     cmd.current_dir(&run.worktree);
-    agent::restrict(&mut cmd, &empty);
+    if let Err(e) = agent::restrict(&mut cmd, &agent_env) {
+        fail(run, &mut a, format!("{}: {e}", agent_env.display()));
+        return a;
+    }
     a.started_at = crate::dates::now();
     run.error = None;
     let log = logs.join(format!("agent-{n}.log"));
@@ -810,8 +1028,14 @@ fn attempt(
     }
     a.summary = Some(report.summary.clone());
     run.summary = Some(report.summary);
-    run.commits = git(
-        &run.worktree,
+    // Before any git call in the tree: what follows would run under a config
+    // the agent wrote.
+    if let Err(e) = own_gitdir(run) {
+        fail(run, &mut a, e.to_string());
+        return a;
+    }
+    run.commits = wt_git(
+        run,
         &["rev-list", "--count", &format!("{}..HEAD", run.base)],
     )
     .ok()
@@ -843,7 +1067,7 @@ fn attempt(
     run.verify_ok = None;
     if let Some(v) = &run.verify {
         let vlog = logs.join(format!("verify-{n}.log"));
-        match verify_once(v, &run.worktree, &empty, &vlog, timeout) {
+        match verify_once(v, &run.worktree, &agent_env, &vlog, timeout) {
             Ok((ok, seconds)) => {
                 a.seconds = Some(a.seconds.unwrap_or(0) + seconds);
                 run.seconds = Some(run.seconds.unwrap_or(0) + seconds);
@@ -877,13 +1101,13 @@ fn tracked_files(worktree: &Path) -> i64 {
 pub fn verify_once(
     command: &str,
     worktree: &Path,
-    empty: &Path,
+    agent_env: &Path,
     log: &Path,
     timeout: Duration,
 ) -> std::io::Result<(Option<bool>, i64)> {
     let mut cmd = Command::new("sh");
     cmd.args(["-c", command]).current_dir(worktree);
-    agent::restrict(&mut cmd, empty);
+    agent::restrict(&mut cmd, agent_env)?;
     let f = agent::run_limited(cmd, log, timeout)?;
     Ok((f.success, f.seconds))
 }
@@ -904,13 +1128,12 @@ fn base_verify(
     if let Some((ok, seconds)) = store.verify_base(project, base, command, cfg.timeout)? {
         return Ok((ok, Some(seconds)));
     }
-    let empty = home.join("empty");
+    let agent_env = home.join("agent-env");
     let logs = home.join("verify-base");
-    std::fs::create_dir_all(&empty).map_err(|e| format!("{}: {e}", empty.display()))?;
     std::fs::create_dir_all(&logs).map_err(|e| format!("{}: {e}", logs.display()))?;
     let log = logs.join(format!("{project}-{}.log", &base[..base.len().min(12)]));
     let timeout = Duration::from_secs(cfg.timeout as u64 * 60);
-    let (ok, seconds) = match verify_once(command, worktree, &empty, &log, timeout) {
+    let (ok, seconds) = match verify_once(command, worktree, &agent_env, &log, timeout) {
         Ok((success, seconds)) => (success, seconds),
         Err(_) => (None, 0),
     };
@@ -948,8 +1171,8 @@ fn fail(run: &mut Run, a: &mut Attempt, error: String) {
 /// The last line of `git diff --stat` against the base, untracked files
 /// included.
 fn diffstat(run: &Run) -> Option<String> {
-    git(&run.worktree, &["add", "--all", "--intent-to-add"]).ok()?;
-    let stat = git(&run.worktree, &["diff", "--stat", &run.base]).ok()?;
+    wt_git(run, &["add", "--all", "--intent-to-add"]).ok()?;
+    let stat = wt_git(run, &["diff", "--stat", &run.base]).ok()?;
     Some(
         stat.lines()
             .last()
@@ -964,9 +1187,9 @@ fn diffstat(run: &Run) -> Option<String> {
 /// newline, and `--name-status` rather than `--name-only`, because a rename
 /// names two paths and only the status says so.
 fn changed_paths(run: &Run) -> Result<Vec<String>> {
-    git(&run.worktree, &["add", "--all", "--intent-to-add"])?;
-    let out = git(
-        &run.worktree,
+    wt_git(run, &["add", "--all", "--intent-to-add"])?;
+    let out = wt_git(
+        run,
         &["diff", "--name-status", "-z", "--find-renames", &run.base],
     )?;
     let mut fields = out.split('\0').filter(|f| !f.is_empty());
@@ -990,16 +1213,16 @@ fn changed_paths(run: &Run) -> Result<Vec<String>> {
 
 /// `git diff` of the worktree against the run's base.
 pub fn diff(run: &Run) -> Result<String> {
-    git(&run.worktree, &["add", "--all", "--intent-to-add"])?;
-    git(&run.worktree, &["diff", &run.base])
+    wt_git(run, &["add", "--all", "--intent-to-add"])?;
+    wt_git(run, &["diff", &run.base])
 }
 
 /// The worktree's content as one object id: `git add --all`, which stages
 /// without committing, then `git write-tree`. The same call at ship time
 /// says whether anything changed since.
 pub fn tree(run: &Run) -> Result<String> {
-    git(&run.worktree, &["add", "--all"])?;
-    git(&run.worktree, &["write-tree"])
+    wt_git(run, &["add", "--all"])?;
+    wt_git(run, &["write-tree"])
 }
 
 pub fn approve(store: &Store, run: &mut Run, by: &str) -> Result<()> {
@@ -1024,7 +1247,7 @@ pub fn approve(store: &Store, run: &mut Run, by: &str) -> Result<()> {
     }
     // Recorded now, so ship can say whether it is publishing what was read.
     run.approved_tree = Some(tree(run)?);
-    run.approved_head = git(&run.worktree, &["rev-parse", "HEAD"]).ok();
+    run.approved_head = wt_git(run, &["rev-parse", "HEAD"]).ok();
     run.approved_by = Some(by.to_string());
     run.enter(RunState::Approved);
     store.update_run(run)
@@ -1100,11 +1323,16 @@ pub fn rework(
 
 /// Removes the worktree and its branch. Either may already be gone.
 pub fn remove_worktree(repo: &Path, worktree: &Path, branch: &str) -> Result<()> {
-    if worktree.exists() {
+    let gitfile = std::fs::symlink_metadata(worktree.join(".git")).is_ok_and(|m| m.is_file());
+    if worktree.exists() && gitfile {
         git(
             repo,
             &["worktree", "remove", "--force", path_arg(worktree)?],
         )?;
+    } else if worktree.exists() {
+        // Git refuses a worktree whose `.git` is not its file. The directory
+        // is pma's, so it goes directly, and `prune` drops the entry.
+        std::fs::remove_dir_all(worktree).map_err(|e| format!("{}: {e}", worktree.display()))?;
     }
     let _ = git(repo, &["worktree", "prune"]);
     if git(
@@ -1244,6 +1472,7 @@ mod tests {
             lap: 0,
             preset: None,
             extra_args: Vec::new(),
+            git_snapshot: None,
         };
         let p = prompt(&run, "for all classes\n", Some("make test"));
         assert!(p.contains("`cynn`"));
@@ -1280,6 +1509,31 @@ mod tests {
             };
             assert!(!consumes(&run), "{error}");
         }
+    }
+
+    /// An item named like a signal, a campaign or a workflow unit is still an
+    /// item: checked on origin before dispatch, and ticked at ship.
+    #[test]
+    fn an_item_key_never_reads_as_another_kind_of_task() {
+        let file = "# TODO\n\n## High\n\n- [ ] CI\n- [ ] deps\n- [ ] Workflow: migrate\n\
+                    - [ ] campaign: x\n- [ ] item:ci\n- [ ] fix CI\n";
+        let keys: Vec<String> = todo::parse(file).items.iter().map(|i| i.key()).collect();
+        assert_eq!(
+            keys,
+            [
+                "item:ci",
+                "item:deps",
+                "item:workflow: migrate",
+                "item:campaign: x",
+                "item:item:ci",
+                "fix ci"
+            ]
+        );
+        assert!(keys.iter().all(|k| !without_item(k)), "{keys:?}");
+        assert_eq!(
+            on_origin(Some(file), "item:ci", "CI"),
+            OnOrigin::Open(String::new(), Vec::new())
+        );
     }
 
     #[test]

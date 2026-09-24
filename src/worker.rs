@@ -275,8 +275,8 @@ impl Worker {
         }
         let mut cmd = Command::new(&self.command);
         cmd.args(args);
-        // After `agent::restrict`, which the caller applies first, so a record
-        // cannot put back a credential the pipeline took away.
+        // Before `agent::restrict`, which the caller applies last, so a
+        // record cannot put back a credential the pipeline took away.
         for (key, value) in &self.env {
             cmd.env(key, value);
         }
@@ -625,7 +625,7 @@ mod tests {
             ("GH_TOKEN".into(), "sneaky".into()),
         ]);
         let mut cmd = w.build("", &dir, None, 1.0, &[], MINUTE);
-        crate::agent::restrict(&mut cmd, &dir);
+        crate::agent::restrict(&mut cmd, &dir).unwrap();
         let out = cmd.output().unwrap();
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),

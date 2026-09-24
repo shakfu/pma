@@ -23,7 +23,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 25;
+const VERSION: i64 = 26;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -305,6 +305,14 @@ CREATE TABLE campaign_members (
     run_id INTEGER,
     PRIMARY KEY (campaign, project)
 );
+";
+
+/// Version 26. What makes git run a program in a run's repository, or push
+/// elsewhere, as it stood at dispatch: hooks and the settings that name a
+/// command or rewrite a URL. Ship refuses when it has changed, since neither
+/// is in the diff a reviewer reads.
+const GIT_SNAPSHOT: &str = "
+ALTER TABLE runs ADD COLUMN git_snapshot TEXT;
 ";
 
 /// Version 25. Seeds `sanduk`, the worker that runs the same agent in a
@@ -638,6 +646,7 @@ impl Store {
                     PRESETS,
                     PRESETS_REPLACE_WORKER_MODEL,
                     SANDUK_WORKER,
+                    GIT_SNAPSHOT,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -1040,10 +1049,11 @@ impl Store {
                                verify, verify_base_ok, verify_base_seconds, model,
                                complexity, features, estimator,
                                route_revision, route, approval,
-                               workflow_instance, node, unit, lap, preset, extra_args)
+                               workflow_instance, node, unit, lap, preset, extra_args,
+                               git_snapshot)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
                      ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-                     ?31, ?32, ?33, ?34, ?35, ?36)",
+                     ?31, ?32, ?33, ?34, ?35, ?36, ?37)",
             params![
                 run.project,
                 run.task_key,
@@ -1081,6 +1091,7 @@ impl Store {
                 run.lap,
                 run.preset,
                 serde_json::to_string(&run.extra_args).unwrap_or_else(|_| "[]".into()),
+                run.git_snapshot,
             ],
         )?;
         run.id = self.conn.last_insert_rowid();
@@ -1138,7 +1149,7 @@ impl Store {
                     verify_base_ok, verify_base_seconds, changed_paths, scope_error, model,
                     complexity, features, estimator, route_revision, route, approval,
                     approved_tree, approved_head, approved_by,
-                    workflow_instance, node, unit, lap, preset, extra_args
+                    workflow_instance, node, unit, lap, preset, extra_args, git_snapshot
              FROM runs ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1219,6 +1230,7 @@ impl Store {
                     .get::<_, Option<String>>(54)?
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default(),
+                git_snapshot: r.get(55)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -2097,6 +2109,9 @@ pub struct Run {
     pub preset: Option<String>,
     /// Arguments the preset added, recorded so a replay reads back what ran.
     pub extra_args: Vec<String>,
+    /// `dispatch::git_snapshot` at dispatch. `None` for a run from before it
+    /// was taken.
+    pub git_snapshot: Option<String>,
 }
 
 impl Run {
@@ -2159,6 +2174,7 @@ impl Run {
             lap: 0,
             preset: None,
             extra_args: Vec::new(),
+            git_snapshot: None,
         }
     }
 
@@ -2582,7 +2598,10 @@ mod tests {
             let store = Store::open(&path).unwrap();
             store
                 .conn
-                .execute_batch("ALTER TABLE agents ADD COLUMN model TEXT")
+                .execute_batch(
+                    "ALTER TABLE agents ADD COLUMN model TEXT;
+                     ALTER TABLE runs DROP COLUMN git_snapshot;",
+                )
                 .unwrap();
             store
                 .conn
@@ -2836,6 +2855,7 @@ mod tests {
             lap: 0,
             preset: None,
             extra_args: Vec::new(),
+            git_snapshot: Some("hook pre-commit abc executable".into()),
         };
         store.insert_run(&mut run).unwrap();
         assert_eq!(store.run(run.id).unwrap(), run);

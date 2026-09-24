@@ -5,7 +5,7 @@
 use std::process::Command;
 
 use crate::config::{Attribution, Config, Publish};
-use crate::dispatch::{git, remove_worktree};
+use crate::dispatch::{remove_worktree, wt_git};
 use crate::store::{Result, Run, RunState, Store};
 use crate::todo;
 
@@ -65,10 +65,11 @@ fn ship_one(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
     if !wt.is_dir() {
         return Err(format!("{} no longer exists", wt.display()).into());
     }
+    unchanged_git(run)?;
     // What was approved is what gets published, or nothing is. Once ship has
     // committed, the head has moved and the content is its own; a resumed
     // ship is recognised further down by its pushed commits.
-    let head = git(wt, &["rev-parse", "HEAD"]).ok();
+    let head = wt_git(run, &["rev-parse", "HEAD"]).ok();
     if let Some(approved) = &run.approved_tree
         && head == run.approved_head
     {
@@ -89,24 +90,25 @@ fn ship_one(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
     }
     let message = message(cfg, run);
 
-    git(wt, &["add", "--all"])?;
-    let staged = git(wt, &["diff", "--cached", "--quiet"]).is_err();
+    wt_git(run, &["add", "--all"])?;
+    let staged = wt_git(run, &["diff", "--cached", "--quiet"]).is_err();
     if staged {
-        git(wt, &["commit", "--quiet", "-m", &message])?;
+        wt_git(run, &["commit", "--quiet", "-m", &message])?;
     }
     let upstream = format!("origin/{}", run.default_branch);
     if publish == Publish::Push {
-        git(wt, &["fetch", "--quiet", "origin"])?;
+        wt_git(run, &["fetch", "--quiet", "origin"])?;
         // An earlier ship pushed these commits and stopped before recording
         // it. Pushed commits keep their ids, so HEAD is in the upstream.
-        let head = git(wt, &["rev-parse", "HEAD"])?;
-        if head != run.base && git(wt, &["merge-base", "--is-ancestor", "HEAD", &upstream]).is_ok()
+        let head = wt_git(run, &["rev-parse", "HEAD"])?;
+        if head != run.base
+            && wt_git(run, &["merge-base", "--is-ancestor", "HEAD", &upstream]).is_ok()
         {
-            let sha = git(wt, &["rev-parse", "--short", "HEAD"])?;
+            let sha = wt_git(run, &["rev-parse", "--short", "HEAD"])?;
             return Ok(format!("already pushed {sha} to {}", run.default_branch));
         }
-        if let Err(e) = git(wt, &["rebase", "--quiet", &upstream]) {
-            let _ = git(wt, &["rebase", "--abort"]);
+        if let Err(e) = wt_git(run, &["rebase", "--quiet", &upstream]) {
+            let _ = wt_git(run, &["rebase", "--abort"]);
             return Err(format!(
                 "rebase onto {upstream} failed; resolve it in {}: {e}",
                 wt.display()
@@ -123,15 +125,15 @@ fn ship_one(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
             std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         if let Some(edited) = todo::mark_done(&text, &run.task_key, &run.text) {
             std::fs::write(&path, edited).map_err(|e| format!("{}: {e}", path.display()))?;
-            git(wt, &["add", "TODO.md"])?;
+            wt_git(run, &["add", "TODO.md"])?;
             if staged {
-                git(wt, &["commit", "--quiet", "--amend", "--no-edit"])?;
+                wt_git(run, &["commit", "--quiet", "--amend", "--no-edit"])?;
             } else {
-                git(wt, &["commit", "--quiet", "-m", &message])?;
+                wt_git(run, &["commit", "--quiet", "-m", &message])?;
             }
         }
     }
-    if git(wt, &["rev-list", "--count", &format!("{upstream}..HEAD")])? == "0" {
+    if wt_git(run, &["rev-list", "--count", &format!("{upstream}..HEAD")])? == "0" {
         return Err("nothing to ship: no changes".into());
     }
     // The rebase merged other work into this tree, and the tick above added
@@ -139,14 +141,13 @@ fn ship_one(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
     // together, and a clean rebase is not a semantic one.
     if let Some(command) = &run.verify {
         let timeout = std::time::Duration::from_secs(cfg.timeout as u64 * 60);
-        let empty = home.join("empty");
+        let agent_env = home.join("agent-env");
         let log = home
             .join("runs")
             .join(run.id.to_string())
             .join("verify-ship.log");
-        let _ = std::fs::create_dir_all(&empty);
-        let _ = std::fs::create_dir_all(log.parent().unwrap_or(&empty));
-        match crate::dispatch::verify_once(command, wt, &empty, &log, timeout) {
+        let _ = std::fs::create_dir_all(log.parent().unwrap_or(&agent_env));
+        match crate::dispatch::verify_once(command, wt, &agent_env, &log, timeout) {
             Ok((Some(true), _)) => {}
             Ok((Some(false), _)) => {
                 return Err(format!(
@@ -162,10 +163,13 @@ fn ship_one(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
         }
     }
 
+    // Again, because verify ran code from the tree and could have installed
+    // a `pre-push` hook.
+    unchanged_git(run)?;
     let outcome = match publish {
         Publish::Push => {
-            git(
-                wt,
+            wt_git(
+                run,
                 &[
                     "push",
                     "--quiet",
@@ -173,11 +177,11 @@ fn ship_one(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
                     &format!("HEAD:refs/heads/{}", run.default_branch),
                 ],
             )?;
-            let sha = git(wt, &["rev-parse", "--short", "HEAD"])?;
+            let sha = wt_git(run, &["rev-parse", "--short", "HEAD"])?;
             format!("pushed {sha} to {}", run.default_branch)
         }
         Publish::Pr => {
-            git(wt, &["push", "--quiet", "-u", "origin", &run.branch])?;
+            wt_git(run, &["push", "--quiet", "-u", "origin", &run.branch])?;
             // A retry after `gh pr create` failed may find the pull request
             // made anyway.
             let open = gh_in(
@@ -218,6 +222,39 @@ fn ship_one(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
         }
     };
     Ok(outcome)
+}
+
+/// Refuses a run whose repository gained or changed a hook, or a setting
+/// that runs a program or redirects a push, since dispatch. Ship commits and
+/// pushes with the user's credentials, and none of that is in the diff the
+/// reviewer read. A run from before the snapshot existed has nothing to
+/// compare.
+fn unchanged_git(run: &Run) -> Result<()> {
+    let Some(then) = &run.git_snapshot else {
+        return Ok(());
+    };
+    let now = crate::dispatch::git_snapshot(run)?;
+    if &now == then {
+        return Ok(());
+    }
+    let (then, now): (Vec<&str>, Vec<&str>) = (then.lines().collect(), now.lines().collect());
+    let changes: Vec<String> = then
+        .iter()
+        .filter(|l| !now.contains(l))
+        .map(|l| format!("  - {l}"))
+        .chain(
+            now.iter()
+                .filter(|l| !then.contains(l))
+                .map(|l| format!("  + {l}")),
+        )
+        .collect();
+    Err(format!(
+        "the repository's hooks or git settings changed since run #{} was dispatched:\n{}\n\
+         ship would run them with your credentials. Restore them, or reject the run.",
+        run.id,
+        changes.join("\n")
+    )
+    .into())
 }
 
 /// Moves each `pr-open` run to `shipped` when its pull request is merged, or

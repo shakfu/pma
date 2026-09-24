@@ -1377,10 +1377,9 @@ struct Staged {
     out: std::path::PathBuf,
     doc: Option<std::path::PathBuf>,
     log: std::path::PathBuf,
-    /// An empty directory outside the worktree, which `agent::restrict` hands
-    /// the child as its `gh` configuration. Inside the tree the agent could
-    /// write credentials back into it.
-    empty: std::path::PathBuf,
+    /// A directory outside the worktree for `agent::restrict`. Inside the
+    /// tree the agent could write credentials or hooks into it.
+    agent_env: std::path::PathBuf,
 }
 
 /// What a worker thread produced: no store, no repository, just the run's own
@@ -1495,8 +1494,7 @@ fn stage(
     if let Some(parent) = log.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
-    let empty = ctx.home.join("empty");
-    std::fs::create_dir_all(&empty).map_err(|e| format!("{}: {e}", empty.display()))?;
+    let agent_env = ctx.home.join("agent-env");
     Ok(Staged {
         run,
         batch: batch.to_vec(),
@@ -1505,7 +1503,7 @@ fn stage(
         out: out_file,
         doc: doc_file,
         log,
-        empty,
+        agent_env,
     })
 }
 
@@ -1522,8 +1520,9 @@ fn work(cfg: &Config, worker: &crate::worker::Worker, chosen: &Chosen, job: &Sta
         timeout.saturating_sub(crate::dispatch::INNER_GRACE),
     );
     cmd.current_dir(&job.tree);
-    crate::agent::restrict(&mut cmd, &job.empty);
-    let finished = match crate::agent::run_limited(cmd, &job.log, timeout) {
+    let finished = match crate::agent::restrict(&mut cmd, &job.agent_env)
+        .and_then(|()| crate::agent::run_limited(cmd, &job.log, timeout))
+    {
         Ok(f) => f,
         Err(e) => {
             return Ran {

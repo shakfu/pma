@@ -63,10 +63,24 @@ pub struct Item {
 
 impl Item {
     /// Identity across scans and edits: `gh:N`, or the text in comparable form.
+    /// Text that reads as another kind of task's key, such as an item named
+    /// `CI`, is prefixed with `item:`, so it cannot be taken for a signal, a
+    /// campaign or a workflow unit.
     pub fn key(&self) -> String {
         match self.gh {
             Some(n) => format!("gh:{n}"),
-            None => normal_text(&self.text),
+            None => {
+                let text = normal_text(&self.text);
+                let reserved = matches!(text.as_str(), "ci" | "deps")
+                    || ["campaign:", "workflow:", "item:"]
+                        .iter()
+                        .any(|p| text.starts_with(p));
+                if reserved {
+                    format!("item:{text}")
+                } else {
+                    text
+                }
+            }
         }
     }
 

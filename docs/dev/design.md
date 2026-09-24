@@ -371,7 +371,7 @@ Provider keys are inherited from the session, on purpose. `agent::restrict` stri
 pma agent set opencode env '{"OPENAI_BASE_URL": "http://localhost:11434/v1"}'
 ```
 
-That environment is applied after `restrict`, so a record cannot put back a credential the pipeline took away. There is one test for exactly that.
+`restrict` is applied after that environment, so a record cannot put back a credential the pipeline took away. There is one test for exactly that.
 
 `claude` reports `total_cost_usd`. Its budget cap is checked between turns, so a run can exceed it: a one-word reply under a $0.05 cap cost $0.09 on 2026-09-15. `batch_budget` therefore bounds how many runs start, not what they spend.
 
@@ -379,7 +379,11 @@ Only `codex` has a sandbox. `cursor-agent --force` and `opencode --auto` auto-ap
 
 `claude` runs with `--permission-mode acceptEdits` and one exact `Bash(...)` allow rule per subcommand of the verify command, so it can run the check `pma` runs afterwards. Claude Code checks each part of `a && b` against the rules separately ([permissions](https://code.claude.com/docs/en/permissions.md#compound-commands)), hence one rule per part. In `-p` mode other shell commands are denied, unless the user's own settings allow them. The permission mode is not an isolation boundary: the agent edits the files that verify executes, so allowing verify to the agent adds no reach that verify lacks. Isolation would need a container around both.
 
-Because `pma` owns commits and pushes, the agent environment drops push credentials: `GH_TOKEN` and `GITHUB_TOKEN` unset, `GH_CONFIG_DIR` pointed at an empty directory, `SSH_AUTH_SOCK` unset, and `GIT_TERMINAL_PROMPT=0`. Through `GIT_CONFIG_COUNT`, credential helpers are cleared and `remote.origin.pushurl` is set to an unusable URL. This makes an accidental push fail. It does not stop a determined process. The verify command runs in the same environment.
+Because `pma` owns commits and pushes, the agent environment drops push credentials: `GH_TOKEN` and `GITHUB_TOKEN` unset, `GH_CONFIG_DIR` pointed at an empty directory, `SSH_AUTH_SOCK` unset, and `GIT_TERMINAL_PROMPT=0`. Through `GIT_CONFIG_*`, appended after any the user set, credential helpers are cleared, an empty-prefix `pushInsteadOf` rewrites every push URL to an unusable one, and `core.hooksPath` names a `pre-push` hook that refuses, for a remote with an explicit `pushurl`, which git exempts from `pushInsteadOf`. This makes an accidental push fail. `git push --no-verify` to such a remote, or a credential read from disk, still gets through. The verify command runs in the same environment.
+
+`pma`'s own git calls in a worktree do carry credentials. Each first checks that the worktree's `.git` is still the file `git worktree add` wrote, and runs with `core.fsmonitor=false`. Ship refuses a run whose repository gained or changed a hook, or a setting that runs a program or redirects a push, since dispatch, because neither is in the diff the reviewer read. The user's own hooks still run.
+
+An agent and its verify run under a `sh` watchdog holding a pipe from `pma`. When `pma` exits for any reason, the pipe closes and the watchdog kills the process group, so no agent outlives the session lock it ran under. The group is also killed after a normal exit.
 
 ## Dispatch
 

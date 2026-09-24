@@ -23,7 +23,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 27;
+const VERSION: i64 = 28;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -59,7 +59,7 @@ CREATE TABLE tasks (
 ";
 
 /// Version 2. Runs outlive a project's removal from the scan: their worktrees
-/// still exist and must be shipped or rejected.
+/// still exist and must be published or rejected.
 const RUNS: &str = "
 CREATE TABLE runs (
     id INTEGER PRIMARY KEY,
@@ -307,6 +307,19 @@ CREATE TABLE campaign_members (
 );
 ";
 
+/// Version 28. `shipped` named two different things: a push to the default
+/// branch, and a pull request merged. `pma push` and `pma pr` are separate
+/// commands now, and a run's state says which happened, in GitHub's words. A
+/// pull request closed without merging is `closed`, not `rejected`, which is
+/// kept for a run rejected in review and never published. The `publish`
+/// settings are dropped: the command says where a run goes.
+const PUSH_OR_PR: &str = "
+UPDATE runs SET state = 'merged' WHERE state = 'shipped' AND outcome LIKE '%/pull/%';
+UPDATE runs SET state = 'pushed' WHERE state = 'shipped';
+UPDATE runs SET state = 'closed' WHERE state = 'rejected' AND outcome LIKE '%/pull/%';
+DELETE FROM config WHERE key = 'publish' OR (key LIKE 'projects.%' AND key LIKE '%.publish');
+";
+
 /// Version 27. Drops the health score's weights. `pma status` sorts by the
 /// worst state a project is in, which needs no weight, and a stored row for a
 /// key nothing reads is one `pma config` would have to explain forever.
@@ -316,7 +329,7 @@ DELETE FROM config WHERE key LIKE 'weights.%';
 
 /// Version 26. What makes git run a program in a run's repository, or push
 /// elsewhere, as it stood at dispatch: hooks and the settings that name a
-/// command or rewrite a URL. Ship refuses when it has changed, since neither
+/// command or rewrite a URL. Publishing refuses when it has changed, since neither
 /// is in the diff a reviewer reads.
 const GIT_SNAPSHOT: &str = "
 ALTER TABLE runs ADD COLUMN git_snapshot TEXT;
@@ -525,7 +538,7 @@ pub struct Footprint {
     pub campaigns: i64,
     /// Runs are kept, so this is reported rather than deleted.
     pub runs: i64,
-    /// Runs that are not shipped or rejected; each may own a worktree.
+    /// Runs that are not final; each may own a worktree.
     pub open_runs: Vec<i64>,
 }
 
@@ -593,7 +606,7 @@ impl Session {
                 pid => format!(" (pid {pid})"),
             };
             format!(
-                "another pma session{holder} is dispatching, reworking, rejecting or shipping; wait for it to finish"
+                "another pma session{holder} is dispatching, reworking, rejecting or publishing; wait for it to finish"
             )
             .into()
         })
@@ -673,6 +686,7 @@ impl Store {
                     SANDUK_WORKER,
                     GIT_SNAPSHOT,
                     RETIRE_WEIGHTS,
+                    PUSH_OR_PR,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -1856,11 +1870,11 @@ impl Store {
         let mut accepted = 0;
         for run in self.runs()?.iter().filter(|r| r.project == project) {
             match run.state {
-                RunState::Approved | RunState::Shipped => {
+                RunState::Approved | RunState::Pushed | RunState::Merged => {
                     decided += 1;
                     accepted += 1;
                 }
-                RunState::Rejected => decided += 1,
+                RunState::Rejected | RunState::Closed => decided += 1,
                 _ => {}
             }
         }
@@ -2056,14 +2070,20 @@ pub enum RunState {
     Ready,
     Failed,
     Approved,
-    /// Published as a pull request that is neither merged nor closed.
+    /// `pma pr` opened a pull request that is neither merged nor closed.
     PrOpen,
+    /// Rejected in `pma review`: never published.
     Rejected,
-    Shipped,
+    /// `pma push` pushed it to the default branch.
+    Pushed,
+    /// Its pull request was merged.
+    Merged,
+    /// Its pull request was closed without merging.
+    Closed,
 }
 
 impl RunState {
-    const ALL: [(&'static str, RunState); 8] = [
+    const ALL: [(&'static str, RunState); 10] = [
         ("queued", RunState::Queued),
         ("running", RunState::Running),
         ("ready", RunState::Ready),
@@ -2071,7 +2091,9 @@ impl RunState {
         ("approved", RunState::Approved),
         ("pr-open", RunState::PrOpen),
         ("rejected", RunState::Rejected),
-        ("shipped", RunState::Shipped),
+        ("pushed", RunState::Pushed),
+        ("merged", RunState::Merged),
+        ("closed", RunState::Closed),
     ];
 
     pub fn name(self) -> &'static str {
@@ -2087,11 +2109,19 @@ impl RunState {
 
     /// A run in a final state no longer holds its task or its worktree.
     pub fn is_final(self) -> bool {
-        matches!(self, RunState::Rejected | RunState::Shipped)
+        matches!(
+            self,
+            RunState::Rejected | RunState::Pushed | RunState::Merged | RunState::Closed
+        )
+    }
+
+    /// Whether its change reached the default branch: pushed, or merged.
+    pub fn landed(self) -> bool {
+        matches!(self, RunState::Pushed | RunState::Merged)
     }
 }
 
-/// One task dispatched to an agent, from its worktree to shipping. `Default`
+/// One task dispatched to an agent, from its worktree to publishing. `Default`
 /// is every field empty, which a workflow node fills differently from a
 /// dispatch: it has no branch to push and no item to tick.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -2128,7 +2158,7 @@ pub struct Run {
     pub verify: Option<String>,
     pub verify_ok: Option<bool>,
     pub error: Option<String>,
-    /// What shipping did: a pushed commit, or a pull request URL.
+    /// What publishing did: a pushed commit, or a pull request URL.
     pub outcome: Option<String>,
     /// When the run row was created. Never updated, so a per-day count and a
     /// digest window have a stable date. Per-attempt start times are in
@@ -2182,12 +2212,12 @@ pub struct Run {
     pub route_revision: Option<i64>,
     pub route: Option<String>,
     pub approval: Option<Approval>,
-    /// The tree the approver saw, as `git write-tree` names it. Ship refuses
+    /// The tree the approver saw, as `git write-tree` names it. Publishing refuses
     /// to publish a worktree that no longer matches.
     pub approved_tree: Option<String>,
-    /// The commit the worktree was on. Ship commits before it publishes, so
+    /// The commit the worktree was on. Publishing commits before it pushes, so
     /// the tree check applies only while the head is still this one; past
-    /// that, a resumed ship is recognised by its own pushed commits.
+    /// that, a resumed publish is recognised by its own pushed commits.
     pub approved_head: Option<String>,
     pub approved_by: Option<String>,
     /// The workflow instance that dispatched this run, or `None` for a task
@@ -2281,7 +2311,7 @@ impl Run {
             RunState::Approved | RunState::Rejected => {
                 self.decided_at.get_or_insert(now);
             }
-            RunState::Shipped | RunState::PrOpen => {
+            RunState::Pushed | RunState::PrOpen => {
                 self.published_at.get_or_insert(now);
             }
             _ => {}
@@ -2505,6 +2535,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// `shipped` said two things. A run with a pull request became `merged`,
+    /// a push became `pushed`, and a pull request closed without merging is
+    /// `closed`, where it was `rejected`. The `publish` settings go.
+    #[test]
+    fn shipped_splits_into_pushed_merged_and_closed() {
+        let dir = scratch("push-or-pr");
+        let db = dir.join("v27.db");
+        let conn = Connection::open(&db).unwrap();
+        let steps = [
+            SCHEMA,
+            RUNS,
+            DEPS_AND_NOTES,
+            LEFTOVER,
+            PR_OPEN,
+            ATTEMPTS,
+            SNAPSHOT,
+            VERIFY_BASE,
+            CHANGED_PATHS,
+            EXHAUSTION,
+            AGENTS,
+            RETIRE_KEYS,
+            COMPLEXITY,
+            ROUTES,
+            APPROVAL_EVIDENCE,
+            CAMPAIGNS,
+            SLUG,
+            ABSENCE,
+            PROJECT_TAGS,
+            WORKFLOWS,
+            WORKER_ENV,
+            WORKER_MODEL,
+            PRESETS,
+            PRESETS_REPLACE_WORKER_MODEL,
+            SANDUK_WORKER,
+            GIT_SNAPSHOT,
+            RETIRE_WEIGHTS,
+        ];
+        for step in steps {
+            conn.execute_batch(step).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 27).unwrap();
+        for (state, outcome) in [
+            ("shipped", "https://github.com/o/r/pull/3"),
+            ("shipped", "pushed abc to main"),
+            ("rejected", "https://github.com/o/r/pull/4"),
+            ("rejected", ""),
+        ] {
+            conn.execute(
+                "INSERT INTO runs (project, task_key, text, agent, repo, branch, worktree,
+                                   default_branch, base, prompt, state, outcome)
+                 VALUES ('p', 'k', 't', 'claude', '/k', 'pma/t', '/w', 'main', 'b', 'p', ?1,
+                         NULLIF(?2, ''))",
+                params![state, outcome],
+            )
+            .unwrap();
+        }
+        for (key, value) in [
+            ("publish", "push"),
+            ("projects.a.publish", "pr"),
+            ("timeout", "5"),
+        ] {
+            conn.execute(
+                "INSERT INTO config (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let store = Store::open(&db).unwrap();
+        let states: Vec<_> = store.runs().unwrap().iter().map(|r| r.state).collect();
+        assert_eq!(
+            states,
+            [
+                RunState::Merged,
+                RunState::Pushed,
+                RunState::Closed,
+                RunState::Rejected
+            ]
+        );
+        let keys: Vec<String> = store
+            .config_rows()
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, ["timeout"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn older_databases_are_upgraded_in_place() {
         let dir = scratch("migrate");
@@ -2549,8 +2668,8 @@ mod tests {
             if version >= 2 {
                 assert_eq!(
                     states,
-                    [RunState::PrOpen, RunState::Shipped],
-                    "v{version}: a shipped pull request is open again"
+                    [RunState::PrOpen, RunState::Pushed],
+                    "v{version}: a published pull request is open again, and a push is `pushed`"
                 );
             }
             assert!(store.notes().unwrap().is_empty());
@@ -2848,7 +2967,7 @@ mod tests {
         run.enter(RunState::PrOpen);
         let published = run.published_at.expect("publication stamped");
 
-        run.enter(RunState::Shipped);
+        run.enter(RunState::Merged);
         assert_eq!(
             run.published_at,
             Some(published),
@@ -3000,7 +3119,7 @@ mod tests {
             leftover(&mut store, &[scanned.clone(), other.clone()]),
             [1, 1]
         );
-        run.state = RunState::Shipped;
+        run.state = RunState::Pushed;
         store.update_run(&run).unwrap();
         assert_eq!(leftover(&mut store, &[scanned, other]), [2, 1]);
         let _ = std::fs::remove_dir_all(dir);
@@ -3076,7 +3195,7 @@ mod tests {
         assert_eq!(f.open_runs, [run.id], "an open run holds a worktree");
 
         let mut open = store.run(run.id).unwrap();
-        open.state = RunState::Shipped;
+        open.state = RunState::Merged;
         store.update_run(&open).unwrap();
         assert!(store.project_footprint("a").unwrap().open_runs.is_empty());
 

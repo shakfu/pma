@@ -2,7 +2,7 @@
 
 Maintain many repositories from one place.
 
-If you keep dozens of small projects, the work is not hard, it is scattered. Each repository has a `TODO.md`, failing CI, outdated dependencies and a dirty working tree, and finding out means opening all of them. `pma` reads them all in one pass, ranks every task across every project in one list, and can hand a task to a coding agent in a throwaway worktree. You read the diff, and `pma` commits and publishes it.
+If you keep dozens of small projects, the work is not hard, it is scattered. Each repository has a `TODO.md`, failing CI, outdated dependencies and a dirty working tree, and finding out means opening all of them. `pma` reads them all in one pass, ranks every task across every project in one list, and can hand a task to a coding agent in a throwaway worktree. You read the diff, and `pma` commits it and opens a pull request or pushes.
 
 Scanning 95 repositories takes about 15 seconds.
 
@@ -16,14 +16,14 @@ pma                            # next: tasks for agents, and what waits on you
 pma dispatch myproject:31      # hand line 31 to an agent
 pma review 1                   # the diff, the test result, the cost
 pma review 1 --approve
-pma ship                       # commit, push or open a pull request
+pma pr 1                       # commit and open a pull request; or `pma push 1`
 ```
 
 ## Features
 
 **One view of everything**
 
-- `pma next`, or `pma` alone: one list of tasks for agents, in the order `pma dispatch --auto` takes them, and one of what waits on you: runs to review, ship or merge, then critical or urgent tasks no agent may take.
+- `pma next`, or `pma` alone: one list of tasks for agents, in the order `pma dispatch --auto` takes them, and one of what waits on you: runs to review, publish or merge, then critical or urgent tasks no agent may take.
 
 - Every task in every project in one Eisenhower matrix, ranked by project importance and item priority.
 
@@ -183,7 +183,7 @@ pma verify myproject            # run its check where a dispatch would, before o
 
 Highest wins: the `-a` and `-m` flags, then `-p <preset>`, then an applied route, then the default preset.
 
-Dispatch, review, ship:
+Dispatch, review, publish:
 
 ```sh
 pma dispatch myproject:31       # a TODO.md line from the last scan
@@ -192,17 +192,21 @@ pma dispatch myproject:critical # every open item under that heading
 pma dispatch myproject          # pick from a list
 pma dispatch --auto -n 3        # the top 3 dispatchable tasks
 pma dispatch -p claude-haiku myproject:31
-pma review                      # runs not yet shipped or rejected
+pma review                      # runs not yet published or rejected
 pma review 4                    # task, test result, cost, summary, diff
 pma review 4 --approve          # or --reject, or --rework "feedback"
 pma review 4 5 6 --approve      # a batch; every run is checked before any is approved
-pma ship                        # commit, push or open a PR, remove worktrees
+pma pr 4                        # commit, open a pull request, remove the worktree
+pma push 4                      # commit and push to the default branch instead
+pma pr --all-approved           # every approved run; also on push
 pma report --by project         # also class or agent
 ```
 
 A target naming one task fails if that task cannot run. A target naming many passes over each with its reason, and dispatches the rest.
 
-Each run gets a worktree of the remote default branch under `~/.local/state/pma/worktrees`, on a `pma/` branch. The item must be open in the remote `TODO.md`, so commit and push before dispatching. Set the test command with `pma config projects.myproject.verify "make check"`, or let it be detected. `publish` is `pr` by default; `pma config publish push` pushes to the default branch instead.
+Each run gets a worktree of the remote default branch under `~/.local/state/pma/worktrees`, on a `pma/` branch. The item must be open in the remote `TODO.md`, so commit and push before dispatching. Set the test command with `pma config projects.myproject.verify "make check"`, or let it be detected.
+
+A run opened with `pma pr` is `pr-open` until the pull request is merged or closed; `pma review` settles it and shows review activity meanwhile. A run published with `pma push` is `pushed`.
 
 Repeating work:
 
@@ -239,11 +243,11 @@ Each `## Critical` item gets an issue labelled `pma:critical`, and `gh:N` is wri
 
 - The database is `~/.config/pma/projects.db`, or `$PMA_HOME/projects.db`. It serves one machine: two copies cannot be merged.
 
-- Worktrees, logs and artifacts sit under `~/.local/state/pma` (`$XDG_STATE_HOME/pma`), or `$PMA_HOME/state` when `PMA_HOME` is set; `PMA_STATE` overrides both. Worktrees are removed when a run ships or is rejected. A workflow's agent nodes read the code in a worktree of their own and leave nothing behind; what they read and wrote stays in `artifacts/<instance>/<node>/<n>/`, numbered per run.
+- Worktrees, logs and artifacts sit under `~/.local/state/pma` (`$XDG_STATE_HOME/pma`), or `$PMA_HOME/state` when `PMA_HOME` is set; `PMA_STATE` overrides both. Worktrees are removed when a run is published or rejected. A workflow's agent nodes read the code in a worktree of their own and leave nothing behind; what they read and wrote stays in `artifacts/<instance>/<node>/<n>/`, numbered per run.
 
 - Settings live in the database rather than a file. `pma config` lists them, `pma config <key> <value>` sets one, and `--reset` clears one.
 
-One command that runs agents or edits worktrees runs at a time. `dispatch`, `ship`, `workflow run` and `review --reject` take a lock and name the process holding it. Reading commands run alongside.
+One command that runs agents or edits worktrees runs at a time. `dispatch`, `pr`, `push`, `workflow run` and `review --reject` take a lock and name the process holding it. Reading commands run alongside.
 
 ## Development
 

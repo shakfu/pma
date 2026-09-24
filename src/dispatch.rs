@@ -125,7 +125,7 @@ pub fn is_signal(key: &str) -> bool {
 
 /// A task with no line in any `TODO.md`: a signal, or a campaign applying one
 /// definition across repositories. There is nothing to check on origin before
-/// dispatch and nothing to tick at ship.
+/// dispatch and nothing to tick when it is published.
 pub fn without_item(key: &str) -> bool {
     is_signal(key) || key.starts_with("campaign:") || key.starts_with("workflow:")
 }
@@ -232,7 +232,7 @@ pub fn own_gitdir(run: &Run) -> Result<()> {
 /// What makes git run a program in the worktree, or push somewhere else,
 /// that the diff does not show: each hook by content and executable bit, and
 /// each repository setting that names a command or rewrites a URL, by a hash
-/// of its value, since a URL may carry a token. Ship compares it with the one
+/// of its value, since a URL may carry a token. Publishing compares it with the one
 /// taken at dispatch. Hooks that run tracked files, such as husky's scripts or
 /// a `.pre-commit-config.yaml`, run what the reviewer approved in the diff.
 /// Global and system settings are the user's, so they are left out.
@@ -745,7 +745,7 @@ fn prompt(run: &Run, details: &str, verify: Option<&str>) -> String {
     p.push_str(
         "\nRules:\n\
          - Leave your changes uncommitted. Do not commit, push, or switch branches.\n\
-         - Do not edit TODO.md. pma marks the task done when the change ships.\n",
+         - Do not edit TODO.md. pma marks the task done when the change is published.\n",
     );
     if let Some(v) = verify {
         p.push_str(&format!(
@@ -1312,7 +1312,7 @@ pub fn diff(run: &Run) -> Result<String> {
 }
 
 /// The worktree's content as one object id: `git add --all`, which stages
-/// without committing, then `git write-tree`. The same call at ship time
+/// without committing, then `git write-tree`. The same call when publishing
 /// says whether anything changed since.
 pub fn tree(run: &Run) -> Result<String> {
     wt_git(run, &["add", "--all"])?;
@@ -1321,7 +1321,7 @@ pub fn tree(run: &Run) -> Result<String> {
 
 pub fn approve(store: &Store, run: &mut Run, by: &str) -> Result<()> {
     // Approving an already approved run re-takes the evidence, which is how
-    // a reviewer says the tree is fine after ship refused a stale one.
+    // a reviewer says the tree is fine after a publish refused a stale one.
     if !matches!(run.state, RunState::Ready | RunState::Approved) {
         return Err(format!(
             "run #{} is {}; only a ready or approved run can be approved",
@@ -1339,7 +1339,7 @@ pub fn approve(store: &Store, run: &mut Run, by: &str) -> Result<()> {
         )
         .into());
     }
-    // Recorded now, so ship can say whether it is publishing what was read.
+    // Recorded now, so a publish can say whether it is publishing what was read.
     run.approved_tree = Some(tree(run)?);
     run.approved_head = wt_git(run, &["rev-parse", "HEAD"]).ok();
     run.approved_by = Some(by.to_string());
@@ -1625,7 +1625,7 @@ mod tests {
     }
 
     /// An item named like a signal, a campaign or a workflow unit is still an
-    /// item: checked on origin before dispatch, and ticked at ship.
+    /// item: checked on origin before dispatch, and ticked when published.
     #[test]
     fn an_item_key_never_reads_as_another_kind_of_task() {
         let file = "# TODO\n\n## High\n\n- [ ] CI\n- [ ] deps\n- [ ] Workflow: migrate\n\

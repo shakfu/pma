@@ -4,13 +4,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0]
+
+Upgrading from 0.3:
+
+- The database moves from schema 24 to 28 on first open. 0.3 refuses it afterwards.
+- `pma ship` is now `pma pr` or `pma push`; `publish` settings are retired. See Changed.
+- `weights.*` settings are retired, with the health score.
+- `pma workflow run --yes` is now `--approve <plan>`.
+- New worktrees, logs and artifacts go to `~/.local/state/pma`.
+
 ### Added
 
 **Each agent step's prompt ends with the output it is held to**, generated from the type it declares and the op it applies: the array's shape, `@id` and `@from` where they apply, the fields it may set, and each field's limits. A prompt author restated these by hand, and in a trial a confirm wrote a `reason` longer than the type allowed and two true findings were refused.
 
-**`pma next`, and `pma` alone runs it: what should happen next, and who does it.** One list of tasks for agents, in the order `pma dispatch --auto` takes them, and one of what waits on you: runs to review, then to ship, then pull requests to merge, then critical or urgent tasks no agent may take or may take no more. The order is the matrix's and what an agent may take is dispatch's, so the view and `--auto` cannot disagree. `pma tui` opens on it; `m` switches to the 2x2. Each list shows `quadrant_limit` rows; `--all` shows every row.
+**`pma next`, and `pma` alone runs it: what should happen next, and who does it.** One list of tasks for agents, in the order `pma dispatch --auto` takes them, and one of what waits on you: runs to review, then to publish, then pull requests to merge, then critical or urgent tasks no agent may take or may take no more. The order is the matrix's and what an agent may take is dispatch's, so the view and `--auto` cannot disagree. `pma tui` opens on it; `m` switches to the 2x2. Each list shows `quadrant_limit` rows; `--all` shows every row.
 
-**Stable item ids: a trailing `^k3f9q`.** An item's identity was its text, so rewording one reset its age and hid a run it had. An id is 5 random characters of lowercase Crockford base32 (no `i`, `l`, `o`, `u`) after a caret, which is how Obsidian marks a block id and which GitHub renders as text; `<<id>>` was rejected because CommonMark reads `<k3f9q>` as an HTML tag, which GitHub strips. Identity is now the id, else `gh:N`, else the text. `pma lint --ids` lists the open items without one and `--apply` writes them, moving any open run onto the id; the workflow `todo` sink gives one to each item it adds. A scan carries an item's age by key, including the date git gave its old text. Not minted at dispatch: ship ticks that line on origin, and an uncommitted id in the clone would then conflict on every pull.
+**Stable item ids: a trailing `^k3f9q`.** An item's identity was its text, so rewording one reset its age and hid a run it had. An id is 5 random characters of lowercase Crockford base32 (no `i`, `l`, `o`, `u`) after a caret, which is how Obsidian marks a block id and which GitHub renders as text; `<<id>>` was rejected because CommonMark reads `<k3f9q>` as an HTML tag, which GitHub strips. Identity is now the id, else `gh:N`, else the text. `pma lint --ids` lists the open items without one and `--apply` writes them, moving any open run onto the id; the workflow `todo` sink gives one to each item it adds. A scan carries an item's age by key, including the date git gave its old text. Not minted at dispatch: publishing ticks that line on origin, and an uncommitted id in the clone would then conflict on every pull.
 
 ```markdown
 - [ ] accept a trailing comma #parser ^7hq2m
@@ -30,7 +40,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 Iteration is not included. `retry`, a lap edge and a self-edge parse, bound and cost as they always did, and the runtime takes none of the three: a document using them runs its forward path once. A node's `publish` is parsed and ignored for the same kind of reason -- an agent node's worktree is discarded after the run. `docs/dev/workflows.md` marks both at the point it specifies them.
 
-**The rules of section 8 are all built.** `open-issues` through `gh issue list`, `open-runs` from the runs that are not shipped or rejected, `outdated-deps` from the last `--deps` measurement, and `rank` and `limit:<n>` on a reduce. A rule that names something unbuilt is an error, never a verdict of `unknown` or a quiet fallback to another rule's behaviour.
+**The rules of section 8 are all built.** `open-issues` through `gh issue list`, `open-runs` from the runs not in a final state, `outdated-deps` from the last `--deps` measurement, and `rank` and `limit:<n>` on a reduce. A rule that names something unbuilt is an error, never a verdict of `unknown` or a quiet fallback to another rule's behaviour.
 
 **Calls are flattened at propose time (W2).** A `call` node is replaced by its callee's nodes, named `<call site>/<node>`, before anything is estimated or run, so the runtime holds one graph, one set of caps and one frontier. An argument the call site passed becomes the default of a parameter the flat graph declares, under the same qualified name, while the callee's `max` still bounds it. Guards on both sides of a call compose by union; a field both guard differently is refused, since picking one would silently drop the other.
 
@@ -48,7 +58,7 @@ Iteration is not included. `retry`, a lap edge and a self-edge parse, bound and 
 
 **An agent's push is refused on every remote.** `remote.origin.pushurl` was added to a remote's push URLs, not substituted for them: a remote with its own `pushurl`, another remote, or a URL on the command line still took the push. An empty-prefix `pushInsteadOf` now rewrites every push URL, and a `pre-push` hook covers a remote with an explicit `pushurl`, which git exempts from `pushInsteadOf`. `restrict` also appends its settings after any `GIT_CONFIG_*` the user set, which a fixed count overwrote.
 
-**Ship refuses a repository whose hooks or git settings changed since dispatch.** A hook, or a setting that runs a program or redirects a push, added during a run would run at ship with the user's credentials, and neither is in the diff. The run records its hooks and those settings at dispatch, before base verify, and ship compares them before it commits and again before it pushes. The user's own hooks keep running. The alternative, disabling hooks for ship, would have dropped them too. Schema 26.
+**Publishing refuses a repository whose hooks or git settings changed since dispatch.** A hook, or a setting that runs a program or redirects a push, added during a run would run at publishing with the user's credentials, and neither is in the diff. The run records its hooks and those settings at dispatch, before base verify, and `pma pr` and `pma push` compare them before they commit and again before they push. The user's own hooks keep running. The alternative, disabling hooks when publishing, would have dropped them too. Schema 26.
 
 ### Fixed
 
@@ -84,7 +94,7 @@ Iteration is not included. `retry`, a lap edge and a self-edge parse, bound and 
 
 **A cap is recorded on the instance whichever node hits it.** The mark was written inside the transaction the cap rolled back, so rule and reduce nodes hit the same cap on every pass.
 
-**`ci-green` and `pr-merged` wait while the run is on its way**, and read the pull request by the URL ship recorded. They read the worktree, which ship removes, so both returned `unknown` after shipping, and a check never waited. A `run` unit from `open-runs` now reaches the run it names.
+**`ci-green` and `pr-merged` wait while the run is on its way**, and read the pull request by the URL `pma pr` recorded. They read the worktree, which publishing removes, so both returned `unknown` after publishing, and a check never waited. A `run` unit from `open-runs` now reaches the run it names.
 
 **The `todo` sink refuses one unit rather than aborting the pass**, and no longer loses data silently. A missing section wrote nothing and routed the unit on as written; an item already open was added again, which the linter refuses; `remove` pruned every finished item in the file; a list field reached `TODO.md` as JSON text.
 
@@ -114,12 +124,11 @@ Iteration is not included. `retry`, a lap edge and a self-edge parse, bound and 
 
 **A dispatch refused after its worktree existed left the worktree behind.** A route refusal, or an error from base verify or worker choice, came after `git worktree add`, with no run row to release the worktree and branch. They are now removed.
 
-**An item named like a signal is dispatched as an item.** An item whose text was `CI` or `deps` had the signal's key, and one starting `Workflow:` or `campaign:` read as a unit or campaign task, which skipped the origin check and was never ticked at ship. Such keys are now prefixed with `item:`.
+**An item named like a signal is dispatched as an item.** An item whose text was `CI` or `deps` had the signal's key, and one starting `Workflow:` or `campaign:` read as a unit or campaign task, which skipped the origin check and was never ticked when published. Such keys are now prefixed with `item:`.
 
 **`default_tier` accepts 1 to 5.** Any number from 0 was accepted, and every ranking command then panicked: `9` indexed past the tier weights and `0` underflowed.
 
-**Two integration tests shared a scratch directory.** `Scratch::new` keyed the path on the test's label and the process id, and `ship_resumes_after_a_partial_failure` and `an_instance_resumes_under_its_own_revision` both passed `"resume"`. Tests in one binary share a pid and run in parallel, so each wiped the directory on the way in and deleted it on the way out, under the other: whichever lost the race failed with `git init: cannot change to .../root/alpha`. The path now carries a counter, so a repeated label cannot collide.
-
+**Two integration tests shared a scratch directory.** `Scratch::new` keyed the path on the test's label and the process id, and `publishing_resumes_after_a_partial_failure` and `an_instance_resumes_under_its_own_revision` both passed `"resume"`. Tests in one binary share a pid and run in parallel, so each wiped the directory on the way in and deleted it on the way out, under the other: whichever lost the race failed with `git init: cannot change to .../root/alpha`. The path now carries a counter, so a repeated label cannot collide.
 
 **An instance now resumes under the revision it started with.** `--instance` read whichever revision was active, so activating another between passes walked old units with a different graph: moves are keyed by edge index, so the units could route through unrelated edges or reach a changed sink. The instance is loaded first, the name on the command line must be the one it runs, and its own recorded revision is what the pass walks. An instance that stopped short records why and is not resumed into the same wall; a finished one still re-derives to nothing, because readiness is evidence rather than a cursor (W9).
 
@@ -138,6 +147,10 @@ Iteration is not included. `retry`, a lap edge and a self-edge parse, bound and 
 **A declaration is checked where it is written.** `parse_params` checked an enum's members and nothing else, and a field's `max`, `min` and `unique` were read with `as_i64` and `as_str`, so `"max": "ten"` silently meant 200 and `"unique": true` silently meant not unique. A default is now checked against its parameter's own type and maximum, `max` is refused on a parameter that is not an int, and a field option that does not apply to its type is refused by name.
 
 ### Changed
+
+**`pma pr <id>...` and `pma push <id>...` replace `pma ship`.** `ship` published every approved run to wherever the `publish` setting said, so one command did two different things and where a run went was not visible at the call. Each command now does one: `pr` opens a pull request, `push` pushes to the default branch. Both take the runs to publish, or `--all-approved`, and refuse one that is not approved. The `publish` and `projects.<name>.publish` settings are retired; setting one names the commands.
+
+The `shipped` state is gone. A pushed run is `pushed`. A pull request run is `pr-open`, then `merged` or `closed`, as on GitHub; `closed` was `rejected`, which also meant a run the reviewer refused. While a pull request is open, `pma review` shows its review decision, comment count and review count. `pma report`'s `merged` column is now `landed`: pushed or merged. Migration 28 moves `shipped` runs with a pull request URL to `merged` and the rest to `pushed`, moves `rejected` runs with one to `closed`, and drops the stored `publish` settings.
 
 **Q4 is labelled "Later", not "Remove".** Under the default weights no `Medium` or `Low` item is ever important, so every such item that is not urgent lands in Q4, and "Remove" was the wrong advice for most of a backlog.
 

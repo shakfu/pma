@@ -3,7 +3,7 @@
 //! the evidence rather than trusting a verdict recorded under rules nobody
 //! can name any more.
 //!
-//! Nothing here approves or ships. `pma review` shows the reasons; the
+//! Nothing here approves or publishes. `pma review` shows the reasons; the
 //! approval modes of phase 4 are what consume an empty list.
 
 use crate::class::Class;

@@ -9,7 +9,7 @@
 //! parser plus `serde` derive for one file is a larger change than the
 //! syntax is worth.
 //!
-//! Nothing here approves, ships or merges. A route names an approval mode;
+//! Nothing here approves, publishes or merges. A route names an approval mode;
 //! phases 4b and 4c are what act on one.
 
 use serde_json::Value;

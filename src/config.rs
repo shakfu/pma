@@ -30,7 +30,6 @@ pub struct Config {
     /// Tier for a project that has none, so untiered projects are ranked
     /// rather than invisible. `None` leaves them out, as before.
     pub default_tier: Option<i64>,
-    pub publish: Publish,
     pub attribution: Attribution,
     /// Agents running at once.
     pub max_parallel: i64,
@@ -47,14 +46,6 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Publish {
-    /// Rebase onto the default branch and push it.
-    Push,
-    /// Push the task branch and open a pull request.
-    Pr,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attribution {
     User,
     CoAuthor,
@@ -64,8 +55,6 @@ pub enum Attribution {
 pub struct ProjectSettings {
     /// Shell command that checks an agent's work; `None` detects one.
     pub verify: Option<String>,
-    /// Overrides the global `publish`.
-    pub publish: Option<Publish>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,7 +86,6 @@ impl Default for Config {
             agent: "claude".into(),
             preset: None,
             default_tier: None,
-            publish: Publish::Pr,
             attribution: Attribution::User,
             max_parallel: 2,
             batch_budget: 5.0,
@@ -118,8 +106,6 @@ enum Slot<'a> {
     Tier(&'a mut Option<i64>),
     Priority(&'a mut Priority),
     List(&'a mut Vec<String>),
-    Publish(&'a mut Publish),
-    OptPublish(&'a mut Option<Publish>),
     Attribution(&'a mut Attribution),
     /// Empty text is `None`.
     OptText(&'a mut Option<String>),
@@ -127,25 +113,11 @@ enum Slot<'a> {
     Text(&'a mut String),
 }
 
-const PUBLISH: [(&str, Publish); 2] = [("push", Publish::Push), ("pr", Publish::Pr)];
-
-fn publish_name(p: Publish) -> &'static str {
-    PUBLISH.iter().find(|(_, v)| *v == p).map_or("", |(n, _)| n)
-}
-
-fn parse_publish(s: &str) -> Result<Publish, String> {
-    PUBLISH
-        .iter()
-        .find(|(n, _)| *n == s)
-        .map(|(_, v)| *v)
-        .ok_or_else(|| "expected push or pr".into())
-}
-
 /// Settings that no longer exist, with what replaced them. A retired name
 /// stays here so `pma config <old>` explains it. `with_overrides` skips a
 /// stored row for one, because an unknown key is a hard error on every
 /// command and an upgrade must not brick a store that set it.
-pub const RETIRED: [(&str, &str); 13] = [
+pub const RETIRED: [(&str, &str); 14] = [
     (
         "model",
         "a model belongs to a preset: `pma preset set <name> <agent> <model>`",
@@ -183,12 +155,20 @@ pub const RETIRED: [(&str, &str); 13] = [
     ("weights.ci", WEIGHTS),
     ("weights.deps", WEIGHTS),
     ("weights.hygiene", WEIGHTS),
+    (
+        "publish",
+        "where a run goes is the command now: `pma pr <id>` opens a pull request, `pma push <id>` pushes to the default branch",
+    ),
 ];
 
 const WEIGHTS: &str =
     "the health score is gone; `pma status` sorts by the worst state a project is in";
 
 pub fn retired(key: &str) -> Option<&'static str> {
+    // Per project as well as global: every `projects.<name>.publish` went too.
+    if key.starts_with("projects.") && key.ends_with(".publish") {
+        return retired("publish");
+    }
     RETIRED
         .iter()
         .find(|(name, _)| *name == key)
@@ -211,7 +191,6 @@ impl Config {
                 "agent",
                 "preset",
                 "default_tier",
-                "publish",
                 "attribution",
                 "max_parallel",
                 "batch_budget",
@@ -250,8 +229,6 @@ impl Config {
             Slot::Tier(v) => v.map_or("never".into(), |n| n.to_string()),
             Slot::Priority(p) => p.name().into(),
             Slot::List(v) => v.join(","),
-            Slot::Publish(p) => publish_name(*p).into(),
-            Slot::OptPublish(p) => p.map_or("", publish_name).into(),
             Slot::Attribution(a) => match a {
                 Attribution::User => "user".into(),
                 Attribution::CoAuthor => "co-author".into(),
@@ -313,12 +290,6 @@ impl Config {
                     .map(String::from)
                     .collect();
             }
-            Slot::Publish(p) => *p = parse_publish(value)?,
-            Slot::OptPublish(p) => {
-                *p = (!value.is_empty())
-                    .then(|| parse_publish(value))
-                    .transpose()?
-            }
             Slot::Attribution(a) => {
                 *a = match value {
                     "user" => Attribution::User,
@@ -352,7 +323,6 @@ impl Config {
                 "agent" => Slot::Text(&mut self.agent),
                 "preset" => Slot::OptText(&mut self.preset),
                 "default_tier" => Slot::Tier(&mut self.default_tier),
-                "publish" => Slot::Publish(&mut self.publish),
                 "attribution" => Slot::Attribution(&mut self.attribution),
                 "max_parallel" => Slot::Count(&mut self.max_parallel, 1),
                 "batch_budget" => Slot::Number(&mut self.batch_budget, 0.0),
@@ -380,16 +350,11 @@ impl Config {
             }
             Some(("projects", rest)) => {
                 let (name, field) = rest.rsplit_once('.')?;
-                if name.is_empty() || name.contains('.') || !["verify", "publish"].contains(&field)
-                {
+                if name.is_empty() || name.contains('.') || field != "verify" {
                     return None;
                 }
                 let settings = self.projects.entry(name.to_string()).or_default();
-                match field {
-                    "verify" => Slot::OptText(&mut settings.verify),
-                    "publish" => Slot::OptPublish(&mut settings.publish),
-                    _ => return None,
-                }
+                Slot::OptText(&mut settings.verify)
             }
             _ => return None,
         })
@@ -406,10 +371,6 @@ impl Config {
     pub fn project(&self, name: &str) -> ProjectSettings {
         self.projects.get(name).cloned().unwrap_or_default()
     }
-
-    pub fn publish_for(&self, name: &str) -> Publish {
-        self.project(name).publish.unwrap_or(self.publish)
-    }
 }
 
 #[cfg(test)]
@@ -419,7 +380,7 @@ mod tests {
     #[test]
     fn every_key_reads_and_round_trips() {
         let keys = Config::keys();
-        assert_eq!(keys.len(), 32);
+        assert_eq!(keys.len(), 31);
         let defaults = Config::default();
         let mut copy = Config::default();
         for key in &keys {
@@ -451,18 +412,16 @@ mod tests {
         cfg.set("agent", "codex").unwrap();
         // `model` is retired: a model belongs to the worker record.
         assert!(cfg.set("model", "haiku").is_err());
-        cfg.set("publish", "push").unwrap();
         cfg.set("attribution", "co-author").unwrap();
         cfg.set("projects.cyllama.verify", " make check ").unwrap();
-        cfg.set("projects.cyllama.publish", "pr").unwrap();
         assert_eq!(cfg.agent, "codex");
         assert_eq!(cfg.attribution, Attribution::CoAuthor);
         assert_eq!(cfg.project("cyllama").verify.as_deref(), Some("make check"));
-        assert_eq!(cfg.publish_for("cyllama"), Publish::Pr);
-        assert_eq!(cfg.publish_for("other"), Publish::Push);
-        assert_eq!(cfg.get("projects.cyllama.publish").unwrap(), "pr");
-        cfg.set("projects.cyllama.publish", "").unwrap();
-        assert_eq!(cfg.publish_for("cyllama"), Publish::Push, "empty unsets");
+        // Where a run goes is the command now, so both settings are retired.
+        for key in ["publish", "projects.cyllama.publish"] {
+            let e = cfg.set(key, "pr").unwrap_err();
+            assert!(e.contains("was retired") && e.contains("pma pr"), "{e}");
+        }
     }
 
     /// A store that set a retired key must still open, and asking about the
@@ -507,12 +466,10 @@ mod tests {
             ("weights.ci", "1"),
             ("activity.horizon.1", "0"),
             ("agent", ""),
-            ("publish", "merge"),
             ("attribution", "agent"),
             ("max_parallel", "0"),
             ("projects.a.b.verify", "x"),
             ("projects.a.colour", "x"),
-            ("projects.a.publish", "merge"),
             ("nope", "1"),
         ] {
             assert!(cfg.set(key, value).is_err(), "{key} = {value} was accepted");

@@ -46,7 +46,8 @@ struct Tally {
     first_pass: i64,
     decided: i64,
     accepted: i64,
-    merged: i64,
+    /// Runs whose change reached the default branch: pushed, or merged.
+    landed: i64,
     open: i64,
     attempts: i64,
     cost: f64,
@@ -65,19 +66,19 @@ impl Tally {
             self.first_pass += 1;
         }
         match run.state {
-            RunState::Approved | RunState::Shipped => {
+            RunState::Approved | RunState::Pushed | RunState::Merged => {
                 self.decided += 1;
                 self.accepted += 1;
             }
-            RunState::Rejected => self.decided += 1,
+            RunState::Rejected | RunState::Closed => self.decided += 1,
             // Neither accepted nor refused until someone merges or closes it,
             // so it is in no share.
             RunState::PrOpen => self.open += 1,
             // Failed and never reviewed: no one has judged it.
             _ => {}
         }
-        if run.state == RunState::Shipped {
-            self.merged += 1;
+        if run.state.landed() {
+            self.landed += 1;
         }
         match run.cost_usd {
             Some(c) => self.cost += c,
@@ -93,7 +94,7 @@ impl Tally {
             self.runs.to_string(),
             self.first_pass.to_string(),
             self.accepted.to_string(),
-            self.merged.to_string(),
+            self.landed.to_string(),
             self.open.to_string(),
             self.attempts.to_string(),
             match self.cost_unknown {
@@ -107,7 +108,7 @@ impl Tally {
 }
 
 const HEADINGS: [&str; 9] = [
-    "runs", "1st pass", "accepted", "merged", "open", "attempts", "cost", "agent", "review",
+    "runs", "1st pass", "accepted", "landed", "open", "attempts", "cost", "agent", "review",
 ];
 
 /// A run still queued or running has not produced a result yet, so it is left
@@ -210,7 +211,7 @@ mod tests {
     #[test]
     fn unfinished_runs_and_open_pull_requests_are_excluded() {
         let runs = [
-            run(1, Class::Mechanical, RunState::Shipped),
+            run(1, Class::Mechanical, RunState::Merged),
             run(2, Class::Mechanical, RunState::Running),
             run(3, Class::Mechanical, RunState::PrOpen),
         ];
@@ -232,8 +233,8 @@ mod tests {
     #[test]
     fn a_rework_does_not_become_a_first_pass() {
         let runs = [
-            run(1, Class::Specified, RunState::Shipped),
-            run(2, Class::Specified, RunState::Shipped),
+            run(1, Class::Specified, RunState::Merged),
+            run(2, Class::Specified, RunState::Merged),
         ];
         let attempts = [
             attempt(1, 1, Some(true)),
@@ -243,26 +244,26 @@ mod tests {
         let out = report(&runs, &attempts, By::Class);
         let row = out.lines().find(|l| l.starts_with("B ")).unwrap();
         let cells: Vec<&str> = row.split_whitespace().collect();
-        // class, runs, 1st pass, accepted, merged, open, attempts
+        // class, runs, 1st pass, accepted, landed, open, attempts
         assert_eq!(&cells[..7], ["B", "2", "1", "2", "2", "0", "3"], "{row}");
     }
 
     /// A worker that reports no cost must not read as free.
     #[test]
     fn unknown_cost_is_marked_not_summed_as_zero() {
-        let mut a = run(1, Class::Mechanical, RunState::Shipped);
+        let mut a = run(1, Class::Mechanical, RunState::Merged);
         a.cost_usd = None;
-        let runs = [a, run(2, Class::Mechanical, RunState::Shipped)];
+        let runs = [a, run(2, Class::Mechanical, RunState::Merged)];
         let out = report(&runs, &[], By::Class);
         assert!(out.contains("$0.10+1?"), "{out}");
     }
 
     #[test]
     fn grouping_follows_the_dimension() {
-        let mut b = run(2, Class::Specified, RunState::Shipped);
+        let mut b = run(2, Class::Specified, RunState::Merged);
         b.project = "beta".into();
         b.agent = "codex".into();
-        let runs = [run(1, Class::Mechanical, RunState::Shipped), b];
+        let runs = [run(1, Class::Mechanical, RunState::Merged), b];
         for (by, labels) in [
             (By::Project, ["alpha", "beta"]),
             (By::Class, ["A", "B"]),

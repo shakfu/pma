@@ -28,7 +28,7 @@ pub enum Class {
 pub const PRIVILEGED: [&str; 4] = [".github/**", "LICENSE", "COPYING", "**/.netrc"];
 
 /// Files `pma` writes itself. No class may change one: an agent is told not
-/// to, and ship marks the item done after the rebase. Keeping the file out of
+/// to, and publishing marks the item done after the rebase. Keeping the file out of
 /// every scope is what lets that edit be admitted without granting an agent
 /// access to it.
 pub const OWNED: [&str; 1] = ["TODO.md"];

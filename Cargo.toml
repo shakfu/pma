@@ -1,9 +1,9 @@
 [package]
 name = "pma"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.89"
-description = "Lint TODO.md files across many git repositories and rank their tasks in an Eisenhower matrix"
+description = "Maintain many git repositories from one place: rank their TODO.md tasks and hand them to coding agents"
 license = "MIT"
 repository = "https://github.com/shakfu/pma"
 readme = "README.md"

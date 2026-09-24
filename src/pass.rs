@@ -1238,7 +1238,7 @@ fn rule_map(
             .filter(|t| t.project == project)
             .map(item_data)
             .collect()),
-        // A run that is shipped or rejected no longer holds its task or its
+        // A run that is final no longer holds its task or its
         // worktree, so it is not work a workflow can act on.
         "open-runs" => Ok(store
             .runs()?
@@ -1462,7 +1462,7 @@ fn run_of(ctx: &Ctx<'_>, unit: &WorkflowUnit) -> Result<Option<crate::store::Run
 
 /// A check about a run. `ci-green` and `pr-merged` wait while the run is on
 /// its way: not yet published, or a pull request still open or still
-/// checking. They read the pull request by the URL ship recorded, since the
+/// checking. They read the pull request by the URL `pma pr` recorded, since the
 /// worktree is gone by then.
 fn verdict_of(run: &crate::store::Run, rule: &str) -> Checked {
     use crate::store::RunState;
@@ -1522,7 +1522,15 @@ fn verdict_of(run: &crate::store::Run, rule: &str) -> Checked {
             }
         }
         "pr-merged" => match (&pr, run.state) {
-            (None, RunState::Shipped) => ok(true),
+            // Settled already: no need to ask GitHub again.
+            (_, RunState::Merged) => ok(true),
+            (_, RunState::Closed) => verdict(
+                "failed",
+                Some("the pull request was closed without merging".into()),
+            ),
+            // Pushed to the default branch: the change landed with no pull
+            // request to merge.
+            (None, RunState::Pushed) => ok(true),
             (None, _) => unpublished(),
             (Some(url), _) => match gh_json(&["pr", "view", url, "--json", "state"]) {
                 Err(e) => verdict("unknown", Some(e)),
@@ -1538,7 +1546,7 @@ fn verdict_of(run: &crate::store::Run, rule: &str) -> Checked {
             },
         },
         "ci-green" => match (&pr, run.state) {
-            (None, RunState::Shipped) => verdict(
+            (None, RunState::Pushed) => verdict(
                 "unknown",
                 Some("pushed without a pull request, so no checks are read".into()),
             ),
@@ -2561,7 +2569,7 @@ fn fill(
 /// `dispatch::prepare` and the phase 1 gates like any other dispatch, and the
 /// routing policy sees its node and lap, so a workflow chooses order, prompts
 /// and parameters, never authority (W14). The runs it leaves are reviewed and
-/// shipped the way every other run is.
+/// published the way every other run is.
 ///
 /// Every unit is prepared before any is run, because `dispatch::execute`
 /// spreads runs over `max_parallel`.

@@ -1,22 +1,34 @@
-//! Ship: commit approved runs, publish them, and remove their worktrees. A
-//! run published as a pull request stays `pr-open`, holding its task, until
-//! the pull request is merged or closed.
+//! Publishing approved runs, one of two ways, each its own command:
+//! `pma push` commits a run and pushes it to the default branch, and `pma pr`
+//! commits it and opens a pull request. Both remove the worktree afterwards. A
+//! run with a pull request stays `pr-open`, holding its task, until the pull
+//! request is merged or closed.
 
 use std::process::Command;
 
-use crate::config::{Attribution, Config, Publish};
+use crate::config::{Attribution, Config};
 use crate::dispatch::{remove_worktree, wt_git};
 use crate::store::{Result, Run, RunState, Store};
 use crate::todo;
 
-/// Ships approved runs in id order, project by project. A failure stops the
-/// rest of that project and leaves its runs approved; running `ship` again
-/// resumes them. `done` sees each run with its outcome.
-pub fn ship(
+/// Where a run's commit goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// Rebased onto the remote default branch and pushed to it.
+    Push,
+    /// Pushed as the run's own branch, with a pull request opened for it.
+    Pr,
+}
+
+/// Publishes approved runs in id order, project by project. A failure stops
+/// the rest of that project and leaves its runs approved; running the command
+/// again resumes them. `done` sees each run with its outcome.
+pub fn publish(
     store: &Store,
     home: &std::path::Path,
     cfg: &Config,
     runs: Vec<Run>,
+    target: Target,
     mut done: impl FnMut(&Run, &std::result::Result<String, String>),
 ) -> Result<()> {
     let mut blocked: Vec<String> = Vec::new();
@@ -28,11 +40,11 @@ pub fn ship(
             );
             continue;
         }
-        match ship_one(home, cfg, &run) {
+        match publish_one(home, cfg, &run, target) {
             Ok(outcome) => {
-                run.enter(match cfg.publish_for(&run.project) {
-                    Publish::Push => RunState::Shipped,
-                    Publish::Pr => RunState::PrOpen,
+                run.enter(match target {
+                    Target::Push => RunState::Pushed,
+                    Target::Pr => RunState::PrOpen,
                 });
                 run.outcome = Some(outcome.clone());
                 run.error = None;
@@ -50,7 +62,7 @@ pub fn ship(
                 done(&run, &Ok(report));
             }
             Err(e) => {
-                run.error = Some(format!("ship: {e}"));
+                run.error = Some(format!("publish: {e}"));
                 store.update_run(&run)?;
                 blocked.push(run.project.clone());
                 done(&run, &Err(e.to_string()));
@@ -60,15 +72,15 @@ pub fn ship(
     Ok(())
 }
 
-fn ship_one(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
+fn publish_one(home: &std::path::Path, cfg: &Config, run: &Run, target: Target) -> Result<String> {
     let wt = &run.worktree;
     if !wt.is_dir() {
         return Err(format!("{} no longer exists", wt.display()).into());
     }
     unchanged_git(run)?;
-    // What was approved is what gets published, or nothing is. Once ship has
-    // committed, the head has moved and the content is its own; a resumed
-    // ship is recognised further down by its pushed commits.
+    // What was approved is what gets published, or nothing is. Once a publish
+    // has committed, the head has moved and the content is its own; a resumed
+    // publish is recognised further down by its pushed commits.
     let head = wt_git(run, &["rev-parse", "HEAD"]).ok();
     if let Some(approved) = &run.approved_tree
         && head == run.approved_head
@@ -84,9 +96,8 @@ fn ship_one(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
             .into());
         }
     }
-    let publish = cfg.publish_for(&run.project);
-    if publish == Publish::Pr && which("gh").is_none() {
-        return Err("publish = pr needs `gh` on PATH; or `pma config publish push`".into());
+    if target == Target::Pr && which("gh").is_none() {
+        return Err("`pma pr` needs `gh` on PATH; `pma push` pushes without it".into());
     }
     let message = message(cfg, run);
 
@@ -96,9 +107,9 @@ fn ship_one(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
         wt_git(run, &["commit", "--quiet", "-m", &message])?;
     }
     let upstream = format!("origin/{}", run.default_branch);
-    if publish == Publish::Push {
+    if target == Target::Push {
         wt_git(run, &["fetch", "--quiet", "origin"])?;
-        // An earlier ship pushed these commits and stopped before recording
+        // An earlier push pushed these commits and stopped before recording
         // it. Pushed commits keep their ids, so HEAD is in the upstream.
         let head = wt_git(run, &["rev-parse", "HEAD"])?;
         if head != run.base
@@ -117,8 +128,8 @@ fn ship_one(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
         }
     }
 
-    // After the rebase, so ticks on nearby lines by tasks shipped together do
-    // not conflict.
+    // After the rebase, so ticks on nearby lines by tasks published together
+    // do not conflict.
     if !crate::dispatch::without_item(&run.task_key) {
         let path = wt.join("TODO.md");
         let text =
@@ -134,7 +145,7 @@ fn ship_one(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
         }
     }
     if wt_git(run, &["rev-list", "--count", &format!("{upstream}..HEAD")])? == "0" {
-        return Err("nothing to ship: no changes".into());
+        return Err("nothing to publish: no changes".into());
     }
     // The rebase merged other work into this tree, and the tick above added
     // a line. Two changes that each pass against the same base can fail
@@ -145,7 +156,7 @@ fn ship_one(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
         let log = home
             .join("runs")
             .join(run.id.to_string())
-            .join("verify-ship.log");
+            .join("verify-publish.log");
         let _ = std::fs::create_dir_all(log.parent().unwrap_or(&agent_env));
         match crate::dispatch::verify_once(command, wt, &agent_env, &log, timeout) {
             Ok((Some(true), _)) => {}
@@ -166,8 +177,8 @@ fn ship_one(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
     // Again, because verify ran code from the tree and could have installed
     // a `pre-push` hook.
     unchanged_git(run)?;
-    let outcome = match publish {
-        Publish::Push => {
+    let outcome = match target {
+        Target::Push => {
             wt_git(
                 run,
                 &[
@@ -180,7 +191,7 @@ fn ship_one(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
             let sha = wt_git(run, &["rev-parse", "--short", "HEAD"])?;
             format!("pushed {sha} to {}", run.default_branch)
         }
-        Publish::Pr => {
+        Target::Pr => {
             wt_git(run, &["push", "--quiet", "-u", "origin", &run.branch])?;
             // A retry after `gh pr create` failed may find the pull request
             // made anyway.
@@ -225,8 +236,8 @@ fn ship_one(home: &std::path::Path, cfg: &Config, run: &Run) -> Result<String> {
 }
 
 /// Refuses a run whose repository gained or changed a hook, or a setting
-/// that runs a program or redirects a push, since dispatch. Ship commits and
-/// pushes with the user's credentials, and none of that is in the diff the
+/// that runs a program or redirects a push, since dispatch. Publishing commits
+/// and pushes with the user's credentials, and none of that is in the diff the
 /// reviewer read. A run from before the snapshot existed has nothing to
 /// compare.
 fn unchanged_git(run: &Run) -> Result<()> {
@@ -250,16 +261,18 @@ fn unchanged_git(run: &Run) -> Result<()> {
         .collect();
     Err(format!(
         "the repository's hooks or git settings changed since run #{} was dispatched:\n{}\n\
-         ship would run them with your credentials. Restore them, or reject the run.",
+         publishing would run them with your credentials. Restore them, or reject the run.",
         run.id,
         changes.join("\n")
     )
     .into())
 }
 
-/// Moves each `pr-open` run to `shipped` when its pull request is merged, or
-/// to `rejected` when it is closed unmerged. `done` sees each settled run, and
-/// each run whose pull request `gh` cannot read, which stays `pr-open`.
+/// Moves each `pr-open` run to `merged` when its pull request is merged, or
+/// to `closed` when it is closed without merging. An open pull request keeps
+/// the run `pr-open`; `done` still sees it when someone has reviewed or
+/// commented on it, as GitHub shows it. `done` also sees each run whose pull
+/// request `gh` cannot read, which stays `pr-open`.
 pub fn settle(
     store: &Store,
     mut done: impl FnMut(&Run, &std::result::Result<String, String>),
@@ -269,31 +282,69 @@ pub fn settle(
             continue;
         }
         let url = run.outcome.clone().unwrap_or_default();
-        let state =
-            match crate::sync::gh(&["pr", "view", &url, "--json", "state", "--jq", ".state"]) {
-                Ok(s) => s,
-                Err(e) => {
-                    done(&run, &Err(e));
-                    continue;
-                }
-            };
-        let outcome = match state.trim() {
+        let read = crate::sync::gh(&[
+            "pr",
+            "view",
+            &url,
+            "--json",
+            "state,reviewDecision,comments,reviews",
+            "--jq",
+            "[.state, .reviewDecision, (.comments | length), (.reviews | length)] | @tsv",
+        ]);
+        let read = match read {
+            Ok(s) => s,
+            Err(e) => {
+                done(&run, &Err(e));
+                continue;
+            }
+        };
+        let mut fields = read.trim().split('\t');
+        let state = fields.next().unwrap_or_default();
+        let decision = fields.next().unwrap_or_default();
+        let comments: usize = fields.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+        let reviews: usize = fields.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+        let outcome = match state {
             "MERGED" => {
                 // `published_at` keeps the time the pull request was opened.
-                run.enter(RunState::Shipped);
+                run.enter(RunState::Merged);
                 format!("pull request merged: {url}")
             }
             "CLOSED" => {
-                run.enter(RunState::Rejected);
+                run.enter(RunState::Closed);
                 run.error = Some("pull request closed without merging".into());
                 format!("pull request closed without merging: {url}")
             }
-            _ => continue,
+            _ => {
+                if let Some(activity) = activity(decision, comments, reviews) {
+                    done(&run, &Ok(format!("pull request open: {activity}: {url}")));
+                }
+                continue;
+            }
         };
         store.update_run(&run)?;
         done(&run, &Ok(outcome));
     }
     Ok(())
+}
+
+/// What has happened on an open pull request, in GitHub's terms: its review
+/// decision, and how many comments and reviews it has. `None` when nothing
+/// has.
+fn activity(decision: &str, comments: usize, reviews: usize) -> Option<String> {
+    let plural = |n: usize, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
+    let mut parts = Vec::new();
+    match decision {
+        "APPROVED" => parts.push("approved".to_string()),
+        "CHANGES_REQUESTED" => parts.push("changes requested".to_string()),
+        _ => {}
+    }
+    if comments > 0 {
+        parts.push(plural(comments, "comment"));
+    }
+    if reviews > 0 {
+        parts.push(plural(reviews, "review"));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 /// Runs `gh` in `dir`, so it finds the repository from the git remote.
@@ -338,4 +389,24 @@ fn which(program: &str) -> Option<std::path::PathBuf> {
             .map(|d| d.join(program))
             .find(|p| p.is_file())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activity_on_an_open_pull_request_reads_as_github_shows_it() {
+        assert_eq!(activity("", 0, 0), None);
+        assert_eq!(activity("REVIEW_REQUIRED", 0, 0), None);
+        assert_eq!(
+            activity("CHANGES_REQUESTED", 2, 1).as_deref(),
+            Some("changes requested, 2 comments, 1 review")
+        );
+        assert_eq!(
+            activity("APPROVED", 0, 1).as_deref(),
+            Some("approved, 1 review")
+        );
+        assert_eq!(activity("", 1, 0).as_deref(), Some("1 comment"));
+    }
 }

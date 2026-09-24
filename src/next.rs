@@ -16,7 +16,7 @@ use crate::todo::Priority;
 pub enum Taken {
     /// Nothing holds it: `--auto` would take it.
     Free,
-    /// A run that is not shipped or rejected holds it. It shows as that run.
+    /// A run that is not final holds it. It shows as that run.
     Held,
     /// Its attempts were used without an accepted result.
     Exhausted(i64),
@@ -35,7 +35,7 @@ pub struct Row {
 pub struct Next {
     /// Tasks an agent may take, in dispatch order.
     pub agents: Vec<Row>,
-    /// Runs waiting on you: to review, to ship, or a pull request to merge.
+    /// Runs waiting on you: to review, to publish, or a pull request to merge.
     pub runs: Vec<Row>,
     /// Tasks no agent may take, or may take no more, that are critical or
     /// urgent.
@@ -90,7 +90,7 @@ pub fn build(
     }
 
     // A run you decide blocks its task, so the ones that cost least to settle
-    // come first: read and decide, then ship, then merge.
+    // come first: read and decide, then publish, then merge.
     let mut waiting: Vec<&Run> = runs
         .iter()
         .filter(|r| {
@@ -108,7 +108,7 @@ pub fn build(
     waiting.sort_by_key(|r| (order(r), r.id));
     for r in waiting {
         let (what, command) = match r.state {
-            RunState::Approved => ("to ship", "pma ship".to_string()),
+            RunState::Approved => ("to publish", format!("pma pr {} | pma push {}", r.id, r.id)),
             RunState::PrOpen => (
                 "to merge",
                 r.outcome
@@ -268,7 +268,7 @@ mod tests {
             run(2, RunState::Approved),
             run(3, RunState::Ready),
             run(4, RunState::Running),
-            run(5, RunState::Shipped),
+            run(5, RunState::Merged),
             run(6, RunState::Failed),
         ];
         let next = build(&[], &runs, 100, |_| Taken::Free);
@@ -282,7 +282,7 @@ mod tests {
             [
                 ("#3", "pma review 3"),
                 ("#6", "pma review 6"),
-                ("#2", "pma ship"),
+                ("#2", "pma pr 2 | pma push 2"),
                 ("#1", "https://x/pull/1"),
             ]
         );

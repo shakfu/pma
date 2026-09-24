@@ -15,13 +15,13 @@ mod next;
 mod pass;
 mod progress;
 mod projects;
+mod publish;
 mod rank;
 mod report;
 mod report_runs;
 mod route;
 mod scan;
 mod script;
-mod ship;
 mod store;
 mod sync;
 mod todo;
@@ -45,7 +45,7 @@ use todo::Priority;
 const GROUPS: [(&str, &[&str]); 6] = [
     (
         "The loop",
-        &["next", "scan", "matrix", "dispatch", "review", "ship"],
+        &["next", "scan", "matrix", "dispatch", "review", "pr", "push"],
     ),
     ("Tasks", &["lint", "prune", "stale", "sync", "note"]),
     ("Reading", &["status", "report", "tui"]),
@@ -174,7 +174,7 @@ enum Command {
     /// Tasks for agents, and what waits on you. The default.
     ///
     /// Agents' tasks are listed in the order `pma dispatch --auto` takes
-    /// them. Yours are runs to review, ship or merge, then critical or urgent
+    /// them. Yours are runs to review, publish or merge, then critical or urgent
     /// tasks no agent may take. `pma` alone runs this.
     Next {
         /// Limit to these projects.
@@ -258,7 +258,7 @@ enum Command {
     Review {
         /// Run ids; omit to list runs. Several are allowed with --approve.
         ids: Vec<i64>,
-        /// Mark ready runs for `pma ship`.
+        /// Mark ready runs for `pma pr` or `pma push`.
         #[arg(long, requires = "ids", conflicts_with_all = ["reject", "rework"])]
         approve: bool,
         /// Remove the run's worktree and branch.
@@ -332,13 +332,31 @@ enum Command {
         #[arg(long = "tag", value_name = "TAG")]
         tags: Vec<String>,
     },
-    /// Commit and publish approved runs.
-    Ship {
-        /// Limit to these projects.
-        projects: Vec<String>,
-        /// Also select every project carrying this tag; repeatable.
-        #[arg(long = "tag", value_name = "TAG")]
-        tags: Vec<String>,
+    /// Open a pull request for each approved run named.
+    ///
+    /// Commits the run, pushes its `pma/` branch and opens a pull request
+    /// against the default branch. The run stays `pr-open`, holding its task,
+    /// until the pull request is merged (`merged`) or closed without merging
+    /// (`closed`); `pma review` and `pma dispatch` read that from GitHub.
+    Pr {
+        /// Run ids, as `pma review` lists them.
+        #[arg(required_unless_present = "all_approved")]
+        ids: Vec<i64>,
+        /// Every approved run instead of named ones.
+        #[arg(long, conflicts_with = "ids")]
+        all_approved: bool,
+    },
+    /// Push each approved run named to the default branch.
+    ///
+    /// Commits the run, rebases it onto the remote default branch and pushes
+    /// it there, with no pull request. The run becomes `pushed`.
+    Push {
+        /// Run ids, as `pma review` lists them.
+        #[arg(required_unless_present = "all_approved")]
+        ids: Vec<i64>,
+        /// Every approved run instead of named ones.
+        #[arg(long, conflicts_with = "ids")]
+        all_approved: bool,
     },
     /// Portfolio notes, which belong to no one project.
     Note {
@@ -730,7 +748,10 @@ fn main() -> ExitCode {
         Command::Preset { action } => preset_command(action),
         Command::Agent { action } => agent_command(action),
         Command::Report { by } => run_report(by.as_deref()),
-        Command::Ship { projects, tags } => run_ship(&projects, &tags),
+        Command::Pr { ids, all_approved } => run_publish(&ids, all_approved, publish::Target::Pr),
+        Command::Push { ids, all_approved } => {
+            run_publish(&ids, all_approved, publish::Target::Push)
+        }
         Command::Verify { projects, tags } => run_verify(&projects, &tags),
         Command::Sync {
             projects,
@@ -1003,7 +1024,7 @@ fn forget(name: &str, apply: bool) -> Result<()> {
     if !f.open_runs.is_empty() {
         let ids: Vec<String> = f.open_runs.iter().map(|id| format!("#{id}")).collect();
         return Err(format!(
-            "{name} has runs that are not shipped or rejected: {}. Each may own a worktree; \
+            "{name} has runs still open: {}. Each may own a worktree; \
              settle them with `pma review` first",
             ids.join(" ")
         )
@@ -1592,7 +1613,7 @@ fn show_status(names: &[String], tags: &[String], explain: bool, all: bool) -> R
     Ok(())
 }
 
-/// Whether a task already has a run that is not shipped or rejected. Text is
+/// Whether a task already has a run that is not final. Text is
 /// compared too, since sync may have added `gh:N` after dispatch.
 fn has_run(runs: &[store::Run], project: &str, key: &str, text: &str) -> bool {
     runs.iter().any(|r| {
@@ -2018,7 +2039,7 @@ fn run_picks(
 
 /// Reports runs whose pull request was merged or closed since the last check.
 fn settle_prs(store: &Store) -> Result<()> {
-    ship::settle(store, |run, outcome| match outcome {
+    publish::settle(store, |run, outcome| match outcome {
         Ok(o) => println!("#{} {}: {o}", run.id, run.project),
         Err(e) => eprintln!(
             "warning: #{} {}: pull request state unknown: {e}",
@@ -3340,27 +3361,43 @@ fn run_verify(projects: &[String], tags: &[String]) -> Result<()> {
     }
 }
 
-fn run_ship(projects: &[String], tags: &[String]) -> Result<()> {
+/// Publishes the named runs one way: `pma pr` or `pma push`. Every run is
+/// checked before any is published, so a list with one run that is not
+/// approved changes nothing. `all` takes every approved run instead.
+fn run_publish(ids: &[i64], all: bool, target: publish::Target) -> Result<()> {
     let store = Store::open_default()?;
     let _session = Session::acquire(&store::home()?)?;
     let cfg = load_config(&store)?;
-    let projects = &select(&store, projects, tags)?;
-    let runs: Vec<_> = store
-        .runs()?
-        .into_iter()
-        .filter(|r| r.state == RunState::Approved)
-        .filter(|r| projects.is_empty() || projects.contains(&r.project))
-        .collect();
-    if runs.is_empty() {
-        println!("nothing approved");
-        return Ok(());
+    let mut runs = Vec::new();
+    if all {
+        runs = store.runs()?;
+        runs.retain(|r| r.state == RunState::Approved);
+        if runs.is_empty() {
+            println!("no approved runs");
+            return Ok(());
+        }
     }
+    for id in ids {
+        let run = store.run(*id)?;
+        if run.state != RunState::Approved {
+            return Err(format!(
+                "run #{id} is {}; only an approved run is published. `pma review {id}` shows it",
+                run.state.name()
+            )
+            .into());
+        }
+        if !runs.iter().any(|r: &store::Run| r.id == run.id) {
+            runs.push(run);
+        }
+    }
+    runs.sort_by_key(|r| r.id);
     let mut failed = 0;
-    ship::ship(
+    publish::publish(
         &store,
         &store::state_home()?,
         &cfg,
         runs,
+        target,
         |run, outcome| match outcome {
             Ok(o) => println!("#{} {}: {o}", run.id, run.project),
             Err(e) => {
@@ -3370,7 +3407,7 @@ fn run_ship(projects: &[String], tags: &[String]) -> Result<()> {
         },
     )?;
     if failed > 0 {
-        return Err(format!("{failed} runs not shipped; they stay approved").into());
+        return Err(format!("{failed} runs not published; they stay approved").into());
     }
     Ok(())
 }

@@ -38,14 +38,14 @@ Composition unions effects and multiplies bounds. `[Project] -> [Finding]` and `
 
 ## 2. The test for a primitive
 
-A verb earns a primitive when it changes what `pma` must check. Everything else is vocabulary: review, validate, triage, decompose, dedupe, fix and ship are the same five operations with different prompts.
+A verb earns a primitive when it changes what `pma` must check. Everything else is vocabulary: review, validate, triage, decompose, dedupe, fix and publish are the same five operations with different prompts.
 
 Three dimensions generate the set.
 
 | Dimension | Values | What it decides |
 |-|-|-|
 | cardinality | grows, preserved, shrinks, one per group | where parallel work is created and joined |
-| effect | data, repository, outside world | which gates apply. Only a repository writer needs a worktree, base and head verify, a scope check, approval and ship |
+| effect | data, repository, outside world | which gates apply. Only a repository writer needs a worktree, base and head verify, a scope check, approval and publishing |
 | decider | agent or rule | an agent costs money, is nondeterministic and untrusted; a rule is free, deterministic and replayable |
 
 ## 3. The five primitives
@@ -58,7 +58,7 @@ Each reads as a bag function, which is what makes composition check.
 | `map out: 1` | `[T] -> [T]` | agent or rule | the type, and that no field outside `writes` changed |
 | `map out: 0..1` | `[T] -> [T]` | agent or rule | the above, plus kept ids being a subset of the input and a reason on every drop |
 | `reduce` | `[T] -> [U]` | agent or rule | provenance: every output unit names the inputs it came from |
-| `edit` | `[T] -> [T]` `!repo` | agent | all of phase 1: base and head verify, scope, attempts, approval evidence, ship. The only primitive that changes a repository |
+| `edit` | `[T] -> [T]` `!repo` | agent | all of phase 1: base and head verify, scope, attempts, approval evidence, publishing. The only primitive that changes a repository |
 | `check` | `[T] -> [T]` | rule | nothing. It is the checker |
 | `emit` | `[T] -> [T]` `!writes` | rule | the sink's rules: `TODO.md` lint and item identity, the `pma sync` conflict |
 | `call` | the callee's signature | -- | type and parameter agreement; resolved by flattening at propose time |
@@ -193,7 +193,7 @@ Prefixing by call site rather than by callee is what lets one workflow be called
 
 **W14. A workflow is not an escape from the class rules.** Every `edit` run goes through `dispatch::prepare` and the phase 1 gates: class D is refused before a worktree exists, `TODO.md` and the privileged paths are refused to the classes that may not touch them, and `unattended` on A-, C or D is refused where a policy is read. A workflow chooses order, prompts and parameters, never authority.
 
-**W15. `pma-agent` may propose a revision and request a trigger; it may not activate one.** minos design section 2 puts "which workflow a situation gets" behind a submission to `pma`, and D2 keeps mint, ship and push out of a model's hands. `pma workflow activate` records who activated it.
+**W15. `pma-agent` may propose a revision and request a trigger; it may not activate one.** minos design section 2 puts "which workflow a situation gets" behind a submission to `pma`, and D2 keeps mint, publish and push out of a model's hands. `pma workflow activate` records who activated it.
 
 ### Data
 
@@ -203,9 +203,9 @@ Prefixing by call site rather than by callee is what lets one workflow be called
 
 **W18. Files are how an agent reads and writes units; the store is where they live.** `pma` writes `in.json` before a run and reads `out.json` after, under `<data>/artifacts/<instance>/<node>/<n>/`, numbered per run so nothing overwrites an earlier one. Prose documents sit beside them. Rejected: units as files only, which cannot record why a unit was dropped or which guard stopped it.
 
-**W19. Prose documents live outside the worktree.** An untracked file there enters `dispatch::changed_paths`, counts as a violation for any class whose scope is bounded ([class.rs:101](../../src/class.rs)), and `git add -A` at ship publishes it. A node that wants its prose committed says `"publish": true`.
+**W19. Prose documents live outside the worktree.** An untracked file there enters `dispatch::changed_paths`, counts as a violation for any class whose scope is bounded ([class.rs:101](../../src/class.rs)), and `git add -A` at publishing commits it. A node that wants its prose committed says `"publish": true`.
 
-**W20. No node writes `TODO.md`. A node emits units and `pma` writes the items.** `OWNED` puts `TODO.md` outside every class's scope ([class.rs:34](../../src/class.rs)), the dispatch prompt says so ([dispatch.rs:502](../../src/dispatch.rs)), and plan 4.7 depends on it: ship ticks the item after the rebase, which is admissible only because no agent may touch the file.
+**W20. No node writes `TODO.md`. A node emits units and `pma` writes the items.** `OWNED` puts `TODO.md` outside every class's scope ([class.rs:34](../../src/class.rs)), the dispatch prompt says so ([dispatch.rs:502](../../src/dispatch.rs)), and plan 4.7 depends on it: publishing ticks the item after the rebase, which is admissible only because no agent may touch the file.
 
 **W21. An `edit` node takes its unit from the graph, not from `TODO.md`.** Dispatch requires the item open in the remote default branch (`dispatch::on_origin`), so an item written by an earlier node cannot be dispatched until it is committed and pushed. A unit-keyed task takes the existing no-item path, with key `workflow:<instance>:<root>`. An `emit` is therefore independent of an `edit`: switching the record off changes nothing about what the fix runs.
 
@@ -329,7 +329,7 @@ A parameter is referenced as `{$name}`: in a prompt, a document name, a guard's 
 | `task` | agent nodes | required | The prompt. `{field}`, `{@field}`, `{$param}`, `{in}`, `{out}` and `{doc}` are replaced. |
 | `rule` | rule nodes | required | A named builtin. Section 8. |
 | `doc` | map, agent | absent | A prose document the node also writes. Usually `{$param}`. |
-| `publish` | map, agent | `false` | Copy `doc` into the worktree, so ship commits it. |
+| `publish` | map, agent | `false` | Copy `doc` into the worktree, so `pma pr` or `pma push` commits it. |
 | `check` | edit | absent | A check run after the node. `verify` is the usual one. |
 | `retry` | edit, map | absent | `{max, while, escalate}`. Section 7. |
 | `sink` | emit | required | `todo`, `note` or `doc`. Section 9. |
@@ -503,7 +503,7 @@ A unit that produced children is settled; its children re-enter `split`. A unit 
 {"name": "merged", "op": "check", "rule": "pr-merged", "in": "run"}
 ```
 
-The node is not runnable until the check passes. The pass ends, the next `pma workflow run` re-derives the frontier. This is what `ship.rs::settle` and the `pr-open` state already do (plan 4.8).
+The node is not runnable until the check passes. The pass ends, the next `pma workflow run` re-derives the frontier. This is what `publish.rs::settle` and the `pr-open` state already do (plan 4.8).
 
 ## 8. Rules
 
@@ -515,7 +515,7 @@ A rule node costs nothing, is deterministic and replays exactly.
 |-|-|
 | `todo-items` | the project's `TODO.md` items from the last scan, as `item` units |
 | `open-issues` | open issues through `gh issue list --json`, as units of the declared type |
-| `open-runs` | the project's runs that are not shipped or rejected, as `run` units |
+| `open-runs` | the project's runs that are not in a final state, as `run` units |
 | `outdated-deps` | the last `--deps` measurement, as `signal` units |
 | `as:<type>` | projects a unit onto another type by field name, dropping the rest. Refused when a required field of the target has no same-named source |
 | `where:<field>=<v>` | keeps a unit whose field matches. `out: 0..1`; the drop reason is the rule |
@@ -549,7 +549,7 @@ Each writes `passed`, `failed` or `unknown`.
 | `doc` | `add` | a rendered file under the instance's artifact directory |
 | `issue` | -- | refused. `pma sync` owns issue creation for `Critical` items (design.md, Sync); a second creator needs reconciling with it first |
 
-`todo` writes are the `pma sync` precedent, not a ship batch: the edit is uncommitted and `scripts/commit_todo.py` commits it.
+`todo` writes are the `pma sync` precedent, not a published batch: the edit is uncommitted and `scripts/commit_todo.py` commits it.
 
 A new `todo::insert(text, priority, item, description) -> Option<String>`:
 
@@ -601,7 +601,7 @@ Rule nodes cost nothing and are excluded from the sum. A document whose graph is
 
 One pass: collect every runnable node, run them, record, route the units, exit. Within a pass, runs are bounded by `max_parallel` and admitted by `batch_budget`, exactly as `pma dispatch` admits them today. `edit` runs get one worktree each, as they do now.
 
-Two `edit` nodes over the same project in one pass produce two worktrees and two branches. That is today's behaviour under `--auto`, and the conflict at ship is plan 5.3's barrier problem, which this design does not solve.
+Two `edit` nodes over the same project in one pass produce two worktrees and two branches. That is today's behaviour under `--auto`, and the conflict at publishing is plan 5.3's barrier problem, which this design does not solve.
 
 ## 13. Routing: `node` and `lap`
 
@@ -1096,7 +1096,7 @@ Waiting with no loop and no model. Every node is a rule or a check, so the worst
      "in": "project", "emits": "run", "max_units": 20},
     {"name": "merged", "op": "check", "rule": "pr-merged", "in": "run"},
     {"name": "close", "op": "emit", "in": "run", "sink": "note", "action": "add",
-     "map": {"text": "shipped: {task}"}}
+     "map": {"text": "merged: {task}"}}
   ],
   "edges": [
     {"from": "@input", "to": "open-runs"},
@@ -1213,7 +1213,7 @@ No `edit`, so `effects` is `writes` alone and this runs before phase 4b's gate. 
 |-|-|-|
 | 15.1, 15.2, 15.4, 15.5, 15.6 | reads the documents if they want | none. `!pure` |
 | 15.8, 15.9, 15.12 | reads uncommitted `TODO.md` edits and notes; commits them | none |
-| 15.3, 15.7, 15.10, 15.11 | `pma review`, then `pma review --approve <ids>`, then `pma ship` | phase 4b |
+| 15.3, 15.7, 15.10, 15.11 | `pma review`, then `pma review --approve <ids>`, then `pma pr` or `pma push` | phase 4b |
 
 ## 16. Acceptance
 
@@ -1297,7 +1297,7 @@ Sinks:
 
 - `note add` writes one note per unit
 
-End to end, on fixture repositories: 15.10 with two findings, one fixed and shipped; 15.12 over three projects with no `edit` at all; 15.9 with one merged and one open pull request.
+End to end, on fixture repositories: 15.10 with two findings, one fixed and pushed; 15.12 over three projects with no `edit` at all; 15.9 with one merged and one open pull request.
 
 ## 17. Commands
 
@@ -1319,7 +1319,7 @@ pma workflow stop <instance>          # no further node; runs already open stand
 
 **A script cannot reach into a pass.** It builds a document and stops. A custom deterministic rule for `map` or `reduce` -- a projection or a ranking the closed rule list cannot express -- is the one seam where running a script later would add something, and it would have to stay pure, effect-free and unable to influence the graph's shape. The trigger is a third library wanting the same projection; until then `as:`, `where:`, `dedupe`, `rank` and `limit:` are the list.
 
-**Two `edit` nodes can conflict at ship.** Separate worktrees make them safe to run; merging them is plan 5.3's barrier problem, and nothing here solves it. `caps.max_edits` bounds how bad it gets.
+**Two `edit` nodes can conflict at publishing.** Separate worktrees make them safe to run; merging them is plan 5.3's barrier problem, and nothing here solves it. `caps.max_edits` bounds how bad it gets.
 
 **A node's input is unbounded in size.** A 200-file repository does not fit a prompt, and no node declares which files it reads. The agent walks the worktree within its timeout.
 
@@ -1337,7 +1337,7 @@ pma workflow stop <instance>          # no further node; runs already open stand
 |-|-|-|
 | 6a | types, parameters, units, `map` at three bounds, `check`, `emit`, guards, default edges, `@input` and `@output`, the pass, caps and the cost bound, migration 20, `node` and `lap` on a route, the commands | none. No `edit`, so nothing changes a repository: 15.1, 15.4, 15.5, 15.8, 15.9 run under it |
 | 6b | `call` and propose-time flattening | 6a in use. 15.12 runs here |
-| 6c | `edit` with `retry` | phase 0 measured and phase 4b's gate met: 10 runs shipped through batch approval. 15.7, 15.10, 15.11 run here |
+| 6c | `edit` with `retry` | phase 0 measured and phase 4b's gate met: 10 runs published through batch approval. 15.7, 15.10, 15.11 run here |
 | 6d | `reduce` and lap edges | 6a in use. 15.2 and 15.3 run here |
 | 6e | recursion | evidence that one level of decomposition helps. 15.6 runs here |
 

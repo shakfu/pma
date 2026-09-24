@@ -85,7 +85,7 @@ fn warnings_alone_exit_zero() {
 #[test]
 fn prune_lists_then_removes_finished_items() {
     let s = Scratch::new("prune");
-    let text = "# TODO\n\n## High\n\n- [x] shipped\n  notes\n- [ ] open\n\n## Done\n\n- [x] old\n- [ ] stray\n";
+    let text = "# TODO\n\n## High\n\n- [x] finished\n  notes\n- [ ] open\n\n## Done\n\n- [x] old\n- [ ] stray\n";
     let a = s.project("a", text);
     let bad = s.project("bad", "## High\n\n- [x] kept\n");
     let todo = a.join("TODO.md");
@@ -97,7 +97,7 @@ fn prune_lists_then_removes_finished_items() {
         format!(
             "{0}:9: remove `## Done`, lines 9-12\n\
              {0}:12: remove open item with `## Done`: `- [ ] stray`\n\
-             {0}:5: remove `shipped`\n\
+             {0}:5: remove `finished`\n\
              {1}: skipped: lint errors; see `pma lint`\n\
              2 removals; run `pma prune --apply` to make them\n",
             todo.display(),
@@ -525,10 +525,9 @@ fn dispatch_env(s: &Scratch, scripts: &[(&str, &str)]) -> (Env, PathBuf, PathBuf
 }
 
 #[test]
-fn dispatch_review_rework_and_ship() {
+fn dispatch_review_rework_and_push() {
     let s = Scratch::new("stage3");
     let (env, origin, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
-    env.ok(&["config", "publish", "push"]);
 
     // Both runs start from origin; the second fails its verify.
     let out = env.ok(&["dispatch", "--auto", "-n", "2"]);
@@ -637,7 +636,7 @@ fn dispatch_review_rework_and_ship() {
     assert!(!env.home.join("state/worktrees/alpha/third-task").exists());
     assert_eq!(git_out(&alpha, &["branch", "--list", "pma/third-task"]), "");
 
-    let out = env.ok(&["ship"]);
+    let out = env.ok(&["push", "1", "2"]);
     assert!(out.contains("#1 alpha: pushed "), "{out}");
     assert!(out.contains("#2 alpha: pushed "), "{out}");
     let log = git_out(&origin, &["log", "--format=%B|", "main"]);
@@ -654,7 +653,11 @@ fn dispatch_review_rework_and_ship() {
     assert!(!env.home.join("state/worktrees/alpha/add-greeting").exists());
     assert_eq!(git_out(&alpha, &["branch", "--list", "pma/*"]), "");
     assert_eq!(env.ok(&["review"]), "no runs to review\n");
-    assert_eq!(env.ok(&["ship"]), "nothing approved\n");
+    let (_, err, success) = env.run(&["push", "1"]);
+    assert!(
+        !success && err.contains("run #1 is pushed; only an approved run is published"),
+        "{err}"
+    );
 
     // `third task` failed its verify and was then rejected, so it is not
     // dispatched again without an explicit reset.
@@ -676,7 +679,7 @@ fn dispatch_review_rework_and_ship() {
         out.ends_with("0 ready, 1 failed, $0.00 spent; see `pma review`\n"),
         "{out}"
     );
-    // Four runs: two shipped, `third task` rejected, and one refused at the
+    // Four runs: two pushed, `third task` rejected, and one refused at the
     // batch budget, which is not decided because no one judged it. One passed
     // on its first attempt and one after a rework, so four attempts in all,
     // and the refused run reported no cost.
@@ -735,7 +738,7 @@ fn a_pull_request_holds_its_task_until_merged_or_closed() {
 
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
-    let out = env.ok(&["ship"]);
+    let out = env.ok(&["pr", "1"]);
     assert_eq!(out, "#1 alpha: https://github.com/me/alpha/pull/1\n");
     assert_eq!(
         git_out(&origin, &["branch", "--list", "pma/*"]),
@@ -763,12 +766,26 @@ fn a_pull_request_holds_its_task_until_merged_or_closed() {
         out.starts_with("#1 alpha: pull request closed without merging: https://"),
         "{out}"
     );
+    assert!(
+        env.ok(&["review", "1"]).starts_with("#1 closed  alpha"),
+        "a closed pull request is `closed`, not rejected"
+    );
     let out = env.ok(&["dispatch", "alpha:5"]);
     assert!(out.contains("#3 alpha: add greeting"), "{out}");
     assert!(env.ok(&["review", "3"]).contains("pma/add-greeting-2 in"));
 
     env.ok(&["review", "3", "--approve"]);
-    env.ok(&["ship"]);
+    env.ok(&["pr", "3"]);
+    // An open pull request someone has reviewed says so, as GitHub does.
+    fs::write(&pr_state, "OPEN\tCHANGES_REQUESTED\t2\t1\n").unwrap();
+    let out = env.ok(&["review"]);
+    assert!(
+        out.starts_with(
+            "#3 alpha: pull request open: changes requested, 2 comments, 1 review: https://"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("#3  pr-open"), "{out}");
     fs::write(&pr_state, "MERGED\n").unwrap();
     let out = env.ok(&["review"]);
     assert_eq!(
@@ -776,13 +793,13 @@ fn a_pull_request_holds_its_task_until_merged_or_closed() {
         "#3 alpha: pull request merged: https://github.com/me/alpha/pull/1\nno runs to review\n"
     );
     assert!(!alpha.join("hello.txt").exists(), "the clone is untouched");
+    assert!(env.ok(&["review", "3"]).starts_with("#3 merged  alpha"));
 }
 
 #[test]
-fn ship_resumes_after_a_partial_failure() {
+fn publishing_resumes_after_a_partial_failure() {
     let s = Scratch::new("resume");
     let (env, origin, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE), ("gh", FAKE_GH_PR)]);
-    env.ok(&["config", "publish", "push"]);
 
     // The push succeeds and removing the worktree fails.
     env.ok(&["dispatch", "alpha:5"]);
@@ -793,7 +810,7 @@ fn ship_resumes_after_a_partial_failure() {
         &["worktree", "lock", worktree.to_str().unwrap()],
         None,
     );
-    let out = env.ok(&["ship"]);
+    let out = env.ok(&["push", "1"]);
     assert!(
         out.starts_with("#1 alpha: pushed ") && out.contains("; warning: worktree not removed: "),
         "{out}"
@@ -801,7 +818,7 @@ fn ship_resumes_after_a_partial_failure() {
     assert_eq!(
         env.ok(&["review"]),
         "no runs to review\n",
-        "shipped all the same"
+        "published all the same"
     );
 
     // As if pma had stopped between the push and recording it.
@@ -814,7 +831,7 @@ fn ship_resumes_after_a_partial_failure() {
         &["worktree", "unlock", worktree.to_str().unwrap()],
         None,
     );
-    let out = env.ok(&["ship"]);
+    let out = env.ok(&["push", "1"]);
     assert!(out.starts_with("#1 alpha: already pushed "), "{out}");
     assert!(!worktree.exists());
     assert_eq!(
@@ -824,11 +841,10 @@ fn ship_resumes_after_a_partial_failure() {
     );
 
     // `gh pr create` fails after the push; the retry finds the pull request.
-    env.ok(&["config", "publish", "pr"]);
     env.ok(&["dispatch", "alpha:7"]);
     env.ok(&["review", "2", "--approve"]);
     fs::write(env.home.join("pr-create-fails"), "").unwrap();
-    let (out, _, success) = env.run(&["ship"]);
+    let (out, _, success) = env.run(&["pr", "2"]);
     assert!(!success && out.contains("gh pr create: HTTP 502"), "{out}");
     assert!(env.ok(&["review"]).contains("#2  approved"));
     fs::remove_file(env.home.join("pr-create-fails")).unwrap();
@@ -837,10 +853,14 @@ fn ship_resumes_after_a_partial_failure() {
         "https://github.com/me/alpha/pull/9\n",
     )
     .unwrap();
+    // Run 1 is pushed, so only run 2 is approved.
+    let (_, err, success) = env.run(&["pr", "2", "--all-approved"]);
+    assert!(!success && err.contains("cannot be used with"), "{err}");
     assert_eq!(
-        env.ok(&["ship"]),
+        env.ok(&["pr", "--all-approved"]),
         "#2 alpha: https://github.com/me/alpha/pull/9\n"
     );
+    assert_eq!(env.ok(&["push", "--all-approved"]), "no approved runs\n");
 }
 
 #[test]
@@ -936,13 +956,12 @@ fn the_scope_check_reads_the_whole_change_not_the_agents_report() {
     assert!(env.ok(&["review"]).contains("2 to read"), "{detail}");
 }
 
-/// A second worker runs through the same dispatch, review and ship path as
+/// A second worker runs through the same dispatch, review and push path as
 /// `claude`, with no code that knows its name.
 #[test]
 fn a_worker_without_json_output_or_an_allowlist_runs_the_same_path() {
     let s = Scratch::new("adapter");
     let (env, origin, _) = dispatch_env(&s, &[("plain", PLAIN_WORKER)]);
-    env.ok(&["config", "publish", "push"]);
 
     let listed = env.ok(&["agent"]);
     assert!(listed.contains("* claude"), "{listed}");
@@ -977,7 +996,10 @@ fn a_worker_without_json_output_or_an_allowlist_runs_the_same_path() {
     );
 
     env.ok(&["review", "1", "--approve"]);
-    assert!(env.ok(&["ship"]).contains("#1 alpha: pushed "), "shipped");
+    assert!(
+        env.ok(&["push", "1"]).contains("#1 alpha: pushed "),
+        "pushed"
+    );
     assert_eq!(git_out(&origin, &["show", "main:hello.txt"]), "hi\n");
     // No cost to sum, and `--by agent` names the worker that did the work.
     let report = env.ok(&["report", "--by", "agent"]);
@@ -1127,20 +1149,19 @@ fn a_campaign_applies_one_definition_across_repositories() {
     );
 }
 
-/// Approval names a tree. Ship publishes that tree or nothing, and rechecks
+/// Approval names a tree. A publish sends that tree or nothing, and rechecks
 /// what the rebase produced rather than what was approved in isolation.
 #[test]
 fn an_approval_is_evidence_about_a_tree_not_a_state() {
     let s = Scratch::new("evidence");
     let (env, origin, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
-    env.ok(&["config", "publish", "push"]);
 
     // A worktree edited after approval is not published.
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
     let worktree = env.home.join("state/worktrees/alpha/add-greeting");
     fs::write(worktree.join("sneaked.txt"), "later\n").unwrap();
-    let (out, err, success) = env.run(&["ship"]);
+    let (out, err, success) = env.run(&["push", "1"]);
     assert!(!success, "{out}{err}");
     assert!(
         out.contains("the worktree changed after it was approved"),
@@ -1151,7 +1172,10 @@ fn an_approval_is_evidence_about_a_tree_not_a_state() {
     // Reviewing it again approves the tree that is actually there.
     fs::remove_file(worktree.join("sneaked.txt")).unwrap();
     env.ok(&["review", "1", "--approve"]);
-    assert!(env.ok(&["ship"]).contains("#1 alpha: pushed "), "shipped");
+    assert!(
+        env.ok(&["push", "1"]).contains("#1 alpha: pushed "),
+        "pushed"
+    );
 
     // A rework withdraws an approval: the approver read another tree.
     env.ok(&["dispatch", "alpha:7"]);
@@ -1172,7 +1196,7 @@ fn an_approval_is_evidence_about_a_tree_not_a_state() {
     fs::write(other.join("Makefile"), "test:\n\ttest -f never.txt\n").unwrap();
     git(&other, &["commit", "-qam", "stricter test"], None);
     git(&other, &["push", "-q"], None);
-    let (out, err, success) = env.run(&["ship"]);
+    let (out, err, success) = env.run(&["push", "2"]);
     assert!(!success, "{out}{err}");
     assert!(
         out.contains("`make test` failed on the integrated tree"),
@@ -1430,7 +1454,7 @@ fn a_second_session_leaves_running_runs_alone() {
     );
     for args in [
         &["dispatch", "alpha:6"][..],
-        &["ship"],
+        &["push", "1"],
         &["review", "1", "--reject"],
     ] {
         let (_, err, success) = env.run(args);
@@ -2837,7 +2861,7 @@ fn a_check_that_cannot_run_is_unknown_and_takes_the_default_edge() {
             .check("merged", "pr-merged")
             .otherwise(|g| g.emit_note("waiting", #{ text: "waiting: {name}" }))
             .when(#{ "@pr-merged": ["passed"] })
-            .emit_note("shipped", #{ text: "merged: {name}" })
+            .emit_note("record", #{ text: "merged: {name}" })
             .output();
         document(#{}, [
             workflow("gate", graph, #{ caps: #{ max_units: 10, max_edits: 0 }}),
@@ -3132,16 +3156,15 @@ esac
 echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","total_cost_usd":0.1}'
 "#;
 
-/// The user's own hooks run at ship. One a run added does not: nothing in
-/// the diff shows it, and ship commits and pushes with the user's
+/// The user's own hooks run at publishing. One a run added does not: nothing
+/// in the diff shows it, and `pma push` commits and pushes with the user's
 /// credentials.
 #[test]
-fn a_hook_added_during_a_run_stops_its_ship() {
+fn a_hook_added_during_a_run_stops_its_push() {
     use std::os::unix::fs::PermissionsExt;
 
     let s = Scratch::new("hooks");
     let (env, origin, alpha) = dispatch_env(&s, &[("claude", HOOKING_CLAUDE)]);
-    env.ok(&["config", "publish", "push"]);
     let own = alpha.join(".git/hooks/post-commit");
     fs::write(
         &own,
@@ -3152,12 +3175,12 @@ fn a_hook_added_during_a_run_stops_its_ship() {
 
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
-    assert!(env.ok(&["ship"]).contains("#1 alpha: pushed "));
+    assert!(env.ok(&["push", "1"]).contains("#1 alpha: pushed "));
     assert!(s.0.join("own.log").exists(), "the user's hook did not run");
 
     env.ok(&["dispatch", "alpha:7"]);
     env.ok(&["review", "2", "--approve"]);
-    let (out, _, success) = env.run(&["ship"]);
+    let (out, _, success) = env.run(&["push", "2"]);
     assert!(!success, "{out}");
     assert!(
         out.contains("hooks or git settings changed since run #2 was dispatched")
@@ -3172,7 +3195,7 @@ fn a_hook_added_during_a_run_stops_its_ship() {
 
     // Restoring the hooks is enough.
     fs::remove_file(alpha.join(".git/hooks/pre-commit")).unwrap();
-    assert!(env.ok(&["ship"]).contains("#2 alpha: pushed "));
+    assert!(env.ok(&["push", "2"]).contains("#2 alpha: pushed "));
 }
 
 /// A refusal that comes after the worktree exists, here a policy with no

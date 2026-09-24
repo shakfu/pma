@@ -61,7 +61,7 @@ In `argdec`, 11, each reproduced by hand and filed in its `TODO.md`: reversed po
 In `pma` at `647c850`, 8 true claims across instances 3 and 4:
 
 - Already fixed in the working tree that day: the `todo` sink's `remove` pruning every finished item, multi-line text written into `TODO.md`, a missing `out.json` read as empty, a scan deleting tasks on a read error, and `sync` linking by a stale line number.
-- New, filed in `TODO.md`: ship skips the approved-tree check once `HEAD` has moved, and ship commits the `TODO.md` tick for a run with no changes.
+- New, filed in `TODO.md`: publishing (then `pma ship`) skips the approved-tree check once `HEAD` has moved, and commits the `TODO.md` tick for a run with no changes.
 - Arguable: class A- may edit `LICENSE`, `COPYING` and `.netrc`. The code and the comment on `PRIVILEGED` allow it; A-'s scope is `.github/**`.
 
 ## Conclusions

@@ -45,7 +45,7 @@ Goal 5 is not built. The manager is deterministic today, in scoring formulas and
 | Portfolio store | SQLite at `~/.config/pma/projects.db`; one user, one machine, one session |
 | Agents | `claude`, `codex`, `cursor-agent`, `opencode` |
 | Agent output | Uncommitted changes, reviewed, then committed and pushed by `pma` |
-| Publish | Configurable: push to the default branch, or push a branch and open a PR |
+| Publish | Per run, by command: `pma push` to the default branch, or `pma pr` for a branch and a PR |
 | Attribution | Configurable, default the user only |
 | Issues sync | Hybrid, `Critical` items only |
 | Language | Rust |
@@ -113,7 +113,7 @@ Within a quadrant: importance, then days to due (dated tasks first), then age. T
 | Q1 | Dispatched first. |
 | Q2 | Dispatched after Q1. |
 | Q3 | Dispatched only when `overflow_quadrants` includes it and Q1 and Q2 are exhausted. |
-| Q4 | Never dispatched. Offered for removal from `TODO.md`, shipped as a batch. |
+| Q4 | Never dispatched. Offered for removal from `TODO.md`, committed as a batch. |
 
 `dispatch_quadrants` (default `["Q1", "Q2"]`) sets what `pma dispatch --auto` draws from. `overflow_quadrants` (default `[]`) is drawn from only when every task in `dispatch_quadrants` is dispatched, in review, or not dispatchable.
 
@@ -169,7 +169,7 @@ Rules. `pma lint` reports errors (E), which exit 1, and warnings (W), which do n
 
   - `gh:N`: a positive issue number (E), at most one (E).
 
-  - `^k3f9q`: an optional id, five characters of lowercase Crockford base32 without `i`, `l`, `o` or `u`, unique in the file (E), at most one (E). The caret is Obsidian's mark for a block id, and GitHub renders it as text. A caret word that is not an id, such as `^1.2`, is text. `pma` writes ids, at random so two branches do not mint the same one: `pma lint --ids --apply` for every open item, and the workflow `todo` sink for an item it adds. Not at dispatch: ship ticks the same line on origin, so an uncommitted id in the clone would conflict on every pull.
+  - `^k3f9q`: an optional id, five characters of lowercase Crockford base32 without `i`, `l`, `o` or `u`, unique in the file (E), at most one (E). The caret is Obsidian's mark for a block id, and GitHub renders it as text. A caret word that is not an id, such as `^1.2`, is text. `pma` writes ids, at random so two branches do not mint the same one: `pma lint --ids --apply` for every open item, and the workflow `todo` sink for an item it adds. Not at dispatch: publishing ticks the same line on origin, so an uncommitted id in the clone would conflict on every pull.
 
   - A token-shaped word earlier in the line is text. A trailing `#42` is text, with a hint to write `gh:42` (W).
 
@@ -204,9 +204,9 @@ Priorities are configurable per signal. With `High`, failing CI is important in 
 
 Hygiene and activity tasks concern the user's working tree or judgement, which agents never touch, so they are not dispatchable.
 
-Every `pma` worktree is made with a `pma/` branch, so counting branches finds worktrees too, and branches whose worktree is gone. A branch is leftover when no open run of that project owns it at scan time. Ship and reject remove the branch before a run becomes final, so leftovers come from interrupted dispatches or a lost database.
+Every `pma` worktree is made with a `pma/` branch, so counting branches finds worktrees too, and branches whose worktree is gone. A branch is leftover when no open run of that project owns it at scan time. Publishing and reject remove the branch before a run becomes final, so leftovers come from interrupted dispatches or a lost database.
 
-A fix-CI dispatch includes, for each workflow failing at the last scan, the `gh run view --log-failed` output of that workflow's latest decisive run, the run scan judged. A workflow that passes by dispatch time refuses the task until the next scan. A startup failure has no job log; the prompt says so. `pma` fetches it, because the agent environment has no GitHub credentials. The local `verify` passing does not prove CI passes on other platforms. With `publish = "pr"`, CI runs before merge.
+A fix-CI dispatch includes, for each workflow failing at the last scan, the `gh run view --log-failed` output of that workflow's latest decisive run, the run scan judged. A workflow that passes by dispatch time refuses the task until the next scan. A startup failure has no job log; the prompt says so. `pma` fetches it, because the agent environment has no GitHub credentials. The local `verify` passing does not prove CI passes on other platforms. With `pma pr`, CI runs before merge.
 
 The deps signal counts outdated dependencies as each tool reports them. The tools write nothing to the project:
 
@@ -242,7 +242,7 @@ It replaces a health score, `tier * sum(w_i * s_i) / sum(w_i)` over five signals
 
 SQLite at `~/.config/pma/projects.db`, via `rusqlite`. It holds projects, tiers, settings, notes, the scanned task index, the dispatch queue, and agent run history. Worktrees, logs and artifacts live apart from it, under `~/.local/state/pma`, so the database directory holds only the database and the session lock.
 
-This assumes one user. Commands that run agents or change worktrees (`dispatch`, `ship`, `review --reject`, `review --rework`) hold an exclusive `flock` on `session.lock` for their whole run. A second one refuses to start and names the holder's pid. The kernel releases the lock when the process exits, so a crash leaves no stale lock, unlike a pid file. Other commands run alongside, and SQLite waits up to 5s for a write lock. `pma review` holds the lock for milliseconds to fail runs of an ended session, so a command that needs the lock waits up to 2s before refusing.
+This assumes one user. Commands that run agents or change worktrees (`dispatch`, `pr`, `push`, `review --reject`, `review --rework`) hold an exclusive `flock` on `session.lock` for their whole run. A second one refuses to start and names the holder's pid. The kernel releases the lock when the process exits, so a crash leaves no stale lock, unlike a pid file. Other commands run alongside, and SQLite waits up to 5s for a write lock. `pma review` holds the lock for milliseconds to fail runs of an ended session, so a command that needs the lock waits up to 2s before refusing.
 
 - `journal_mode=DELETE`, not WAL. The file on disk is complete whenever no transaction is open, so it can be copied as a backup. WAL lets readers run during a write; here writes are single rows, and the busy timeout covers them.
 
@@ -262,7 +262,6 @@ urgent_within       = 7                  # days
 quadrant_limit      = 10
 dispatch_quadrants  = ["Q1", "Q2"]
 overflow_quadrants  = []                 # ["Q3"] to continue past Q1 and Q2
-publish             = "pr"               # or "push"
 attribution         = "user"             # or "co-author"
 max_parallel        = 2                  # agents at once
 batch_budget        = 5.0                # USD per dispatch batch
@@ -300,7 +299,6 @@ horizon = { 1 = 30, 2 = 60, 3 = 120, 4 = 240, 5 = 365 }   # days
 [projects.cyllama]
 tier    = 1
 verify  = "make test"                     # default: detected; "none" disables
-publish = "push"                          # overrides the global value
 ```
 
 Shown as TOML for readability. The values are stored in `projects.db` and set with `pma config <key> <value>`, using dotted keys such as `tiers.2` or `activity.horizon.1`. `activity.ignore` takes a comma-separated list.
@@ -374,15 +372,15 @@ Only `codex` has a sandbox. `cursor-agent --force` and `opencode --auto` auto-ap
 
 Because `pma` owns commits and pushes, the agent environment drops push credentials: `GH_TOKEN` and `GITHUB_TOKEN` unset, `GH_CONFIG_DIR` pointed at an empty directory, `SSH_AUTH_SOCK` unset, and `GIT_TERMINAL_PROMPT=0`. Through `GIT_CONFIG_*`, appended after any the user set, credential helpers are cleared, an empty-prefix `pushInsteadOf` rewrites every push URL to an unusable one, and `core.hooksPath` names a `pre-push` hook that refuses, for a remote with an explicit `pushurl`, which git exempts from `pushInsteadOf`. This makes an accidental push fail. `git push --no-verify` to such a remote, or a credential read from disk, still gets through. The verify command runs in the same environment.
 
-`pma`'s own git calls in a worktree do carry credentials. Each first checks that the worktree's `.git` is still the file `git worktree add` wrote, and runs with `core.fsmonitor=false`. Ship refuses a run whose repository gained or changed a hook, or a setting that runs a program or redirects a push, since dispatch, because neither is in the diff the reviewer read. The user's own hooks still run.
+`pma`'s own git calls in a worktree do carry credentials. Each first checks that the worktree's `.git` is still the file `git worktree add` wrote, and runs with `core.fsmonitor=false`. Publishing refuses a run whose repository gained or changed a hook, or a setting that runs a program or redirects a push, since dispatch, because neither is in the diff the reviewer read. The user's own hooks still run.
 
 An agent and its verify run under a `sh` watchdog holding a pipe from `pma`. When `pma` exits for any reason, the pipe closes and the watchdog kills the process group, so no agent outlives the session lock it ran under. The group is also killed after a normal exit.
 
 ## Dispatch
 
-`pma dispatch cynn:31` names a TODO.md line from the last scan, and `pma dispatch cynn:ci` names failing CI. `pma dispatch --auto -n N` takes the top N dispatchable tasks of tiered projects, as ordered in the matrix. A task with a run that is not shipped or rejected is skipped.
+`pma dispatch cynn:31` names a TODO.md line from the last scan, and `pma dispatch cynn:ci` names failing CI. `pma dispatch --auto -n N` takes the top N dispatchable tasks of tiered projects, as ordered in the matrix. A task with a run that is not final is skipped.
 
-1. `git fetch`, then `git worktree add` from the remote default branch into `<state>/worktrees/<project>/<slug>`, on branch `pma/<slug>`. The user's working tree is never touched, so a dirty tree does not block dispatch. The slug is the task text's first words, up to 40 bytes, with `-2`, `-3` on collision with a worktree, a local branch, or a remote `pma/` branch left by a pull request. The item must be open in the remote `TODO.md`, checked before the worktree exists; otherwise ship could not mark it done. A refusal names the cause: not in the remote file (commit and push it), or already done there (pull the clone). With `--auto`, a refused task gives its place to the next one in matrix order. A project-level failure, such as a failed fetch, skips that project's other tasks.
+1. `git fetch`, then `git worktree add` from the remote default branch into `<state>/worktrees/<project>/<slug>`, on branch `pma/<slug>`. The user's working tree is never touched, so a dirty tree does not block dispatch. The slug is the task text's first words, up to 40 bytes, with `-2`, `-3` on collision with a worktree, a local branch, or a remote `pma/` branch left by a pull request. The item must be open in the remote `TODO.md`, checked before the worktree exists; otherwise publishing could not mark it done. A refusal names the cause: not in the remote file (commit and push it), or already done there (pull the clone). With `--auto`, a refused task gives its place to the next one in matrix order. A project-level failure, such as a failed fetch, skips that project's other tasks.
 
 2. Run the agent template with a timeout and, where supported, a budget, allowed to run the verify command (see Agents).
 
@@ -400,11 +398,11 @@ Limits: `max_parallel` agents, and `batch_budget`. A run starts only while the b
 
 ## Review
 
-States: `queued -> running -> ready | failed`, then `approved -> shipped`, or `rejected`. With `publish = "pr"`, `approved -> pr-open`, then `shipped` when the pull request is merged, or `rejected` when it is closed unmerged. Rework returns a ready, failed or approved run to `running`.
+States: `queued -> running -> ready | failed`, then `approved`, or `rejected`. `pma push` takes `approved -> pushed`. `pma pr` takes `approved -> pr-open`, then `merged` when the pull request is merged, or `closed` when it is closed unmerged. Final states: `rejected`, `pushed`, `merged`, `closed`. Rework returns a ready, failed or approved run to `running`.
 
-`pr-open` is not final, so the task is not dispatched again while its pull request is open. The item is still open on the default branch until the merge, which alone would admit it. `pma review` and `pma dispatch` read each open pull request's state with `gh pr view`. A run whose state cannot be read stays `pr-open`.
+`pr-open` is not final, so the task is not dispatched again while its pull request is open. The item is still open on the default branch until the merge, which alone would admit it. `pma review` and `pma dispatch` read each open pull request's state with `gh pr view`. A run whose state cannot be read stays `pr-open`. An open pull request with a review decision, comments or reviews shows them in `pma review`.
 
-`pma review` lists runs not shipped or rejected. `pma review <id>` shows task text, quadrant, verify result, cost, agent summary, and `git diff` against the base, untracked files included. Actions:
+`pma review` lists runs not in a final state. `pma review <id>` shows task text, quadrant, verify result, cost, agent summary, and `git diff` against the base, untracked files included. Actions:
 
 - `--approve`, from ready
 
@@ -412,29 +410,29 @@ States: `queued -> running -> ready | failed`, then `approved -> shipped`, or `r
 
 - `--rework <feedback>`, running the agent again in the same worktree, with the feedback after the original prompt
 
-## Ship
+## Publish
 
-**Superseded by implementation plan 4.7 and 4.8.** Ship publishes without rerunning verification after approval, so an edited worktree, or a clean but semantically incompatible rebase, can publish content no verify run ever saw. Approval will carry evidence (verified tree, base SHA, verify command, scope revision, approver) that the integrated tree is rechecked against after the rebase. With `publish = "pr"`, the run will also gain a merge lifecycle gated on positive green CI for the current head, rather than only observing whether a person merged it.
+**Superseded by implementation plan 4.7 and 4.8.** Publishing runs no verification after approval, so an edited worktree, or a clean but semantically incompatible rebase, can publish content no verify run ever saw. Approval will carry evidence (verified tree, base SHA, verify command, scope revision, approver) that the integrated tree is rechecked against after the rebase. A `pma pr` run will also gain a merge lifecycle gated on positive green CI for the current head, rather than only observing whether a person merged it.
 
-`pma ship` processes approved tasks, per project:
+`pma pr <id>...` and `pma push <id>...` publish the named runs, each of which must be approved; `--all-approved` names every approved run. Per project:
 
 1. `git add -A`, then commit with the task text as the subject. Add `Closes #N` when `gh:N` is set. Author is the user. With `attribution = "co-author"`, a trailer names the agent.
 
-2. With `publish = "push"`, rebase onto the remote default branch.
+2. With `push`, rebase onto the remote default branch.
 
 3. Mark the item `[x]` in place and amend the commit. This follows the rebase. Git treats changes to adjacent lines as a conflict, so two tasks ticked before the rebase could conflict. A fix-CI run has no item and skips this step.
 
-4. Publish per `publish`:
+4. Publish:
 
-   - `push`: push to the default branch.
+   - `push`: push to the default branch. The run becomes `pushed`.
 
    - `pr`: push `pma/<slug>` and `gh pr create`. `gh` is required up front. The run becomes `pr-open`.
 
 5. Remove the worktree and branch.
 
-A failure in one project, such as a rebase conflict, stops that project and does not stop the batch. Its runs stay approved, so `pma ship` can be run again. The report lists each outcome.
+A failure in one project, such as a rebase conflict, stops that project and does not stop the batch. Its runs stay approved, so the command can be run again. The report lists each outcome.
 
-Ship resumes where it stopped. The outcome is saved as soon as the publish step succeeds, and a failure to remove the worktree afterwards is a warning; the leftover branch then shows in the hygiene signal. With `push`, a worktree whose commits are already in the fetched default branch was pushed by an earlier, interrupted ship, and is recorded as shipped. With `pr`, an open pull request for the branch is reused instead of creating another.
+Publishing resumes where it stopped. The outcome is saved as soon as the publish step succeeds, and a failure to remove the worktree afterwards is a warning; the leftover branch then shows in the hygiene signal. With `push`, a worktree whose commits are already in the fetched default branch was pushed by an earlier, interrupted push, and is recorded as pushed. With `pr`, an open pull request for the branch is reused instead of creating another.
 
 The user's clone is not updated. After a push it is behind its remote, and an uncommitted `TODO.md` edit there can conflict on pull.
 
@@ -448,7 +446,7 @@ The user's clone is not updated. After a push it is behind its remote, and an un
 
 - Issues opened by other people are listed as untriaged, not imported.
 
-- A `gh:N` that names no issue is a warning. A finished item whose issue is still open is left alone; `Closes #N` from ship closes it.
+- A `gh:N` that names no issue is a warning. A finished item whose issue is still open is left alone; `Closes #N` in the published commit closes it.
 
 Sync keys on the `Critical` heading, not on Q1. A quadrant shifts as due dates approach, which would open and close issues without any edit.
 
@@ -456,9 +454,9 @@ Sync keys on the `Critical` heading, not on Q1. A quadrant shifts as due dates a
 
 Each `gh:N` is written to the file right after its issue is created. A sync that stops between the two leaves an open, labelled issue with the item's title and no link. The next sync links that issue instead of opening another.
 
-Write-backs are uncommitted edits to `TODO.md` in the user's clone, not a `pma ship` batch: ship commits worktrees, and the clone is the file the matrix reads. `scripts/commit_todo.py` commits them.
+Write-backs are uncommitted edits to `TODO.md` in the user's clone, not a published batch: `pma pr` and `pma push` commit worktrees, and the clone is the file the matrix reads. `scripts/commit_todo.py` commits them.
 
-Adding `gh:N` changes an item's key from its text to the issue number. Dispatch, ship, and the one-run-per-task check therefore match a task by key or by text.
+Adding `gh:N` changes an item's key from its text to the issue number. Dispatch, publishing, and the one-run-per-task check therefore match a task by key or by text.
 
 ## Implementation
 
@@ -480,7 +478,7 @@ Each stage is used before the next one is built.
 
 2. `pma scan`, `pma matrix`, `pma status --explain`, with tiers and weights.
 
-3. `pma dispatch`, `pma review`, `pma ship`, with `claude` first, then the other three agent templates. Built: `claude`, and leftover worktrees in the hygiene signal. Not built: the other three agents, and offering Q4 items for removal.
+3. `pma dispatch`, `pma review`, `pma pr` and `pma push`, with `claude` first, then the other three agent templates. Built: `claude`, and leftover worktrees in the hygiene signal. Not built: the other three agents, and offering Q4 items for removal.
 
 4. `pma sync` with Issues. Built.
 

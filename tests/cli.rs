@@ -297,6 +297,16 @@ Q4 Remove: 3
         "{status}"
     );
     assert!(status.contains("open: 2 high, 1 low"), "{status}");
+    assert!(!status.contains("beta"), "{status}");
+
+    // `--all` ranks the untiered project as tier 5 and marks it so.
+    let status = ok(&home, &["status", "--all", "--explain"]);
+    assert!(
+        status.starts_with("last scan just now; 2 projects, 1 untiered ranked as tier 5\n"),
+        "{status}"
+    );
+    assert!(status.contains("\nbeta     -     0."), "{status}");
+    assert!(status.contains("\nbeta  tier 5, untiered (x0.2)"), "{status}");
 
     // Lowering tier 1's multiplier makes its high items unimportant.
     ok(&home, &["config", "tiers.1", "0.3"]);

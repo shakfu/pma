@@ -146,6 +146,8 @@ pub fn matrix(
 
 pub struct StatusRow<'a> {
     pub project: &'a Project,
+    /// False for an untiered project that `status --all` ranks as tier 5.
+    pub tiered: bool,
     pub has_todo: bool,
     pub lint_errors: i64,
     pub scan_error: Option<&'a str>,
@@ -184,7 +186,11 @@ pub fn status(cfg: &Config, rows: &[StatusRow], explain: bool) -> String {
         .join(", ");
         cells.push(vec![
             p.name.clone(),
-            p.tier.to_string(),
+            if r.tiered {
+                p.tier.to_string()
+            } else {
+                "-".into()
+            },
             format!("{score:.2}"),
             p.open.len().to_string(),
             p.idle_days.map_or("-".into(), |d| format!("{d}d")),
@@ -215,9 +221,10 @@ pub fn status(cfg: &Config, rows: &[StatusRow], explain: bool) -> String {
         for (score, parts, r) in &scored {
             let p = r.project;
             out.push_str(&format!(
-                "\n{}  tier {} (x{})  health {score:.2}\n",
+                "\n{}  tier {}{} (x{})  health {score:.2}\n",
                 p.name,
                 p.tier,
+                if r.tiered { "" } else { ", untiered" },
                 cfg.tier(p.tier)
             ));
             let lines: Vec<Vec<String>> = parts
@@ -603,12 +610,14 @@ mod tests {
         let rows = [
             StatusRow {
                 project: &quiet,
+                tiered: true,
                 has_todo: true,
                 lint_errors: 0,
                 scan_error: None,
             },
             StatusRow {
                 project: &busy,
+                tiered: true,
                 has_todo: true,
                 lint_errors: 3,
                 scan_error: None,

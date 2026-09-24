@@ -157,6 +157,7 @@ pma scan --offline myproject    # one project, without GitHub
 pma scan --deps                 # also count outdated cargo, uv and go deps
 pma matrix                      # the ranked view; -q q1 for one quadrant
 pma status --explain            # projects by health, with each signal's share
+pma status --all                # untiered projects too, e.g. to find failing CI
 pma stale                       # open items by age, oldest first
 pma tui                         # browse the matrix; q quits
 pma note add "move CI to a reusable workflow"

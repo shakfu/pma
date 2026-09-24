@@ -186,6 +186,9 @@ enum Command {
         /// Show each signal's contribution.
         #[arg(long)]
         explain: bool,
+        /// Include untiered projects, ranked as tier 5.
+        #[arg(long)]
+        all: bool,
     },
     /// Run an agent on tasks, each in its own worktree.
     ///
@@ -640,7 +643,8 @@ fn main() -> ExitCode {
             projects,
             tags,
             explain,
-        } => show_status(&projects, &tags, explain),
+            all,
+        } => show_status(&projects, &tags, explain, all),
         Command::Dispatch {
             targets,
             agent,
@@ -1235,6 +1239,8 @@ struct Portfolio {
     projects: Vec<(rank::Project, store::ProjectRow)>,
     tasks: Vec<rank::Task>,
     untiered: usize,
+    /// Whether the untiered projects are in `projects`, ranked as tier 5.
+    all: bool,
     scanned_ago: i64,
 }
 
@@ -1258,6 +1264,11 @@ fn select(store: &Store, names: &[String], tags: &[String]) -> Result<Vec<String
 }
 
 fn portfolio(names: &[String], tags: &[String]) -> Result<Portfolio> {
+    portfolio_with(names, tags, false)
+}
+
+/// The portfolio; with `all`, untiered projects are ranked as tier 5.
+fn portfolio_with(names: &[String], tags: &[String], all: bool) -> Result<Portfolio> {
     let store = Store::open_default()?;
     let cfg = load_config(&store)?;
     let now = dates::now();
@@ -1287,7 +1298,7 @@ fn portfolio(names: &[String], tags: &[String]) -> Result<Portfolio> {
     let mut projects = Vec::new();
     let mut tasks = Vec::new();
     for row in rows {
-        let Some(tier) = row.tier.or(fallback) else {
+        let Some(tier) = row.tier.or(fallback).or(all.then_some(5)) else {
             continue;
         };
         let own: Vec<&store::TaskRow> =
@@ -1329,11 +1340,20 @@ fn portfolio(names: &[String], tags: &[String]) -> Result<Portfolio> {
         projects,
         tasks,
         untiered,
+        all,
         scanned_ago: now - last,
     })
 }
 
 fn header_text(p: &Portfolio) -> String {
+    if p.all {
+        return format!(
+            "last scan {}; {} projects, {} untiered ranked as tier 5",
+            report::ago(p.scanned_ago),
+            p.projects.len(),
+            p.untiered
+        );
+    }
     format!(
         "last scan {}; {} tiered projects, {} untiered (pma project tier <1-5> <project>...)",
         report::ago(p.scanned_ago),
@@ -1360,14 +1380,15 @@ fn show_matrix(
     Ok(())
 }
 
-fn show_status(names: &[String], tags: &[String], explain: bool) -> Result<()> {
-    let p = portfolio(names, tags)?;
+fn show_status(names: &[String], tags: &[String], explain: bool, all: bool) -> Result<()> {
+    let p = portfolio_with(names, tags, all)?;
     header(&p);
     let rows: Vec<report::StatusRow> = p
         .projects
         .iter()
         .map(|(project, row)| report::StatusRow {
             project,
+            tiered: row.tier.is_some() || p.cfg.default_tier.is_some(),
             has_todo: row.has_todo,
             lint_errors: row.lint_errors,
             scan_error: row.scan_error.as_deref(),

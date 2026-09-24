@@ -20,7 +20,7 @@
   `scan_project` in `src/scan.rs` runs `git` and `gh` through `Command::output()` with no deadline, so one hung `gh run list` hangs the whole scan. `src/deps.rs` already bounds its tools with `agent::run_limited`.
   Give scan's calls a deadline, record a timed-out call in the project's detail rather than failing the scan, and test it with a fake `gh` that sleeps.
 
-- [ ] A `##Critical` heading without a space is a lint error #agent
+- [x] A `##Critical` heading without a space is a lint error #agent
 
 - [ ] A project whose name contains a dot can take `projects.<name>.verify` and `projects.<name>.publish` #agent
 

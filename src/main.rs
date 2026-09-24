@@ -48,7 +48,7 @@ const GROUPS: [(&str, &[&str]); 6] = [
     ),
     ("Tasks", &["lint", "prune", "stale", "sync", "note"]),
     ("Reading", &["status", "report", "tui"]),
-    ("Setup", &["root", "project", "config"]),
+    ("Setup", &["root", "project", "config", "verify"]),
     ("Agents", &["agent", "preset", "route"]),
     ("Many at once", &["campaign", "workflow"]),
 ];
@@ -286,6 +286,18 @@ enum Command {
         /// Group by `project`, `class` or `agent`. Default: class.
         #[arg(long, value_name = "DIMENSION")]
         by: Option<String>,
+    },
+    /// Run each project's check where a dispatch would.
+    ///
+    /// Checks out the head of the remote default branch in a fresh worktree
+    /// and runs the verify command there, under the agent's environment. The
+    /// result is what the next dispatch at that commit reads as its base.
+    Verify {
+        /// Project names.
+        projects: Vec<String>,
+        /// Also select every project carrying this tag; repeatable.
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
     },
     /// Commit and publish approved runs.
     Ship {
@@ -659,6 +671,7 @@ fn main() -> ExitCode {
         Command::Agent { action } => agent_command(action),
         Command::Report { by } => run_report(by.as_deref()),
         Command::Ship { projects, tags } => run_ship(&projects, &tags),
+        Command::Verify { projects, tags } => run_verify(&projects, &tags),
         Command::Sync {
             projects,
             tags,
@@ -2911,6 +2924,53 @@ fn approve_many(store: &Store, ids: &[i64]) -> Result<()> {
         println!("#{} {}: approved", run.id, run.project);
     }
     Ok(())
+}
+
+fn run_verify(projects: &[String], tags: &[String]) -> Result<()> {
+    let store = Store::open_default()?;
+    let home = store::home()?;
+    // It adds and removes a worktree, as a dispatch does.
+    let _session = Session::acquire(&home)?;
+    let cfg = load_config(&store)?;
+    let names = select(&store, projects, tags)?;
+    if names.is_empty() {
+        return Err("name a project, or --tag".into());
+    }
+    let rows = store.projects()?;
+    let mut failed = 0;
+    for name in &names {
+        let row = rows
+            .iter()
+            .find(|r| &r.name == name)
+            .ok_or_else(|| format!("unknown project `{name}`"))?;
+        if row.absent_since.is_some() {
+            return Err(format!("{name} is not under a root; run `pma scan`").into());
+        }
+        let p = dispatch::preflight(&store, &home, &cfg, name, &row.path)?;
+        let at = &p.base[..p.base.len().min(7)];
+        let log = p
+            .log
+            .as_ref()
+            .map_or(String::new(), |l| format!("; log: {}", l.display()));
+        let line = match (&p.command, p.ok) {
+            (None, _) => {
+                format!("no verify command; set `pma config projects.{name}.verify <command>`")
+            }
+            (Some(c), Some(true)) => format!("`{c}` passed at {at} in {}s", p.seconds),
+            (Some(c), Some(false)) => format!("`{c}` FAILED at {at} in {}s{log}", p.seconds),
+            (Some(c), None) => {
+                format!("`{c}` did not finish at {at}: timed out or could not start{log}")
+            }
+        };
+        if p.ok != Some(true) {
+            failed += 1;
+        }
+        println!("{name}: {line}");
+    }
+    match failed {
+        0 => Ok(()),
+        n => Err(format!("{n} of {} projects did not pass their check", names.len()).into()),
+    }
 }
 
 fn run_ship(projects: &[String], tags: &[String]) -> Result<()> {

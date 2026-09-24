@@ -16,6 +16,9 @@ def run(cwd: Path, *args: str) -> str:
 def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A clone of a bare 'origin' with one pushed commit on main."""
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
+    # Under pma's own verify these block every push, and the fixture pushes.
+    monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
+    monkeypatch.delenv("GIT_CONFIG_PARAMETERS", raising=False)
     run(tmp_path, "git", "config", "--global", "user.name", "t")
     run(tmp_path, "git", "config", "--global", "user.email", "t@example.com")
     run(tmp_path, "git", "config", "--global", "init.defaultBranch", "main")

@@ -14,11 +14,14 @@ pma config projects.pma.verify "make check"
 pma config projects.pkgdb.verify "make test"
 pma config projects.margo.verify "go test ./pkg/... ./internal/... ./cmd/..."
 pma scan
+pma verify pma pkgdb margo
 ```
+
+`pma verify` runs each check where a dispatch would, under the agent's environment. Run it before the first dispatch, and again after any change to a verify command. See [initial_run.md](initial_run.md) for what skipping it cost.
 
 `publish` stays `pr`, so each approved run opens a pull request, and `pma review` settles it once merged or closed. Defaults: `agent_budget` $1.00, `timeout` 30 minutes.
 
-Verify, measured on a fresh clone of each repository:
+Verify, measured on a fresh clone of each repository in a plain shell. `pma verify` measured `pkgdb` at 113 s and `margo` at 8 s under the agent's environment:
 
 | Project | Command | Result | Time |
 |-|-|-|-|

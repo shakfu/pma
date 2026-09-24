@@ -35,8 +35,18 @@ impl Drop for Scratch {
     }
 }
 
+/// A command that ignores git settings passed through the environment. Under
+/// `pma`'s own verify, `agent::restrict` sets them to block every push, and
+/// the fixtures here push to local repositories.
+fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS");
+    cmd
+}
+
 fn pma(args: &[&std::ffi::OsStr]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_pma"))
+    command(env!("CARGO_BIN_EXE_pma"))
         .args(args)
         .output()
         .unwrap()
@@ -161,7 +171,7 @@ fn now() -> i64 {
 }
 
 fn git(dir: &std::path::Path, args: &[&str], date: Option<i64>) {
-    let mut cmd = Command::new("git");
+    let mut cmd = command("git");
     cmd.arg("-C")
         .arg(dir)
         .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
@@ -181,7 +191,7 @@ fn git(dir: &std::path::Path, args: &[&str], date: Option<i64>) {
 }
 
 fn pma_in(home: &std::path::Path, args: &[&str]) -> (String, String, bool) {
-    let out = Command::new(env!("CARGO_BIN_EXE_pma"))
+    let out = command(env!("CARGO_BIN_EXE_pma"))
         .env("PMA_HOME", home)
         .args(args)
         .output()
@@ -367,7 +377,7 @@ impl Env {
             self.bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_pma"));
+        let mut cmd = command(env!("CARGO_BIN_EXE_pma"));
         cmd.env("PMA_HOME", &self.home)
             .env("PATH", path)
             .env("PUSH_LOG", &self.push_log)
@@ -398,7 +408,7 @@ impl Env {
 }
 
 fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let out = command("git")
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -1447,7 +1457,7 @@ fn sync_plans_then_applies_and_settles() {
     git(&beta, &["init", "-q"], None);
 
     let sync = |args: &[&str]| {
-        let out = Command::new(env!("CARGO_BIN_EXE_pma"))
+        let out = command(env!("CARGO_BIN_EXE_pma"))
             .env("PMA_HOME", &home)
             .env(
                 "PATH",
@@ -1521,7 +1531,7 @@ fn notes_and_measured_dependencies() {
     .unwrap();
     fs::set_permissions(bin.join("uv"), fs::Permissions::from_mode(0o755)).unwrap();
     let run = |args: &[&str]| {
-        let out = Command::new(env!("CARGO_BIN_EXE_pma"))
+        let out = command(env!("CARGO_BIN_EXE_pma"))
             .env("PMA_HOME", &home)
             .env(
                 "PATH",
@@ -1807,7 +1817,7 @@ fn a_workflow_document_is_a_draft_until_its_cost_is_accepted() {
     let home = s.0.join("home");
     fs::create_dir_all(&home).unwrap();
     let run = |args: &[&str]| {
-        let out = Command::new(env!("CARGO_BIN_EXE_pma"))
+        let out = command(env!("CARGO_BIN_EXE_pma"))
             .env("PMA_HOME", &home)
             .args(args)
             .output()
@@ -2044,7 +2054,7 @@ fn an_agent_node_is_priced_then_run_on_approval() {
             bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let out = Command::new(env!("CARGO_BIN_EXE_pma"))
+        let out = command(env!("CARGO_BIN_EXE_pma"))
             .env("PMA_HOME", &home)
             .env("PATH", path)
             .args(args)
@@ -2864,7 +2874,7 @@ fn agent_runs_go_in_parallel_and_the_batch_budget_bounds_the_pass() {
             bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let out = Command::new(env!("CARGO_BIN_EXE_pma"))
+        let out = command(env!("CARGO_BIN_EXE_pma"))
             .env("PMA_HOME", &home)
             .env("PATH", path)
             .args(args)
@@ -3092,4 +3102,36 @@ fn an_agent_does_not_outlive_a_killed_session() {
     // The next session fails the interrupted run, and rejecting it is safe.
     assert!(env.ok(&["review"]).contains("#1  failed"));
     env.ok(&["review", "1", "--reject"]);
+}
+
+/// `pma verify` runs the check where a dispatch would: at origin's head, in a
+/// worktree of its own, under the agent's environment. A check that fails
+/// only there shows before any agent is paid.
+#[test]
+fn verify_runs_the_check_where_a_dispatch_would() {
+    let s = Scratch::new("preflight");
+    let (env, _, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    // origin's test needs hello.txt, which the base lacks.
+    let (out, err, success) = env.run(&["verify", "alpha"]);
+    assert!(!success, "{out}");
+    assert!(out.starts_with("alpha: `make test` FAILED at "), "{out}");
+    assert!(
+        err.contains("1 of 1 projects did not pass their check"),
+        "{err}"
+    );
+    // A push is blocked there, as it is for an agent.
+    env.ok(&[
+        "config",
+        "projects.alpha.verify",
+        "git push -q origin HEAD:refs/heads/x",
+    ]);
+    let (out, _, success) = env.run(&["verify", "alpha"]);
+    assert!(!success && out.contains("FAILED"), "{out}");
+    env.ok(&["config", "projects.alpha.verify", "true"]);
+    let out = env.ok(&["verify", "alpha"]);
+    assert!(out.starts_with("alpha: `true` passed at "), "{out}");
+    assert!(!env.home.join("verify-trees/alpha").exists());
+    assert_eq!(git_out(&alpha, &["worktree", "list"]).lines().count(), 1);
+    let (_, err, success) = env.run(&["verify"]);
+    assert!(!success && err.contains("name a project"), "{err}");
 }

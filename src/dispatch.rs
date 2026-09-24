@@ -1128,6 +1128,22 @@ fn base_verify(
     if let Some((ok, seconds)) = store.verify_base(project, base, command, cfg.timeout)? {
         return Ok((ok, Some(seconds)));
     }
+    let (ok, seconds, _) = measure_base(store, home, cfg, project, base, command, worktree)?;
+    Ok((ok, Some(seconds)))
+}
+
+/// Runs `command` in `worktree`, a checkout of `base`, under the agent's
+/// environment, and records the result in the base cache. Returns the result,
+/// the seconds it took and the log.
+fn measure_base(
+    store: &Store,
+    home: &Path,
+    cfg: &Config,
+    project: &str,
+    base: &str,
+    command: &str,
+    worktree: &Path,
+) -> Result<(Option<bool>, i64, PathBuf)> {
     let agent_env = home.join("agent-env");
     let logs = home.join("verify-base");
     std::fs::create_dir_all(&logs).map_err(|e| format!("{}: {e}", logs.display()))?;
@@ -1138,7 +1154,75 @@ fn base_verify(
         Err(_) => (None, 0),
     };
     store.set_verify_base(project, base, command, cfg.timeout, ok, seconds)?;
-    Ok((ok, Some(seconds)))
+    Ok((ok, seconds, log))
+}
+
+/// What `pma verify` found for one project.
+#[derive(Debug)]
+pub struct Preflight {
+    pub base: String,
+    /// `None` when the project has no verify command.
+    pub command: Option<String>,
+    /// As in the base cache: `None` when the check timed out or could not
+    /// start.
+    pub ok: Option<bool>,
+    pub seconds: i64,
+    pub log: Option<PathBuf>,
+}
+
+/// Runs the project's verify at the head of its remote default branch, in a
+/// fresh worktree and under the agent's environment, as a dispatch's base
+/// check does, and records the result in the base cache. A check that fails
+/// for a reason of its own then shows before an agent is paid to find it.
+/// Unlike dispatch, it measures again rather than reading the cache.
+pub fn preflight(
+    store: &Store,
+    home: &Path,
+    cfg: &Config,
+    project: &str,
+    repo: &Path,
+) -> Result<Preflight> {
+    git(repo, &["fetch", "--quiet", "origin"])?;
+    let default_branch = scan::default_branch(repo).ok_or(scan::DEFAULT_BRANCH_UNKNOWN)?;
+    let base = git(
+        repo,
+        &[
+            "rev-parse",
+            &format!("refs/remotes/origin/{default_branch}"),
+        ],
+    )?;
+    let tree = home.join("verify-trees").join(project);
+    // Left by a preflight that was interrupted.
+    remove_worktree(repo, &tree, "")?;
+    if let Some(parent) = tree.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    git(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            "--quiet",
+            path_arg(&tree)?,
+            &base,
+        ],
+    )?;
+    let measured = match verify_command(cfg, project, &tree) {
+        None => Ok((None, None, 0, None)),
+        Some(command) => measure_base(store, home, cfg, project, &base, &command, &tree)
+            .map(|(ok, seconds, log)| (Some(command), ok, seconds, Some(log))),
+    };
+    let removed = remove_worktree(repo, &tree, "");
+    let (command, ok, seconds, log) = measured?;
+    removed?;
+    Ok(Preflight {
+        base,
+        command,
+        ok,
+        seconds,
+        log,
+    })
 }
 
 /// Added after the original prompt when a run is retried at a stronger

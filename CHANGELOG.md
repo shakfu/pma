@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+**`pma verify <project>`: the check a dispatch would run, before one does.** It checks out the head of the remote default branch in a fresh worktree and runs the verify command there under the agent's environment, then records the result as that commit's base. The first pilot dispatch paid an agent to discover that `pma`'s own check could not pass in that environment; a check run in a plain shell had passed. Exits 1 when any named project's check does not pass.
+
 **A `sanduk` worker, so a dispatch can run in a container.** Seeded like the other templates and selected the same way -- `pma config agent sanduk`, or `agent` on a route -- it runs the same `claude` inside a disposable container with the API key held on the host. Four of its flags are why it is a template rather than a line in the README: `--work-at-host-path` mounts the worktree where the host has it, so a path in a diff or a stack trace resolves; `--stream-json` passes the agent's own records through, which is what `claude-json` reads the cost from; `--no-report-instruction` keeps `REPORT.md` out of the tree the diff is taken from; and `--provider anthropic` is named beside `--agent claude`, because sanduk's default provider is openai and the mismatch fails the run before the container starts. It carries no allowlist: a container that denies egress does not also need a `Bash()` rule.
 
 `key-safe` rather than `sealed`, because sealed blocks the fetch `cargo`, `go` and `pip` do mid-build and a run that cannot fetch fails for a reason unrelated to its task. Verify still runs on the host: containing the agent and not the build is stage (a) of [docs/dev/using-containers.md](docs/dev/using-containers.md), not the end of it. Proved as far as the `docker run` argv sanduk prints for it; not yet run in a container.
@@ -37,6 +39,8 @@ Iteration is not included. `retry`, a lap edge and a self-edge parse, bound and 
 **Ship refuses a repository whose hooks or git settings changed since dispatch.** A hook, or a setting that runs a program or redirects a push, added during a run would run at ship with the user's credentials, and neither is in the diff. The run records its hooks and those settings at dispatch, before base verify, and ship compares them before it commits and again before it pushes. The user's own hooks keep running. The alternative, disabling hooks for ship, would have dropped them too. Schema 26.
 
 ### Fixed
+
+**`pma`'s own tests pass under its verify.** Their fixtures push to local repositories, and inherited the `GIT_CONFIG_*` settings with which `agent::restrict` blocks every push, so `make check` failed at the base and at the head of every `pma` dispatch. The tests now start git and `pma` without them.
 
 **An agent no longer outlives its session.** Agents ran in their own process group, so Ctrl-C killed `pma` and not the agent, and freed the session lock. The next `pma review` then failed the run as interrupted while the agent still wrote to it, and `--reject` could delete the worktree under it. Each agent and verify now runs under a `sh` watchdog that kills the group when `pma`'s end of a pipe closes. That covers every way `pma` can exit, with no signal handler, on Linux and macOS alike. The group is also killed after a normal exit, so a background process the agent started does not keep writing to the worktree.
 

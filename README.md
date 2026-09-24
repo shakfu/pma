@@ -173,6 +173,7 @@ pma preset set omp-luna-high omp gpt-5.6-luna --thinking high
 pma preset                      # every named combination; * is the default
 pma preset use omp-luna-high
 pma config                      # every setting; `pma config <key> <value>` sets one
+pma verify myproject            # run its check where a dispatch would, before one does
 ```
 
 Highest wins: the `-a` and `-m` flags, then `-p <preset>`, then an applied route, then the default preset.

@@ -325,13 +325,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    fn alive(pid: &str) -> bool {
-        Command::new("kill")
-            .args(["-0", pid.trim()])
-            .stderr(Stdio::null())
-            .status()
-            .unwrap()
-            .success()
+    /// Whether `pid` is gone within 5 s. A killed process can linger as a
+    /// zombie until its new parent reaps it, and `kill -0` still finds one.
+    fn gone(pid: &str) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            let alive = Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            if !alive {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
     }
 
     /// Reads the pid a child wrote to `file`, waiting for it to appear.
@@ -356,10 +366,7 @@ mod tests {
             .current_dir(&dir);
         let done = run_limited(cmd, &dir.join("log"), Duration::from_secs(10)).unwrap();
         assert_eq!(done.success, Some(true), "the child's own status");
-        assert!(
-            !alive(&pid_in(&pid)),
-            "the background sleep was left running"
-        );
+        assert!(gone(&pid_in(&pid)), "the background sleep was left running");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -377,7 +384,7 @@ mod tests {
         let started = Instant::now();
         child.wait().unwrap();
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(!alive(&grandchild));
+        assert!(gone(&grandchild));
         let _ = std::fs::remove_dir_all(dir);
     }
 

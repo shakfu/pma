@@ -34,6 +34,11 @@
 
 - [ ] `pma dispatch --retry` resets the attempt count before it knows the run started #agent
 
+- [ ] `pma merge <id>...` merges a run's pull request and settles it #agent
+  Today a `pr-open` run is merged on GitHub by hand, and the next `pma review` settles it. `pma merge` runs `gh pr merge <url> --squash --delete-branch` for each named `pr-open` run, then settles it to `shipped` at once, as `ship::settle` does for a merge it observes.
+  Refuse a run that is not `pr-open`. Refuse one whose pull request has failing or pending checks; allow one with no checks. Refuse one whose head is no longer the commit pma pushed, since that merges commits no one approved: record the pushed commit at ship, which today records only the URL.
+  Tests in `tests/cli.rs` with the fake `gh` (`FAKE_GH_PR`): a merge, each refusal, and the run shipped afterwards.
+
 - [ ] **Render `gh:N` as a link**: `report`, `rank`, `matrix` and `tui` print a bare issue number, and the project row now stores `owner/name` to resolve it against.
 
 - [ ] **Absent projects still rank**: `status` and `matrix` score a project no scan can find, so its tasks compete for attention when nothing can be dispatched against them. Either drop them from ranking or mark them in the listing.

@@ -42,7 +42,7 @@ Every item is class B: `Class::of` gives B to an item with no class tag, and `#a
 | 1 | pma | `pma sync` checks an item's text before writing `gh:N` | described | 2 | | | | | |
 | 2 | pma | `pma lint` reports an unclosed code fence | described | 3 | | | | | |
 | 3 | pma | `pma scan` bounds each git and gh call with a timeout | described | 3 | | | | | |
-| 4 | pma | `##Critical` without a space is a lint error | one-liner | 1 | | | | | |
+| 4 | pma | `##Critical` without a space is a lint error | one-liner | 1 | #1, #2 | no (#1, infrastructure) | yes (#2) | yes ([PR 1](https://github.com/shakfu/pma/pull/1)) | 3 |
 | 5 | pma | a dotted project name can take `projects.<name>.*` | one-liner | 2 | | | | | |
 | 6 | pma | `review 3 4 --approve --minutes 5` drops the minutes | one-liner | 2 | | | | | |
 | 7 | pma | `pma config <retired key>` says unknown | one-liner | 1 | | | | | |
@@ -58,8 +58,9 @@ Every item is class B: `Class::of` gives B to an item with no class tag, and `#a
 | 17 | margo | 10.4 Ollama / local model support | described | 3 | | | | | |
 | 18 | margo | 10.3 OpenRouter live model fetch | one-liner | 3 | | | | | |
 | 19 | margo | 10.2 per-workspace MCP server scoping | one-liner | 5 | | | | | |
+| 20 | pma | `pma merge` merges a run's pull request and settles it | described | 4 | | | | | |
 
-19 items rather than 20: the rest of `pkgdb` and `margo` failed the exclusions below.
+Item 20 was added after the first shipped run, which had to be merged on GitHub by hand. Its difficulty is a draft, as the others were. The rest of `pkgdb` and `margo` failed the exclusions below.
 
 Confounds, stated so the result is not over-read:
 
@@ -98,9 +99,15 @@ Confounds, stated so the result is not over-read:
 
 pma records attempts, cost, both verify results, changed paths and review time. The table and the notes below hold what it cannot know.
 
+## Findings
+
+- **An infrastructure rejection counts against the agent.** `pma report` put run #1, rejected for our own verify fault, in the decided runs: "50% of 2 decided runs accepted", where the agent was 1 for 1. `--reject` records no reason, so the report cannot tell an infrastructure failure from a refused change. Until it can, report the pilot's shares from this table, and exclude runs whose note says infrastructure. A fix: a reason on `--reject`, and a report that leaves infrastructure rejections out of the share and names them.
+
 ## Notes per run
 
 (one line per rework or rejection: run id, why)
+
+- #1 (item 4) rejected: infrastructure, not the agent. `make check` failed at base and head because `pma`'s tests inherited the verify push block; see [initial_run.md](initial_run.md). The change itself was correct. Redispatched with `--retry`.
 
 ## Gate
 

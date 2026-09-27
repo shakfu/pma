@@ -9,9 +9,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Upgrading from 0.3:
 
 - The database moves from schema 24 to 28 on first open. 0.3 refuses it afterwards.
+
 - `pma ship` is now `pma pr` or `pma push`; `publish` settings are retired. See Changed.
+
 - `weights.*` settings are retired, with the health score.
+
 - `pma workflow run --yes` is now `--approve <plan>`.
+
 - New worktrees, logs and artifacts go to `~/.local/state/pma`.
 
 ### Added

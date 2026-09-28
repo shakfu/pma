@@ -185,11 +185,100 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// `git` in the run's worktree, once its `.git` is still the one `git
-/// worktree add` wrote. An agent that replaced it would hand these calls,
-/// which carry the user's credentials, a config and hooks of its own.
+/// worktree add` wrote and its hooks and settings are the ones taken at
+/// dispatch. An agent that replaced either would hand these calls, which
+/// carry the user's credentials, a program of its own to run.
 pub fn wt_git(run: &Run, args: &[&str]) -> Result<String> {
-    own_gitdir(run)?;
+    unchanged_git(run)?;
     git(&run.worktree, args)
+}
+
+/// How a snapshot change reads in an error, which is also how a run that
+/// found one is recognised afterwards.
+const GIT_CHANGED: &str = "the repository's hooks or git settings changed since run #";
+
+/// Refuses a run whose repository gained or changed a hook, or a setting
+/// that runs a program or redirects a push, since dispatch. pma's git calls
+/// carry the user's credentials and environment, and none of that is in the
+/// diff the reviewer read. Also refuses a replaced `.git`, which is all a run
+/// from before the snapshot existed can be checked for.
+pub fn unchanged_git(run: &Run) -> Result<()> {
+    let Some(then) = &run.git_snapshot else {
+        return own_gitdir(run);
+    };
+    match changes(then, &git_snapshot(run)?) {
+        None => Ok(()),
+        Some(changes) => Err(format!(
+            "{GIT_CHANGED}{} was dispatched:\n{changes}\n\
+             pma runs no git in {} until they are restored, since its calls carry your \
+             credentials. If you made these changes, `pma review {} --reject \
+             --keep-git-changes`.",
+            run.id,
+            run.repo.display(),
+            run.id,
+        )
+        .into()),
+    }
+}
+
+/// The lines each snapshot has and the other lacks, or `None` when equal.
+fn changes(then: &str, now: &str) -> Option<String> {
+    if then == now {
+        return None;
+    }
+    let (then, now): (Vec<&str>, Vec<&str>) = (then.lines().collect(), now.lines().collect());
+    let lines: Vec<String> = then
+        .iter()
+        .filter(|l| !now.contains(l))
+        .map(|l| format!("  - {l}"))
+        .chain(
+            now.iter()
+                .filter(|l| !then.contains(l))
+                .map(|l| format!("  + {l}")),
+        )
+        .collect();
+    Some(lines.join("\n"))
+}
+
+/// Refuses to run git in `repo` while a run there that is not settled found
+/// its snapshot changed, until the clone matches that snapshot again. A
+/// setting an agent added stays in the clone after its run fails; the next
+/// fetch or `worktree add` would run it, and the next snapshot would take it
+/// as its baseline.
+pub fn clone_unchanged(store: &Store, repo: &Path) -> Result<()> {
+    clone_held(&store.runs()?, repo)
+}
+
+/// `clone_unchanged` over runs already read, for a caller checking many
+/// repositories.
+pub fn clone_held(runs: &[Run], repo: &Path) -> Result<()> {
+    let found: Vec<&Run> = runs
+        .iter()
+        .filter(|r| {
+            r.repo == repo
+                && !r.state.is_final()
+                && r.git_snapshot.is_some()
+                && r.error.as_deref().is_some_and(|e| e.contains(GIT_CHANGED))
+        })
+        .collect();
+    if found.is_empty() {
+        return Ok(());
+    }
+    let now = snapshot_in(repo, repo)?;
+    for run in found {
+        if let Some(changes) = changes(run.git_snapshot.as_deref().unwrap_or_default(), &now) {
+            return Err(format!(
+                "{GIT_CHANGED}{} was dispatched, and they are still in {}:\n{changes}\n\
+                 pma runs no git there until they are restored. If you made these changes, \
+                 `pma review {} --reject --keep-git-changes`.",
+                run.id,
+                repo.display(),
+                run.id,
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Refuses a worktree whose `.git` is not a file naming this worktree's
@@ -237,11 +326,18 @@ pub fn own_gitdir(run: &Run) -> Result<()> {
 /// a `.pre-commit-config.yaml`, run what the reviewer approved in the diff.
 /// Global and system settings are the user's, so they are left out.
 pub fn git_snapshot(run: &Run) -> Result<String> {
+    own_gitdir(run)?;
+    snapshot_in(&run.repo, &run.worktree)
+}
+
+/// The snapshot as git reads it in `dir`, a worktree of `repo` or the clone
+/// itself.
+fn snapshot_in(repo: &Path, dir: &Path) -> Result<String> {
     use std::os::unix::fs::PermissionsExt;
 
     let mut lines = Vec::new();
-    let hooks = wt_git(
-        run,
+    let hooks = git(
+        dir,
         &["rev-parse", "--path-format=absolute", "--git-path", "hooks"],
     )?;
     let mut files: Vec<(String, PathBuf, bool)> = std::fs::read_dir(&hooks)
@@ -259,7 +355,7 @@ pub fn git_snapshot(run: &Run) -> Result<String> {
     if !files.is_empty() {
         let mut args = vec!["hash-object", "--no-filters", "--"];
         args.extend(files.iter().filter_map(|(_, p, _)| p.to_str()));
-        let hashes = git(&run.repo, &args)?;
+        let hashes = git(repo, &args)?;
         for ((name, _, executable), hash) in files.iter().zip(hashes.lines()) {
             let x = if *executable {
                 "executable"
@@ -270,7 +366,7 @@ pub fn git_snapshot(run: &Run) -> Result<String> {
         }
     }
     // NUL-separated scope and entry, each entry `key\nvalue`.
-    let listing = wt_git(run, &["config", "--list", "--show-scope", "-z"])?;
+    let listing = git(dir, &["config", "--list", "--show-scope", "-z"])?;
     let mut settings: Vec<(String, String)> = Vec::new();
     let mut fields = listing.split('\0');
     while let (Some(scope), Some(entry)) = (fields.next(), fields.next()) {
@@ -281,7 +377,7 @@ pub fn git_snapshot(run: &Run) -> Result<String> {
     }
     settings.sort();
     for (key, value) in settings {
-        lines.push(format!("config {key} {}", hash_text(&run.repo, &value)?));
+        lines.push(format!("config {key} {}", hash_text(repo, &value)?));
     }
     Ok(lines.join("\n"))
 }
@@ -395,6 +491,8 @@ pub fn prepare(
     pick: &Pick,
 ) -> Result<Prepared> {
     let repo = &pick.repo;
+    // Before the fetch, which reads `url.*` and `core.sshCommand`.
+    clone_unchanged(store, repo)?;
     git(repo, &["fetch", "--quiet", "origin"])?;
     let default_branch = scan::default_branch(repo).ok_or(scan::DEFAULT_BRANCH_UNKNOWN)?;
     let base = git(
@@ -572,7 +670,15 @@ fn queue(
     };
     let active = store.active_route()?;
     let mut routed = (None, None, None, None, class.scope());
-    if let Some(rev) = &active {
+    if let Some(rev) = &active
+        && rev.shadow
+    {
+        // Recorded for `pma route replay`; it refuses, scopes and approves
+        // nothing.
+        let policy = rev.policy()?;
+        routed.0 = Some(rev.revision);
+        routed.1 = policy.route(&subject).map(|r| r.name.clone());
+    } else if let Some(rev) = &active {
         let policy = rev.policy()?;
         let Some(route) = policy.route(&subject) else {
             return refuse(format!(
@@ -585,7 +691,7 @@ fn queue(
             Some(rev.revision),
             Some(route.name.clone()),
             Some(route.approval),
-            (!rev.shadow).then(|| (route.agent.clone(), route.model.clone())),
+            Some((route.agent.clone(), route.model.clone())),
             scope,
         );
     }
@@ -651,6 +757,7 @@ fn queue(
         preset: chosen.preset.clone(),
         extra_args: chosen.args.clone(),
         git_snapshot: Some(git_snapshot),
+        reviewed_tree: None,
     };
     run.prompt = prompt(&run, &details, verify.as_deref());
     store.insert_run(&mut run)?;
@@ -783,18 +890,27 @@ pub fn choose_worker(
         (None, Some(name)) => Some(store.preset(name)?),
         (None, None) => None,
     };
-    let named = over.preset.clone().or(default);
     let agent = over
         .agent
         .clone()
-        .or_else(|| named.as_ref().map(|p| p.agent.clone()))
+        .or_else(|| over.preset.as_ref().map(|p| p.agent.clone()))
         .or(route_agent)
+        .or_else(|| default.as_ref().map(|p| p.agent.clone()))
         .unwrap_or_else(|| cfg.agent.clone());
+    // The default preset's model is for its own worker; a route that named
+    // another worker does not inherit it.
     let model = over
         .model
         .clone()
-        .or_else(|| named.as_ref().and_then(|p| p.model.clone()))
-        .or(route_model);
+        .or_else(|| over.preset.as_ref().and_then(|p| p.model.clone()))
+        .or(route_model)
+        .or_else(|| {
+            default
+                .as_ref()
+                .filter(|p| p.agent == agent)
+                .and_then(|p| p.model.clone())
+        });
+    let named = over.preset.clone().or(default);
     // Arguments come with the preset that named them or not at all: a route
     // names a worker and a model, never a flag.
     let (args, preset) = match &named {
@@ -1039,8 +1155,8 @@ fn attempt(
     a.summary = Some(report.summary.clone());
     run.summary = Some(report.summary);
     // Before any git call in the tree: what follows would run under a config
-    // the agent wrote.
-    if let Err(e) = own_gitdir(run) {
+    // or hooks the agent wrote.
+    if let Err(e) = unchanged_git(run) {
         fail(run, &mut a, e.to_string());
         return a;
     }
@@ -1091,6 +1207,8 @@ fn attempt(
         }
     }
     a.verify_ok = run.verify_ok;
+    // After verify, so it is the tree `pma review` will show.
+    run.reviewed_tree = tree(run).ok();
     run.enter(RunState::Ready);
     a.outcome = Some(RunState::Ready.name().into());
     a
@@ -1192,6 +1310,7 @@ pub fn preflight(
     project: &str,
     repo: &Path,
 ) -> Result<Preflight> {
+    clone_unchanged(store, repo)?;
     git(repo, &["fetch", "--quiet", "origin"])?;
     let default_branch = scan::default_branch(repo).ok_or(scan::DEFAULT_BRANCH_UNKNOWN)?;
     let base = git(
@@ -1339,15 +1458,33 @@ pub fn approve(store: &Store, run: &mut Run, by: &str) -> Result<()> {
         )
         .into());
     }
-    // Recorded now, so a publish can say whether it is publishing what was read.
-    run.approved_tree = Some(tree(run)?);
+    // What is approved is what the reviewer was last shown. Anything written
+    // since, by an agent that outlived its run or by anyone, is read first.
+    let now = tree(run)?;
+    if run
+        .reviewed_tree
+        .as_ref()
+        .is_some_and(|shown| shown != &now)
+    {
+        return Err(format!(
+            "run #{} changed after it was last shown; read `pma review {}` again, \
+             then approve it",
+            run.id, run.id
+        )
+        .into());
+    }
+    run.approved_tree = Some(now);
     run.approved_head = wt_git(run, &["rev-parse", "HEAD"]).ok();
     run.approved_by = Some(by.to_string());
     run.enter(RunState::Approved);
     store.update_run(run)
 }
 
-pub fn reject(store: &Store, run: &mut Run) -> Result<()> {
+/// `keep` accepts hooks or settings the run found changed as the user's own.
+/// Without it, such a run is rejected only once the clone matches its
+/// snapshot again, so rejecting does not quietly lift what `clone_unchanged`
+/// holds.
+pub fn reject(store: &Store, run: &mut Run, keep: bool) -> Result<()> {
     if run.state == RunState::PrOpen {
         return Err(format!(
             "run #{} has an open pull request; merge or close it: {}",
@@ -1361,6 +1498,22 @@ pub fn reject(store: &Store, run: &mut Run) -> Result<()> {
             "run #{} is {}; it cannot be rejected",
             run.id,
             run.state.name()
+        )
+        .into());
+    }
+    if !keep
+        && let Some(then) = &run.git_snapshot
+        && run
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains(GIT_CHANGED))
+        && let Some(changes) = changes(then, &snapshot_in(&run.repo, &run.repo)?)
+    {
+        return Err(format!(
+            "run #{} found the hooks or git settings of {} changed, and they still are:\n\
+             {changes}\nRestore them first, or pass --keep-git-changes if you made them.",
+            run.id,
+            run.repo.display()
         )
         .into());
     }
@@ -1567,6 +1720,7 @@ mod tests {
             preset: None,
             extra_args: Vec::new(),
             git_snapshot: None,
+            reviewed_tree: None,
         };
         let p = prompt(&run, "for all classes\n", Some("make test"));
         assert!(p.contains("`cynn`"));

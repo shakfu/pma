@@ -23,7 +23,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 28;
+const VERSION: i64 = 29;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -305,6 +305,12 @@ CREATE TABLE campaign_members (
     run_id INTEGER,
     PRIMARY KEY (campaign, project)
 );
+";
+
+/// Version 29. The tree a reviewer was last shown, which an approval must
+/// match: what the agent left, or what `pma review <id>` printed since.
+const REVIEWED_TREE: &str = "
+ALTER TABLE runs ADD COLUMN reviewed_tree TEXT;
 ";
 
 /// Version 28. `shipped` named two different things: a push to the default
@@ -687,6 +693,7 @@ impl Store {
                     GIT_SNAPSHOT,
                     RETIRE_WEIGHTS,
                     PUSH_OR_PR,
+                    REVIEWED_TREE,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -869,6 +876,13 @@ impl Store {
             .collect();
         let tx = self.conn.transaction()?;
         for f in facts {
+            if f.held {
+                tx.execute(
+                    "UPDATE projects SET scan_error = ?2, absent_since = NULL WHERE name = ?1",
+                    params![f.name, f.error],
+                )?;
+                continue;
+            }
             let (ci, ci_detail) = f.ci.to_columns();
             let leftover = f
                 .pma_branches
@@ -1184,7 +1198,7 @@ impl Store {
                 error = ?10, outcome = ?11, prompt = ?12, ready_at = ?13,
                 decided_at = ?14, published_at = ?15, review_seconds = ?16,
                 changed_paths = ?17, scope_error = ?18, approved_tree = ?19,
-                approved_head = ?20, approved_by = ?21
+                approved_head = ?20, approved_by = ?21, reviewed_tree = ?22
              WHERE id = ?1",
             params![
                 run.id,
@@ -1210,7 +1224,18 @@ impl Store {
                 run.approved_tree,
                 run.approved_head,
                 run.approved_by,
+                run.reviewed_tree,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Records the tree `pma review <id>` showed. One column, so a reading
+    /// command does not write back a copy of the whole run.
+    pub fn set_reviewed_tree(&self, id: i64, tree: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET reviewed_tree = ?2 WHERE id = ?1",
+            params![id, tree],
         )?;
         Ok(())
     }
@@ -1225,7 +1250,8 @@ impl Store {
                     verify_base_ok, verify_base_seconds, changed_paths, scope_error, model,
                     complexity, features, estimator, route_revision, route, approval,
                     approved_tree, approved_head, approved_by,
-                    workflow_instance, node, unit, lap, preset, extra_args, git_snapshot
+                    workflow_instance, node, unit, lap, preset, extra_args, git_snapshot,
+                    reviewed_tree
              FROM runs ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1307,6 +1333,7 @@ impl Store {
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default(),
                 git_snapshot: r.get(55)?,
+                reviewed_tree: r.get(56)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -2215,9 +2242,8 @@ pub struct Run {
     /// The tree the approver saw, as `git write-tree` names it. Publishing refuses
     /// to publish a worktree that no longer matches.
     pub approved_tree: Option<String>,
-    /// The commit the worktree was on. Publishing commits before it pushes, so
-    /// the tree check applies only while the head is still this one; past
-    /// that, a resumed publish is recognised by its own pushed commits.
+    /// The commit the worktree was on. Each publish attempt starts again from
+    /// it and `approved_tree`.
     pub approved_head: Option<String>,
     pub approved_by: Option<String>,
     /// The workflow instance that dispatched this run, or `None` for a task
@@ -2236,6 +2262,10 @@ pub struct Run {
     /// `dispatch::git_snapshot` at dispatch. `None` for a run from before it
     /// was taken.
     pub git_snapshot: Option<String>,
+    /// The tree the reviewer was last shown: what the agent left, or what
+    /// `pma review <id>` printed since. An approval must match it. `None` for
+    /// a run from before it was recorded.
+    pub reviewed_tree: Option<String>,
 }
 
 impl Run {
@@ -2299,6 +2329,7 @@ impl Run {
             preset: None,
             extra_args: Vec::new(),
             git_snapshot: None,
+            reviewed_tree: None,
         }
     }
 
@@ -2514,6 +2545,7 @@ mod tests {
             deps: None,
             error: None,
             todo_unread: false,
+            held: false,
         }
     }
 
@@ -2814,7 +2846,8 @@ mod tests {
                 .conn
                 .execute_batch(
                     "ALTER TABLE agents ADD COLUMN model TEXT;
-                     ALTER TABLE runs DROP COLUMN git_snapshot;",
+                     ALTER TABLE runs DROP COLUMN git_snapshot;
+                     ALTER TABLE runs DROP COLUMN reviewed_tree;",
                 )
                 .unwrap();
             store
@@ -3070,6 +3103,7 @@ mod tests {
             preset: None,
             extra_args: Vec::new(),
             git_snapshot: Some("hook pre-commit abc executable".into()),
+            reviewed_tree: None,
         };
         store.insert_run(&mut run).unwrap();
         assert_eq!(store.run(run.id).unwrap(), run);
@@ -3340,6 +3374,26 @@ mod tests {
             (Some("2026-10-01"), Some(4), Some(100))
         );
         assert_eq!(store.last_scan().unwrap(), Some(4000));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A project left unread keeps everything the last scan recorded, and is
+    /// not absent: only its scan error changes.
+    #[test]
+    fn a_held_project_keeps_its_last_scan() {
+        let dir = scratch("held");
+        let mut store = Store::open(&dir.join("p.db")).unwrap();
+        store
+            .save_scan(&[facts("one", vec![item("x", 5)])], true, 1000)
+            .unwrap();
+        let held = Facts::held("one", Path::new("/r/one"), "settings changed".into());
+        assert!(store.save_scan(&[held], true, 2000).unwrap().is_empty());
+        let tasks: Vec<_> = store.tasks().unwrap().into_iter().map(|t| t.key).collect();
+        assert_eq!(tasks, ["x"]);
+        let p = store.project("one").unwrap().unwrap();
+        assert_eq!((p.dirty, p.absent_since), (3, None));
+        assert!(matches!(p.ci, Ci::Failing(_)), "{:?}", p.ci);
+        assert_eq!(p.scan_error.as_deref(), Some("settings changed"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

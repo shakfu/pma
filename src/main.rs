@@ -107,8 +107,10 @@ struct Cli {
 enum Command {
     /// Check TODO.md files against the format.
     ///
-    /// Each path is a TODO.md file or a directory containing one. Exits 1 when
-    /// any file has errors or cannot be read; warnings alone exit 0.
+    /// Each path is a TODO.md file or a directory containing one. A directory's
+    /// subdirectories are not searched: a project's task file is its root
+    /// TODO.md. Exits 1 when any file has errors or cannot be read; warnings
+    /// alone exit 0.
     Lint {
         /// Files or directories; defaults to the current directory.
         paths: Vec<PathBuf>,
@@ -123,8 +125,8 @@ enum Command {
     },
     /// Remove finished items and `Done` sections.
     ///
-    /// Each path is a TODO.md file or a directory containing one. A file with
-    /// lint errors is skipped. Edits stay uncommitted. Dry run unless --apply.
+    /// Each path is a TODO.md file or a directory containing one, whose
+    /// subdirectories are not searched. A file with lint errors is skipped. Edits stay uncommitted. Dry run unless --apply.
     Prune {
         /// Files or directories; defaults to the current directory.
         paths: Vec<PathBuf>,
@@ -154,7 +156,8 @@ enum Command {
     },
     /// Read TODO.md, git state and CI into the database.
     ///
-    /// With no names, scans every project and marks those no longer found as
+    /// Only the TODO.md at a repository's root is read; one in a subdirectory
+    /// is not a task file. With no names, scans every project and marks those no longer found as
     /// absent, keeping their records.
     Scan {
         /// Project names; defaults to every project.
@@ -264,6 +267,11 @@ enum Command {
         /// Remove the run's worktree and branch.
         #[arg(long, requires = "ids", conflicts_with = "rework")]
         reject: bool,
+        /// With --reject, accept hooks or git settings the run found changed
+        /// as your own. Without it, such a run is rejected once they are
+        /// restored.
+        #[arg(long, requires = "reject")]
+        keep_git_changes: bool,
         /// Run the agent again in the same worktree with this feedback.
         #[arg(long, requires = "ids", value_name = "FEEDBACK")]
         rework: Option<String>,
@@ -734,9 +742,17 @@ fn main() -> ExitCode {
             ids,
             approve,
             reject,
+            keep_git_changes,
             rework,
             minutes,
-        } => run_review(&ids, approve, reject, rework.as_deref(), minutes),
+        } => run_review(
+            &ids,
+            approve,
+            reject,
+            keep_git_changes,
+            rework.as_deref(),
+            minutes,
+        ),
         Command::Stale {
             projects,
             tags,
@@ -1348,12 +1364,25 @@ fn run_scan(names: &[String], tags: &[String], offline: bool, deps: bool) -> Res
             .collect::<std::result::Result<_, _>>()?
     };
 
+    // `git status` in a clone holding a setting a failed run found would
+    // run it, so such a clone is not read.
+    let runs = store.runs()?;
+    let mut held = Vec::new();
+    let mut free = Vec::new();
+    for (name, path) in selected {
+        match dispatch::clone_held(&runs, &path) {
+            Ok(()) => free.push((name, path)),
+            Err(e) => held.push(scan::Facts::held(&name, &path, e.to_string())),
+        }
+    }
+
     let started = Instant::now();
-    let bar = progress::Bar::new(selected.len());
-    let facts = scan::scan_all(&selected, &cfg.activity_ignore, offline, deps, &|name| {
+    let bar = progress::Bar::new(free.len());
+    let mut facts = scan::scan_all(&free, &cfg.activity_ignore, offline, deps, &|name| {
         bar.done(name)
     });
     bar.finish();
+    facts.extend(held);
     for f in facts.iter().filter(|f| f.error.is_some()) {
         eprintln!(
             "warning: {}: {}",
@@ -2052,6 +2081,7 @@ fn run_review(
     ids: &[i64],
     approve: bool,
     reject: bool,
+    keep_git_changes: bool,
     rework: Option<&str>,
     minutes: Option<u32>,
 ) -> Result<()> {
@@ -2101,17 +2131,32 @@ fn run_review(
     if approve {
         dispatch::approve(&store, &mut run, &whoami())?;
     } else if reject {
-        dispatch::reject(&store, &mut run)?;
+        dispatch::reject(&store, &mut run, keep_git_changes)?;
     } else if let Some(feedback) = rework {
         let cfg = load_config(&store)?;
         dispatch::rework(&store, &home, &cfg, &mut run, feedback)?;
         println!("{}", report::run_line(&run));
     } else {
+        // The tree on both sides of the diff, so an approval can require
+        // what was printed. A tree that moved meanwhile is not recorded.
+        let approvable = matches!(run.state, RunState::Ready | RunState::Approved);
+        let before = approvable.then(|| dispatch::tree(&run).ok()).flatten();
         let diff = dispatch::diff(&run).unwrap_or_else(|e| format!("(no diff: {e})"));
         print!(
             "{}",
             report::run_detail(&run, &store.attempts(Some(run.id))?, &diff)
         );
+        match (
+            before,
+            approvable.then(|| dispatch::tree(&run).ok()).flatten(),
+        ) {
+            (Some(a), Some(b)) if a == b => store.set_reviewed_tree(run.id, &a)?,
+            (Some(_), Some(_)) => eprintln!(
+                "warning: run #{} changed while it was shown; read it again before approving",
+                run.id
+            ),
+            _ => {}
+        }
     }
     drop(session);
     Ok(())

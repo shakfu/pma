@@ -51,6 +51,8 @@ pma pr 1                       # commit and open a pull request; or `pma push 1`
 
 - The agent runs without push credentials. `pma` runs the project's test command itself, before and after, and reports both ends.
 
+- A hook or git setting added to the repository during a run fails the run, and `pma` runs no git in that repository until it is restored, or until `pma review <id> --reject --keep-git-changes` accepts it as yours.
+
 - Every run records the diff, the test result, the cost, the duration and the paths it touched. A run that changed a file its task had no business changing is flagged.
 
 - Limits you set: agents at once, dollars per run, dollars per batch, minutes per run.

@@ -73,9 +73,10 @@ pub fn active_policy(store: &Store) -> Result<Option<Active>> {
 }
 
 /// A warning per agent node that the policy in effect would refuse, because
-/// no route names it. Under a policy, a node is never sent to the settings.
+/// no route names it. Under an applied policy, a node is never sent to the
+/// settings; a policy in shadow refuses nothing.
 pub fn unrouted(store: &Store, w: &Workflow) -> Result<Vec<String>> {
-    let Some(active) = active_policy(store)? else {
+    let Some(active) = active_policy(store)?.filter(|a| !a.shadow) else {
         return Ok(Vec::new());
     };
     Ok(w.nodes
@@ -489,7 +490,9 @@ fn tier_of(store: &Store, unit: &WorkflowUnit) -> Result<Option<u8>> {
 /// refused rather than sent to the settings.
 struct Resolved {
     chosen: Chosen,
-    route: Option<(i64, String, Approval)>,
+    /// The revision, the route it chose and that route's approval. Under
+    /// shadow only the first two, and the route may be absent.
+    route: Option<(i64, Option<String>, Option<Approval>)>,
 }
 
 fn resolve(
@@ -503,17 +506,20 @@ fn resolve(
 ) -> Result<std::result::Result<Resolved, String>> {
     let mut applied = None;
     let mut route = None;
-    if let Some(active) = policy {
+    if let Some(active) = policy
+        && active.shadow
+    {
+        let r = active.policy.route_read(&node.name, unit.lap, tier);
+        route = Some((active.revision, r.map(|r| r.name.clone()), None));
+    } else if let Some(active) = policy {
         let Some(r) = active.policy.route_read(&node.name, unit.lap, tier) else {
             return Ok(Err(format!(
                 "node `{}` matches no route in policy revision {}; add a route naming it",
                 node.name, active.revision
             )));
         };
-        route = Some((active.revision, r.name.clone(), r.approval));
-        if !active.shadow {
-            applied = Some((r.agent.clone(), r.model.clone()));
-        }
+        route = Some((active.revision, Some(r.name.clone()), Some(r.approval)));
+        applied = Some((r.agent.clone(), r.model.clone()));
     }
     let chosen = crate::dispatch::choose_worker(store, cfg, over, applied)?;
     Ok(Ok(Resolved { chosen, route }))
@@ -1858,6 +1864,7 @@ fn read_base(ctx: &Ctx<'_>, repo: &Path, project: &str) -> std::result::Result<S
         return found.clone();
     }
     let found = (|| {
+        crate::dispatch::clone_unchanged(ctx.store, repo).map_err(|e| e.to_string())?;
         crate::dispatch::git(repo, &["fetch", "--quiet", "origin"]).map_err(|e| e.to_string())?;
         let branch = crate::scan::default_branch(repo)
             .ok_or_else(|| crate::scan::DEFAULT_BRANCH_UNKNOWN.to_string())?;
@@ -1995,6 +2002,7 @@ fn stage(
     if let Some(parent) = tree.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
+    crate::dispatch::clone_unchanged(ctx.store, &row.path)?;
     crate::dispatch::git(
         &row.path,
         &[
@@ -2011,6 +2019,13 @@ fn stage(
     // may write: an agent allowed to edit its working directory is not always
     // allowed to write outside it. `record` copies them to `dir` before the
     // tree goes, so each run's files outlive it.
+    // Before the agent, as dispatch takes one: a setting it adds to the
+    // clone would otherwise become the baseline of the next run there.
+    let git_snapshot = crate::dispatch::git_snapshot(&crate::store::Run {
+        repo: row.path.clone(),
+        worktree: tree.clone(),
+        ..crate::store::Run::default()
+    })?;
     let io = tree.join(".pma");
     std::fs::create_dir_all(&io).map_err(|e| format!("{}: {e}", io.display()))?;
     let input: Vec<Value> = batch.iter().map(|u| exported(u, known)).collect();
@@ -2045,7 +2060,7 @@ fn stage(
 
     let chosen = resolved.chosen;
     let (route_revision, route, approval) = match resolved.route {
-        Some((rev, name, approval)) => (Some(rev), Some(name), Some(approval)),
+        Some((rev, name, approval)) => (Some(rev), name, approval),
         None => (None, None, None),
     };
     let mut run = crate::store::Run {
@@ -2057,6 +2072,7 @@ fn stage(
         repo: row.path.clone(),
         branch: String::new(),
         worktree: tree.clone(),
+        git_snapshot: Some(git_snapshot),
         base: String::new(),
         prompt,
         state: crate::store::RunState::Running,
@@ -2129,7 +2145,9 @@ fn work(cfg: &Config, job: &Staged) -> Ran {
         &std::fs::read_to_string(&job.log).unwrap_or_default(),
         finished.success == Some(true),
     );
+    let changed = crate::dispatch::unchanged_git(&job.run).map_err(|e| e.to_string());
     let produced = match finished.success {
+        _ if changed.is_err() => changed.map(|()| Vec::new()),
         None => Err(format!("timed out after {} minutes", cfg.timeout)),
         Some(_) if !report.ok => Err(format!("the agent failed; log: {}", job.log.display())),
         _ => read_out(&job.out).and_then(|units| match &job.doc {

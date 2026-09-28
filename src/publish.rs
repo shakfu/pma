@@ -77,55 +77,76 @@ fn publish_one(home: &std::path::Path, cfg: &Config, run: &Run, target: Target) 
     if !wt.is_dir() {
         return Err(format!("{} no longer exists", wt.display()).into());
     }
-    unchanged_git(run)?;
-    // What was approved is what gets published, or nothing is. Once a publish
-    // has committed, the head has moved and the content is its own; a resumed
-    // publish is recognised further down by its pushed commits.
-    let head = wt_git(run, &["rev-parse", "HEAD"]).ok();
-    if let Some(approved) = &run.approved_tree
-        && head == run.approved_head
-    {
-        let now = crate::dispatch::tree(run)?;
-        if &now != approved {
-            return Err(format!(
-                "the worktree changed after it was approved by {}; read \
-                 `pma review {}` and approve it again, or reject it",
-                run.approved_by.as_deref().unwrap_or("?"),
-                run.id
-            )
-            .into());
-        }
+    let (Some(approved), Some(approved_head)) = (&run.approved_tree, &run.approved_head) else {
+        return Err(format!(
+            "run #{} has no approved tree and head to publish; approve it again",
+            run.id
+        )
+        .into());
+    };
+    let head = wt_git(run, &["rev-parse", "HEAD"])?;
+    // Before any publish has committed, an edit since approval is someone's
+    // work, so it is refused rather than discarded below.
+    if &head == approved_head && &crate::dispatch::tree(run)? != approved {
+        return Err(format!(
+            "the worktree changed after it was approved by {}; read \
+             `pma review {}` and approve it again, or reject it",
+            run.approved_by.as_deref().unwrap_or("?"),
+            run.id
+        )
+        .into());
     }
     if target == Target::Pr && which("gh").is_none() {
         return Err("`pma pr` needs `gh` on PATH; `pma push` pushes without it".into());
     }
-    let message = message(cfg, run);
-
-    wt_git(run, &["add", "--all"])?;
-    let staged = wt_git(run, &["diff", "--cached", "--quiet"]).is_err();
-    if staged {
-        wt_git(run, &["commit", "--quiet", "-m", &message])?;
+    if approved == &wt_git(run, &["rev-parse", &format!("{}^{{tree}}", run.base)])? {
+        return Err("nothing to publish: no changes".into());
     }
     let upstream = format!("origin/{}", run.default_branch);
     if target == Target::Push {
         wt_git(run, &["fetch", "--quiet", "origin"])?;
         // An earlier push pushed these commits and stopped before recording
         // it. Pushed commits keep their ids, so HEAD is in the upstream.
-        let head = wt_git(run, &["rev-parse", "HEAD"])?;
         if head != run.base
+            && &head != approved_head
             && wt_git(run, &["merge-base", "--is-ancestor", "HEAD", &upstream]).is_ok()
         {
             let sha = wt_git(run, &["rev-parse", "--short", "HEAD"])?;
             return Ok(format!("already pushed {sha} to {}", run.default_branch));
         }
-        if let Err(e) = wt_git(run, &["rebase", "--quiet", &upstream]) {
-            let _ = wt_git(run, &["rebase", "--abort"]);
-            return Err(format!(
-                "rebase onto {upstream} failed; resolve it in {}: {e}",
-                wt.display()
-            )
-            .into());
-        }
+    }
+    let message = message(cfg, run);
+
+    // Every attempt starts again from the approved head and tree. A failed
+    // publish leaves its commits, and verify its output, in the worktree; a
+    // retry that committed the worktree would publish what nobody read.
+    // `-B` also recovers an agent that switched branches.
+    wt_git(
+        run,
+        &[
+            "checkout",
+            "--quiet",
+            "--force",
+            "-B",
+            &run.branch,
+            approved_head,
+        ],
+    )?;
+    wt_git(run, &["read-tree", "--reset", "-u", approved])?;
+    let staged = wt_git(run, &["diff", "--cached", "--quiet"]).is_err();
+    if staged {
+        wt_git(run, &["commit", "--quiet", "-m", &message])?;
+    }
+    if target == Target::Push
+        && let Err(e) = wt_git(run, &["rebase", "--quiet", &upstream])
+    {
+        let _ = wt_git(run, &["rebase", "--abort"]);
+        return Err(format!(
+            "rebase onto {upstream} failed: {e}. Reject the run and dispatch the \
+             task again, or rebase it in {} and approve it again",
+            wt.display()
+        )
+        .into());
     }
 
     // After the rebase, so ticks on nearby lines by tasks published together
@@ -174,9 +195,8 @@ fn publish_one(home: &std::path::Path, cfg: &Config, run: &Run, target: Target) 
         }
     }
 
-    // Again, because verify ran code from the tree and could have installed
-    // a `pre-push` hook.
-    unchanged_git(run)?;
+    // Verify ran code from the tree and could have installed a `pre-push`
+    // hook; `wt_git` compares the snapshot again before the push.
     let outcome = match target {
         Target::Push => {
             wt_git(
@@ -192,7 +212,16 @@ fn publish_one(home: &std::path::Path, cfg: &Config, run: &Run, target: Target) 
             format!("pushed {sha} to {}", run.default_branch)
         }
         Target::Pr => {
-            wt_git(run, &["push", "--quiet", "-u", "origin", &run.branch])?;
+            // A retry rebuilt its commits, so their ids differ from what an
+            // earlier attempt pushed. The same tree there means it pushed.
+            let pushed = wt_git(run, &["fetch", "--quiet", "origin", &run.branch]).is_ok()
+                && wt_git(
+                    run,
+                    &["rev-parse", &format!("origin/{}^{{tree}}", run.branch)],
+                )? == wt_git(run, &["rev-parse", "HEAD^{tree}"])?;
+            if !pushed {
+                wt_git(run, &["push", "--quiet", "-u", "origin", &run.branch])?;
+            }
             // A retry after `gh pr create` failed may find the pull request
             // made anyway.
             let open = gh_in(
@@ -233,39 +262,6 @@ fn publish_one(home: &std::path::Path, cfg: &Config, run: &Run, target: Target) 
         }
     };
     Ok(outcome)
-}
-
-/// Refuses a run whose repository gained or changed a hook, or a setting
-/// that runs a program or redirects a push, since dispatch. Publishing commits
-/// and pushes with the user's credentials, and none of that is in the diff the
-/// reviewer read. A run from before the snapshot existed has nothing to
-/// compare.
-fn unchanged_git(run: &Run) -> Result<()> {
-    let Some(then) = &run.git_snapshot else {
-        return Ok(());
-    };
-    let now = crate::dispatch::git_snapshot(run)?;
-    if &now == then {
-        return Ok(());
-    }
-    let (then, now): (Vec<&str>, Vec<&str>) = (then.lines().collect(), now.lines().collect());
-    let changes: Vec<String> = then
-        .iter()
-        .filter(|l| !now.contains(l))
-        .map(|l| format!("  - {l}"))
-        .chain(
-            now.iter()
-                .filter(|l| !then.contains(l))
-                .map(|l| format!("  + {l}")),
-        )
-        .collect();
-    Err(format!(
-        "the repository's hooks or git settings changed since run #{} was dispatched:\n{}\n\
-         publishing would run them with your credentials. Restore them, or reject the run.",
-        run.id,
-        changes.join("\n")
-    )
-    .into())
 }
 
 /// Moves each `pr-open` run to `merged` when its pull request is merged, or

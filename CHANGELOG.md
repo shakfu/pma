@@ -4,6 +4,44 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0]
+
+Upgrading from 0.4:
+
+- The database moves from schema 28 to 29 on first open. 0.4 refuses it afterwards.
+
+- A routing policy with an unknown key or an out-of-range condition is refused. An active revision like that fails at dispatch; propose a corrected one.
+
+- `pma review <id> --approve` requires the tree last shown. After editing a run's worktree yourself, read it with `pma review <id>` first.
+
+- A repository where a run found its hooks or git settings changed is held until they are restored, or until `pma review <id> --reject --keep-git-changes`.
+
+### Security
+
+**A hook or git setting an agent adds fails its run before `pma` runs git after it.** The snapshot taken at dispatch was compared only at publishing. An agent could write `filter.x.clean` to the clone's `.git/config` and a `.gitattributes` beside it, and the `git diff` that measures the run ran the filter under `pma`'s environment, `GH_TOKEN` and `SSH_AUTH_SOCK` included. Every git call in a run's worktree now compares the snapshot first, and a workflow read node, which took none, now takes one.
+
+The setting stays in the clone after the run fails, so `dispatch`, `verify` and workflow nodes refuse that repository until it matches the run's snapshot again. `pma scan` leaves it unread, since `git status` runs an added `core.fsmonitor`; the project keeps its last scan and shows the reason as its scan error. `pma review <id> --reject` waits for the same, unless `--keep-git-changes` accepts the change as the user's; if any rejection lifted the hold, the next dispatch would take the setting as its baseline. Storing the values so `reject` could restore them was the alternative; the snapshot keeps hashes because a URL may carry a token.
+
+**A retried publish publishes the approved tree and nothing written since.** The approved tree was compared only while `HEAD` was still the approved head. A publish that committed and then failed, on a rebase conflict, a verify failure or a timeout, moved `HEAD`, and the retry committed whatever the worktree held: an edit made after approval, or a file the publish-time verify wrote, such as `uv.lock`. Each attempt now starts from the approved head and tree. The commit is still made by `git commit`, so the user's hooks run; `git commit-tree` would have skipped them. A rebase conflict is no longer resolved in the worktree and published as found: rebase there, then approve again.
+
+**An approval must match the tree the reviewer was last shown**: what the run left when it became ready, or what `pma review <id>` printed since. An agent that outlives its kill, by calling `setsid`, could write to the worktree between the diff being read and approved, and the approval took whatever was there. A tree that changed is refused with the command to read it again. A batch approval, which shows no diff, now takes only what the agent left. Binding to what `pma review` printed, rather than requiring the tree id on the command line, keeps `--approve` as it was.
+
+### Changed
+
+**The help for `lint`, `prune` and `scan` says only a repository's root `TODO.md` is read.** A nested `TODO.md` is not a task file, which the README already stated. Recursing was the alternative; it would read files no other command treats as tasks.
+
+### Fixed
+
+**A task that mentions `{model}`, `{dir}`, `{budget}` or `{timeout}` reaches the agent as written.** Placeholders were filled one after another over the whole argument, the prompt included. Text such as `{model}` was replaced, and with no model chosen the prompt argument and the flag before it were dropped. Placeholders are now filled in one pass, so an inserted value is not read again.
+
+**A run with no changes is not published.** The `TODO.md` tick counted as a commit, so the task was marked done and published with no work in it.
+
+**An applied route outranks the default preset**, as documented. The default preset was read before the route, so once one was set, as migration 24 does, a route's agent and model never applied. The default preset's model now applies only to its own worker.
+
+**A policy in shadow refuses, scopes and approves nothing.** It refused a task no route matched, replaced the class scope with a route's `scope`, and stored the route's approval, so a `propose` route blocked `pma review --approve`. Workflow read nodes had the same fault. A shadow run records the revision and the route it would take, and `pma review` shows it `in shadow`.
+
+**A policy with an unknown key or a mistyped value is refused.** A missing key read as no condition: `"clas"` in `match`, or `"match": "A"`, matched everything, `"model": 4` was dropped and `"attempts": 3` became 1. `complexity` and `tier` must lie in 1 to 5 and `lap` be at least 0. An active revision outside those bounds now fails at dispatch; propose a corrected one.
+
 ## [0.4.0]
 
 Upgrading from 0.3:

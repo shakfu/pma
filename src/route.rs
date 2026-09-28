@@ -259,13 +259,53 @@ impl Policy {
     }
 }
 
+/// Refuses a key outside `known`. A misspelt condition would otherwise read
+/// as absent, which widens the route to match everything.
+fn known_keys(v: &Value, what: &str, known: &[&str]) -> Result<(), String> {
+    let Value::Object(m) = v else {
+        return Err(format!("{what} must be an object, not {v}"));
+    };
+    match m.keys().find(|k| !known.contains(&k.as_str())) {
+        Some(k) => Err(format!(
+            "unknown key `{k}` in {what}; expected one of {}",
+            known.join(", ")
+        )),
+        None => Ok(()),
+    }
+}
+
+/// A string field, or `None` when absent. Any other type is refused rather
+/// than dropped.
+fn text(v: &Value, key: &str) -> Result<Option<String>, String> {
+    match &v[key] {
+        Value::Null => Ok(None),
+        Value::String(s) => Ok(Some(s.clone())),
+        other => Err(format!("{key} must be a string, not {other}")),
+    }
+}
+
 fn parse_route(i: usize, v: &Value) -> Result<Route, String> {
     let at = |e: String| format!("route {}: {e}", i + 1);
-    let name = v["name"]
-        .as_str()
-        .map(String::from)
+    known_keys(
+        v,
+        "a route",
+        &[
+            "name", "match", "agent", "model", "escalate", "scope", "approval",
+        ],
+    )
+    .map_err(at)?;
+    let name = text(v, "name")
+        .map_err(at)?
         .unwrap_or_else(|| format!("#{}", i + 1));
     let cond = &v["match"];
+    if !cond.is_null() {
+        known_keys(
+            cond,
+            "match",
+            &["class", "node", "lap", "complexity", "tier"],
+        )
+        .map_err(at)?;
+    }
     let classes = match &cond["class"] {
         Value::Null => None,
         Value::String(s) => Some(vec![
@@ -301,14 +341,16 @@ fn parse_route(i: usize, v: &Value) -> Result<Route, String> {
         }
         other => return Err(at(format!("node must be a name or a list, not {other}"))),
     };
-    let range = |key: &str| -> Result<Option<(i64, i64)>, String> {
-        match &cond[key] {
-            Value::Null => Ok(None),
+    // `bounds` is what the value can take, so a range outside it, which
+    // would match nothing, is refused.
+    let range = |key: &str, (min, max): (i64, i64)| -> Result<Option<(i64, i64)>, String> {
+        let (lo, hi) = match &cond[key] {
+            Value::Null => return Ok(None),
             Value::Number(n) => {
                 let n = n
                     .as_i64()
                     .ok_or_else(|| at(format!("{key} must be whole")))?;
-                Ok(Some((n, n)))
+                (n, n)
             }
             Value::String(s) => {
                 let (lo, hi) = s.split_once('-').unwrap_or((s, s));
@@ -323,23 +365,38 @@ fn parse_route(i: usize, v: &Value) -> Result<Route, String> {
                 if lo > hi {
                     return Err(at(format!("{key} `{s}` is empty")));
                 }
-                Ok(Some((lo, hi)))
+                (lo, hi)
             }
-            other => Err(at(format!(
-                "{key} must be a number or a range, not {other}"
-            ))),
+            other => {
+                return Err(at(format!(
+                    "{key} must be a number or a range, not {other}"
+                )));
+            }
+        };
+        if lo < min || hi > max {
+            let bound = match max {
+                i64::MAX => format!("at least {min}"),
+                _ => format!("{min} to {max}"),
+            };
+            return Err(at(format!("{key} must be {bound}, not {}", cond[key])));
         }
+        Ok(Some((lo, hi)))
     };
     let escalate = match &v["escalate"] {
         Value::Null => None,
         e => {
-            let model = e["model"]
-                .as_str()
+            known_keys(e, "escalate", &["model", "attempts"]).map_err(at)?;
+            let model = text(e, "model")
+                .map_err(at)?
                 .ok_or_else(|| at("escalate needs a model".into()))?;
-            Some(Escalate {
-                model: model.into(),
-                attempts: e["attempts"].as_i64().unwrap_or(1).clamp(0, 1),
-            })
+            let attempts = match &e["attempts"] {
+                Value::Null => 1,
+                a => a
+                    .as_i64()
+                    .filter(|n| (0..=1).contains(n))
+                    .ok_or_else(|| at(format!("escalate attempts must be 0 or 1, not {a}")))?,
+            };
+            Some(Escalate { model, attempts })
         }
     };
     let scope = match &v["scope"] {
@@ -363,11 +420,11 @@ fn parse_route(i: usize, v: &Value) -> Result<Route, String> {
         name,
         classes,
         nodes,
-        lap: range("lap")?,
-        complexity: range("complexity")?,
-        tier: range("tier")?,
-        agent: v["agent"].as_str().map(String::from),
-        model: v["model"].as_str().map(String::from),
+        lap: range("lap", (0, i64::MAX))?,
+        complexity: range("complexity", (1, 5))?,
+        tier: range("tier", (1, 5))?,
+        agent: text(v, "agent").map_err(at)?,
+        model: text(v, "model").map_err(at)?,
         escalate,
         scope,
         approval,
@@ -645,6 +702,56 @@ mod tests {
             (
                 r#"{"route":[{"match":{},"escalate":{"attempts":1},"approval":"each"}]}"#,
                 "escalate needs a model",
+            ),
+            // A misspelt key would read as absent and match everything.
+            (
+                r#"{"route":[{"match":{"clas":"A"},"approval":"each"}]}"#,
+                "unknown key `clas` in match",
+            ),
+            (
+                r#"{"route":[{"match":{"complexty":"1-2"},"approval":"each"}]}"#,
+                "unknown key `complexty`",
+            ),
+            (
+                r#"{"route":[{"match":{},"modle":"haiku","approval":"each"}]}"#,
+                "unknown key `modle` in a route",
+            ),
+            (
+                r#"{"route":[{"match":{},"escalate":{"model":"opus","attempt":1},"approval":"each"}]}"#,
+                "unknown key `attempt` in escalate",
+            ),
+            (
+                r#"{"route":[{"match":"A","approval":"each"}]}"#,
+                "match must be an object",
+            ),
+            (r#"{"route":["A"]}"#, "a route must be an object"),
+            (
+                r#"{"route":[{"match":{},"model":4,"approval":"each"}]}"#,
+                "model must be a string",
+            ),
+            (
+                r#"{"route":[{"match":{},"agent":["claude"],"approval":"each"}]}"#,
+                "agent must be a string",
+            ),
+            (
+                r#"{"route":[{"name":7,"match":{},"approval":"each"}]}"#,
+                "name must be a string",
+            ),
+            (
+                r#"{"route":[{"match":{},"escalate":{"model":"opus","attempts":3},"approval":"each"}]}"#,
+                "attempts must be 0 or 1",
+            ),
+            (
+                r#"{"route":[{"match":{"complexity":"4-9"},"approval":"each"}]}"#,
+                "complexity must be 1 to 5",
+            ),
+            (
+                r#"{"route":[{"match":{"tier":0},"approval":"each"}]}"#,
+                "tier must be 1 to 5",
+            ),
+            (
+                r#"{"route":[{"match":{"lap":-1},"approval":"each"}]}"#,
+                "lap must be at least 0",
             ),
         ] {
             let e = Policy::parse(doc).unwrap_err();

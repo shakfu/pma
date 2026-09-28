@@ -398,13 +398,16 @@ pub fn run_detail(run: &Run, attempts: &[Attempt], diff: &str) -> String {
             },
         ]);
         rows.push(vec!["scope".into(), scope_cell(run, c)]);
-        if let (Some(rev), Some(name)) = (run.route_revision, run.route.as_deref()) {
+        // A revision with no approval was in shadow, which records a route,
+        // or none, and applies nothing.
+        if let Some(rev) = run.route_revision {
+            let name = run.route.as_deref().unwrap_or("no route");
             rows.push(vec![
                 "route".into(),
-                format!(
-                    "{name} in revision {rev}, approval {}",
-                    run.approval.map_or("-", |a| a.name())
-                ),
+                match run.approval {
+                    Some(a) => format!("{name} in revision {rev}, approval {}", a.name()),
+                    None => format!("{name} in revision {rev}, in shadow"),
+                },
             ]);
         }
         if let Some(n) = run.complexity {

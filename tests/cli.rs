@@ -863,6 +863,129 @@ fn publishing_resumes_after_a_partial_failure() {
     assert_eq!(env.ok(&["push", "--all-approved"]), "no approved runs\n");
 }
 
+/// A publish that fails after it committed leaves its commits in the
+/// worktree, and verify may have written there too. A retry publishes the
+/// approved tree and the tick, and nothing written since.
+#[test]
+fn a_retried_publish_publishes_only_what_was_approved() {
+    let s = Scratch::new("retry-approved");
+    let (env, origin, _) = dispatch_env(&s, &[("claude", FAKE_CLAUDE), ("gh", FAKE_GH_PR)]);
+    // While `fail` exists, the check fails and leaves output, as a test run
+    // that rewrites a lock file or writes coverage does.
+    let fail = s.0.join("fail");
+    let verify = format!(
+        "if [ -e {0} ]; then echo out > output.txt; echo out >> Makefile; exit 1; fi; test -f hello.txt",
+        fail.display()
+    );
+    env.ok(&["config", "projects.alpha.verify", &verify]);
+
+    env.ok(&["dispatch", "alpha:5"]);
+    env.ok(&["review", "1", "--approve"]);
+    fs::write(&fail, "").unwrap();
+    let (out, _, success) = env.run(&["push", "1"]);
+    assert!(
+        !success && out.contains("failed on the integrated tree"),
+        "{out}"
+    );
+    let worktree = env.home.join("state/worktrees/alpha/add-greeting");
+    assert!(worktree.join("output.txt").exists(), "verify wrote output");
+    // An edit after the failed publish, by a lingering agent or anyone.
+    fs::write(worktree.join("hello.txt"), "edited\n").unwrap();
+    fs::write(worktree.join("extra.txt"), "extra\n").unwrap();
+    fs::remove_file(&fail).unwrap();
+
+    assert!(env.ok(&["push", "1"]).contains("#1 alpha: pushed "));
+    assert_eq!(git_out(&origin, &["show", "main:hello.txt"]), "hi\n");
+    assert_eq!(
+        git_out(&origin, &["ls-tree", "--name-only", "main"]),
+        "Makefile\nTODO.md\nhello.txt\n"
+    );
+    assert!(!git_out(&origin, &["show", "main:Makefile"]).contains("out"));
+    assert!(git_out(&origin, &["show", "main:TODO.md"]).contains("- [x] add greeting"));
+    assert_eq!(
+        git_out(&origin, &["log", "--format=%s", "main"]),
+        "add greeting\ninit\n"
+    );
+
+    // `pma pr` fails after its push; the retry rebuilds its commit with
+    // another date, and finds the same tree already pushed.
+    env.ok(&["dispatch", "alpha:7"]);
+    env.ok(&["review", "2", "--approve"]);
+    fs::write(env.home.join("pr-create-fails"), "").unwrap();
+    let (out, _, success) = env.run(&["pr", "2"]);
+    assert!(!success && out.contains("gh pr create: HTTP 502"), "{out}");
+    let pushed = git_out(&origin, &["rev-parse", "pma/second-task"]);
+    fs::remove_file(env.home.join("pr-create-fails")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    assert_eq!(
+        env.ok(&["pr", "2"]),
+        "#2 alpha: https://github.com/me/alpha/pull/1\n"
+    );
+    assert_eq!(
+        git_out(&origin, &["rev-parse", "pma/second-task"]),
+        pushed,
+        "the branch is not pushed again"
+    );
+}
+
+/// An approval is of what the reviewer was shown. A write after that, by an
+/// agent that outlived its run or by anyone, is read before it is approved.
+#[test]
+fn an_approval_requires_the_tree_last_shown() {
+    let s = Scratch::new("shown");
+    let (env, origin, _) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    env.ok(&["dispatch", "alpha:5"]);
+    let worktree = env.home.join("state/worktrees/alpha/add-greeting");
+    fs::write(worktree.join("late.txt"), "late\n").unwrap();
+
+    // Never shown since the agent finished: the list's diffstat did not
+    // include it.
+    let (_, err, ok) = env.run(&["review", "1", "--approve"]);
+    assert!(
+        !ok && err.contains("changed after it was last shown"),
+        "{err}"
+    );
+
+    // Shown, it is approved and published.
+    assert!(env.ok(&["review", "1"]).contains("late.txt"));
+    env.ok(&["review", "1", "--approve"]);
+    assert!(env.ok(&["push", "1"]).contains("#1 alpha: pushed "));
+    assert_eq!(git_out(&origin, &["show", "main:late.txt"]), "late\n");
+
+    // Shown, then written to: refused again.
+    env.ok(&["dispatch", "alpha:7"]);
+    env.ok(&["review", "2"]);
+    let worktree = env.home.join("state/worktrees/alpha/second-task");
+    fs::write(worktree.join("second.txt"), "changed\n").unwrap();
+    let (_, err, ok) = env.run(&["review", "2", "--approve"]);
+    assert!(
+        !ok && err.contains("changed after it was last shown"),
+        "{err}"
+    );
+}
+
+/// A worker that changes nothing.
+const IDLE_CLAUDE: &str = r#"#!/bin/sh
+echo '{"type":"result","subtype":"success","is_error":false,"result":"nothing to do","total_cost_usd":0.1}'
+"#;
+
+/// The tick alone is not a change: publishing it would mark the task done
+/// with no work in it.
+#[test]
+fn a_run_with_no_changes_is_not_published() {
+    let s = Scratch::new("no-changes");
+    let (env, origin, _) = dispatch_env(&s, &[("claude", IDLE_CLAUDE)]);
+    env.ok(&["config", "projects.alpha.verify", "none"]);
+    env.ok(&["dispatch", "alpha:5"]);
+    env.ok(&["review", "1", "--approve"]);
+    let (out, _, success) = env.run(&["push", "1"]);
+    assert!(
+        !success && out.contains("nothing to publish: no changes"),
+        "{out}"
+    );
+    assert_eq!(git_out(&origin, &["log", "--format=%s", "main"]), "init\n");
+}
+
 #[test]
 fn auto_dispatch_passes_over_refused_tasks_and_names_the_cause() {
     let s = Scratch::new("refused");
@@ -1296,6 +1419,77 @@ fn a_failed_check_escalates_once_and_records_both_attempts() {
     assert!(detail.contains("claude haiku, $0.20"), "{detail}");
 }
 
+/// Shadow records which route a policy would choose and applies none of it:
+/// no refusal, no scope, no approval mode.
+#[test]
+fn a_shadow_policy_refuses_scopes_and_approves_nothing() {
+    let s = Scratch::new("route-shadow");
+    let (env, _, _) = dispatch_env(&s, &[("claude", MODEL_CLAUDE)]);
+    let propose = |name: &str, doc: &str| {
+        let path = s.0.join(name);
+        fs::write(&path, doc).unwrap();
+        env.ok(&["route", "propose", path.to_str().unwrap(), "--by", "me"]);
+    };
+
+    // Applied, `propose` would block approval and the scope would flag
+    // hello.txt.
+    propose(
+        "all.json",
+        r#"{"route":[{"name":"all","match":{},"model":"opus",
+            "scope":["docs/**"],"approval":"propose"}]}"#,
+    );
+    env.ok(&["route", "activate", "1", "--shadow", "--by", "me"]);
+    env.ok(&["dispatch", "alpha:5"]);
+    let detail = env.ok(&["review", "1"]);
+    assert!(detail.contains("all in revision 1, in shadow"), "{detail}");
+    assert!(detail.contains("ran as unset"), "{detail}");
+    assert!(
+        !detail.contains("docs/**"),
+        "the class scope holds: {detail}"
+    );
+    env.ok(&["review", "1", "--approve"]);
+
+    // Applied, a task no route matches would be refused.
+    propose(
+        "narrow.json",
+        r#"{"route":[{"name":"narrow","match":{"class":"A"},"approval":"each"}]}"#,
+    );
+    env.ok(&["route", "activate", "2", "--shadow", "--by", "me"]);
+    env.ok(&["dispatch", "alpha:7"]);
+    let detail = env.ok(&["review", "2"]);
+    assert!(
+        detail.contains("no route in revision 2, in shadow"),
+        "{detail}"
+    );
+}
+
+/// Stated order: flags, `-p`, an applied route, then the default preset. The
+/// default preset is a setting, and a route is policy about the work.
+#[test]
+fn an_applied_route_outranks_the_default_preset() {
+    let s = Scratch::new("route-preset");
+    let (env, _, _) = dispatch_env(&s, &[("claude", MODEL_CLAUDE)]);
+    env.ok(&["preset", "set", "cheap", "claude", "haiku"]);
+    env.ok(&["preset", "use", "cheap"]);
+    let doc = s.0.join("policy.json");
+    fs::write(
+        &doc,
+        r#"{"route":[{"name":"all","match":{},"model":"opus","approval":"each"}]}"#,
+    )
+    .unwrap();
+    env.ok(&["route", "propose", doc.to_str().unwrap(), "--by", "me"]);
+    env.ok(&["route", "activate", "1", "--by", "me"]);
+
+    env.ok(&["dispatch", "alpha:5"]);
+    let detail = env.ok(&["review", "1"]);
+    assert!(detail.contains("ran as opus"), "{detail}");
+
+    // A preset named on the command line still outranks the route.
+    env.ok(&["dispatch", "-p", "cheap", "alpha:7"]);
+    let detail = env.ok(&["review", "2"]);
+    assert!(detail.contains("ran as haiku"), "{detail}");
+}
+
 /// A policy is an artifact: proposed, reviewed, activated, and applied
 /// deterministically. Replaying it over recorded runs must reproduce what
 /// they were routed to.
@@ -1332,8 +1526,10 @@ fn a_policy_is_a_draft_until_activated_and_replays_exactly() {
     env.ok(&["route", "activate", "1", "--shadow", "--by", "me"]);
     env.ok(&["dispatch", "alpha:5", "--retry"]);
     let detail = env.ok(&["review", "2"]);
-    assert!(detail.contains("specified in revision 1"), "{detail}");
-    assert!(detail.contains("approval batch"), "{detail}");
+    assert!(
+        detail.contains("specified in revision 1, in shadow"),
+        "{detail}"
+    );
     assert!(detail.contains("ran as unset"), "shadow applies nothing");
     env.ok(&["review", "2", "--reject"]);
 
@@ -3142,29 +3338,16 @@ fn a_replaced_git_dir_is_refused_before_pma_runs_git_in_it() {
     assert!(!s.0.join("pwned").exists(), "the monitor ran");
 }
 
-/// An agent that reaches from its worktree into the clone's hooks on the
-/// second task, and behaves on the first.
-const HOOKING_CLAUDE: &str = r#"#!/bin/sh
-case "$2" in
-  *"add greeting"*) echo hi > hello.txt ;;
-  *"second task"*)
-    echo hi > hello.txt
-    hooks="$(git rev-parse --git-common-dir)/hooks"
-    printf '#!/bin/sh\ntouch "%s"\n' "$PMA_HOME/../hooked" > "$hooks/pre-commit"
-    chmod +x "$hooks/pre-commit" ;;
-esac
-echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","total_cost_usd":0.1}'
-"#;
-
-/// The user's own hooks run at publishing. One a run added does not: nothing
-/// in the diff shows it, and `pma push` commits and pushes with the user's
-/// credentials.
+/// The user's own hooks run at publishing. One added since dispatch does not:
+/// nothing in the diff shows it, and `pma push` commits and pushes with the
+/// user's credentials. Here the project's check adds it while publishing, so
+/// the run was clean at review.
 #[test]
 fn a_hook_added_during_a_run_stops_its_push() {
     use std::os::unix::fs::PermissionsExt;
 
     let s = Scratch::new("hooks");
-    let (env, origin, alpha) = dispatch_env(&s, &[("claude", HOOKING_CLAUDE)]);
+    let (env, origin, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
     let own = alpha.join(".git/hooks/post-commit");
     fs::write(
         &own,
@@ -3172,6 +3355,14 @@ fn a_hook_added_during_a_run_stops_its_push() {
     )
     .unwrap();
     fs::set_permissions(&own, fs::Permissions::from_mode(0o755)).unwrap();
+    let (mark, hooked) = (s.0.join("mark"), s.0.join("hooked"));
+    let verify = format!(
+        "if [ -e {mark} ]; then h=\"$(git rev-parse --git-common-dir)/hooks/pre-push\"; \
+         printf '#!/bin/sh\\ntouch {hooked}\\n' > \"$h\"; chmod +x \"$h\"; fi; test -f hello.txt",
+        mark = mark.display(),
+        hooked = hooked.display()
+    );
+    env.ok(&["config", "projects.alpha.verify", &verify]);
 
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
@@ -3180,22 +3371,93 @@ fn a_hook_added_during_a_run_stops_its_push() {
 
     env.ok(&["dispatch", "alpha:7"]);
     env.ok(&["review", "2", "--approve"]);
+    fs::write(&mark, "").unwrap();
     let (out, _, success) = env.run(&["push", "2"]);
     assert!(!success, "{out}");
     assert!(
         out.contains("hooks or git settings changed since run #2 was dispatched")
-            && out.contains("  + hook pre-commit "),
+            && out.contains("  + hook pre-push "),
         "{out}"
     );
-    assert!(!s.0.join("hooked").exists(), "the added hook ran");
+    assert!(!hooked.exists(), "the added hook ran");
     assert_eq!(
         git_out(&origin, &["log", "--format=%s", "main"]),
         "add greeting\ninit\n"
     );
 
     // Restoring the hooks is enough.
-    fs::remove_file(alpha.join(".git/hooks/pre-commit")).unwrap();
+    fs::remove_file(&mark).unwrap();
+    fs::remove_file(alpha.join(".git/hooks/pre-push")).unwrap();
     assert!(env.ok(&["push", "2"]).contains("#2 alpha: pushed "));
+}
+
+/// An agent that writes a clean filter and a filesystem monitor into the
+/// clone's config and a hook into its hooks. A git call that reads the
+/// worktree's files would run the filter, `git status` in the clone the
+/// monitor, and a commit the hook, with pma's environment rather than the
+/// agent's.
+const FILTERING_CLAUDE: &str = r#"#!/bin/sh
+echo hi > hello.txt
+git config filter.x.clean "touch MARKER; cat"
+echo '* filter=x' > .gitattributes
+hook="$(git rev-parse --git-common-dir)/hooks/pre-commit"
+printf '#!/bin/sh\ntouch MARKER\n' > "$hook"
+chmod +x "$hook"
+cp "$hook" MARKER.sh
+git config core.fsmonitor MARKER.sh
+echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","total_cost_usd":0.1}'
+"#;
+
+/// A setting the agent added is caught before pma's first git call after it,
+/// and every later call in the worktree refuses, so review and reject run
+/// none of it.
+#[test]
+fn a_git_setting_added_by_the_agent_fails_the_run_before_pma_runs_git() {
+    let s = Scratch::new("filter");
+    let marker = s.0.join("filtered");
+    let agent = FILTERING_CLAUDE.replace("MARKER", marker.to_str().unwrap());
+    let (env, _, alpha) = dispatch_env(&s, &[("claude", &agent)]);
+    // The check reads hello.txt; the filter is what this test is about.
+    env.ok(&["config", "projects.alpha.verify", "none"]);
+
+    let out = env.ok(&["dispatch", "alpha:5"]);
+    assert!(out.contains("0 ready, 1 failed"), "{out}");
+    let (out, err, _) = env.run(&["review", "1"]);
+    let shown = format!("{out}{err}");
+    assert!(
+        shown.contains("hooks or git settings changed since run #1 was dispatched")
+            && shown.contains("  + config filter.x.clean ")
+            && shown.contains("  + hook pre-commit "),
+        "{shown}"
+    );
+    let (_, err, ok) = env.run(&["review", "1", "--approve"]);
+    assert!(!ok, "a failed run is not approved: {err}");
+
+    // The settings stay in the clone, so nothing runs git there, and
+    // rejecting the run does not lift that.
+    let (_, err, ok) = env.run(&["dispatch", "alpha:7"]);
+    assert!(!ok && err.contains("and they are still in"), "{err}");
+    let (_, err, _) = env.run(&["verify", "alpha"]);
+    assert!(err.contains("and they are still in"), "{err}");
+    let (_, err, ok) = env.run(&["review", "1", "--reject"]);
+    assert!(!ok && err.contains("Restore them first"), "{err}");
+    // `git status` would run the monitor, so the clone is not read.
+    let (_, err, ok) = env.run(&["scan", "--offline"]);
+    assert!(
+        ok && err.contains("warning: alpha: ") && err.contains("still in"),
+        "{err}"
+    );
+    assert!(!marker.exists(), "scan ran the monitor");
+
+    // Restored, both clear.
+    git(&alpha, &["config", "--unset", "filter.x.clean"], None);
+    git(&alpha, &["config", "--unset", "core.fsmonitor"], None);
+    fs::remove_file(alpha.join(".git/hooks/pre-commit")).unwrap();
+    let (_, err, _) = env.run(&["verify", "alpha"]);
+    assert!(!err.contains("still in"), "{err}");
+    env.ok(&["review", "1", "--reject"]);
+    assert!(!marker.exists(), "the filter ran");
+    assert_eq!(git_out(&alpha, &["branch", "--list", "pma/*"]), "");
 }
 
 /// A refusal that comes after the worktree exists, here a policy with no
@@ -3908,6 +4170,48 @@ fn the_documented_workflow_library_reads_as_documented() {
 
 /// A review that writes no `out.json` failed; it did not find nothing. Its
 /// files are kept under `artifacts/` after its tree is gone.
+/// A read node's agent that adds a setting to the clone fails its run, as a
+/// dispatch does, rather than leaving it as the next run's baseline.
+#[test]
+fn a_git_setting_added_by_a_read_node_fails_its_run() {
+    let s = Scratch::new("read-filter");
+    let marker = s.0.join("filtered");
+    let agent = format!(
+        "#!/bin/sh\ngit config filter.x.clean \"touch {}; cat\"\n\
+         echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"total_cost_usd\":0.1}}'\n",
+        marker.display()
+    );
+    let (env, _, _) = dispatch_env(&s, &[("claude", &agent)]);
+    let wf = s.0.join("look.rhai");
+    fs::write(&wf, REVIEW_CONFIRM).unwrap();
+    env.ok(&["workflow", "propose", wf.to_str().unwrap()]);
+    env.ok(&["workflow", "activate", "1"]);
+    let out = env.ok(&["workflow", "run", "look", "alpha"]);
+    let (_, err, _) = env.run(&[
+        "workflow",
+        "run",
+        "look",
+        "--instance",
+        "1",
+        "--approve",
+        &plan_id(&out),
+    ]);
+    assert!(
+        err.contains("refused: review")
+            && err.contains("hooks or git settings changed")
+            && err.contains("+ config filter.x.clean"),
+        "{err}"
+    );
+    assert!(!marker.exists(), "the filter ran");
+
+    // The user may say the change is theirs, which lifts the hold.
+    let (_, err, _) = env.run(&["verify", "alpha"]);
+    assert!(err.contains("and they are still in"), "{err}");
+    env.ok(&["review", "1", "--reject", "--keep-git-changes"]);
+    let (_, err, _) = env.run(&["verify", "alpha"]);
+    assert!(!err.contains("still in"), "{err}");
+}
+
 #[test]
 fn a_node_that_writes_no_output_failed() {
     let s = Scratch::new("silent");

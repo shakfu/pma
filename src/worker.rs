@@ -232,6 +232,36 @@ pub const FIELDS: [(&str, &str); 9] = [
     ),
 ];
 
+/// `template` with each `{name}` replaced in one pass, so a value is never
+/// read for placeholders: a task that mentions `{model}` reaches the agent as
+/// written. `None` when a placeholder it holds has no value. An unknown
+/// `{name}` is left as it is.
+fn fill(template: &str, values: &[(&str, Option<&str>)]) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        rest = &rest[open..];
+        let named = values.iter().find(|(name, _)| {
+            rest[1..]
+                .strip_prefix(name)
+                .is_some_and(|r| r.starts_with('}'))
+        });
+        match named {
+            Some((name, value)) => {
+                out.push_str((*value)?);
+                rest = &rest[name.len() + 2..];
+            }
+            None => {
+                out.push('{');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
 impl Worker {
     /// The command to run in `dir`. An argument whose placeholder has no
     /// value is dropped, and with it the argument before it when that one is
@@ -256,22 +286,21 @@ impl Worker {
                 args.extend(extra.iter().cloned());
                 continue;
             }
-            let filled = arg
-                .replace("{prompt}", prompt)
-                .replace("{dir}", &dir_text)
-                .replace("{budget}", &budget)
-                .replace("{timeout}", &timeout);
-            let filled = match model {
-                Some(m) => filled.replace("{model}", m),
-                None if filled.contains("{model}") => {
+            let values = [
+                ("prompt", Some(prompt)),
+                ("dir", Some(dir_text.as_str())),
+                ("budget", Some(budget.as_str())),
+                ("timeout", Some(timeout.as_str())),
+                ("model", model),
+            ];
+            match fill(arg, &values) {
+                Some(filled) => args.push(filled),
+                None => {
                     if args.last().is_some_and(|a| a.starts_with('-')) {
                         args.pop();
                     }
-                    continue;
                 }
-                None => filled,
-            };
-            args.push(filled);
+            }
         }
         let mut cmd = Command::new(&self.command);
         cmd.args(args);
@@ -503,6 +532,41 @@ mod tests {
             args.ends_with(&["--max-budget-usd".into(), "0.5".into()]),
             "{args:?}"
         );
+    }
+
+    /// Task text is the agent's to read, not a template: placeholders in it
+    /// are neither filled nor taken as a missing value.
+    #[test]
+    fn placeholders_in_the_prompt_reach_the_agent_as_written() {
+        let prompt = "document {model}, {dir} and {budget} in the README";
+        let args =
+            args_of(&Worker::claude().build(prompt, Path::new("/w/a"), None, 0.5, &[], MINUTE));
+        assert_eq!(args[..2], ["-p".to_string(), prompt.to_string()]);
+        assert!(!args.contains(&"--model".to_string()), "{args:?}");
+        let args = args_of(&Worker::claude().build(
+            prompt,
+            Path::new("/w/a"),
+            Some("haiku"),
+            0.5,
+            &[],
+            MINUTE,
+        ));
+        assert_eq!(args[1], prompt);
+        assert!(args.ends_with(&[
+            "--model".into(),
+            "haiku".into(),
+            "--max-budget-usd".into(),
+            "0.5".into()
+        ]));
+    }
+
+    #[test]
+    fn fill_replaces_known_placeholders_once() {
+        let v = [("a", Some("{b}")), ("b", Some("x")), ("m", None)];
+        assert_eq!(fill("{a}-{b}", &v).as_deref(), Some("{b}-x"));
+        assert_eq!(fill("{unknown} {", &v).as_deref(), Some("{unknown} {"));
+        assert_eq!(fill("--m={m}", &v), None);
+        assert_eq!(fill("{ab}", &v).as_deref(), Some("{ab}"));
     }
 
     #[test]

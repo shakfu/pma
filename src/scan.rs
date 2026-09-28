@@ -35,6 +35,38 @@ pub struct Facts {
     /// `None` when this scan did not measure dependencies.
     pub deps: Option<DepsFacts>,
     pub error: Option<String>,
+    /// Not read, because git there would run a hook or setting a failed run
+    /// found added. The store keeps what the last scan recorded, and `error`.
+    pub held: bool,
+}
+
+impl Facts {
+    /// A project left unread, with the reason.
+    pub fn held(name: &str, path: &Path, error: String) -> Facts {
+        Facts {
+            held: true,
+            error: Some(error),
+            ..Facts::blank(name, path)
+        }
+    }
+
+    fn blank(name: &str, path: &Path) -> Facts {
+        Facts {
+            name: name.into(),
+            path: path.into(),
+            slug: None,
+            todo: None,
+            todo_unread: false,
+            dirty: 0,
+            pma_branches: Vec::new(),
+            ahead: None,
+            last_activity: None,
+            ci: Ci::Unknown("offline".into()),
+            deps: None,
+            error: None,
+            held: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -181,20 +213,7 @@ pub fn scan_project(
     offline: bool,
     deps: bool,
 ) -> Facts {
-    let mut facts = Facts {
-        name: name.into(),
-        path: path.into(),
-        slug: None,
-        todo: None,
-        todo_unread: false,
-        dirty: 0,
-        pma_branches: Vec::new(),
-        ahead: None,
-        last_activity: None,
-        ci: Ci::Unknown("offline".into()),
-        deps: None,
-        error: None,
-    };
+    let mut facts = Facts::blank(name, path);
 
     let git = Git::new(path);
     match std::fs::read_to_string(path.join("TODO.md")) {

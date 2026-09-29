@@ -87,7 +87,7 @@ fn run(ecosystem: &str, dir: &Path) -> Result<Vec<Outdated>, String> {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    let finished = agent::run_limited(cmd, &log, TIMEOUT).map_err(|e| e.to_string());
+    let finished = agent::run_limited(cmd, None, &log, TIMEOUT).map_err(|e| e.to_string());
     let output = std::fs::read_to_string(&log).unwrap_or_default();
     let _ = std::fs::remove_file(&log);
     match finished?.success {

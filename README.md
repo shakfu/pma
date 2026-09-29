@@ -45,11 +45,13 @@ pma pr 1                       # commit and open a pull request; or `pma push 1`
 
 - `claude`, `opencode` and `omp` come as templates. Any coding agent with a headless mode is a record you edit, not a code change.
 
-- `sanduk` is the same agent in a disposable container: the key stays on the host, the worktree is mounted at its own path, and the box is the bound. Needs [sanduk](https://github.com/shakfu/sanduk) and a container engine; `pma agent show sanduk` prints what it runs. Verify still runs on the host, so a run that edits the build file is contained and the build is not.
+- `sanduk` is the same agent in a disposable container: the key stays on the host, the worktree is mounted at its own path, and the box is the bound. Needs [sanduk](https://github.com/shakfu/sanduk-rs) (`cargo install sanduk`) and a container engine; `pma agent show sanduk` prints what it runs.
 
 - Each run gets its own worktree of the remote default branch, so your dirty checkout is never touched.
 
 - The agent runs without push credentials. `pma` runs the project's test command itself, before and after, and reports both ends.
+
+- That test command runs on the host, able to write only to the worktree, the temp directory and the toolchain caches: Landlock on Linux 6.2 and later, Seatbelt on macOS. Reads and the network stay open.
 
 - A hook or git setting added to the repository during a run fails the run, and `pma` runs no git in that repository until it is restored, or until `pma review <id> --reject --keep-git-changes` accepts it as yours.
 
@@ -206,7 +208,7 @@ pma report --by project         # also class or agent
 
 A target naming one task fails if that task cannot run. A target naming many passes over each with its reason, and dispatches the rest.
 
-Each run gets a worktree of the remote default branch under `~/.local/state/pma/worktrees`, on a `pma/` branch. The item must be open in the remote `TODO.md`, so commit and push before dispatching. Set the test command with `pma config projects.myproject.verify "make check"`, or let it be detected.
+Each run gets a worktree of the remote default branch under `~/.local/state/pma/worktrees`, on a `pma/` branch. The item must be open in the remote `TODO.md`, so commit and push before dispatching. Set the test command with `pma config projects.myproject.verify "make check"`, or let it be detected. A check that must write elsewhere needs `pma config projects.myproject.sandbox off`.
 
 A run opened with `pma pr` is `pr-open` until the pull request is merged or closed; `pma review` settles it and shows review activity meanwhile. A run published with `pma push` is `pushed`.
 

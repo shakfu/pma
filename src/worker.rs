@@ -752,6 +752,40 @@ mod tests {
         assert_eq!(args[1], "fix the test", "the task is sanduk's positional");
     }
 
+    /// The template's flags are ones the installed `sanduk` accepts, so a flag
+    /// renamed upstream fails here rather than on every dispatch. `--help`
+    /// last has clap reject an unknown flag or value without starting
+    /// anything; `--dry-run` would create the container network.
+    #[test]
+    fn the_container_template_parses_against_the_installed_sanduk() {
+        let w = Worker::sanduk();
+        let cmd = w.build("do it", Path::new("/w/a"), Some("opus"), 1.0, &[], MINUTE);
+        let args = args_of(&cmd);
+        let sanduk = |args: &[String]| {
+            Command::new(&w.command)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("{}: {e}; `cargo install sanduk`", w.command))
+        };
+
+        let out = sanduk(&[args.clone(), vec!["--help".into()]].concat());
+        assert!(
+            out.status.success(),
+            "sanduk refuses the template: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let agent = &args[args.iter().position(|a| a == "--agent").unwrap() + 1];
+        let out = sanduk(&["list".into(), "agents".into()]);
+        let agents = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            agents
+                .lines()
+                .any(|l| l.split_whitespace().next() == Some(agent)),
+            "sanduk has no agent {agent}: {agents}"
+        );
+    }
+
     /// The box is the bound. A container that denies egress does not also need
     /// a `Bash()` rule, and shipping both would mean believing in both.
     #[test]

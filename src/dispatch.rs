@@ -1134,7 +1134,7 @@ fn attempt(
     a.started_at = crate::dates::now();
     run.error = None;
     let log = logs.join(format!("agent-{n}.log"));
-    let finished = match agent::run_limited(cmd, &log, timeout) {
+    let finished = match agent::run_limited(cmd, None, &log, timeout) {
         Ok(f) => f,
         Err(e) => {
             fail(run, &mut a, format!("{}: {e}", worker.command));
@@ -1193,7 +1193,8 @@ fn attempt(
     run.verify_ok = None;
     if let Some(v) = &run.verify {
         let vlog = logs.join(format!("verify-{n}.log"));
-        match verify_once(v, &run.worktree, &agent_env, &vlog, timeout) {
+        let sandbox = cfg.project(&run.project).sandbox;
+        match verify_once(v, &run.worktree, sandbox, &agent_env, &vlog, timeout) {
             Ok((ok, seconds)) => {
                 a.seconds = Some(a.seconds.unwrap_or(0) + seconds);
                 run.seconds = Some(run.seconds.unwrap_or(0) + seconds);
@@ -1226,9 +1227,16 @@ fn tracked_files(worktree: &Path) -> i64 {
 /// Runs `command` in `worktree` under the agent's stripped environment, the
 /// same way the head check runs it. `Ok(None)` means it was killed at the
 /// timeout.
+///
+/// With `sandbox`, writes are confined to the worktree, the temp directory and
+/// the toolchain caches, so a build file the agent edited cannot write
+/// elsewhere on the host. Reads and the network stay open. Nothing under the
+/// repository's `.git` is granted: a deleted object loses history nothing can
+/// rebuild. A sandbox that cannot start is an error, not an unconfined run.
 pub fn verify_once(
     command: &str,
     worktree: &Path,
+    sandbox: bool,
     agent_env: &Path,
     log: &Path,
     timeout: Duration,
@@ -1236,8 +1244,24 @@ pub fn verify_once(
     let mut cmd = Command::new("sh");
     cmd.args(["-c", command]).current_dir(worktree);
     agent::restrict(&mut cmd, agent_env)?;
-    let f = agent::run_limited(cmd, log, timeout)?;
+    let policy = match sandbox {
+        true => Some(confine(worktree)?),
+        false => None,
+    };
+    let f = agent::run_limited(cmd, policy.as_ref(), log, timeout)?;
     Ok((f.success, f.seconds))
+}
+
+/// The verify sandbox for `worktree`, checked by running one confined command.
+fn confine(worktree: &Path) -> std::io::Result<sanduk_sandbox::Policy> {
+    let policy = sanduk_sandbox::Policy::new(worktree)?;
+    policy.preflight().map_err(|e| {
+        std::io::Error::other(format!(
+            "the verify sandbox did not start ({e}); \
+             `pma config projects.<name>.sandbox off` runs verify unconfined"
+        ))
+    })?;
+    Ok(policy)
 }
 
 /// `verify` at the base commit, measured once per project, base, command and
@@ -1253,7 +1277,8 @@ fn base_verify(
     command: &str,
     worktree: &Path,
 ) -> Result<(Option<bool>, Option<i64>)> {
-    if let Some((ok, seconds)) = store.verify_base(project, base, command, cfg.timeout)? {
+    let sandbox = cfg.project(project).sandbox;
+    if let Some((ok, seconds)) = store.verify_base(project, base, command, cfg.timeout, sandbox)? {
         return Ok((ok, Some(seconds)));
     }
     let (ok, seconds, _) = measure_base(store, home, cfg, project, base, command, worktree)?;
@@ -1277,11 +1302,12 @@ fn measure_base(
     std::fs::create_dir_all(&logs).map_err(|e| format!("{}: {e}", logs.display()))?;
     let log = logs.join(format!("{project}-{}.log", &base[..base.len().min(12)]));
     let timeout = Duration::from_secs(cfg.timeout as u64 * 60);
-    let (ok, seconds) = match verify_once(command, worktree, &agent_env, &log, timeout) {
+    let sandbox = cfg.project(project).sandbox;
+    let (ok, seconds) = match verify_once(command, worktree, sandbox, &agent_env, &log, timeout) {
         Ok((success, seconds)) => (success, seconds),
         Err(_) => (None, 0),
     };
-    store.set_verify_base(project, base, command, cfg.timeout, ok, seconds)?;
+    store.set_verify_base(project, base, command, cfg.timeout, sandbox, ok, seconds)?;
     Ok((ok, seconds, log))
 }
 

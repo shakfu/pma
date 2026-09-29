@@ -31,4 +31,6 @@ rhai = { version = "1.26.1", default-features = false, features = [
     "no_module",
 ] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# Confines verify's writes to the worktree. Exact: 0.1 has no stable API.
+sanduk-sandbox = "=0.1.0"
 serde_json = "1.0.151"

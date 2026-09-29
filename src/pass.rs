@@ -2129,7 +2129,7 @@ fn work(cfg: &Config, job: &Staged) -> Ran {
     );
     cmd.current_dir(&job.tree);
     let finished = match crate::agent::restrict(&mut cmd, &job.agent_env)
-        .and_then(|()| crate::agent::run_limited(cmd, &job.log, timeout))
+        .and_then(|()| crate::agent::run_limited(cmd, None, &job.log, timeout))
     {
         Ok(f) => f,
         Err(e) => {

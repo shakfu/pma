@@ -179,7 +179,8 @@ fn publish_one(home: &std::path::Path, cfg: &Config, run: &Run, target: Target) 
             .join(run.id.to_string())
             .join("verify-publish.log");
         let _ = std::fs::create_dir_all(log.parent().unwrap_or(&agent_env));
-        match crate::dispatch::verify_once(command, wt, &agent_env, &log, timeout) {
+        let sandbox = cfg.project(&run.project).sandbox;
+        match crate::dispatch::verify_once(command, wt, sandbox, &agent_env, &log, timeout) {
             Ok((Some(true), _)) => {}
             Ok((Some(false), _)) => {
                 return Err(format!(

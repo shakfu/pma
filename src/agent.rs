@@ -10,6 +10,8 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use sanduk_sandbox::Policy;
+
 /// Removes what lets a child push, using `dir`, a directory `pma` owns outside
 /// every worktree, for an empty `gh` configuration and a `pre-push` hook that
 /// refuses. It stops an accidental push, not a process set on pushing:
@@ -85,11 +87,16 @@ pub struct Finished {
 
 /// Runs `cmd` with stdout and stderr in `log`, then kills its process group:
 /// at `timeout`, and also after a normal exit, so nothing it started in the
-/// background outlives it.
-pub fn run_limited(cmd: Command, log: &Path, timeout: Duration) -> std::io::Result<Finished> {
+/// background outlives it. With a `sandbox`, the whole group is confined.
+pub fn run_limited(
+    cmd: Command,
+    sandbox: Option<&Policy>,
+    log: &Path,
+    timeout: Duration,
+) -> std::io::Result<Finished> {
     let started = Instant::now();
     // Held until the group is killed. Dropped any earlier, it ends the run.
-    let (mut child, _lifeline) = spawn_guarded(cmd, log)?;
+    let (mut child, _lifeline) = spawn_guarded(cmd, sandbox, log)?;
     let success = loop {
         if let Some(status) = child.try_wait()? {
             break Some(status.success());
@@ -121,10 +128,20 @@ const WATCHDOG: &str = r#"exec 3<&0 0</dev/null; "$@" 3<&- & pid=$!; { read _ <&
 /// Starts `cmd` under the watchdog, as the leader of a new process group,
 /// with stdout and stderr in `log`. Dropping the returned pipe kills the
 /// group.
-fn spawn_guarded(cmd: Command, log: &Path) -> std::io::Result<(Child, ChildStdin)> {
+///
+/// The sandbox wraps the watchdog's own `sh`: on Linux it is a `pre_exec`
+/// hook on that `Command`, which rebuilding `cmd` below would drop.
+fn spawn_guarded(
+    cmd: Command,
+    sandbox: Option<&Policy>,
+    log: &Path,
+) -> std::io::Result<(Child, ChildStdin)> {
     use std::os::unix::process::CommandExt;
 
-    let mut guarded = Command::new("sh");
+    let mut guarded = match sandbox {
+        Some(policy) => policy.command("sh")?,
+        None => Command::new("sh"),
+    };
     guarded
         .arg("-c")
         .arg(WATCHDOG)
@@ -311,7 +328,7 @@ mod tests {
         let log = dir.join("log");
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "echo out; echo err >&2; exit 3"]);
-        let done = run_limited(cmd, &log, Duration::from_secs(10)).unwrap();
+        let done = run_limited(cmd, None, &log, Duration::from_secs(10)).unwrap();
         assert_eq!(done.success, Some(false));
         assert_eq!(std::fs::read_to_string(&log).unwrap(), "out\nerr\n");
 
@@ -319,7 +336,7 @@ mod tests {
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "sleep 30 & wait"]);
         let started = Instant::now();
-        let done = run_limited(cmd, &log, Duration::from_millis(300)).unwrap();
+        let done = run_limited(cmd, None, &log, Duration::from_millis(300)).unwrap();
         assert_eq!(done.success, None);
         assert!(started.elapsed() < Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(dir);
@@ -364,7 +381,7 @@ mod tests {
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "sleep 30 & echo $! > pid; exit 0"])
             .current_dir(&dir);
-        let done = run_limited(cmd, &dir.join("log"), Duration::from_secs(10)).unwrap();
+        let done = run_limited(cmd, None, &dir.join("log"), Duration::from_secs(10)).unwrap();
         assert_eq!(done.success, Some(true), "the child's own status");
         assert!(gone(&pid_in(&pid)), "the background sleep was left running");
         let _ = std::fs::remove_dir_all(dir);
@@ -378,7 +395,7 @@ mod tests {
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "sleep 30 & echo $! > pid; wait"])
             .current_dir(&dir);
-        let (mut child, lifeline) = spawn_guarded(cmd, &dir.join("log")).unwrap();
+        let (mut child, lifeline) = spawn_guarded(cmd, None, &dir.join("log")).unwrap();
         let grandchild = pid_in(&pid);
         drop(lifeline);
         let started = Instant::now();

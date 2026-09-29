@@ -23,7 +23,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 29;
+const VERSION: i64 = 30;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -304,6 +304,25 @@ CREATE TABLE campaign_members (
     project TEXT NOT NULL,
     run_id INTEGER,
     PRIMARY KEY (campaign, project)
+);
+";
+
+/// Version 30. Whether verify ran confined is part of the base cache's key. A
+/// base measured unconfined says nothing about a confined head: a check that
+/// fails only under the sandbox would read as the agent's regression. The
+/// cached rows are dropped and measured again.
+const VERIFY_BASE_SANDBOX: &str = "
+DROP TABLE verify_base;
+CREATE TABLE verify_base (
+    project TEXT NOT NULL,
+    base TEXT NOT NULL,
+    command TEXT NOT NULL,
+    timeout_minutes INTEGER NOT NULL,
+    sandbox INTEGER NOT NULL,
+    ok INTEGER,
+    seconds INTEGER NOT NULL,
+    measured_at INTEGER NOT NULL,
+    PRIMARY KEY (project, base, command, timeout_minutes, sandbox)
 );
 ";
 
@@ -694,6 +713,7 @@ impl Store {
                     RETIRE_WEIGHTS,
                     PUSH_OR_PR,
                     REVIEWED_TREE,
+                    VERIFY_BASE_SANDBOX,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -1962,43 +1982,49 @@ impl Store {
         )? > 0)
     }
 
-    /// A base verification of this exact repository, commit, command and
-    /// timeout, or `None` when it has not been measured.
+    /// A base verification of this exact repository, commit, command,
+    /// timeout and sandbox, or `None` when it has not been measured.
     pub fn verify_base(
         &self,
         project: &str,
         base: &str,
         command: &str,
         timeout_minutes: i64,
+        sandbox: bool,
     ) -> Result<Option<(Option<bool>, i64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT ok, seconds FROM verify_base
-             WHERE project = ?1 AND base = ?2 AND command = ?3 AND timeout_minutes = ?4",
+             WHERE project = ?1 AND base = ?2 AND command = ?3 AND timeout_minutes = ?4
+               AND sandbox = ?5",
         )?;
-        let mut rows = stmt.query_map(params![project, base, command, timeout_minutes], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?;
+        let mut rows = stmt.query_map(
+            params![project, base, command, timeout_minutes, sandbox],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         Ok(rows.next().transpose()?)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn set_verify_base(
         &self,
         project: &str,
         base: &str,
         command: &str,
         timeout_minutes: i64,
+        sandbox: bool,
         ok: Option<bool>,
         seconds: i64,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO verify_base
-                (project, base, command, timeout_minutes, ok, seconds, measured_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (project, base, command, timeout_minutes, sandbox, ok, seconds, measured_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 project,
                 base,
                 command,
                 timeout_minutes,
+                sandbox,
                 ok,
                 seconds,
                 crate::dates::now()
@@ -2906,42 +2932,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The cache answers only for the exact repository, commit, command and
-    /// timeout it measured. A pass under a longer limit says nothing about a
-    /// shorter one, and a changed command says nothing at all.
+    /// The cache answers only for the exact repository, commit, command,
+    /// timeout and sandbox it measured. A pass under a longer limit says
+    /// nothing about a shorter one, a confined result nothing about an
+    /// unconfined one, and a changed command nothing at all.
     #[test]
     fn base_verification_is_cached_per_command_and_timeout() {
         let dir = scratch("verify-base");
         let store = Store::open(&dir.join("p.db")).unwrap();
         assert_eq!(
-            store.verify_base("p", "abc", "make test", 30).unwrap(),
+            store
+                .verify_base("p", "abc", "make test", 30, true)
+                .unwrap(),
             None
         );
 
         store
-            .set_verify_base("p", "abc", "make test", 30, Some(false), 12)
+            .set_verify_base("p", "abc", "make test", 30, true, Some(false), 12)
             .unwrap();
         assert_eq!(
-            store.verify_base("p", "abc", "make test", 30).unwrap(),
+            store
+                .verify_base("p", "abc", "make test", 30, true)
+                .unwrap(),
             Some((Some(false), 12))
         );
-        for (base, command, timeout) in [
-            ("def", "make test", 30),
-            ("abc", "cargo test", 30),
-            ("abc", "make test", 10),
+        for (base, command, timeout, sandbox) in [
+            ("def", "make test", 30, true),
+            ("abc", "cargo test", 30, true),
+            ("abc", "make test", 10, true),
+            ("abc", "make test", 30, false),
         ] {
             assert_eq!(
-                store.verify_base("p", base, command, timeout).unwrap(),
+                store
+                    .verify_base("p", base, command, timeout, sandbox)
+                    .unwrap(),
                 None,
-                "{base} {command} {timeout}"
+                "{base} {command} {timeout} {sandbox}"
             );
         }
         // A base that could not be measured is unknown, not failing.
         store
-            .set_verify_base("p", "def", "make test", 30, None, 0)
+            .set_verify_base("p", "def", "make test", 30, true, None, 0)
             .unwrap();
         assert_eq!(
-            store.verify_base("p", "def", "make test", 30).unwrap(),
+            store
+                .verify_base("p", "def", "make test", 30, true)
+                .unwrap(),
             Some((None, 0))
         );
         let _ = std::fs::remove_dir_all(dir);

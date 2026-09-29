@@ -4,6 +4,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+Upgrading from 0.5:
+
+- The database moves from schema 29 to 30 on first open. 0.5 refuses it afterwards. Cached base verify results are dropped and measured again.
+
+- Verify runs confined. A check that writes outside the worktree, the temp directory and the toolchain caches now fails; `pma config projects.<name>.sandbox off` restores the old behaviour for that project. On Linux the sandbox needs kernel 6.2.
+
+### Security
+
+**Verify can write only to the worktree, the temp directory and the toolchain caches.** It ran the project's command unconfined on the host, so a `Makefile`, `build.rs` or `conftest.py` the agent edited could write anywhere the user can, including with the `sanduk` worker, whose agent is contained. [sanduk-sandbox](https://github.com/shakfu/sanduk-rs/tree/main/crates/sanduk-sandbox) applies Landlock on Linux and Seatbelt on macOS to the whole process group. A sandbox that cannot start fails the verify rather than running it unconfined. Reads and the network stay open, so this bounds what a bad build file can damage, not what it can read or send. Nothing under the repository's `.git` is writable: granting `objects/` would let a check delete history, and a verify that runs `git add` fails. Whether verify ran confined is part of the base cache's key, so a confined head is never compared with an unconfined base.
+
 ## [0.5.0]
 
 Upgrading from 0.4:

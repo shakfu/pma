@@ -51,10 +51,21 @@ pub enum Attribution {
     CoAuthor,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProjectSettings {
     /// Shell command that checks an agent's work; `None` detects one.
     pub verify: Option<String>,
+    /// Whether verify's writes are confined to the worktree.
+    pub sandbox: bool,
+}
+
+impl Default for ProjectSettings {
+    fn default() -> Self {
+        ProjectSettings {
+            verify: None,
+            sandbox: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,6 +122,8 @@ enum Slot<'a> {
     OptText(&'a mut Option<String>),
     /// Text that may not be empty.
     Text(&'a mut String),
+    /// `on` or `off`.
+    Switch(&'a mut bool),
 }
 
 /// Settings that no longer exist, with what replaced them. A retired name
@@ -235,6 +248,7 @@ impl Config {
             },
             Slot::OptText(v) => v.clone().unwrap_or_default(),
             Slot::Text(v) => v.clone(),
+            Slot::Switch(v) => if *v { "on" } else { "off" }.into(),
         })
     }
 
@@ -304,6 +318,13 @@ impl Config {
                 }
                 *v = value.to_string();
             }
+            Slot::Switch(v) => {
+                *v = match value {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err("expected on or off".into()),
+                }
+            }
         }
         Ok(())
     }
@@ -350,11 +371,17 @@ impl Config {
             }
             Some(("projects", rest)) => {
                 let (name, field) = rest.rsplit_once('.')?;
-                if name.is_empty() || name.contains('.') || field != "verify" {
+                if name.is_empty() || name.contains('.') {
+                    return None;
+                }
+                if !matches!(field, "verify" | "sandbox") {
                     return None;
                 }
                 let settings = self.projects.entry(name.to_string()).or_default();
-                Slot::OptText(&mut settings.verify)
+                match field {
+                    "verify" => Slot::OptText(&mut settings.verify),
+                    _ => Slot::Switch(&mut settings.sandbox),
+                }
             }
             _ => return None,
         })
@@ -417,6 +444,13 @@ mod tests {
         assert_eq!(cfg.agent, "codex");
         assert_eq!(cfg.attribution, Attribution::CoAuthor);
         assert_eq!(cfg.project("cyllama").verify.as_deref(), Some("make check"));
+        assert!(
+            cfg.project("cyllama").sandbox,
+            "verify is confined by default"
+        );
+        cfg.set("projects.cyllama.sandbox", "off").unwrap();
+        assert!(!cfg.project("cyllama").sandbox);
+        assert_eq!(cfg.get("projects.cyllama.sandbox").as_deref(), Some("off"));
         // Where a run goes is the command now, so both settings are retired.
         for key in ["publish", "projects.cyllama.publish"] {
             let e = cfg.set(key, "pr").unwrap_err();
@@ -470,6 +504,7 @@ mod tests {
             ("max_parallel", "0"),
             ("projects.a.b.verify", "x"),
             ("projects.a.colour", "x"),
+            ("projects.a.sandbox", "no"),
             ("nope", "1"),
         ] {
             assert!(cfg.set(key, value).is_err(), "{key} = {value} was accepted");

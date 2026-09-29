@@ -3565,6 +3565,43 @@ fn verify_runs_the_check_where_a_dispatch_would() {
     assert!(!success && err.contains("name a project"), "{err}");
 }
 
+/// Verify runs confined to its worktree. A check that writes elsewhere fails
+/// and leaves nothing on disk; one that writes the tree and the temp directory
+/// and reads git passes. The escape target is under `CARGO_TARGET_TMPDIR`
+/// because the sandbox grants the temp directory, which holds the scratch.
+#[test]
+fn verify_cannot_write_outside_its_worktree() {
+    let s = Scratch::new("sandbox");
+    let (env, _, _) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    let outside = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("pma-sandbox-{}", std::process::id()));
+    let _ = fs::remove_file(&outside);
+    let escape = format!("touch '{}'", outside.display());
+
+    env.ok(&["config", "projects.alpha.verify", &escape]);
+    let (out, _, success) = env.run(&["verify", "alpha"]);
+    assert!(!success && out.contains("FAILED"), "{out}");
+    assert!(
+        !outside.exists(),
+        "a confined verify wrote {}",
+        outside.display()
+    );
+
+    env.ok(&[
+        "config",
+        "projects.alpha.verify",
+        "touch built && t=$(mktemp) && rm \"$t\" && git status --short && git diff --quiet HEAD",
+    ]);
+    let out = env.ok(&["verify", "alpha"]);
+    assert!(out.contains("passed"), "{out}");
+
+    env.ok(&["config", "projects.alpha.verify", &escape]);
+    env.ok(&["config", "projects.alpha.sandbox", "off"]);
+    env.ok(&["verify", "alpha"]);
+    assert!(outside.exists(), "`sandbox off` runs verify unconfined");
+    fs::remove_file(&outside).unwrap();
+}
+
 /// A stand-in for `claude -p` that plays a workflow's agent nodes. `Review`
 /// writes the findings listed in `$PMA_HOME/../findings`, one title per
 /// line; `Confirm` keeps each unit it reads with a `reason`, and fails when

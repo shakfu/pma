@@ -470,7 +470,7 @@ fn shown_worker(
             false => ("by route".into(), None),
         });
     }
-    let tier = tier_of(store, unit)?;
+    let tier = cfg.tier_or_default(tier_of(store, unit)?);
     Ok(match resolve(store, cfg, over, policy, node, unit, tier)? {
         Ok(r) => (r.chosen.agent, r.chosen.model),
         Err(_) => ("no route".into(), None),
@@ -1966,7 +1966,7 @@ fn stage(
         &ctx.policy,
         node,
         lead,
-        row.tier,
+        ctx.cfg.tier_or_default(row.tier),
     )? {
         Ok(r) => r,
         Err(why) => return Ok(Err(why)),
@@ -2078,7 +2078,7 @@ fn stage(
         state: crate::store::RunState::Running,
         agent_budget: Some(ctx.cfg.agent_budget),
         timeout_minutes: Some(ctx.cfg.timeout),
-        tier: row.tier,
+        tier: ctx.cfg.tier_or_default(row.tier),
         route_revision,
         route,
         approval,

@@ -23,7 +23,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 30;
+const VERSION: i64 = 31;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -305,6 +305,12 @@ CREATE TABLE campaign_members (
     run_id INTEGER,
     PRIMARY KEY (campaign, project)
 );
+";
+
+/// Version 31. A rejection the reviewer put down to infrastructure: the
+/// check or the machine failed, not the agent. Such a run is in no share.
+const INFRA_REJECTION: &str = "
+ALTER TABLE runs ADD COLUMN infra INTEGER NOT NULL DEFAULT 0;
 ";
 
 /// Version 30. Whether verify ran confined is part of the base cache's key. A
@@ -714,6 +720,7 @@ impl Store {
                     PUSH_OR_PR,
                     REVIEWED_TREE,
                     VERIFY_BASE_SANDBOX,
+                    INFRA_REJECTION,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -1210,7 +1217,18 @@ impl Store {
 
     /// Writes every mutable column of the run with `run.id`.
     pub fn update_run(&self, run: &Run) -> Result<()> {
-        self.conn.execute(
+        self.write_run(run, None)
+    }
+
+    /// `update_run`, only while the row is still in `read`, the state the copy
+    /// was read in. For a command that holds no session lock, so its stale
+    /// copy cannot undo a publish that ran meanwhile.
+    pub fn update_run_from(&self, run: &Run, read: RunState) -> Result<()> {
+        self.write_run(run, Some(read))
+    }
+
+    fn write_run(&self, run: &Run, read: Option<RunState>) -> Result<()> {
+        let written = self.conn.execute(
             // `verify` is frozen at dispatch: a command re-detected at rework
             // could differ from the one the base was checked with.
             "UPDATE runs SET state = ?2, feedback = ?3, seconds = ?4, cost_usd = ?5,
@@ -1218,8 +1236,8 @@ impl Store {
                 error = ?10, outcome = ?11, prompt = ?12, ready_at = ?13,
                 decided_at = ?14, published_at = ?15, review_seconds = ?16,
                 changed_paths = ?17, scope_error = ?18, approved_tree = ?19,
-                approved_head = ?20, approved_by = ?21, reviewed_tree = ?22
-             WHERE id = ?1",
+                approved_head = ?20, approved_by = ?21, reviewed_tree = ?22, infra = ?23
+             WHERE id = ?1 AND (?24 IS NULL OR state = ?24)",
             params![
                 run.id,
                 run.state.name(),
@@ -1245,7 +1263,29 @@ impl Store {
                 run.approved_head,
                 run.approved_by,
                 run.reviewed_tree,
+                run.infra,
+                read.map(RunState::name),
             ],
+        )?;
+        if written == 0 {
+            let now = self.run(run.id)?.state;
+            return Err(format!(
+                "run #{} is now {}; read it again with `pma review {}`",
+                run.id,
+                now.name(),
+                run.id
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Adds review time in one column, so a command that holds no session
+    /// lock writes nothing else.
+    pub fn add_review_seconds(&self, id: i64, seconds: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET review_seconds = coalesce(review_seconds, 0) + ?2 WHERE id = ?1",
+            params![id, seconds],
         )?;
         Ok(())
     }
@@ -1271,7 +1311,7 @@ impl Store {
                     complexity, features, estimator, route_revision, route, approval,
                     approved_tree, approved_head, approved_by,
                     workflow_instance, node, unit, lap, preset, extra_args, git_snapshot,
-                    reviewed_tree
+                    reviewed_tree, infra
              FROM runs ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1354,6 +1394,7 @@ impl Store {
                     .unwrap_or_default(),
                 git_snapshot: r.get(55)?,
                 reviewed_tree: r.get(56)?,
+                infra: r.get(57)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1662,7 +1703,13 @@ impl Store {
     /// node: a sink writes a file, and a unit whose file is written and whose
     /// move is not would have its sink run twice.
     pub fn atomically<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
-        let tx = self.conn.unchecked_transaction()?;
+        // Immediate takes the write lock first, so `busy_timeout` waits for
+        // it. A deferred read upgraded to a write fails at once when another
+        // writer holds the lock.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         let out = work()?;
         tx.commit()?;
         Ok(out)
@@ -1921,6 +1968,7 @@ impl Store {
                     decided += 1;
                     accepted += 1;
                 }
+                RunState::Rejected if run.infra => {}
                 RunState::Rejected | RunState::Closed => decided += 1,
                 _ => {}
             }
@@ -1972,6 +2020,16 @@ impl Store {
             params![project, revision, crate::dates::now()],
         )?;
         self.consumed_attempts(project, revision)
+    }
+
+    /// Takes back `n` consumed attempts, never below none.
+    pub fn refund_attempts(&self, project: &str, revision: &str, n: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE exhaustion SET attempts = max(attempts - ?3, 0), updated_at = ?4
+             WHERE project = ?1 AND revision = ?2",
+            params![project, revision, n, crate::dates::now()],
+        )?;
+        Ok(())
     }
 
     /// Returns false when the revision had consumed none.
@@ -2292,6 +2350,8 @@ pub struct Run {
     /// `pma review <id>` printed since. An approval must match it. `None` for
     /// a run from before it was recorded.
     pub reviewed_tree: Option<String>,
+    /// Rejected for a fault of the check or the machine, not the agent.
+    pub infra: bool,
 }
 
 impl Run {
@@ -2356,6 +2416,7 @@ impl Run {
             extra_args: Vec::new(),
             git_snapshot: None,
             reviewed_tree: None,
+            infra: false,
         }
     }
 
@@ -2873,7 +2934,8 @@ mod tests {
                 .execute_batch(
                     "ALTER TABLE agents ADD COLUMN model TEXT;
                      ALTER TABLE runs DROP COLUMN git_snapshot;
-                     ALTER TABLE runs DROP COLUMN reviewed_tree;",
+                     ALTER TABLE runs DROP COLUMN reviewed_tree;
+                     ALTER TABLE runs DROP COLUMN infra;",
                 )
                 .unwrap();
             store
@@ -2925,6 +2987,13 @@ mod tests {
             0
         );
         assert_eq!(store.consumed_attempts("q", "fix the parser").unwrap(), 0);
+
+        // A refund never takes the counter below none.
+        store.refund_attempts("p", "fix the parser", 1).unwrap();
+        assert_eq!(store.consumed_attempts("p", "fix the parser").unwrap(), 1);
+        store.refund_attempts("p", "fix the parser", 3).unwrap();
+        assert_eq!(store.consumed_attempts("p", "fix the parser").unwrap(), 0);
+        store.consume_attempt("p", "fix the parser").unwrap();
 
         assert!(store.reset_attempts("p", "fix the parser").unwrap());
         assert_eq!(store.consumed_attempts("p", "fix the parser").unwrap(), 0);
@@ -2980,6 +3049,93 @@ mod tests {
                 .unwrap(),
             Some((None, 0))
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A copy read before a publish must not write its older state over it.
+    #[test]
+    fn a_guarded_write_refuses_a_run_that_moved_on() {
+        let dir = scratch("guarded");
+        let store = Store::open(&dir.join("p.db")).unwrap();
+        let mut run = Run::blank();
+        run.state = RunState::Ready;
+        store.insert_run(&mut run).unwrap();
+        let mut stale = store.run(run.id).unwrap();
+
+        let mut published = store.run(run.id).unwrap();
+        published.state = RunState::Pushed;
+        store.update_run(&published).unwrap();
+
+        stale.state = RunState::Approved;
+        let err = store
+            .update_run_from(&stale, RunState::Ready)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is now pushed"), "{err}");
+        assert_eq!(store.run(run.id).unwrap().state, RunState::Pushed);
+        store.update_run_from(&stale, RunState::Pushed).unwrap();
+
+        store.add_review_seconds(run.id, 60).unwrap();
+        store.add_review_seconds(run.id, 60).unwrap();
+        assert_eq!(store.run(run.id).unwrap().review_seconds, Some(120));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A transaction that reads and then writes waits for another writer.
+    /// Deferred, the read lock it took could not be upgraded, and SQLite
+    /// fails such an upgrade at once rather than waiting.
+    #[test]
+    fn atomically_waits_for_another_writer() {
+        let dir = scratch("immediate");
+        let path = dir.join("p.db");
+        let store = Store::open(&path).unwrap();
+        let (held, holding) = std::sync::mpsc::channel();
+        let other = path.clone();
+        let writer = std::thread::spawn(move || {
+            let conn = Connection::open(&other).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO config VALUES ('a', '1');")
+                .unwrap();
+            held.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        holding.recv().unwrap();
+        store
+            .atomically(|| {
+                let n: i64 = store
+                    .conn
+                    .query_row("SELECT count(*) FROM config", [], |r| r.get(0))?;
+                store
+                    .conn
+                    .execute("INSERT INTO config VALUES ('b', ?1)", [n.to_string()])?;
+                Ok(())
+            })
+            .unwrap();
+        writer.join().unwrap();
+        assert_eq!(store.config_rows().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A rejection put down to infrastructure says nothing about the agent, so
+    /// the project's record that routing reads leaves it out.
+    #[test]
+    fn an_infrastructure_rejection_is_not_decided() {
+        let dir = scratch("decided");
+        let store = Store::open(&dir.join("p.db")).unwrap();
+        for (state, infra) in [
+            (RunState::Merged, false),
+            (RunState::Rejected, false),
+            (RunState::Rejected, true),
+        ] {
+            let mut run = Run::blank();
+            run.project = "p".into();
+            store.insert_run(&mut run).unwrap();
+            run.state = state;
+            run.infra = infra;
+            store.update_run(&run).unwrap();
+        }
+        assert_eq!(store.decided_runs("p").unwrap(), (2, 1));
+        assert!(store.runs().unwrap()[2].infra, "stored and read back");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3140,6 +3296,7 @@ mod tests {
             extra_args: Vec::new(),
             git_snapshot: Some("hook pre-commit abc executable".into()),
             reviewed_tree: None,
+            infra: false,
         };
         store.insert_run(&mut run).unwrap();
         assert_eq!(store.run(run.id).unwrap(), run);

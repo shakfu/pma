@@ -659,10 +659,12 @@ fn queue(
 
     // A policy applies only once someone activates it; in shadow it is
     // computed and recorded but the settings still decide.
+    // An untiered project is ranked at `default_tier`, so it is routed there.
+    let tier = cfg.tier_or_default(pick.tier);
     let subject = Subject {
         class,
         complexity,
-        tier: pick.tier,
+        tier,
         // A task dispatched on its own names no node, which is what a route
         // stating no node condition serves; a workflow unit names its node.
         node: pick.workflow.as_ref().map(|u| u.node.as_str()),
@@ -731,7 +733,7 @@ fn queue(
         review_seconds: None,
         class: Some(class),
         scope,
-        tier: pick.tier,
+        tier,
         description: (!details.trim().is_empty()).then(|| details.clone()),
         agent_budget: Some(cfg.agent_budget),
         timeout_minutes: Some(cfg.timeout),
@@ -758,6 +760,7 @@ fn queue(
         extra_args: chosen.args.clone(),
         git_snapshot: Some(git_snapshot),
         reviewed_tree: None,
+        infra: false,
     };
     run.prompt = prompt(&run, &details, verify.as_deref());
     store.insert_run(&mut run)?;
@@ -1023,7 +1026,10 @@ pub fn execute(
                     {
                         let mut q = queue.lock().unwrap();
                         q.running -= 1;
-                        q.spent += run.cost_usd.unwrap_or(0.0);
+                        // A worker that reports no cost is charged its whole
+                        // budget per attempt, so it cannot run the batch past
+                        // its limit unseen.
+                        q.spent += run.cost_usd.unwrap_or(made.len() as f64 * cfg.agent_budget);
                     }
                     let _ = tx.send((run, made));
                 }
@@ -1465,6 +1471,7 @@ pub fn tree(run: &Run) -> Result<String> {
 }
 
 pub fn approve(store: &Store, run: &mut Run, by: &str) -> Result<()> {
+    let read = run.state;
     // Approving an already approved run re-takes the evidence, which is how
     // a reviewer says the tree is fine after a publish refused a stale one.
     if !matches!(run.state, RunState::Ready | RunState::Approved) {
@@ -1503,14 +1510,15 @@ pub fn approve(store: &Store, run: &mut Run, by: &str) -> Result<()> {
     run.approved_head = wt_git(run, &["rev-parse", "HEAD"]).ok();
     run.approved_by = Some(by.to_string());
     run.enter(RunState::Approved);
-    store.update_run(run)
+    // No session lock is held: a publish may have run since `run` was read.
+    store.update_run_from(run, read)
 }
 
 /// `keep` accepts hooks or settings the run found changed as the user's own.
 /// Without it, such a run is rejected only once the clone matches its
 /// snapshot again, so rejecting does not quietly lift what `clone_unchanged`
 /// holds.
-pub fn reject(store: &Store, run: &mut Run, keep: bool) -> Result<()> {
+pub fn reject(store: &Store, run: &mut Run, keep: bool, infra: bool) -> Result<()> {
     if run.state == RunState::PrOpen {
         return Err(format!(
             "run #{} has an open pull request; merge or close it: {}",
@@ -1545,10 +1553,21 @@ pub fn reject(store: &Store, run: &mut Run, keep: bool) -> Result<()> {
     }
     remove_worktree(&run.repo, &run.worktree, &run.branch)?;
     run.enter(RunState::Rejected);
+    run.infra = infra;
     store.update_run(run)?;
-    // A reviewer who refuses the work has judged the task, whatever verify
-    // made of it.
-    store.consume_attempt(&run.project, &attempt_key(run))?;
+    let attempts = store.attempts(Some(run.id))?;
+    if infra {
+        // The checks this run failed judged the infrastructure, not the task.
+        let failed = attempts
+            .iter()
+            .filter(|a| a.verify_ok == Some(false))
+            .count() as i64;
+        store.refund_attempts(&run.project, &attempt_key(run), failed)?;
+    } else if !attempts.is_empty() {
+        // A reviewer who refuses the work has judged the task, whatever
+        // verify made of it. A run that never started has no work to judge.
+        store.consume_attempt(&run.project, &attempt_key(run))?;
+    }
     Ok(())
 }
 
@@ -1747,6 +1766,7 @@ mod tests {
             extra_args: Vec::new(),
             git_snapshot: None,
             reviewed_tree: None,
+            infra: false,
         };
         let p = prompt(&run, "for all classes\n", Some("make test"));
         assert!(p.contains("`cynn`"));

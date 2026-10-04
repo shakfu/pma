@@ -6,7 +6,7 @@ If you keep dozens of small projects, the work is not hard, it is scattered. Eac
 
 Scanning 95 repositories takes about 15 seconds.
 
-Nothing is published without you. An agent runs with no push credentials, `pma` runs the project's tests itself rather than trusting the agent's report, and every change waits in a worktree until you approve it.
+Nothing is published without you. An agent runs with no push credentials in its environment, `pma` runs the project's tests itself rather than trusting the agent's report, and every change waits in a worktree until you approve it.
 
 ```sh
 pma root add ~/projects        # git repos directly under it are projects
@@ -49,7 +49,7 @@ pma pr 1                       # commit and open a pull request; or `pma push 1`
 
 - Each run gets its own worktree of the remote default branch, so your dirty checkout is never touched.
 
-- The agent runs without push credentials. `pma` runs the project's test command itself, before and after, and reports both ends.
+- The agent's environment holds no push credentials: tokens, the SSH agent and askpass helpers are removed, and git's pushes are redirected. Credentials on disk, such as `~/.ssh` keys or `~/.git-credentials`, stay readable; this stops an accidental push, not a determined one. `pma` runs the project's test command itself, before and after, and reports both ends.
 
 - That test command runs on the host, able to write only to the worktree, the temp directory and the toolchain caches: Landlock on Linux 6.2 and later, Seatbelt on macOS. Reads and the network stay open.
 
@@ -57,7 +57,7 @@ pma pr 1                       # commit and open a pull request; or `pma push 1`
 
 - Every run records the diff, the test result, the cost, the duration and the paths it touched. A run that changed a file its task had no business changing is flagged.
 
-- Limits you set: agents at once, dollars per run, dollars per batch, minutes per run.
+- Limits you set: agents at once, dollars per batch, minutes per run. The per-run dollar figure admits runs into a batch and flags a run that cost more; no shipped worker stops at it.
 
 - `pma report` says what dispatching has produced: first-attempt passes, reworks, merges, cost, review time.
 
@@ -159,6 +159,7 @@ pma project export tiers.csv    # every project's tier and tags, to edit
 pma project import tiers.csv --apply   # read them back
 pma project tag add rust myproject     # private groups; --tag <t> elsewhere
 pma project forget gone         # an absent project's record
+pma project clone --tag work    # check out absent projects again; --apply to do it
 pma scan                        # TODO.md, git state, CI via gh
 pma scan --offline myproject    # one project, without GitHub
 pma scan --deps                 # also count outdated cargo, uv and go deps
@@ -199,6 +200,7 @@ pma dispatch -p claude-haiku myproject:31
 pma review                      # runs not yet published or rejected
 pma review 4                    # task, test result, cost, summary, diff
 pma review 4 --approve          # or --reject, or --rework "feedback"
+pma review 4 --reject --infra   # the check or machine failed, not the agent
 pma review 4 5 6 --approve      # a batch; every run is checked before any is approved
 pma pr 4                        # commit, open a pull request, remove the worktree
 pma push 4                      # commit and push to the default branch instead

@@ -708,13 +708,48 @@ fn dispatch_review_rework_and_push() {
     let (_, err, ok) = env.run(&["report", "--by", "model"]);
     assert!(!ok && err.contains("unknown dimension `model`"), "{err}");
 
-    // The budget refusal never reached the agent, so it consumed nothing:
-    // rejecting it leaves one attempt against the task, not two, and no
-    // second reset is needed.
+    // The budget refusal never reached the agent, so neither it nor its
+    // rejection uses an attempt: the two after it each use one.
     env.ok(&["config", "batch_budget", "5.0"]);
     env.ok(&["review", "4", "--reject"]);
     env.ok(&["dispatch", "alpha:8"]);
     env.ok(&["review", "5", "--reject"]);
+    env.ok(&["dispatch", "alpha:8"]);
+    env.ok(&["review", "6", "--reject"]);
+    let (_, err, success) = env.run(&["dispatch", "alpha:8"]);
+    assert!(!success && err.contains("2 attempts on"), "{err}");
+}
+
+/// A rejection put down to infrastructure judges neither the agent nor the
+/// task: it is in no share, and gives back the attempt its failed check used.
+#[test]
+fn an_infrastructure_rejection_uses_no_attempt_and_is_in_no_share() {
+    let s = Scratch::new("infra");
+    let (env, _, _) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+
+    // `third task` fails its check, which uses one of its two attempts.
+    env.ok(&["dispatch", "alpha:8"]);
+    env.ok(&["review", "1", "--reject", "--infra"]);
+    let report = env.ok(&["report"]);
+    assert!(report.starts_with("nothing decided yet"), "{report}");
+    assert!(
+        report.contains("rejected for infrastructure, in no share: #1"),
+        "{report}"
+    );
+
+    // Both attempts are still there: the check and a plain rejection.
+    env.ok(&["dispatch", "alpha:8"]);
+    env.ok(&["review", "2", "--reject"]);
+    let (_, err, success) = env.run(&["dispatch", "alpha:8"]);
+    assert!(!success && err.contains("2 attempts"), "{err}");
+    assert!(
+        env.ok(&["report"])
+            .starts_with("0% of 1 decided run accepted"),
+        "the plain rejection counts"
+    );
+
+    let (_, err, success) = env.run(&["review", "2", "--infra"]);
+    assert!(!success && err.contains("--reject"), "{err}");
 }
 
 /// A stand-in for `gh pr`, driven by files in `$PMA_HOME`: `pr-state` for
@@ -1080,6 +1115,31 @@ fn the_scope_check_reads_the_whole_change_not_the_agents_report() {
 }
 
 /// A second worker runs through the same dispatch, review and push path as
+/// A worker that reports no cost is charged its whole budget, so the batch
+/// budget still stops it.
+#[test]
+fn unknown_cost_counts_against_the_batch_budget() {
+    let s = Scratch::new("unknown-cost");
+    let (env, _, _) = dispatch_env(&s, &[("plain", PLAIN_WORKER)]);
+    env.ok(&["agent", "set", "plain", "command", "plain"]);
+    env.ok(&[
+        "agent",
+        "set",
+        "plain",
+        "args",
+        r#"["--task","{prompt}","{dir}"]"#,
+    ]);
+    env.ok(&["config", "agent", "plain"]);
+    env.ok(&["config", "max_parallel", "1"]);
+    env.ok(&["config", "agent_budget", "1"]);
+    env.ok(&["config", "batch_budget", "1.5"]);
+    let out = env.ok(&["dispatch", "--auto", "-n", "2"]);
+    assert!(
+        out.contains("not started: batch budget $1.5 reached"),
+        "{out}"
+    );
+}
+
 /// `claude`, with no code that knows its name.
 #[test]
 fn a_worker_without_json_output_or_an_allowlist_runs_the_same_path() {
@@ -1487,6 +1547,121 @@ fn an_applied_route_outranks_the_default_preset() {
     // A preset named on the command line still outranks the route.
     env.ok(&["dispatch", "-p", "cheap", "alpha:7"]);
     let detail = env.ok(&["review", "2"]);
+    assert!(detail.contains("ran as haiku"), "{detail}");
+}
+
+/// A project no scan can find is not ranked: nothing can be dispatched
+/// against its tasks.
+#[test]
+fn an_absent_project_is_not_ranked() {
+    let s = Scratch::new("absent");
+    let (env, _, alpha) = dispatch_env(&s, &[]);
+    let root = alpha.parent().unwrap();
+    git(root, &["clone", "-q", "../origin.git", "beta"], None);
+    env.ok(&["project", "tier", "1", "beta"]);
+    env.ok(&["scan", "--offline"]);
+    assert!(
+        env.ok(&["matrix"]).contains("beta:"),
+        "ranked while present"
+    );
+
+    fs::rename(root.join("beta"), s.0.join("beta-moved")).unwrap();
+    env.ok(&["scan", "--offline"]);
+    for view in [&["matrix"][..], &["status"], &["next"]] {
+        let out = env.ok(view);
+        assert!(!out.contains("beta"), "{view:?}: {out}");
+        assert!(out.contains("alpha"), "{view:?}: {out}");
+    }
+}
+
+/// `gh repo clone` from the local origin, so a clone needs no network.
+const CLONING_GH: &str = r#"#!/bin/sh
+[ "$1 $2" = "repo clone" ] || { echo "fake gh: unexpected $*" >&2; exit 1; }
+git clone -q "$PMA_HOME/../origin.git" "$4"
+"#;
+
+/// A project whose checkout is gone is cloned back from the `owner/name` the
+/// scan recorded: a dry run first, and never over a directory that exists.
+#[test]
+fn a_missing_checkout_is_cloned_from_its_recorded_slug() {
+    let s = Scratch::new("clone");
+    let (env, _, alpha) = dispatch_env(&s, &[("gh", CLONING_GH)]);
+    let root = alpha.parent().unwrap().to_path_buf();
+    git(&root, &["clone", "-q", "../origin.git", "beta"], None);
+    git(
+        &root.join("beta"),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/me/beta.git",
+        ],
+        None,
+    );
+    env.ok(&["scan", "--offline"]);
+    env.ok(&["project", "tag", "add", "work", "alpha", "beta"]);
+    fs::rename(root.join("beta"), s.0.join("beta-moved")).unwrap();
+    env.ok(&["scan", "--offline"]);
+
+    let out = env.ok(&["project", "clone", "--tag", "work"]);
+    assert!(out.contains("alpha: already checked out"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "beta: would clone me/beta into {}",
+            root.join("beta").display()
+        )),
+        "{out}"
+    );
+    assert!(!root.join("beta").exists(), "a dry run clones nothing");
+
+    let out = env.ok(&["project", "clone", "--tag", "work", "--apply"]);
+    assert!(out.contains("beta: cloned me/beta"), "{out}");
+    assert!(root.join("beta/TODO.md").exists());
+    git(
+        &root.join("beta"),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/me/beta.git",
+        ],
+        None,
+    );
+    env.ok(&["scan", "--offline"]);
+    assert!(
+        env.ok(&["status", "--all"]).contains("beta"),
+        "present again"
+    );
+
+    // A directory of that name is never cloned over.
+    fs::rename(root.join("beta"), s.0.join("beta-again")).unwrap();
+    env.ok(&["scan", "--offline"]);
+    fs::create_dir(root.join("beta")).unwrap();
+    let out = env.ok(&["project", "clone", "beta", "--apply"]);
+    assert!(out.contains("already exists; not cloned"), "{out}");
+}
+
+/// An untiered project is ranked at `default_tier`, so a route conditioned on
+/// tier must see that tier too.
+#[test]
+fn an_untiered_project_is_routed_at_the_default_tier() {
+    let s = Scratch::new("default-tier");
+    let (env, _, _) = dispatch_env(&s, &[("claude", MODEL_CLAUDE)]);
+    env.ok(&["project", "tier", "none", "alpha"]);
+    env.ok(&["config", "default_tier", "2"]);
+    let doc = s.0.join("policy.json");
+    fs::write(
+        &doc,
+        r#"{"route":[
+             {"name":"tier-two","match":{"tier":"2-2"},"model":"haiku","approval":"each"},
+             {"name":"rest","match":{},"model":"opus","approval":"each"}
+           ]}"#,
+    )
+    .unwrap();
+    env.ok(&["route", "propose", doc.to_str().unwrap()]);
+    env.ok(&["route", "activate", "1"]);
+    env.ok(&["dispatch", "alpha:5"]);
+    let detail = env.ok(&["review", "1"]);
     assert!(detail.contains("ran as haiku"), "{detail}");
 }
 
@@ -4087,13 +4262,15 @@ fn an_id_keeps_the_age_git_gave_an_item() {
 fn next_lists_work_for_agents_and_for_you() {
     let s = Scratch::new("next");
     let (env, _, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
-    // A critical item no agent may take, written in the clone the scan reads.
+    // Critical items no agent may take, written in the clone the scan reads.
+    // `#manual` wins over `#agent`.
     let text = fs::read_to_string(alpha.join("TODO.md")).unwrap();
     fs::write(
         alpha.join("TODO.md"),
         text.replace(
             "# TODO\n",
-            "# TODO\n\n## Critical\n\n- [ ] rotate the signing key\n",
+            "# TODO\n\n## Critical\n\n- [ ] rotate the signing key\n\
+             - [ ] revoke the old tokens #agent #manual\n",
         ),
     )
     .unwrap();
@@ -4110,13 +4287,14 @@ fn next_lists_work_for_agents_and_for_you() {
         "#manual is not for agents: {out}"
     );
     assert!(
-        out.contains("For you: 1\n  tasks: 1\n")
-            && out.contains("not #agent  rotate the signing key"),
+        out.contains("For you: 2\n  tasks: 2\n")
+            && out.contains("not for agents  rotate the signing key")
+            && out.contains("not for agents  revoke the old tokens"),
         "{out}"
     );
     assert_eq!(env.ok(&[]), out, "`pma` alone is `pma next`");
 
-    env.ok(&["dispatch", "alpha:9"]);
+    env.ok(&["dispatch", "alpha:10"]);
     let out = env.ok(&["next"]);
     assert!(
         out.contains("For agents: 2\n"),

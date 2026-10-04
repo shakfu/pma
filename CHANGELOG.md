@@ -4,15 +4,51 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.0]
+
 Upgrading from 0.5:
 
-- The database moves from schema 29 to 30 on first open. 0.5 refuses it afterwards. Cached base verify results are dropped and measured again.
+- The database moves from schema 29 to 31 on first open. 0.5 refuses it afterwards. Cached base verify results are dropped and measured again.
 
 - Verify runs confined. A check that writes outside the worktree, the temp directory and the toolchain caches now fails; `pma config projects.<name>.sandbox off` restores the old behaviour for that project. On Linux the sandbox needs kernel 6.2.
+
+### Added
+
+**`pma review <id> --reject --infra`: a rejection for a fault of the check or the machine, not the agent.** Every rejection counted as the agent's: `pma report` put the pilot's first run, rejected because its tests inherited the verify push block, in the decided runs, and the complexity estimate read it as a refused change in that project. Such a run is now in no share, `report` names it, and the attempts its failed checks used are given back. A free-text reason was the alternative; nothing in `pma` would read it.
+
+**`pma project clone`: check out a project whose record exists but whose working tree does not.** It clones the GitHub `owner/name` the last scan recorded, with `gh repo clone` so a private repository authenticates as `gh` does. A dry run unless `--apply`; `--root` picks the root when several are registered, and a directory of the project's name is never cloned over. It is under `project` with `forget`, which it reverses in part.
+
+### Changed
+
+**An absent project is not ranked.** `status`, `matrix`, `next` and `tui` scored a project no scan can find, so its tasks competed for attention with nothing to dispatch against them. `pma project` still lists it.
+
+**`pma review <id> --minutes` writes only the review time.** It wrote the whole run from a copy read without the session lock.
+
+### Fixed
+
+**A stale approval no longer overwrites a publish.** `review --approve` holds no session lock, so a `pma push` that ran between its read and its write was undone: the run went from `pushed` back to `approved`. The write now requires the state it read, and otherwise names the state the run is in. Taking the session lock was the alternative; it would refuse every approval while a dispatch runs.
+
+**A workflow pass's transactions wait for another writer.** They read and then wrote inside a deferred transaction. SQLite fails such an upgrade at once, without waiting, when another connection holds the write lock, after the agent had run. They now begin immediate, so the busy timeout applies.
+
+**The batch budget charges a run that reports no cost its whole `agent_budget`.** It counted as free, so `omp`, `opencode` and a run killed at its timeout never stopped a batch.
+
+**Rejecting a run that never started uses no attempt.** A run refused at the batch budget had to be rejected to clear it, and two such rejections reached the attempt limit.
+
+**An untiered project is routed at `default_tier`.** It was ranked there but routed with no tier, so a route with a tier condition never matched it, in a dispatch or a workflow node.
+
+**`pma route replay` compares approval and scope.** It compared the route, agent and model, so a candidate that changed only how a run is approved, or the paths it may touch, replayed as "0 routed differently".
+
+**An `#agent #manual` item is listed for you, not for agents.** `next` treated `#agent` alone as eligible, though dispatch refuses `#manual`. The label "not #agent" is now "not for agents".
+
+**The complexity estimate no longer reads `and/or`, `e.g.` or `Node.js` as a path.** Each lowered the estimate by one, which can choose a weaker model.
+
+**A workflow `todo` sink no longer writes under a heading inside a code fence.** The parser does not see an item there, so each resumed pass added another copy.
 
 ### Security
 
 **Verify can write only to the worktree, the temp directory and the toolchain caches.** It ran the project's command unconfined on the host, so a `Makefile`, `build.rs` or `conftest.py` the agent edited could write anywhere the user can, including with the `sanduk` worker, whose agent is contained. [sanduk-sandbox](https://github.com/shakfu/sanduk-rs/tree/main/crates/sanduk-sandbox) applies Landlock on Linux and Seatbelt on macOS to the whole process group. A sandbox that cannot start fails the verify rather than running it unconfined. Reads and the network stay open, so this bounds what a bad build file can damage, not what it can read or send. Nothing under the repository's `.git` is writable: granting `objects/` would let a check delete history, and a verify that runs `git add` fails. Whether verify ran confined is part of the base cache's key, so a confined head is never compared with an unconfined base.
+
+**`GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GIT_ASKPASS` and `SSH_ASKPASS` are removed from an agent's environment**, as `GH_TOKEN`, `GITHUB_TOKEN` and `SSH_AUTH_SOCK` were. The README said agents run with no push credentials; it now says none are in the environment, and that credentials on disk stay readable.
 
 ## [0.5.0]
 

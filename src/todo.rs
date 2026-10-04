@@ -181,9 +181,7 @@ pub fn parse(text: &str) -> Parsed {
     let mut seen_sections: HashMap<Priority, usize> = HashMap::new();
     let mut title_line: Option<usize> = None;
     let mut first_content = true;
-    // The open fence: its character, its length and its line. It closes only on
-    // a line of the same character at least as long, as CommonMark has it.
-    let mut fence: Option<(u8, usize, usize)> = None;
+    let mut fence = Fence::default();
     // Blank lines seen since the open item's last line. Kept so a description
     // that spans a blank line is carried verbatim.
     let mut blanks = 0;
@@ -210,7 +208,7 @@ pub fn parse(text: &str) -> Parsed {
                         .extend(std::iter::repeat_n(String::new(), blanks));
                     item.description.push(raw.to_string());
                 }
-                None if matches!(place, Place::Known(_)) && fence.is_none() => {
+                None if matches!(place, Place::Known(_)) && fence.0.is_none() => {
                     out.report(n, Severity::Warning, "indented line is not under an item");
                 }
                 None => {}
@@ -228,23 +226,8 @@ pub fn parse(text: &str) -> Parsed {
             }
         }
 
-        match fence {
-            Some((mark, len, _)) => {
-                if fence_run(line, mark).is_some_and(|n| n >= len && n == line.len()) {
-                    fence = None;
-                }
-                continue;
-            }
-            None => {
-                if let Some((mark, len)) = b"`~"
-                    .iter()
-                    .copied()
-                    .find_map(|m| fence_run(line, m).filter(|n| *n >= 3).map(|n| (m, n)))
-                {
-                    fence = Some((mark, len, n));
-                    continue;
-                }
-            }
+        if fence.step(line, n) {
+            continue;
         }
 
         if line.starts_with("# ") {
@@ -326,7 +309,7 @@ pub fn parse(text: &str) -> Parsed {
     }
     finish(&mut open, &mut out);
 
-    if let Some((_, _, line)) = fence {
+    if let Some((_, _, line)) = fence.0 {
         out.report(
             line,
             Severity::Error,
@@ -349,6 +332,37 @@ pub fn parse(text: &str) -> Parsed {
     }
     check_duplicates(&mut out);
     out
+}
+
+/// The open code fence: its character, its length and its line. It closes
+/// only on a line of the same character at least as long, as CommonMark has it.
+#[derive(Default)]
+struct Fence(Option<(u8, usize, usize)>);
+
+impl Fence {
+    /// Whether `line`, trimmed and unindented, opens, is inside or closes a
+    /// fence. `n` is its line number.
+    fn step(&mut self, line: &str, n: usize) -> bool {
+        match self.0 {
+            Some((mark, len, _)) => {
+                if fence_run(line, mark).is_some_and(|k| k >= len && k == line.len()) {
+                    self.0 = None;
+                }
+                true
+            }
+            None => match b"`~"
+                .iter()
+                .copied()
+                .find_map(|m| fence_run(line, m).filter(|k| *k >= 3).map(|k| (m, k)))
+            {
+                Some((mark, len)) => {
+                    self.0 = Some((mark, len, n));
+                    true
+                }
+                None => false,
+            },
+        }
+    }
 }
 
 /// How many of `mark` the line starts with, if any.
@@ -691,19 +705,31 @@ pub fn insert(
 ) -> Option<String> {
     let want = SECTIONS.iter().find(|(_, p)| *p == priority)?.0;
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    let heading = lines.iter().position(|l| {
-        l.trim_end()
-            .strip_prefix("## ")
-            .is_some_and(|name| name.trim() == want)
-    })?;
-    let mut at = lines.len();
-    for (i, line) in lines.iter().enumerate().skip(heading + 1) {
-        let trimmed = line.trim_end();
-        if trimmed.starts_with("## ") || trimmed.starts_with("### ") {
-            at = i;
-            break;
-        }
-    }
+    // A heading inside a code fence is not one; the parser would not see an
+    // item inserted under it.
+    let mut fence = Fence::default();
+    let headings: Vec<(usize, &str)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            let line = l.trim_end();
+            let plain = !line.is_empty() && !line.starts_with([' ', '\t']);
+            (plain && !fence.step(line, i + 1)).then_some((i, line))
+        })
+        .filter(|(_, l)| l.starts_with("## ") || l.starts_with("### "))
+        .collect();
+    let heading = headings
+        .iter()
+        .find(|(_, l)| {
+            l.strip_prefix("## ")
+                .is_some_and(|name| name.trim() == want)
+        })?
+        .0;
+    let at = headings
+        .iter()
+        .find(|(i, _)| *i > heading)
+        .map_or(lines.len(), |(i, _)| *i);
+    let mut at = at;
     // Back over the blank lines that separate one section from the next, so
     // the item lands with the section it belongs to.
     while at > heading + 1 && lines[at - 1].trim().is_empty() {
@@ -944,6 +970,21 @@ mod tests {
         assert_clean("# TODO\n\n## Ideas\n\n- one\n\n## Low\n\n- [ ] real\n");
         assert_clean("# TODO\n\n## High\n");
         assert_clean("# TODO\n\n## Low\n\n## Declined\n\n- not doing this\n");
+    }
+
+    /// A heading in a code fence is not a section: an item written under it
+    /// would be invisible, and each resumed pass would add another copy.
+    #[test]
+    fn insert_skips_headings_in_code_fences() {
+        let text = "# TODO\n\n## Notes\n\n```\n## High\n```\n\n## High\n\n- [ ] old\n\n## Low\n";
+        let out = insert(text, Priority::High, "new", None).unwrap();
+        assert!(out.contains("```\n## High\n```\n\n## High\n"), "{out}");
+        let new = parse(&out).items.into_iter().find(|i| i.text == "new");
+        assert_eq!(new.map(|i| i.priority), Some(Priority::High), "{out}");
+        // A fenced heading does not end the section either.
+        let text = "# TODO\n\n## High\n\n- [ ] old\n\n```\n## Low\n```\n";
+        let out = insert(text, Priority::High, "new", None).unwrap();
+        assert!(out.ends_with("```\n## Low\n```\n\n- [ ] new\n"), "{out}");
     }
 
     #[test]

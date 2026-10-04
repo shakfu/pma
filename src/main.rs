@@ -272,6 +272,10 @@ enum Command {
         /// restored.
         #[arg(long, requires = "reject")]
         keep_git_changes: bool,
+        /// With --reject, the check or the machine failed, not the agent. The
+        /// run is left out of the accepted share and uses no attempt.
+        #[arg(long, requires = "reject")]
+        infra: bool,
         /// Run the agent again in the same worktree with this feedback.
         #[arg(long, requires = "ids", value_name = "FEEDBACK")]
         rework: Option<String>,
@@ -442,6 +446,22 @@ enum ProjectAction {
         /// The project's name, as `pma status` shows it.
         project: String,
         /// Delete it instead of reporting what would go.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Check out projects whose record exists but whose working tree does
+    /// not, from the GitHub `owner/name` the last scan recorded, with
+    /// `gh repo clone`. Dry run unless --apply.
+    Clone {
+        /// Project names.
+        projects: Vec<String>,
+        /// Every project with this tag; may repeat.
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+        /// The root to clone into; needed when several are registered.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Clone instead of reporting what would be cloned.
         #[arg(long)]
         apply: bool,
     },
@@ -743,6 +763,7 @@ fn main() -> ExitCode {
             approve,
             reject,
             keep_git_changes,
+            infra,
             rework,
             minutes,
         } => run_review(
@@ -750,6 +771,7 @@ fn main() -> ExitCode {
             approve,
             reject,
             keep_git_changes,
+            infra,
             rework.as_deref(),
             minutes,
         ),
@@ -1060,6 +1082,79 @@ fn forget(name: &str, apply: bool) -> Result<()> {
     }
     store.forget_project(name)?;
     println!("{name} is forgotten");
+    Ok(())
+}
+
+fn clone_projects(
+    names: &[String],
+    tags: &[String],
+    root: Option<&Path>,
+    apply: bool,
+) -> Result<()> {
+    let store = Store::open_default()?;
+    let names = select(&store, names, tags)?;
+    if names.is_empty() {
+        return Err("name a project, or --tag".into());
+    }
+    let roots = store.roots()?;
+    let root = match (root, roots.as_slice()) {
+        (Some(r), _) => {
+            let r = std::fs::canonicalize(r).map_err(|e| format!("{}: {e}", r.display()))?;
+            if !roots.contains(&r) {
+                return Err(
+                    format!("{} is not a root; `pma root add` it first", r.display()).into(),
+                );
+            }
+            r
+        }
+        (None, [only]) => only.clone(),
+        (None, []) => return Err("no root registered; `pma root add <dir>`".into()),
+        (None, _) => return Err("several roots are registered; name one with --root".into()),
+    };
+    let mut planned = 0;
+    for name in &names {
+        let row = store
+            .project(name)?
+            .ok_or_else(|| format!("unknown project `{name}`"))?;
+        if row.absent_since.is_none() && row.path.exists() {
+            println!("{name}: already checked out at {}", row.path.display());
+            continue;
+        }
+        let Some(slug) = row.slug.as_deref() else {
+            println!("{name}: no GitHub owner/name recorded; not cloned");
+            continue;
+        };
+        // A directory of that name may be another project's, or anything.
+        let target = root.join(name);
+        if target.exists() {
+            println!("{name}: {} already exists; not cloned", target.display());
+            continue;
+        }
+        planned += 1;
+        if !apply {
+            println!("{name}: would clone {slug} into {}", target.display());
+            continue;
+        }
+        let out = std::process::Command::new("gh")
+            .args(["repo", "clone", slug])
+            .arg(&target)
+            .args(["--", "-q"])
+            .output()
+            .map_err(|e| format!("gh: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "{name}: gh repo clone {slug} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )
+            .into());
+        }
+        println!("{name}: cloned {slug} into {}", target.display());
+    }
+    match (planned, apply) {
+        (0, _) => {}
+        (_, false) => println!("run again with --apply to clone"),
+        (_, true) => println!("run `pma scan` to read them"),
+    }
     Ok(())
 }
 
@@ -1479,11 +1574,14 @@ fn portfolio_with(names: &[String], tags: &[String], all: bool) -> Result<Portfo
             return Err(format!("unknown project `{n}`").into());
         }
     }
+    // A project no scan can find has nothing to dispatch against, so it does
+    // not compete for attention. `pma project` still lists it.
     let rows: Vec<_> = rows
         .into_iter()
         .filter(|r| names.is_empty() || names.contains(&r.name))
+        .filter(|r| r.absent_since.is_none())
         .collect();
-    let fallback = cfg.default_tier.and_then(|t| u8::try_from(t).ok());
+    let fallback = cfg.tier_or_default(None);
     let untiered = rows
         .iter()
         .filter(|r| r.tier.is_none() && fallback.is_none())
@@ -1522,7 +1620,7 @@ fn portfolio_with(names: &[String], tags: &[String], all: bool) -> Result<Portfo
             due: t.due.as_deref().and_then(dates::parse),
             tagged_urgent: t.tags.iter().any(|g| g == "urgent"),
             signal_urgent: false,
-            eligible: t.tags.iter().any(|g| g == "agent"),
+            eligible: t.tags.iter().any(|g| g == "agent") && !t.tags.iter().any(|g| g == "manual"),
             age_days:
                 (today - dates::day(t.added_at.unwrap_or(t.first_seen).min(t.first_seen))).max(0),
         }));
@@ -2082,6 +2180,7 @@ fn run_review(
     approve: bool,
     reject: bool,
     keep_git_changes: bool,
+    infra: bool,
     rework: Option<&str>,
     minutes: Option<u32>,
 ) -> Result<()> {
@@ -2125,13 +2224,14 @@ fn run_review(
     // Added before the action, so a rework's own review time is not lost when
     // the run is reviewed again.
     if let Some(m) = minutes {
-        run.review_seconds = Some(run.review_seconds.unwrap_or(0) + i64::from(m) * 60);
-        store.update_run(&run)?;
+        let seconds = i64::from(m) * 60;
+        run.review_seconds = Some(run.review_seconds.unwrap_or(0) + seconds);
+        store.add_review_seconds(run.id, seconds)?;
     }
     if approve {
         dispatch::approve(&store, &mut run, &whoami())?;
     } else if reject {
-        dispatch::reject(&store, &mut run, keep_git_changes)?;
+        dispatch::reject(&store, &mut run, keep_git_changes, infra)?;
     } else if let Some(feedback) = rework {
         let cfg = load_config(&store)?;
         dispatch::rework(&store, &home, &cfg, &mut run, feedback)?;
@@ -2400,6 +2500,12 @@ fn project_command(action: Option<ProjectAction>) -> Result<()> {
         ProjectAction::Import { file, apply } => import_projects(&file, apply),
         ProjectAction::Tag { action } => tag(action),
         ProjectAction::Forget { project, apply } => forget(&project, apply),
+        ProjectAction::Clone {
+            projects,
+            tags,
+            root,
+            apply,
+        } => clone_projects(&projects, &tags, root.as_deref(), apply),
     }
 }
 

@@ -52,27 +52,27 @@
 
 - [ ] **Render `gh:N` as a link**: `report`, `rank`, `matrix` and `tui` print a bare issue number, and the project row now stores `owner/name` to resolve it against.
 
-- [ ] **Absent projects still rank**: `status` and `matrix` score a project no scan can find, so its tasks compete for attention when nothing can be dispatched against them. Either drop them from ranking or mark them in the listing.
+- [x] **Absent projects still rank**: `status` and `matrix` score a project no scan can find, so its tasks compete for attention when nothing can be dispatched against them. Either drop them from ranking or mark them in the listing.
 
-- [ ] **`pma clone --tag <tag>`**: create the checkout for a project whose record exists but whose working tree does not, from its stored `owner/name`. Needs a target root when several are registered, and a rule for a directory name already taken under another one.
+- [x] **`pma clone --tag <tag>`**: create the checkout for a project whose record exists but whose working tree does not, from its stored `owner/name`. Needs a target root when several are registered, and a rule for a directory name already taken under another one.
 
-- [ ] `update_run` can overwrite a newer run state. It writes 21 columns from an in-memory copy with no state guard and ignores the affected-row count (`src/store.rs:1178`). `review --approve` and `--minutes` hold no session lock (`src/main.rs:2068-2101`), so a stale copy can overwrite `pushed` with `approved`. Decide the concurrency model first: every writing command takes the session lock, or `BEGIN IMMEDIATE` with guarded, column-scoped updates. (REVIEW.md M1)
+- [x] `update_run` can overwrite a newer run state. It writes 21 columns from an in-memory copy with no state guard and ignores the affected-row count (`src/store.rs:1178`). `review --approve` and `--minutes` hold no session lock (`src/main.rs:2068-2101`), so a stale copy can overwrite `pushed` with `approved`. Decide the concurrency model first: every writing command takes the session lock, or `BEGIN IMMEDIATE` with guarded, column-scoped updates. (REVIEW.md M1)
 
-- [ ] `atomically` opens a deferred transaction and its callers read before they write (`src/store.rs:1617`). SQLite returns `SQLITE_BUSY` without waiting when a read lock is upgraded while another writer holds the reserved lock. At `src/pass.rs:2186` the agent has already run. Failure is inferred, not reproduced. Same decision as M1. (REVIEW.md M2)
+- [x] `atomically` opens a deferred transaction and its callers read before they write (`src/store.rs:1617`). SQLite returns `SQLITE_BUSY` without waiting when a read lock is upgraded while another writer holds the reserved lock. At `src/pass.rs:2186` the agent has already run. Failure is inferred, not reproduced. Same decision as M1. (REVIEW.md M2)
 
 - [x] Worker placeholders are substituted after the prompt is inserted (`src/worker.rs:259-273`). A task containing `{model}` with no model chosen drops the prompt argument and the flag before it; with a model chosen, `{model}`, `{dir}`, `{budget}` and `{timeout}` in task text are rewritten. Substitute before inserting the prompt. (REVIEW.md M3)
 
-- [ ] The batch budget counts unknown cost as zero (`src/dispatch.rs:881-884`, `910`). `omp`, `opencode` and runs killed at the timeout report no cost, so `batch_budget` never stops them. (REVIEW.md M4)
+- [x] The batch budget counts unknown cost as zero (`src/dispatch.rs:881-884`, `910`). `omp`, `opencode` and runs killed at the timeout report no cost, so `batch_budget` never stops them. (REVIEW.md M4)
 
-- [ ] `reject` consumes an attempt for a run that never started (`src/dispatch.rs:1367-1372`). Two such rejections reach the attempt limit. Open: can a run refused by the batch budget be cleared without `reject`? (REVIEW.md M5)
+- [x] `reject` consumes an attempt for a run that never started (`src/dispatch.rs:1367-1372`). Two such rejections reach the attempt limit. Open: can a run refused by the batch budget be cleared without `reject`? (REVIEW.md M5)
 
-- [ ] A project ranked through `default_tier` is routed with `tier: None`, so a route with a tier condition never matches it (`src/main.rs:1712`, `1848`). Unverified. (REVIEW.md M6)
+- [x] A project ranked through `default_tier` is routed with `tier: None`, so a route with a tier condition never matches it (`src/main.rs:1712`, `1848`). Unverified. (REVIEW.md M6)
 
-- [ ] `route replay` compares only route name, agent and model (`src/route.rs:417-437`). A change to `approval` or `scope` prints "0 routed differently". Unverified. (REVIEW.md M7)
+- [x] `route replay` compares only route name, agent and model (`src/route.rs:417-437`). A change to `approval` or `scope` prints "0 routed differently". Unverified. (REVIEW.md M7)
 
-- [ ] `eligible` ignores `#manual` (`src/main.rs:1496`). An `#agent #manual` item is listed under "For agents" and missing from "For you"; dispatch does refuse it. (REVIEW.md M8)
+- [x] `eligible` ignores `#manual` (`src/main.rs:1496`). An `#agent #manual` item is listed under "For agents" and missing from "For you"; dispatch does refuse it. (REVIEW.md M8)
 
-- [ ] `names_a_place` matches `and/or`, `e.g.`, `Node.js` (`src/complexity.rs:86-96`). Complexity drops by one, which can select a weaker model and a higher autonomy band. Unverified. (REVIEW.md M9)
+- [x] `names_a_place` matches `and/or`, `e.g.`, `Node.js` (`src/complexity.rs:86-96`). Complexity drops by one, which can select a weaker model and a higher autonomy band. Unverified. (REVIEW.md M9)
 
 - [ ] The process-group kill does not reach a child that calls `setsid` (`src/agent.rs:105-106`, `119`). `docs/dev/design.md:377` says no agent outlives the session. A survivor's writes to the worktree no longer reach an approval or a publish: an approval must match the tree last shown, and publishing starts from the approved tree. It still runs, reads what the user can, and writes outside the worktree. A cgroup or PID namespace would bound it; `sanduk` does. (REVIEW.md M10)
 
@@ -82,9 +82,9 @@
 
 - [x] `pma scan` still runs `git status` in a clone holding a setting a failed run found, which runs an added `core.fsmonitor`. Such a clone is now left unread; it keeps its last scan and records why as its scan error.
 
-- [ ] `todo::insert` finds headings without tracking code fences (`src/todo.rs:694-706`). A `## example` line inside a fence receives the new item; the parser does not see it there, so each resumed pass inserts another copy. (REVIEW.md M12)
+- [x] `todo::insert` finds headings without tracking code fences (`src/todo.rs:694-706`). A `## example` line inside a fence receives the new item; the parser does not see it there, so each resumed pass inserts another copy. (REVIEW.md M12)
 
-- [ ] README claims overstate the agent sandbox and budget. "No push credentials": `HOME` is unchanged, so `~/.ssh`, `~/.git-credentials` and `~/.netrc` stay readable, and `GH_ENTERPRISE_TOKEN`, `GIT_ASKPASS`, `SSH_ASKPASS` are not removed (`src/agent.rs:23-38`). "Dollars per run": no shipped worker enforces a budget (`src/accept.rs:89`). Reword to "no push credentials in its environment" and to what `accept.rs:89` says, or close the gaps. Open: does `gh` authenticate from the system keyring with `GH_CONFIG_DIR` set to an empty directory? (REVIEW.md, README claims)
+- [x] README claims overstate the agent sandbox and budget. "No push credentials": `HOME` is unchanged, so `~/.ssh`, `~/.git-credentials` and `~/.netrc` stay readable, and `GH_ENTERPRISE_TOKEN`, `GIT_ASKPASS`, `SSH_ASKPASS` are not removed (`src/agent.rs:23-38`). "Dollars per run": no shipped worker enforces a budget (`src/accept.rs:89`). Reword to "no push credentials in its environment" and to what `accept.rs:89` says, or close the gaps. Open: does `gh` authenticate from the system keyring with `GH_CONFIG_DIR` set to an empty directory? (REVIEW.md, README claims)
 
 ## Low
 

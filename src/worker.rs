@@ -755,20 +755,23 @@ mod tests {
     /// The template's flags are ones the installed `sanduk` accepts, so a flag
     /// renamed upstream fails here rather than on every dispatch. `--help`
     /// last has clap reject an unknown flag or value without starting
-    /// anything; `--dry-run` would create the container network.
+    /// anything; `--dry-run` would create the container network. Skipped where
+    /// `sanduk` is not installed: there is no binary to drift from.
     #[test]
     fn the_container_template_parses_against_the_installed_sanduk() {
         let w = Worker::sanduk();
         let cmd = w.build("do it", Path::new("/w/a"), Some("opus"), 1.0, &[], MINUTE);
         let args = args_of(&cmd);
-        let sanduk = |args: &[String]| {
-            Command::new(&w.command)
-                .args(args)
-                .output()
-                .unwrap_or_else(|e| panic!("{}: {e}; `cargo install sanduk`", w.command))
-        };
+        let sanduk = |args: &[String]| Command::new(&w.command).args(args).output();
 
-        let out = sanduk(&[args.clone(), vec!["--help".into()]].concat());
+        let out = match sanduk(&[args.clone(), vec!["--help".into()]].concat()) {
+            Ok(out) => out,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipped: {} is not on PATH", w.command);
+                return;
+            }
+            Err(e) => panic!("{}: {e}", w.command),
+        };
         assert!(
             out.status.success(),
             "sanduk refuses the template: {}",
@@ -776,7 +779,7 @@ mod tests {
         );
 
         let agent = &args[args.iter().position(|a| a == "--agent").unwrap() + 1];
-        let out = sanduk(&["list".into(), "agents".into()]);
+        let out = sanduk(&["list".into(), "agents".into()]).expect("sanduk list agents");
         let agents = String::from_utf8_lossy(&out.stdout);
         assert!(
             agents

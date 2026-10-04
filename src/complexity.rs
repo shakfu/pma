@@ -85,13 +85,32 @@ impl Features {
 /// point of five.
 fn names_a_place(text: &str) -> bool {
     text.split_whitespace().any(|word| {
-        let word = word.trim_matches(|c: char| !c.is_alphanumeric() && c != ')');
+        let word = word.trim_matches(|c: char| !c.is_alphanumeric() && c != ')' && c != '/');
         word.ends_with("()")
             || word.contains("::")
-            || (word.contains('/') && !word.contains("://"))
-            || word.rsplit_once('.').is_some_and(|(stem, ext)| {
-                !stem.is_empty() && ext.len() <= 4 && ext.chars().all(|c| c.is_ascii_alphabetic())
-            })
+            || (word.contains('/') && !word.contains("://") && is_path(word))
+            || is_file(word)
+    })
+}
+
+/// `docs/dev/`, `src/scan.rs`, `a/b/c`; not `and/or`.
+fn is_path(word: &str) -> bool {
+    word.ends_with('/')
+        || word.matches('/').count() >= 2
+        || word.rsplit('/').next().is_some_and(is_file)
+}
+
+/// `TODO.md`, `scan.rs:42`; not `e.g`, `i.e` or a product such as `Node.js`.
+fn is_file(word: &str) -> bool {
+    let word = match word.split_once(':') {
+        Some((file, at)) if at.chars().all(|c| c.is_ascii_digit() || c == '-') => file,
+        _ => word,
+    };
+    word.rsplit_once('.').is_some_and(|(stem, ext)| {
+        stem.len() >= 2
+            && (1..=4).contains(&ext.len())
+            && ext.chars().all(|c| c.is_ascii_alphabetic())
+            && !(ext == "js" && stem.starts_with(|c: char| c.is_ascii_uppercase()))
     })
 }
 
@@ -152,6 +171,8 @@ mod tests {
             "glob_match() rejects **",
             "Store::open leaks",
             "update README.md",
+            "document docs/dev/",
+            "move the check to src/dispatch.rs:42",
         ] {
             assert!(names_a_place(text), "{text}");
         }
@@ -159,6 +180,9 @@ mod tests {
             "make the parser faster",
             "see https://example.com/x",
             "decide on the api",
+            "keep and/or drop it",
+            "a flag, e.g. --all, or i.e. none",
+            "support Node.js and Vue.js",
         ] {
             assert!(!names_a_place(text), "{text}");
         }

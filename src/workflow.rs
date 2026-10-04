@@ -1033,11 +1033,11 @@ fn parse_node(wf: &str, v: &Value) -> Result<Node, String> {
                 writes: strings("writes")?,
                 max_units: match &v["max_units"] {
                     Value::Null => None,
-                    c => Some(count(c, "max_units").map_err(&at)?),
+                    c => Some(count(c, "max_units").map_err(at)?),
                 },
                 max_depth: match &v["max_depth"] {
                     Value::Null => None,
-                    c => Some(count(c, "max_depth").map_err(&at)?),
+                    c => Some(count(c, "max_depth").map_err(at)?),
                 },
                 task,
                 rule,
@@ -1186,7 +1186,7 @@ fn parse_edge(wf: &str, i: usize, v: &Value) -> Result<Edge, String> {
         default,
         max_laps: match &v["max_laps"] {
             Value::Null => None,
-            c => Some(count(c, "max_laps").map_err(&at)?),
+            c => Some(count(c, "max_laps").map_err(at)?),
         },
     })
 }

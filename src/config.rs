@@ -189,6 +189,12 @@ pub fn retired(key: &str) -> Option<&'static str> {
 }
 
 impl Config {
+    /// A project's tier, else `default_tier`: what ranks it, and so what
+    /// routes it.
+    pub fn tier_or_default(&self, tier: Option<u8>) -> Option<u8> {
+        tier.or_else(|| self.default_tier.and_then(|t| u8::try_from(t).ok()))
+    }
+
     pub fn keys() -> Vec<String> {
         let mut keys: Vec<String> = ["important_threshold", "urgent_within", "quadrant_limit"]
             .map(String::from)

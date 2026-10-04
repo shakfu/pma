@@ -82,7 +82,7 @@ pub fn build(
                 command: Some(format!("pma dispatch {at} --retry")),
             }),
             (false, _) if needs_you && t.line.is_some() => next.tasks.push(Row {
-                cells: cells("not #agent"),
+                cells: cells("not for agents"),
                 command: None,
             }),
             _ => {}
@@ -253,7 +253,10 @@ mod tests {
             .collect();
         assert_eq!(
             yours,
-            [("spent:8", "2 attempts used"), ("mine:10", "not #agent")]
+            [
+                ("spent:8", "2 attempts used"),
+                ("mine:10", "not for agents")
+            ]
         );
         assert_eq!(
             next.tasks[0].command.as_deref(),

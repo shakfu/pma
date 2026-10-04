@@ -22,10 +22,18 @@ pub fn restrict(cmd: &mut Command, dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(&gh)?;
     let hooks = dir.join("hooks");
     write_hook(&hooks)?;
-    cmd.env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("SSH_AUTH_SOCK")
-        .env("GH_CONFIG_DIR", &gh)
+    for var in [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "SSH_AUTH_SOCK",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd.env("GH_CONFIG_DIR", &gh)
         .env("GIT_TERMINAL_PROMPT", "0");
     let settings: [(&str, &OsStr); 3] = [
         // An empty helper clears the user's credential helpers.
@@ -409,12 +417,20 @@ mod tests {
     fn restricted_children_cannot_see_tokens() {
         let dir = scratch("env");
         let mut cmd = Command::new("sh");
-        cmd.args(["-c", "echo \"${GH_TOKEN-unset} $GIT_TERMINAL_PROMPT\""])
-            .env("GH_TOKEN", "secret")
-            .current_dir(&dir);
+        cmd.args([
+            "-c",
+            "echo \"${GH_TOKEN-unset} ${GH_ENTERPRISE_TOKEN-unset} ${GIT_ASKPASS-unset} $GIT_TERMINAL_PROMPT\"",
+        ])
+        .env("GH_TOKEN", "secret")
+        .env("GH_ENTERPRISE_TOKEN", "secret")
+        .env("GIT_ASKPASS", "/bin/echo")
+        .current_dir(&dir);
         restrict(&mut cmd, &dir).unwrap();
         let out = cmd.output().unwrap();
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "unset 0\n");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "unset unset unset 0\n"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

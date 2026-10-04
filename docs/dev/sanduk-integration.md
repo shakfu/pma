@@ -110,7 +110,7 @@ Fixed in sanduk-rs (Unreleased): each run starts `sanduk reap` in its own proces
 
 ## Order
 
-1. Done 2026-09-29: `cargo install sanduk`, and a test that the template's flags and agent parse against the installed binary. `make test` now needs `sanduk` on `PATH`.
+1. Done 2026-09-29: `cargo install sanduk`, and a test that the template's flags and agent parse against the installed binary. The test skips where `sanduk` is not on `PATH`.
 2. Done 2026-09-29: `sanduk-sandbox` for `verify`, with the policy wrapping the watchdog, `projects.<name>.sandbox off` as the opt-out, the sandbox in the base cache's key, and a disk test. No git grants: see problem 2.
 3. Closed 2026-09-29, not done: host workers stay unconfined. See problem 3.
 4. Done in sanduk-rs 2026-09-29 (Unreleased): `run --verify CMD`, and `--stats-file` with `mode`, the relay's numbers and the verify result. `run --verify` with no task checks a base tree in the same container setup, in place of a separate verb. Toolchain kits followed the same day: `build`, `rust`, `go` and `uv`, which stack on one image. sanduk-rs's own suite passes inside `--kit rust`. `pma` does not read the results yet; that is the next step: a per-project opt-in with the project's kits, `--verify {verify}` in the `sanduk` template, head and base results from the stats file, and where verify ran in the base cache's key.

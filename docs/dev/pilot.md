@@ -101,7 +101,7 @@ pma records attempts, cost, both verify results, changed paths and review time. 
 
 ## Findings
 
-- **An infrastructure rejection counts against the agent.** `pma report` put run #1, rejected for our own verify fault, in the decided runs: "50% of 2 decided runs accepted", where the agent was 1 for 1. `--reject` records no reason, so the report cannot tell an infrastructure failure from a refused change. Until it can, report the pilot's shares from this table, and exclude runs whose note says infrastructure. A fix: a reason on `--reject`, and a report that leaves infrastructure rejections out of the share and names them.
+- **An infrastructure rejection counts against the agent.** `pma report` put run #1, rejected for our own verify fault, in the decided runs: "50% of 2 decided runs accepted", where the agent was 1 for 1. `--reject` records no reason, so the report cannot tell an infrastructure failure from a refused change. Until it can, report the pilot's shares from this table, and exclude runs whose note says infrastructure. Fixed after the pilot's first run: `--reject --infra` leaves the run out of the share, and `report` names it. Run #1 predates the flag and still counts.
 
 ## Notes per run
 

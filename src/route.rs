@@ -475,6 +475,8 @@ pub fn replay(policy: &Policy, runs: &[crate::store::Run]) -> (Vec<Difference>, 
             run.route.as_deref(),
             run.agent.as_str(),
             run.model.as_deref(),
+            run.approval,
+            &run.scope,
         );
         let would_be = match policy.route(&subject) {
             None => "refused: no route matches".to_string(),
@@ -482,6 +484,8 @@ pub fn replay(policy: &Policy, runs: &[crate::store::Run]) -> (Vec<Difference>, 
                 Some(&r.name),
                 r.agent.as_deref().unwrap_or(&run.agent),
                 r.model.as_deref().or(run.model.as_deref()),
+                Some(r.approval),
+                r.scope.as_ref().unwrap_or(&class.scope()),
             ),
         };
         if was != would_be {
@@ -495,17 +499,55 @@ pub fn replay(policy: &Policy, runs: &[crate::store::Run]) -> (Vec<Difference>, 
     (differences, compared)
 }
 
-fn describe(route: Option<&str>, agent: &str, model: Option<&str>) -> String {
+fn describe(
+    route: Option<&str>,
+    agent: &str,
+    model: Option<&str>,
+    approval: Option<Approval>,
+    scope: &[String],
+) -> String {
     format!(
-        "{} {agent}{}",
+        "{} {agent}{} {}{}",
         route.unwrap_or("-"),
-        model.map_or(String::new(), |m| format!("/{m}"))
+        model.map_or(String::new(), |m| format!("/{m}")),
+        approval.map_or("-", Approval::name),
+        match scope {
+            [] => String::new(),
+            globs => format!(" in {}", globs.join(",")),
+        }
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A change to approval or scope changes what happens to a run, so a
+    /// replay that saw only the route, agent and model would call it a match.
+    #[test]
+    fn replay_compares_approval_and_scope() {
+        let policy = |approval: &str, scope: &str| {
+            Policy::parse(&format!(
+                r#"{{"route":[{{"name":"r","match":{{}},"approval":"{approval}"{scope}}}]}}"#
+            ))
+            .unwrap()
+        };
+        let run = crate::store::Run {
+            id: 1,
+            agent: "claude".into(),
+            class: Some(Class::Specified),
+            complexity: Some(3),
+            route: Some("r".into()),
+            approval: Some(Approval::Each),
+            scope: Class::Specified.scope(),
+            ..crate::store::Run::blank()
+        };
+        let runs = [run];
+        assert!(replay(&policy("each", ""), &runs).0.is_empty());
+        assert_eq!(replay(&policy("batch", ""), &runs).0.len(), 1);
+        let (d, _) = replay(&policy("each", r#","scope":["src/**"]"#), &runs);
+        assert!(d[0].would_be.ends_with("in src/**"), "{}", d[0].would_be);
+    }
 
     const DOC: &str = r#"{
       "route": [

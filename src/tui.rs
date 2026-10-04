@@ -352,7 +352,7 @@ mod tests {
                     "T1",
                     "critical",
                     "open 9d",
-                    "not #agent",
+                    "not for agents",
                     "urgent thing",
                 ],
                 None,

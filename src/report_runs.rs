@@ -49,6 +49,8 @@ struct Tally {
     /// Runs whose change reached the default branch: pushed, or merged.
     landed: i64,
     open: i64,
+    /// Runs rejected for infrastructure, in no share.
+    infra: Vec<i64>,
     attempts: i64,
     cost: f64,
     /// Runs whose agent reported no cost, so `cost` is a floor.
@@ -70,6 +72,7 @@ impl Tally {
                 self.decided += 1;
                 self.accepted += 1;
             }
+            RunState::Rejected if run.infra => self.infra.push(run.id),
             RunState::Rejected | RunState::Closed => self.decided += 1,
             // Neither accepted nor refused until someone merges or closes it,
             // so it is in no share.
@@ -159,7 +162,17 @@ pub fn report(runs: &[Run], attempts: &[Attempt], by: By) -> String {
         1 => "; 1 pull request open, in no share".into(),
         n => format!("; {n} pull requests open, in no share"),
     };
-    format!("{share}{pending}\n\n{}", table(&rows, ""))
+    let infra = match total.infra.as_slice() {
+        [] => String::new(),
+        ids => format!(
+            "; rejected for infrastructure, in no share: {}",
+            ids.iter()
+                .map(|id| format!("#{id}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+    };
+    format!("{share}{pending}{infra}\n\n{}", table(&rows, ""))
 }
 
 #[cfg(test)]
@@ -226,6 +239,25 @@ mod tests {
             .collect();
         // The running run is not counted at all; the open one only as open.
         assert_eq!(&cells[..6], ["A", "2", "0", "1", "1", "1"], "{out}");
+    }
+
+    /// The check or the machine failing is not the agent failing: such a
+    /// rejection is in no share, and named so it is not lost.
+    #[test]
+    fn an_infrastructure_rejection_is_in_no_share() {
+        let mut infra = run(2, Class::Specified, RunState::Rejected);
+        infra.infra = true;
+        let runs = [
+            run(1, Class::Specified, RunState::Merged),
+            infra,
+            run(3, Class::Specified, RunState::Rejected),
+        ];
+        let out = report(&runs, &[], By::Class);
+        assert!(out.contains("50% of 2 decided runs accepted"), "{out}");
+        assert!(
+            out.contains("rejected for infrastructure, in no share: #2\n"),
+            "{out}"
+        );
     }
 
     /// Passing on the first attempt and being accepted after rework are

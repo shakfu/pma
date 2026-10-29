@@ -59,6 +59,8 @@ pma workflow run find-issues --tag nightly --unattended
 
 ### Fixed
 
+- **Terminal control sockets are removed from an agent's environment**: herdr's `HERDR_*`, `TMUX`, `TMUX_PANE`, `STY`, `ZELLIJ`, `ZELLIJ_SESSION_NAME`, `KITTY_LISTEN_ON`, `WEZTERM_UNIX_SOCKET` and `NVIM`. An agent inherited them and could type a command such as `git push` into another pane holding the user's credentials. Under herdr, `HERDR_ENV` also enabled its agent skill and state hooks for headless runs. A socket at a default path, such as tmux's or herdr's, stays reachable by a process that looks for it. Analysis: `docs/dev/herdr-integration.md`.
+
 - The web page opened blank, with its footer on "Connecting" and no projects in the sidebar. `app.js` still named the tabs `next` and `status` from before the tabs were merged; the first draw threw before the event stream was opened, so no live update arrived either.
 
 - Enter in a web prompt cancelled it. The dialog's first button, Cancel, was the form's default button.

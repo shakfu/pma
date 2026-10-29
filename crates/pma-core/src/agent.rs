@@ -30,6 +30,22 @@ pub fn restrict(cmd: &mut Command, dir: &Path) -> std::io::Result<()> {
         "SSH_AUTH_SOCK",
         "GIT_ASKPASS",
         "SSH_ASKPASS",
+        // A multiplexer's or terminal's control socket lets a child type into
+        // other panes, which hold credentials.
+        "HERDR_ENV",
+        "HERDR_SOCKET_PATH",
+        "HERDR_PANE_ID",
+        "HERDR_TAB_ID",
+        "HERDR_WORKSPACE_ID",
+        "HERDR_BIN_PATH",
+        "TMUX",
+        "TMUX_PANE",
+        "STY",
+        "ZELLIJ",
+        "ZELLIJ_SESSION_NAME",
+        "KITTY_LISTEN_ON",
+        "WEZTERM_UNIX_SOCKET",
+        "NVIM",
     ] {
         cmd.env_remove(var);
     }
@@ -434,22 +450,57 @@ mod tests {
     }
 
     #[test]
+    fn restricted_children_cannot_see_control_sockets() {
+        let dir = scratch("sockets");
+        let vars = [
+            "HERDR_SOCKET_PATH",
+            "TMUX",
+            "STY",
+            "ZELLIJ",
+            "KITTY_LISTEN_ON",
+            "WEZTERM_UNIX_SOCKET",
+            "NVIM",
+        ];
+        let script = vars
+            .iter()
+            .map(|v| format!("${{{v}-unset}}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", &format!("echo {script}")]).current_dir(&dir);
+        for v in vars {
+            cmd.env(v, "/tmp/socket");
+        }
+        restrict(&mut cmd, &dir).unwrap();
+        let out = cmd.output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            vec!["unset"; vars.len()].join(" ")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn restricted_children_cannot_see_tokens() {
         let dir = scratch("env");
         let mut cmd = Command::new("sh");
         cmd.args([
             "-c",
-            "echo \"${GH_TOKEN-unset} ${GH_ENTERPRISE_TOKEN-unset} ${GIT_ASKPASS-unset} $GIT_TERMINAL_PROMPT\"",
+            "echo \"${GH_TOKEN-unset} ${GH_ENTERPRISE_TOKEN-unset} ${GIT_ASKPASS-unset} \
+             ${HERDR_ENV-unset} ${HERDR_SOCKET_PATH-unset} ${HERDR_PANE_ID-unset} $GIT_TERMINAL_PROMPT\"",
         ])
         .env("GH_TOKEN", "secret")
         .env("GH_ENTERPRISE_TOKEN", "secret")
         .env("GIT_ASKPASS", "/bin/echo")
+        .env("HERDR_ENV", "1")
+        .env("HERDR_SOCKET_PATH", "/tmp/herdr.sock")
+        .env("HERDR_PANE_ID", "w1:p1")
         .current_dir(&dir);
         restrict(&mut cmd, &dir).unwrap();
         let out = cmd.output().unwrap();
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
-            "unset unset unset 0\n"
+            "unset unset unset unset unset unset 0\n"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

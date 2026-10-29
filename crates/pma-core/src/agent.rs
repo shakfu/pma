@@ -467,7 +467,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let mut cmd = Command::new("sh");
-        cmd.args(["-c", &format!("echo {script}")]).current_dir(&dir);
+        cmd.args(["-c", &format!("echo {script}")])
+            .current_dir(&dir);
         for v in vars {
             cmd.env(v, "/tmp/socket");
         }

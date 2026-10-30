@@ -38,11 +38,13 @@ impl Drop for Scratch {
 
 /// A command that ignores git settings passed through the environment. Under
 /// `pma`'s own verify, `agent::restrict` sets them to block every push, and
-/// the fixtures here push to local repositories.
+/// the fixtures here push to local repositories. It also ignores `PMA_JOB`: under
+/// a `pma` job, a plan would print `pma job approve` instead of `--approve <id>`.
 fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut cmd = Command::new(program);
     cmd.env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_CONFIG_PARAMETERS");
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("PMA_JOB");
     cmd
 }
 

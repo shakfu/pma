@@ -703,6 +703,29 @@ mod tests {
     }
 
     #[test]
+    fn a_dotted_project_name_round_trips() {
+        let path = scratch("dotted");
+        edit(&path, |doc| {
+            set_config(doc, "projects.socket.io.verify", "npm test")
+        })
+        .unwrap();
+        let (text, s) = read(&path).unwrap();
+        assert_eq!(
+            s.config,
+            [(
+                "projects.socket.io.verify".to_string(),
+                "npm test".to_string()
+            )],
+            "{text}"
+        );
+        edit(&path, |doc| {
+            assert!(reset_config(doc, "projects.socket.io.verify"))
+        })
+        .unwrap();
+        assert!(read(&path).unwrap().1.config.is_empty());
+    }
+
+    #[test]
     fn tags_tiers_and_forgetting_tidy_up() {
         let path = scratch("tags");
         edit(&path, |doc| {

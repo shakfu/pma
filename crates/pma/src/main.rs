@@ -2526,6 +2526,7 @@ fn push_clean(
         dispatch::approve(store, &mut run, &by)?;
         approved.push(run);
     }
+    let mut ticked = Vec::new();
     publish::publish(
         store,
         home,
@@ -2534,10 +2535,49 @@ fn push_clean(
         publish::Target::Push,
         None,
         |run, outcome| match outcome {
-            Ok(said) => println!("#{} {}: {said}", run.id, run.project),
+            Ok(said) => {
+                println!("#{} {}: {said}", run.id, run.project);
+                ticked.push((run.project.clone(), run.repo.clone()));
+            }
             Err(e) => println!("#{} {}: not pushed: {e}", run.id, run.project),
         },
-    )
+    )?;
+    rescan_ticked(ticked);
+    Ok(())
+}
+
+/// Rereads `TODO.md` in each `(project, clone)` a publish just ticked, so the
+/// task lists stop showing the item. A failure here leaves the publish done.
+fn rescan_ticked(mut ticked: Vec<(String, PathBuf)>) {
+    ticked.sort();
+    ticked.dedup();
+    if let Err(e) = rescan(&ticked) {
+        eprintln!("warning: task list not refreshed: {e}; `pma scan` refreshes it");
+    }
+}
+
+/// An offline scan that keeps each project's last CI, which it does not ask
+/// for and would otherwise record as unknown, and its run links.
+fn rescan(projects: &[(String, PathBuf)]) -> Result<()> {
+    if projects.is_empty() {
+        return Ok(());
+    }
+    let mut store = Store::open_default()?;
+    let cfg = api::config(&store)?;
+    let runs = store.runs()?;
+    let mut facts = Vec::new();
+    for (name, path) in projects {
+        if dispatch::clone_held(&runs, path).is_err() {
+            continue;
+        }
+        let mut f = scan::scan_project(name, path, &cfg.activity_ignore, true, false);
+        if let Some(row) = store.project(name)? {
+            (f.ci, f.ci_runs) = (row.ci, row.ci_runs);
+        }
+        facts.push(f);
+    }
+    store.save_scan(&facts, false, dates::now())?;
+    Ok(())
 }
 
 /// The project's open items from the last scan, one priority or all of them.
@@ -4110,6 +4150,7 @@ fn run_publish(
     }
     runs.sort_by_key(|r| r.id);
     let mut failed = 0;
+    let mut ticked = Vec::new();
     publish::publish(
         &store,
         &store::state_home()?,
@@ -4119,23 +4160,31 @@ fn run_publish(
         subject.as_deref(),
         |run, outcome| match outcome {
             // A run left part way says what takes it on.
-            Ok(o) => match target {
-                publish::Target::Stage => println!(
-                    "#{} {}: {o}; next: `pma commit {}`",
-                    run.id, run.project, run.id
-                ),
-                publish::Target::Commit => println!(
-                    "#{} {}: {o}; next: `pma push {}`",
-                    run.id, run.project, run.id
-                ),
-                _ => println!("#{} {}: {o}", run.id, run.project),
-            },
+            Ok(o) => {
+                match target {
+                    publish::Target::Stage => println!(
+                        "#{} {}: {o}; next: `pma commit {}`",
+                        run.id, run.project, run.id
+                    ),
+                    publish::Target::Commit => println!(
+                        "#{} {}: {o}; next: `pma push {}`",
+                        run.id, run.project, run.id
+                    ),
+                    _ => println!("#{} {}: {o}", run.id, run.project),
+                }
+                // Staged is undone by unstaging, and a pull request ticks its
+                // branch, so only these two leave the clone's item closed.
+                if matches!(target, publish::Target::Commit | publish::Target::Push) {
+                    ticked.push((run.project.clone(), run.repo.clone()));
+                }
+            }
             Err(e) => {
                 failed += 1;
                 println!("#{} {}: {e}", run.id, run.project);
             }
         },
     )?;
+    rescan_ticked(ticked);
     if failed > 0 {
         return Err(
             format!("{failed} runs stopped; each stays in the last state it reached").into(),

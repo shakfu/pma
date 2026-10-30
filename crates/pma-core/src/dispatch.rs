@@ -632,11 +632,15 @@ pub fn prepare(
     // Before the fetch, which reads `url.*` and `core.sshCommand`.
     clone_unchanged(store, repo)?;
     let in_clone = pick.workspace == Workspace::Clone;
+    if in_clone {
+        crate::publish::settle_committed(store)?;
+    }
     if in_clone && let Some(held) = clone_busy(&store.runs()?, repo) {
+        let state = store.run(held)?.state;
         return Ok(Prepared::Refused(format!(
-            "{project}: its clone holds run #{held} ({}); approve or reject it first, or \
-             dispatch with --worktree",
-            store.run(held)?.state.name()
+            "{project}: its clone holds run #{held} ({}); {}, or dispatch with --worktree",
+            state.name(),
+            clears_clone(state, held)
         )));
     }
     // A clone run's `base` is `HEAD`, which publishing requires unmoved; its
@@ -874,6 +878,18 @@ fn noting(prepared: Result<Prepared>, dropped: Vec<String>) -> Result<Prepared> 
 /// The clone run that holds `repo`, if one does: one that is queued, under
 /// way, or waiting in review or in its clone's index. A failed one too, since
 /// its agent may have left edits that only a reject reverts.
+/// What ends the hold of a run in `state` on its clone.
+fn clears_clone(state: RunState, id: i64) -> String {
+    match state {
+        RunState::Queued | RunState::Running => "wait for it to finish".into(),
+        RunState::Approved => format!("push it with `pma push {id}`, or reject it"),
+        RunState::Staged => format!("commit it with `pma commit {id}`, or reject it"),
+        RunState::Committed => format!("push it with `pma push {id}`"),
+        RunState::PrOpen => format!("merge it with `pma merge {id}`"),
+        _ => "approve or reject it first".into(),
+    }
+}
+
 pub fn clone_busy(runs: &[Run], repo: &Path) -> Option<i64> {
     runs.iter()
         .filter(|r| r.repo == repo && r.workspace == Workspace::Clone && !r.state.is_final())

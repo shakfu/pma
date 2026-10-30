@@ -63,6 +63,12 @@ pma workflow run find-issues --tag nightly --unattended
 
 ### Fixed
 
+- **A commit pushed by hand no longer holds its clone.** A `committed` run stayed so after `git push`, because `pma push` refuses a `HEAD` that has moved past it, so every later clone dispatch was refused. `pma review` and a clone dispatch now move it to `pushed` once `origin/<default branch>` holds the commit. Matching the commit's ancestry over a new column settles runs already stuck; a rebased or squashed commit is not recognised.
+
+- The clone-busy refusal names the step that ends the hold, by the run's state. It said "approve or reject" to a run already committed.
+
+- `pma commit` and `pma push` refresh the project's tasks, so a ticked item leaves the task lists without a `pma scan`. The refresh does not ask GitHub, and keeps the last CI result. `pma pr` and `pma merge` are unchanged: the tick is on the branch until the clone pulls it.
+
 - **A project whose name contains a dot can take `projects.<name>.verify` and `projects.<name>.sandbox`.** The key was refused as unknown, so a project such as `socket.io` could not set either. The field is the last component of the key, so the name is unambiguous.
 
 - **Terminal control sockets are removed from an agent's environment**: herdr's `HERDR_*`, `TMUX`, `TMUX_PANE`, `STY`, `ZELLIJ`, `ZELLIJ_SESSION_NAME`, `KITTY_LISTEN_ON`, `WEZTERM_UNIX_SOCKET` and `NVIM`. An agent inherited them and could type a command such as `git push` into another pane holding the user's credentials. Under herdr, `HERDR_ENV` also enabled its agent skill and state hooks for headless runs. A socket at a default path, such as tmux's or herdr's, stays reachable by a process that looks for it. Analysis: `docs/dev/herdr-integration.md`.

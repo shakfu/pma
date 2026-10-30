@@ -776,11 +776,15 @@ pub fn merge(store: &Store, run: &mut Run) -> Result<String> {
 /// to `closed` when it is closed without merging. An open pull request keeps
 /// the run `pr-open`; `done` still sees it when someone has reviewed or
 /// commented on it, as GitHub shows it. `done` also sees each run whose pull
-/// request `gh` cannot read, which stays `pr-open`.
+/// request `gh` cannot read, which stays `pr-open`. A `committed` run settles
+/// too; see `settle_committed`.
 pub fn settle(
     store: &Store,
     mut done: impl FnMut(&Run, &std::result::Result<String, String>),
 ) -> Result<()> {
+    for run in settle_committed(store)? {
+        done(&run, &Ok(run.outcome.clone().unwrap_or_default()));
+    }
     for mut run in store.runs()? {
         if run.state != RunState::PrOpen {
             continue;
@@ -834,6 +838,41 @@ pub fn settle(
         done(&run, &Ok(outcome));
     }
     Ok(())
+}
+
+/// Moves each `committed` run to `pushed` once its remote-tracking default
+/// branch holds the commit, as after a `git push` by hand. Nothing else would
+/// end such a run: `pma push` refuses a `HEAD` that has moved past it. Returns
+/// the runs moved. A commit rebased or squashed on the way is not recognised.
+pub fn settle_committed(store: &Store) -> Result<Vec<Run>> {
+    let runs = store.runs()?;
+    let mut settled = Vec::new();
+    for run in runs.iter().filter(|r| r.state == RunState::Committed) {
+        let Some(sha) = committed_sha(run) else {
+            continue;
+        };
+        let branch = format!("origin/{}", run.default_branch);
+        if crate::dispatch::clone_held(&runs, &run.repo).is_err()
+            || git(&run.repo, &["merge-base", "--is-ancestor", sha, &branch]).is_err()
+        {
+            continue;
+        }
+        let mut run = run.clone();
+        run.outcome = Some(format!("{sha} found on {branch}"));
+        run.enter(RunState::Pushed);
+        store.update_run(&run)?;
+        settled.push(run);
+    }
+    Ok(settled)
+}
+
+/// The commit a `committed` run's outcome names, as `commit` wrote it.
+fn committed_sha(run: &Run) -> Option<&str> {
+    run.outcome
+        .as_deref()?
+        .strip_prefix("committed ")?
+        .split(' ')
+        .next()
 }
 
 /// What has happened on an open pull request, in GitHub's terms: its review

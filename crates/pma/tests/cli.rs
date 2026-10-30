@@ -1784,6 +1784,105 @@ fn stage_commit_and_push_follow_git() {
     );
 }
 
+/// `pma push` refuses a `HEAD` past the run's commit, so a commit pushed by
+/// hand with another on top could end the run no other way.
+#[test]
+fn a_commit_pushed_by_hand_settles_and_frees_the_clone() {
+    let s = Scratch::new("pushed-by-hand");
+    let (env, origin, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    env.ok(&["config", "workspace", "clone"]);
+    env.ok(&["dispatch", "alpha:5"]);
+
+    let (_, err, success) = env.run(&["dispatch", "alpha:8"]);
+    assert!(
+        !success && err.contains("(ready); approve or reject"),
+        "{err}"
+    );
+    env.ok(&["review", "1", "--approve"]);
+    env.ok(&["commit", "1"]);
+
+    let (_, err, success) = env.run(&["dispatch", "alpha:8"]);
+    assert!(
+        !success && err.contains("(committed); push it with `pma push 1`"),
+        "{err}"
+    );
+    assert!(!err.contains("approve or reject"), "{err}");
+
+    // Not settled by a commit only the clone holds.
+    env.ok(&["review"]);
+    assert!(env.ok(&["review", "1"]).starts_with("#1 committed"));
+
+    fs::write(alpha.join("mine.txt"), "mine\n").unwrap();
+    git(&alpha, &["add", "mine.txt"], None);
+    git(&alpha, &["commit", "-qm", "mine"], None);
+    git(&alpha, &["push", "-q", "origin", "main"], None);
+    assert!(git_out(&origin, &["log", "--format=%s", "main"]).starts_with("mine\n"));
+
+    let (out, err, success) = env.run(&["dispatch", "alpha:8"]);
+    assert!(success && !err.contains("holds run"), "{out}{err}");
+    let detail = env.ok(&["review", "1"]);
+    assert!(detail.starts_with("#1 pushed"), "{detail}");
+}
+
+/// `pma review` settles the same run, without a dispatch.
+#[test]
+fn review_settles_a_commit_pushed_by_hand() {
+    let s = Scratch::new("pushed-review");
+    let (env, _, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    env.ok(&["config", "workspace", "clone"]);
+    env.ok(&["dispatch", "alpha:5"]);
+    env.ok(&["review", "1", "--approve"]);
+    env.ok(&["commit", "1"]);
+    git(&alpha, &["push", "-q", "origin", "main"], None);
+
+    let out = env.ok(&["review"]);
+    assert!(out.contains("found on origin/main"), "{out}");
+    assert!(env.ok(&["review", "1"]).starts_with("#1 pushed"));
+}
+
+/// A commit ticks the item in the clone, so the task leaves the lists then.
+/// The refresh asks GitHub nothing, so the failing CI stays as last read.
+#[test]
+fn a_commit_refreshes_the_tasks_and_keeps_ci() {
+    const FAILING_GH: &str = r#"#!/bin/sh
+case "$1" in
+workflow) echo '[{"id":1,"name":"test","state":"active"}]' ;;
+run) printf 'test\tcompleted\tfailure\thttps://example.com/1\n' ;;
+esac
+"#;
+    let s = Scratch::new("commit-rescan");
+    let (env, _, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE), ("gh", FAILING_GH)]);
+    let ci = |shown: &str| {
+        shown
+            .lines()
+            .find(|l| l.trim_start().starts_with("ci "))
+            .unwrap_or_else(|| panic!("no ci in {shown}"))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    // Read CI through a GitHub origin, then return to the local one to push.
+    let local = git_out(&alpha, &["remote", "get-url", "origin"]);
+    let github = "https://github.com/me/alpha.git";
+    git(&alpha, &["remote", "set-url", "origin", github], None);
+    env.ok(&["scan"]);
+    git(&alpha, &["remote", "set-url", "origin", local.trim()], None);
+    let before = ci(&env.ok(&["project", "show", "alpha"]));
+    assert!(before.contains("failing"), "{before}");
+
+    env.ok(&["dispatch", "alpha:5"]);
+    env.ok(&["stage", "1"]);
+    // Staging can be undone, so the item stays listed.
+    assert!(env.ok(&["project", "show", "alpha"]).contains("alpha:5 "));
+
+    env.ok(&["commit", "1"]);
+    let shown = env.ok(&["project", "show", "alpha"]);
+    assert!(!shown.contains("alpha:5 "), "{shown}");
+    assert!(shown.contains("alpha:7 "), "{shown}");
+    assert_eq!(ci(&shown), before);
+}
+
 /// Commits a secret, then deletes it: the net diff is clean.
 const COMMITTING_CLAUDE: &str = r#"#!/bin/sh
 echo key > secret.txt

@@ -1612,6 +1612,7 @@ pub fn key_name(code: KeyCode) -> Option<String> {
         KeyCode::Enter => "Enter".into(),
         KeyCode::Esc => "Escape".into(),
         KeyCode::Tab => "Tab".into(),
+        KeyCode::BackTab => "BackTab".into(),
         KeyCode::Backspace => "Backspace".into(),
         KeyCode::Up => "ArrowUp".into(),
         KeyCode::Down => "ArrowDown".into(),
@@ -1836,6 +1837,7 @@ mod tests {
                 ],
                 command: Some("pma review 4".into()),
                 subject: Subject::Run {
+                    fixing: false,
                     id: 4,
                     state: "ready".into(),
                     project: "b".into(),
@@ -1890,6 +1892,13 @@ mod tests {
             panic!("a dispatch");
         };
         assert_eq!(targets, ["a:5"]);
+
+        let t = index(app.tab);
+        let start = app.pane[t];
+        app.key("Tab");
+        assert_ne!(app.pane[t], start);
+        app.key("BackTab");
+        assert_eq!(app.pane[t], start, "BackTab undoes Tab");
 
         app.key("Tab");
         assert_eq!(
@@ -2531,6 +2540,7 @@ mod tests {
         assert_eq!(key_name(KeyCode::Esc).as_deref(), Some("Escape"));
         assert_eq!(key_name(KeyCode::Down).as_deref(), Some("ArrowDown"));
         assert_eq!(key_name(KeyCode::Char('G')).as_deref(), Some("G"));
+        assert_eq!(key_name(KeyCode::BackTab).as_deref(), Some("BackTab"));
         for b in keys::BINDINGS {
             assert!(
                 b.key.chars().count() == 1
@@ -2538,6 +2548,7 @@ mod tests {
                         "Enter",
                         "Escape",
                         "Tab",
+                        "BackTab",
                         "ArrowDown",
                         "ArrowUp",
                         "Home",

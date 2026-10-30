@@ -30,6 +30,7 @@ const GROUPS: [(&str, &[&str]); 6] = [
         "The loop",
         &[
             "next", "run", "scan", "matrix", "dispatch", "review", "stage", "commit", "push", "pr",
+            "merge",
         ],
     ),
     (
@@ -465,6 +466,17 @@ enum Command {
         /// Every approved run instead of named ones.
         #[arg(long, conflicts_with = "ids")]
         all_approved: bool,
+    },
+    /// Merge a run's open pull request, or fix its conflicts.
+    ///
+    /// With `--fix`, the agent resolves the conflicts with the default branch
+    /// and the run returns to review. `pma pr` then updates the pull request.
+    Merge {
+        /// Run id, as `pma review` lists it.
+        id: i64,
+        /// Resolve the pull request's conflicts instead of merging.
+        #[arg(long)]
+        fix: bool,
     },
     /// Write each run named into its clone's index, for review.
     ///
@@ -1095,6 +1107,7 @@ fn main() -> ExitCode {
         Command::Pr { ids, all_approved } => {
             run_publish(&ids, all_approved, publish::Target::Pr, None)
         }
+        Command::Merge { id, fix } => run_merge(id, fix),
         Command::Stage { ids, all_approved } => {
             run_publish(&ids, all_approved, publish::Target::Stage, None)
         }
@@ -2805,6 +2818,23 @@ fn run_review(
     Ok(())
 }
 
+/// Merges run `id`'s pull request; with `fix`, has an agent resolve its
+/// conflicts, in the foreground: a front end queues this command as a job.
+fn run_merge(id: i64, fix: bool) -> Result<()> {
+    let store = Store::open_default()?;
+    if !fix {
+        say(api::act(&store, Action::MergePr { id })?);
+        return Ok(());
+    }
+    let session = Session::acquire(&store::home()?)?;
+    store.fail_interrupted_runs(&session)?;
+    let cfg = api::config(&store)?;
+    let mut run = store.run(id)?;
+    dispatch::fix_conflicts(&store, &store::state_home()?, &cfg, &mut run)?;
+    println!("{}", report::run_line(&run));
+    Ok(())
+}
+
 /// Rejects failed run `id` and dispatches its task again with the agent and
 /// model its last attempt ran. The target is found before the rejection, so
 /// a task that cannot be found leaves the run as it was.
@@ -2817,6 +2847,19 @@ fn retry_run(id: i64) -> Result<()> {
             run.state.name()
         )
         .into());
+    }
+    // A failed conflict fix runs again; the pull request still holds the task.
+    if run.fixing_pr().is_some() {
+        say(api::act(
+            &store,
+            Action::RejectRun {
+                id,
+                keep_git_changes: false,
+                infra: false,
+                seen: Some(RunState::Failed.name().to_string()),
+            },
+        )?);
+        return run_merge(id, true);
     }
     let line = |key: &str| -> Result<String> {
         store
@@ -4799,6 +4842,7 @@ mod tests {
                 feedback: "--not a flag".into(),
             },
             Action::RetryRun { id: 4 },
+            Action::FixConflicts { id: 4 },
             Action::Publish {
                 ids: vec![],
                 all_approved: true,

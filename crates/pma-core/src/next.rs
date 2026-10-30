@@ -48,6 +48,7 @@ pub enum Subject {
     /// A run, with the state this row showed and its project.
     Run {
         id: i64,
+        fixing: bool,
         state: String,
         project: String,
     },
@@ -146,6 +147,9 @@ pub fn build(
     waiting.sort_by_key(|r| (order(r), r.id));
     for r in waiting {
         let (what, command) = match r.state {
+            RunState::Approved if r.fixing_pr().is_some() => {
+                ("to publish", format!("pma pr {}", r.id))
+            }
             RunState::Approved => ("to publish", format!("pma pr {} | pma push {}", r.id, r.id)),
             RunState::PrOpen => (
                 "to merge",
@@ -167,6 +171,7 @@ pub fn build(
             issue: r.gh,
             subject: Subject::Run {
                 id: r.id,
+                fixing: r.fixing_pr().is_some(),
                 state: r.state.name().into(),
                 project: r.project.clone(),
             },

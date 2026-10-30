@@ -254,7 +254,7 @@ In a project with a `CHANGELOG.md`, the agent leaves that file alone and drafts 
 
 `stage`, `commit` and `push` work in your clone, and each runs the steps before it that the run has not done. The clone must be at the run's base, the commit its check ran on; one that has moved is refused, and `pma pr` remains. `stage` refuses a clone with staged changes. `commit` and `push` need `--approve` for a run not yet staged. `push` pushes the run's commit only. Design: `docs/dev/stage-commit-push.md`.
 
-A run opened with `pma pr` is `pr-open` until the pull request is merged or closed; `pma review` settles it and shows review activity meanwhile.
+A run opened with `pma pr` is `pr-open` until the pull request is merged or closed; `pma review` settles it and shows review activity meanwhile. `pma merge <id>` merges it, or `M` in the TUI and web. If it conflicts, `pma merge <id> --fix` or `F` has an agent resolve the conflicts and returns the run to review; `pma pr` then updates the same pull request, and `stage`, `commit` and `push` refuse it. Rejecting the fix returns the run to `pr-open`.
 
 Stale dependencies:
 

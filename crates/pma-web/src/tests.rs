@@ -20,6 +20,7 @@ fn picks_round_trip_through_json() {
         Pick::Run {
             id: 3,
             clean: true,
+            fixing: false,
             state: "ready".into(),
             project: "socket.io".into(),
         },

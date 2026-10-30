@@ -77,6 +77,10 @@ pub fn publish(
             done(&run, &Err(why));
             continue;
         }
+        if let Some(why) = keeps_pr(&run, target) {
+            done(&run, &Err(why));
+            continue;
+        }
         let result = match target {
             Target::Pr => open_pr(store, cfg, &mut run),
             _ => to_clone(store, home, cfg, &mut run, target, subject),
@@ -92,6 +96,15 @@ pub fn publish(
         }
     }
     Ok(())
+}
+
+/// Refuses to publish a conflict fix anywhere but its open pull request.
+pub fn keeps_pr(run: &Run, target: Target) -> Option<String> {
+    let url = run.fixing_pr().filter(|_| target != Target::Pr)?;
+    Some(format!(
+        "run #{} fixes the conflicts of {url}; `pma pr {}` updates it, or reject the fix",
+        run.id, run.id
+    ))
 }
 
 fn open_pr(store: &Store, cfg: &Config, run: &mut Run) -> Result<String> {
@@ -624,15 +637,36 @@ fn publish_one(cfg: &Config, run: &Run) -> Result<String> {
             wt_git(run, &["commit", "--quiet", "--amend", "--no-edit"])?;
         }
     }
+    // A conflict fix rebuilt the branch, so its push is forced, but only over
+    // the tip the fix read: a commit pushed since is refused, not lost.
+    let tip_ref = crate::dispatch::pr_tip_ref(run);
+    let lease = wt_git(run, &["rev-parse", "--verify", "--quiet", &tip_ref]).ok();
     // A retry rebuilt its commits, so their ids differ from what an
-    // earlier attempt pushed. The same tree there means it pushed.
+    // earlier attempt pushed. The same tree there means it pushed, unless
+    // that is still the tip a fix read: the same tree on the old base.
+    let origin_branch = format!("origin/{}", run.branch);
     let pushed = wt_git(run, &["fetch", "--quiet", "origin", &run.branch]).is_ok()
-        && wt_git(
-            run,
-            &["rev-parse", &format!("origin/{}^{{tree}}", run.branch)],
-        )? == wt_git(run, &["rev-parse", "HEAD^{tree}"])?;
+        && wt_git(run, &["rev-parse", &format!("{origin_branch}^{{tree}}")])?
+            == wt_git(run, &["rev-parse", "HEAD^{tree}"])?
+        && lease.as_ref() != Some(&wt_git(run, &["rev-parse", &origin_branch])?);
     if !pushed {
-        wt_git(run, &["push", "--quiet", "-u", "origin", &run.branch])?;
+        match &lease {
+            Some(tip) => wt_git(
+                run,
+                &[
+                    "push",
+                    "--quiet",
+                    "-u",
+                    &format!("--force-with-lease={}:{tip}", run.branch),
+                    "origin",
+                    &run.branch,
+                ],
+            )?,
+            None => wt_git(run, &["push", "--quiet", "-u", "origin", &run.branch])?,
+        };
+    }
+    if lease.is_some() {
+        wt_git(run, &["update-ref", "-d", &tip_ref])?;
     }
     // A retry after `gh pr create` failed may find the pull request
     // made anyway.
@@ -697,6 +731,45 @@ fn pr_body(run: &Run, trailers: &str) -> String {
         parts.push(trailers.to_string());
     }
     parts.join("\n\n")
+}
+
+/// Whether GitHub finds the pull request at `url` in conflict with its base.
+pub fn conflicting(url: &str) -> Result<bool> {
+    let read = crate::sync::gh(&[
+        "pr",
+        "view",
+        url,
+        "--json",
+        "mergeable",
+        "--jq",
+        ".mergeable",
+    ])?;
+    Ok(read.trim() == "CONFLICTING")
+}
+
+/// Merges a `pr-open` run's pull request. Squashes, as a publish makes one
+/// commit; a repository that forbids it refuses through `gh`.
+pub fn merge(store: &Store, run: &mut Run) -> Result<String> {
+    if run.state != RunState::PrOpen {
+        return Err(format!(
+            "run #{} is {}; it has no open pull request",
+            run.id,
+            run.state.name()
+        )
+        .into());
+    }
+    let url = run.outcome.clone().unwrap_or_default();
+    if conflicting(&url)? {
+        return Err(format!(
+            "pull request has conflicts: {url}\nPress F, or run `pma merge {} --fix`, to have an agent fix them.",
+            run.id
+        )
+        .into());
+    }
+    crate::sync::gh(&["pr", "merge", &url, "--squash"])?;
+    run.enter(RunState::Merged);
+    store.update_run(run)?;
+    Ok(format!("pull request merged: {url}"))
 }
 
 /// Moves each `pr-open` run to `merged` when its pull request is merged, or

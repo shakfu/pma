@@ -367,6 +367,14 @@ pub enum Action {
     },
     /// Reads each open pull request's state from GitHub.
     SettlePrs,
+    /// Merges a run's open pull request.
+    MergePr {
+        id: i64,
+    },
+    /// Has an agent resolve the conflicts of a run's open pull request.
+    FixConflicts {
+        id: i64,
+    },
     StopJob {
         id: i64,
     },
@@ -824,6 +832,7 @@ impl Transition {
             "run" => screen::Pick::Run {
                 id: self.id,
                 clean: false,
+                fixing: false,
                 state: self.state.clone(),
                 project: self.project.clone(),
             },
@@ -1461,6 +1470,9 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
         if let Some(why) = runs.iter().find_map(dispatch::needs_approval) {
             return Err(why.into());
         }
+        if let Some(why) = runs.iter().find_map(|r| publish::keeps_pr(r, *target)) {
+            return Err(why.into());
+        }
         for mut run in runs {
             if run.state == RunState::Ready {
                 dispatch::approve(store, &mut run, &by)?;
@@ -1526,6 +1538,10 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
             let files = dispatch::reject(store, &mut run, keep_git_changes, infra)?;
             let plural = if files == 1 { "" } else { "s" };
             Outcome::said(match run.workspace {
+                _ if run.state == RunState::PrOpen => format!(
+                    "Fix of run #{id} rejected; its pull request stays open: {}",
+                    run.outcome.as_deref().unwrap_or_default()
+                ),
                 _ if files == 0 => format!("Run #{id} rejected; it changed no files."),
                 Workspace::Clone => format!(
                     "Run #{id} rejected; reverted {files} file{plural} in {}.",
@@ -1551,6 +1567,10 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
                 )),
             })?;
             out
+        }
+        Action::MergePr { id } => {
+            let mut run = store.run(id)?;
+            Outcome::said(publish::merge(store, &mut run)?)
         }
         Action::StopJob { id } => Outcome::said(jobs::stop(store, id)?),
         Action::ApproveJob { id } => Outcome::said(jobs::approve(store, id)?),
@@ -1932,6 +1952,9 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
                 format!("--rework={feedback}"),
             ]);
         }
+        Action::FixConflicts { id } => {
+            v.extend(["merge".to_string(), id.to_string(), "--fix".into()]);
+        }
         Action::RetryRun { id } => {
             v.extend(["review".to_string(), id.to_string(), "--retry".into()]);
         }
@@ -1966,6 +1989,7 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
         | Action::RejectRun { .. }
         | Action::AddReviewTime { .. }
         | Action::SettlePrs
+        | Action::MergePr { .. }
         | Action::StopJob { .. }
         | Action::ApproveJob { .. }
         | Action::StopWorkflow { .. }

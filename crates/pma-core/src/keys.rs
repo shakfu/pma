@@ -3,6 +3,8 @@
 //! names (`j`, `Enter`, `Escape`, `ArrowDown`), so the web uses the table as
 //! it is and the TUI maps its key codes to the same names. Plain keys only:
 //! a browser or screen reader reserves most combinations with a modifier.
+//! `BackTab` is the one name the DOM lacks: it is Shift+Tab, which the web
+//! maps from `Tab` and `shiftKey`.
 
 use crate::api::{Action, Query, Selection};
 use crate::report_runs::By;
@@ -117,6 +119,10 @@ pub enum Act {
     Commit,
     Pr,
     Push,
+    /// Merges the run's open pull request.
+    Merge,
+    /// Has an agent resolve the conflicts of the run's open pull request.
+    FixConflicts,
     RunCampaign,
     Sync,
     Verify,
@@ -155,7 +161,7 @@ pub enum Act {
 }
 
 impl Act {
-    pub const ALL: [Act; 44] = [
+    pub const ALL: [Act; 46] = [
         Act::ApproveRun,
         Act::ApproveRuns,
         Act::RejectRun,
@@ -178,6 +184,8 @@ impl Act {
         Act::Commit,
         Act::Pr,
         Act::Push,
+        Act::Merge,
+        Act::FixConflicts,
         Act::RunCampaign,
         Act::Sync,
         Act::Verify,
@@ -243,6 +251,7 @@ impl Act {
             | Act::StopWorkflow
             | Act::RemoveNote
             | Act::Push
+            | Act::Merge
             | Act::ResetSetting
             | Act::RemoveRoot
             | Act::RemoveAgent
@@ -262,6 +271,8 @@ impl Act {
             Action::RejectRun { .. } => &[Act::RejectRun],
             Action::AddReviewTime { .. } => &[Act::AddReviewTime],
             Action::SettlePrs => &[Act::SettlePrs],
+            Action::MergePr { .. } => &[Act::Merge],
+            Action::FixConflicts { .. } => &[Act::FixConflicts],
             Action::StopJob { .. } => &[Act::StopJob],
             Action::ApproveJob { .. } => &[Act::ApproveJob],
             Action::StopWorkflow { .. } => &[Act::StopWorkflow],
@@ -418,6 +429,10 @@ pub const BINDINGS: &[Binding] = &[
     },
     Binding {
         tabs: PANES,
+        ..bind("BackTab", Command::PrevPane, "previous list")
+    },
+    Binding {
+        tabs: PANES,
         ..bind("l", Command::NextPane, "next list")
     },
     Binding {
@@ -530,6 +545,8 @@ pub const BINDINGS: &[Binding] = &[
     on("p", RUNS, Act::Pr, Ask::Confirm, "pull request"),
     on("u", RUNS, Act::Push, Ask::Confirm, "push"),
     on("y", RUNS, Act::SettlePrs, Ask::Nothing, "check PRs"),
+    on("M", RUNS, Act::Merge, Ask::Confirm, "merge PR"),
+    on("F", RUNS, Act::FixConflicts, Ask::Confirm, "fix conflicts"),
     // A job. `a` and `s` are a run's keys too: a key means one thing for
     // the row it is pressed on, and `lookup` tells them apart by the row.
     on("a", JOBS, Act::ApproveJob, Ask::Nothing, "approve plan"),
@@ -758,6 +775,7 @@ mod tests {
             Pick::Run {
                 id: 1,
                 clean: true,
+                fixing: false,
                 state: "ready".into(),
                 project: "p".into(),
             },
@@ -841,6 +859,7 @@ mod tests {
         let run = Pick::Run {
             id: 1,
             clean: true,
+            fixing: false,
             state: "ready".into(),
             project: "p".into(),
         };

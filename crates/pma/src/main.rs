@@ -370,7 +370,7 @@ enum Command {
         /// agent and model, its used attempts reset.
         #[arg(long, requires = "ids", conflicts_with_all = ["approve", "reject", "rework"])]
         retry: bool,
-        /// Minutes spent reviewing this run, added to the run's total.
+        /// Minutes spent reviewing, added to the total of each run named.
         #[arg(long, requires = "ids", value_name = "N")]
         minutes: Option<u32>,
         /// With --approve on a bundle, the items left open, by the numbers
@@ -2763,6 +2763,13 @@ fn run_review(
             return Err("--drop names the items of one run; approve it on its own".into());
         }
         say(api::act(&store, Action::ApproveRuns { ids: ids.to_vec() })?);
+        // After the approval, which refuses the whole list: a refused list
+        // records nothing, so running it again does not count the time twice.
+        if let Some(minutes) = minutes {
+            for &id in ids {
+                say(api::act(&store, Action::AddReviewTime { id, minutes })?);
+            }
+        }
         return Ok(());
     }
     let id = ids[0];

@@ -74,7 +74,7 @@
 
 - [ ] A project whose name contains a dot can take `projects.<name>.verify` #agent
 
-- [ ] `pma review 3 4 --approve --minutes 5` drops the minutes #agent
+- [x] `pma review 3 4 --approve --minutes 5` drops the minutes #agent
 
 - [ ] `pma prune --apply` exits 0 when it skips a file for lint errors #agent
 

@@ -38,11 +38,13 @@ impl Drop for Scratch {
 
 /// A command that ignores git settings passed through the environment. Under
 /// `pma`'s own verify, `agent::restrict` sets them to block every push, and
-/// the fixtures here push to local repositories.
+/// the fixtures here push to local repositories. A run started from a job also
+/// inherits `PMA_JOB`, which would make each `pma` here act as that job.
 fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut cmd = Command::new(program);
     cmd.env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_CONFIG_PARAMETERS");
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("PMA_JOB");
     cmd
 }
 
@@ -2078,9 +2080,10 @@ fn a_batch_approval_refuses_a_list_with_anything_to_read_in_it() {
     assert!(list.contains("clean"), "{list}");
 
     // #2 and #3 fail their checks, so the list is refused whole.
-    let (_, err, success) = env.run(&["review", "1", "2", "--approve"]);
+    let (_, err, success) = env.run(&["review", "1", "2", "--approve", "--minutes", "5"]);
     assert!(!success && err.contains("#2 is not clean"), "{err}");
     assert!(err.contains("verify failed at the head"), "{err}");
+    assert!(!env.ok(&["review", "1"]).contains("5m00s"));
     assert_eq!(
         env.ok(&["review"]).matches("ready").count(),
         3,
@@ -2100,6 +2103,25 @@ fn a_batch_approval_refuses_a_list_with_anything_to_read_in_it() {
     env.ok(&["dispatch", "alpha:5", "--retry"]);
     let (_, err, success) = env.run(&["review", "4", "--approve"]);
     assert!(!success && err.contains("which is `propose`"), "{err}");
+}
+
+/// `--minutes` on a batch approval reaches every run named.
+#[test]
+fn a_batch_approval_records_review_time_on_each_run() {
+    const PASSING_CLAUDE: &str = r#"#!/bin/sh
+echo hi > hello.txt
+echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","total_cost_usd":0.1}'
+"#;
+    let s = Scratch::new("batch-minutes");
+    let (env, _, _) = dispatch_env(&s, &[("claude", PASSING_CLAUDE)]);
+    env.ok(&["dispatch", "--auto", "-n", "2"]);
+
+    env.ok(&["review", "1", "2", "--approve", "--minutes", "5"]);
+    for id in ["1", "2"] {
+        let detail = env.ok(&["review", id]);
+        assert!(detail.starts_with(&format!("#{id} approved")), "{detail}");
+        assert!(detail.contains("5m00s"), "{detail}");
+    }
 }
 
 /// Fails its check at the first model and passes at the second, so a route's

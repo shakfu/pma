@@ -2069,7 +2069,8 @@ impl Store {
                 error = ?10, outcome = ?11, prompt = ?12, ready_at = ?13,
                 decided_at = ?14, published_at = ?15, review_seconds = ?16,
                 changed_paths = ?17, scope_error = ?18, approved_tree = ?19,
-                approved_head = ?20, approved_by = ?21, reviewed_tree = ?22, infra = ?23
+                approved_head = ?20, approved_by = ?21, reviewed_tree = ?22, infra = ?23,
+                base = ?25
              WHERE id = ?1 AND (?24 IS NULL OR state = ?24)",
             params![
                 run.id,
@@ -2098,6 +2099,7 @@ impl Store {
                 run.reviewed_tree,
                 run.infra,
                 read.map(RunState::name),
+                run.base,
             ],
         )?;
         if written == 0 {
@@ -3309,6 +3311,18 @@ pub struct RunItem {
 }
 
 impl Run {
+    /// The open pull request a conflict fix under review will update. A
+    /// publish to the clone would leave it open and untracked.
+    pub fn fixing_pr(&self) -> Option<&str> {
+        matches!(
+            self.state,
+            RunState::Ready | RunState::Failed | RunState::Approved
+        )
+        .then_some(self.outcome.as_deref())
+        .flatten()
+        .filter(|o| o.starts_with("http"))
+    }
+
     /// A run with every field empty, for tests in this crate to override.
     #[cfg(test)]
     pub fn blank() -> Run {

@@ -36,6 +36,8 @@ pub enum Pick {
         id: i64,
         /// Ready, with no reason to read it: a batch approval may take it.
         clean: bool,
+        /// A conflict fix, which publishes only to its open pull request.
+        fixing: bool,
         /// The state the row showed. Approving or rejecting is refused once
         /// the run has left it, so no one acts on a run they did not see.
         state: String,
@@ -153,10 +155,12 @@ pub fn fits(act: Act, pick: &Pick) -> bool {
         | Act::RejectRun
         | Act::ReworkRun
         | Act::RetryRun
-        | Act::Stage
-        | Act::Commit
         | Act::Pr
-        | Act::Push => matches!(pick, Pick::Run { state, .. } if run_allows(act, state)),
+        | Act::Merge
+        | Act::FixConflicts => matches!(pick, Pick::Run { state, .. } if run_allows(act, state)),
+        Act::Stage | Act::Commit | Act::Push => {
+            matches!(pick, Pick::Run { state, fixing: false, .. } if run_allows(act, state))
+        }
         Act::ApproveJob => matches!(pick, Pick::Job { awaiting: true, .. }),
         Act::StopJob => matches!(pick, Pick::Job { .. }),
         Act::StopWorkflow => matches!(pick, Pick::Instance { open: true, .. }),
@@ -186,6 +190,7 @@ fn run_allows(act: Act, state: &str) -> bool {
         Act::Stage | Act::Pr => &["ready", "approved"],
         Act::Commit => &["ready", "approved", "staged"],
         Act::Push => &["ready", "approved", "staged", "committed"],
+        Act::Merge | Act::FixConflicts => &["pr-open"],
         _ => return true,
     };
     takes.contains(&state)
@@ -195,7 +200,8 @@ fn run_allows(act: Act, state: &str) -> bool {
 /// keeps in view: a staged run commits next, a committed one pushes.
 pub fn next_act(pick: &Pick) -> Option<Act> {
     match pick {
-        Pick::Run { state, .. } => match state.as_str() {
+        Pick::Run { state, fixing, .. } => match state.as_str() {
+            "approved" if *fixing => Some(Act::Pr),
             "ready" => Some(Act::ApproveRun),
             "failed" => Some(Act::RetryRun),
             "staged" => Some(Act::Commit),
@@ -434,9 +440,15 @@ fn next_pick(s: &next::Subject) -> Pick {
         next::Subject::Manual { project } => Pick::Manual {
             project: project.clone(),
         },
-        next::Subject::Run { id, state, project } => Pick::Run {
+        next::Subject::Run {
+            id,
+            fixing,
+            state,
+            project,
+        } => Pick::Run {
             id: *id,
             clean: false,
+            fixing: *fixing,
             state: state.clone(),
             project: project.clone(),
         },
@@ -575,6 +587,7 @@ fn run_pick(r: &Run) -> Pick {
     Pick::Run {
         id: r.id,
         clean: r.state == RunState::Ready && accept::review_reasons(r).is_empty(),
+        fixing: r.fixing_pr().is_some(),
         state: r.state.name().into(),
         project: r.project.clone(),
     }
@@ -2224,6 +2237,8 @@ pub fn question(act: Act, pick: &Pick) -> String {
         Act::Pr => "open a pull request for",
         Act::Push if ready => "approve and push",
         Act::Push => "push",
+        Act::Merge => "merge the pull request of",
+        Act::FixConflicts => "have an agent fix the conflicts of",
         Act::StopJob | Act::StopWorkflow => "stop",
         Act::RemoveNote => "remove note",
         Act::RunCampaign => "run campaign",
@@ -2651,6 +2666,8 @@ pub fn action_in(
                 .filter(|s| act == Act::Commit && !s.is_empty())
                 .map(str::to_string),
         },
+        (Act::Merge, Pick::Run { id, .. }) => Action::MergePr { id: *id },
+        (Act::FixConflicts, Pick::Run { id, .. }) => Action::FixConflicts { id: *id },
         (
             Act::ApproveRun
             | Act::RejectRun
@@ -2660,7 +2677,9 @@ pub fn action_in(
             | Act::Stage
             | Act::Commit
             | Act::Pr
-            | Act::Push,
+            | Act::Push
+            | Act::Merge
+            | Act::FixConflicts,
             _,
         ) => return need("a run"),
         (Act::ApproveJob, Pick::Job { id, awaiting: true }) => Action::ApproveJob { id: *id },
@@ -2728,6 +2747,7 @@ mod tests {
         Item {
             cells: vec![plain(format!("#{id}"))],
             pick: Pick::Run {
+                fixing: false,
                 id,
                 clean,
                 state: "ready".into(),
@@ -2742,6 +2762,7 @@ mod tests {
         let run = |state: &str| Pick::Run {
             id: 1,
             clean: false,
+            fixing: false,
             state: state.into(),
             project: "p".into(),
         };
@@ -2764,6 +2785,7 @@ mod tests {
             let pick = Pick::Run {
                 id: 1,
                 clean: false,
+                fixing: false,
                 state: state.into(),
                 project: "p".into(),
             };
@@ -2789,6 +2811,32 @@ mod tests {
         );
         assert!(!offered("ready").contains(&Act::RetryRun));
         assert!(!offered("running").contains(&Act::RejectRun));
+    }
+
+    /// A conflict fix offers no publish but its pull request, and says so as
+    /// the next step.
+    #[test]
+    fn a_conflict_fix_offers_only_its_pull_request() {
+        let pick = |state: RunState, url: Option<&str>| {
+            run_pick(&Run {
+                state,
+                outcome: url.map(str::to_string),
+                ..Default::default()
+            })
+        };
+        let url = Some("https://x/pull/1");
+        let fix = pick(RunState::Approved, url);
+        for act in [Act::Stage, Act::Commit, Act::Push] {
+            assert!(!fits(act, &fix), "{act:?}");
+            assert!(fits(act, &pick(RunState::Approved, None)), "{act:?}");
+        }
+        assert!(fits(Act::Pr, &fix) && fits(Act::RejectRun, &fix));
+        assert_eq!(next_act(&fix), Some(Act::Pr));
+        assert_eq!(next_act(&pick(RunState::Approved, None)), Some(Act::Push));
+        assert!(!fits(Act::Push, &pick(RunState::Ready, url)));
+        // Open, the run takes its merge keys, not a publish.
+        let open = pick(RunState::PrOpen, url);
+        assert!(fits(Act::Merge, &open) && !fits(Act::Pr, &open));
     }
 
     /// Activity lists finished runs newest first, those in one state when
@@ -2849,6 +2897,7 @@ mod tests {
         let run = Pick::Run {
             id: 3,
             clean: false,
+            fixing: false,
             state: "ready".into(),
             project: "a".into(),
         };
@@ -2874,6 +2923,7 @@ mod tests {
         let run = Pick::Run {
             id: 1,
             clean: false,
+            fixing: false,
             state: "ready".into(),
             project: "a".into(),
         };
@@ -2945,6 +2995,7 @@ mod tests {
                 &Pick::Run {
                     id: 2,
                     clean: false,
+                    fixing: false,
                     state: "ready".into(),
                     project: "p".into()
                 },
@@ -2959,6 +3010,7 @@ mod tests {
                 &Pick::Run {
                     id: 2,
                     clean: false,
+                    fixing: false,
                     state: "ready".into(),
                     project: "p".into()
                 },
@@ -2981,6 +3033,7 @@ mod tests {
         let run = Pick::Run {
             id: 1,
             clean: true,
+            fixing: false,
             state: "ready".into(),
             project: "a".into(),
         };
@@ -3134,6 +3187,7 @@ mod tests {
         let ready = Pick::Run {
             id: 7,
             clean: false,
+            fixing: false,
             state: "ready".into(),
             project: "p".into(),
         };

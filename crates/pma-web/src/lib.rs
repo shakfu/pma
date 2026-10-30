@@ -524,10 +524,11 @@ fn pick_json(p: &Pick) -> Value {
         Pick::Run {
             id,
             clean,
+            fixing,
             state,
             project,
         } => {
-            json!({ "kind": "run", "id": id, "clean": clean, "state": state, "project": project })
+            json!({ "kind": "run", "id": id, "clean": clean, "fixing": fixing, "state": state, "project": project })
         }
         Pick::Job { id, awaiting } => json!({ "kind": "job", "id": id, "awaiting": awaiting }),
         Pick::Instance { id, workflow, open } => {
@@ -581,6 +582,7 @@ fn pick_from(v: &Value) -> Option<Pick> {
         "run" => Pick::Run {
             id: n("id")?,
             clean: b("clean")?,
+            fixing: b("fixing")?,
             state: s("state")?,
             project: s("project")?,
         },

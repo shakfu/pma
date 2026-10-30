@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`pma merge <id>`** merges a run's open pull request; `M` does so in the TUI and web. A conflicting one is refused, and `pma merge <id> --fix` or `F` has an agent resolve the conflicts on the default branch. The run returns to review, so its diff is read before anything is pushed, and `pma pr` updates the same pull request. That push is forced only over the tip the fix read, so a commit pushed since is refused rather than lost. `stage`, `commit` and `push` refuse a fix, which would leave the pull request open and untracked, and the TUI and web do not offer them on one. Rejecting a fix returns the run to `pr-open` and charges no attempt, and retrying a failed one runs the fix again. Rebuilding on the branch was chosen over closing and redispatching, which charges an attempt and discards the pull request's discussion.
+
+- `Shift+Tab` moves to the previous list in the TUI and the web. The TUI ignored it; the web treated it as `Tab` and moved forward.
+
 - **Bundles.** The `TODO.md` items `pma dispatch` names in one project are one run: one agent session, one diff, one review, one commit. The prompt numbers the tasks. `pma review <id> --approve --drop 2,3` leaves those items open; publishing ticks the rest, lists them in the commit body and closes each one's issue. A dropped item's changes stay in the diff. A bundle is never clean, so `--push` and batch approval pass over it, and a ready one must be approved before it is staged or published. In the clone, which holds one run, several items could not run at all. Design and open steps: `docs/dev/bundled-dispatch.md`.
 
 - Space marks tasks in the TUI, and a checkbox does in the web; `d` then dispatches every marked task, one bundle per project. Marks clear on a dispatch, on Escape and on another view, and a mark on a row a refresh removed is dropped, so nothing unseen is dispatched.
@@ -58,6 +62,8 @@ pma workflow run find-issues --tag nightly --unattended
 - The TUI footer queues transitions: three runs reaching review within a second name the first with "2 more", and each Enter opens the next. Before, only the last was named.
 
 ### Fixed
+
+- **A project whose name contains a dot can take `projects.<name>.verify` and `projects.<name>.sandbox`.** The key was refused as unknown, so a project such as `socket.io` could not set either. The field is the last component of the key, so the name is unambiguous.
 
 - **Terminal control sockets are removed from an agent's environment**: herdr's `HERDR_*`, `TMUX`, `TMUX_PANE`, `STY`, `ZELLIJ`, `ZELLIJ_SESSION_NAME`, `KITTY_LISTEN_ON`, `WEZTERM_UNIX_SOCKET` and `NVIM`. An agent inherited them and could type a command such as `git push` into another pane holding the user's credentials. Under herdr, `HERDR_ENV` also enabled its agent skill and state hooks for headless runs. A socket at a default path, such as tmux's or herdr's, stays reachable by a process that looks for it. Analysis: `docs/dev/herdr-integration.md`.
 

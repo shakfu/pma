@@ -38,8 +38,8 @@ impl Drop for Scratch {
 
 /// A command that ignores git settings passed through the environment. Under
 /// `pma`'s own verify, `agent::restrict` sets them to block every push, and
-/// the fixtures here push to local repositories. A run started from a job also
-/// inherits `PMA_JOB`, which would make each `pma` here act as that job.
+/// the fixtures here push to local repositories. It also ignores `PMA_JOB`: under
+/// a `pma` job, a plan would print `pma job approve` instead of `--approve <id>`.
 fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut cmd = Command::new(program);
     cmd.env_remove("GIT_CONFIG_COUNT")
@@ -1063,9 +1063,193 @@ case "$1 $2" in
     echo "https://github.com/me/alpha/pull/1" ;;
   "pr list") if [ -e "$PMA_HOME/pr-list" ]; then cat "$PMA_HOME/pr-list"; fi ;;
   "pr view") cat "$PMA_HOME/pr-state" ;;
+  "pr merge") printf '%s\n' "$@" > "$PMA_HOME/pr-merge-args" ;;
   *) echo "fake gh: unexpected $*" >&2; exit 1 ;;
 esac
 "#;
+
+/// Puts a commit on origin's default branch that conflicts with `hello.txt`
+/// on a run's branch.
+fn conflict_on_origin(s: &Scratch, origin: &std::path::Path) {
+    let up = s.0.join("up");
+    git(&s.0, &["clone", "-q", origin.to_str().unwrap(), "up"], None);
+    fs::write(up.join("hello.txt"), "theirs\n").unwrap();
+    git(&up, &["add", "."], None);
+    git(&up, &["commit", "-qm", "theirs"], None);
+    git(&up, &["push", "-q", "origin", "main"], None);
+}
+
+#[test]
+fn a_pull_request_merges_or_has_its_conflicts_fixed() {
+    let s = Scratch::new("pr-merge");
+    let (env, origin, _alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE), ("gh", FAKE_GH_PR)]);
+    let pr_state = env.home.join("pr-state");
+
+    env.ok(&["dispatch", "alpha:5"]);
+    env.ok(&["review", "1", "--approve"]);
+    env.ok(&["pr", "1"]);
+    let tip = git_out(&origin, &["rev-parse", "pma/add-greeting"]);
+    conflict_on_origin(&s, &origin);
+
+    // A conflict refuses the merge and names the fix.
+    fs::write(&pr_state, "CONFLICTING\n").unwrap();
+    let (_, err, success) = env.run(&["merge", "1"]);
+    assert!(
+        !success && err.contains("has conflicts") && err.contains("--fix"),
+        "{err}"
+    );
+    assert!(!env.home.join("pr-merge-args").exists());
+
+    // The fix returns the run to review, on the new base.
+    env.ok(&["merge", "1", "--fix"]);
+    let out = env.ok(&["review", "1"]);
+    assert!(out.starts_with("#1 ready"), "{out}");
+
+    // Publishing moves the same branch to one commit on the new base.
+    env.ok(&["review", "1", "--approve"]);
+    env.ok(&["pr", "1"]);
+    let log = git_out(&origin, &["log", "--format=%s", "main..pma/add-greeting"]);
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert_ne!(git_out(&origin, &["rev-parse", "pma/add-greeting"]), tip);
+    assert_eq!(
+        git_out(&origin, &["merge-base", "main", "pma/add-greeting"]),
+        git_out(&origin, &["rev-parse", "main"])
+    );
+    let todo = git_out(&origin, &["show", "pma/add-greeting:TODO.md"]);
+    assert!(todo.contains("- [x] add greeting"), "{todo}");
+
+    fs::write(&pr_state, "MERGEABLE\n").unwrap();
+    assert!(env.ok(&["merge", "1"]).contains("pull request merged"));
+    let args = fs::read_to_string(env.home.join("pr-merge-args")).unwrap();
+    assert!(args.contains("--squash"), "{args}");
+    assert!(env.ok(&["review", "1"]).starts_with("#1 merged"));
+    let (_, err, success) = env.run(&["merge", "1"]);
+    assert!(!success && err.contains("no open pull request"), "{err}");
+}
+
+/// A conflict fix publishes only to its pull request, and rejecting it keeps
+/// the pull request tracked.
+#[test]
+fn a_conflict_fix_stays_with_its_pull_request() {
+    let s = Scratch::new("pr-keep");
+    let (env, origin, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE), ("gh", FAKE_GH_PR)]);
+    let pr_state = env.home.join("pr-state");
+    env.ok(&["dispatch", "alpha:5"]);
+    env.ok(&["review", "1", "--approve"]);
+    env.ok(&["pr", "1"]);
+    let tip = git_out(&origin, &["rev-parse", "pma/add-greeting"]);
+    conflict_on_origin(&s, &origin);
+    let main = git_out(&origin, &["rev-parse", "main"]);
+    fs::write(&pr_state, "CONFLICTING\n").unwrap();
+
+    env.ok(&["merge", "1", "--fix"]);
+    env.ok(&["review", "1", "--approve"]);
+    assert!(env.ok(&["next"]).contains("pma pr 1"));
+    assert!(!env.ok(&["next"]).contains("pma push 1"));
+    for verb in ["stage", "commit", "push"] {
+        let (out, err, success) = env.run(&[verb, "1"]);
+        assert!(!success, "{verb}: {out}");
+        assert!(
+            format!("{out}{err}").contains("`pma pr 1` updates it"),
+            "{verb}: {out}{err}"
+        );
+    }
+    assert_eq!(git_out(&origin, &["rev-parse", "main"]), main);
+    assert_eq!(git_out(&alpha, &["diff", "--cached"]), "");
+
+    // Rejecting drops the fix alone: the task is held and no attempt charged.
+    let out = env.ok(&["review", "1", "--reject"]);
+    assert!(
+        out.contains("its pull request stays open: https://"),
+        "{out}"
+    );
+    assert!(env.ok(&["review", "1"]).starts_with("#1 pr-open"));
+    assert_eq!(git_out(&origin, &["rev-parse", "pma/add-greeting"]), tip);
+    assert_eq!(git_out(&alpha, &["for-each-ref", "refs/pma"]), "");
+    let (_, err, success) = env.run(&["dispatch", "alpha:5"]);
+    assert!(!success && err.contains("already has a run"), "{err}");
+
+    // It stays settled from GitHub, and can be fixed again.
+    env.ok(&["merge", "1", "--fix"]);
+    assert!(env.ok(&["review", "1"]).starts_with("#1 ready"));
+    env.ok(&["review", "1", "--reject"]);
+    fs::write(&pr_state, "CLOSED\n").unwrap();
+    env.ok(&["review"]);
+    assert!(env.ok(&["review", "1"]).starts_with("#1 closed"));
+}
+
+/// A commit pushed to the pull request after the fix read it is not lost.
+#[test]
+fn a_conflict_fix_does_not_push_over_a_newer_commit() {
+    let s = Scratch::new("pr-lease");
+    let (env, origin, _alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE), ("gh", FAKE_GH_PR)]);
+    env.ok(&["dispatch", "alpha:5"]);
+    env.ok(&["review", "1", "--approve"]);
+    env.ok(&["pr", "1"]);
+    conflict_on_origin(&s, &origin);
+    fs::write(env.home.join("pr-state"), "CONFLICTING\n").unwrap();
+    env.ok(&["merge", "1", "--fix"]);
+
+    let up = s.0.join("up");
+    git(&up, &["fetch", "-q", "origin"], None);
+    git(
+        &up,
+        &[
+            "checkout",
+            "-q",
+            "-b",
+            "pma/add-greeting",
+            "origin/pma/add-greeting",
+        ],
+        None,
+    );
+    fs::write(up.join("human.txt"), "mine\n").unwrap();
+    git(&up, &["add", "."], None);
+    git(&up, &["commit", "-qm", "human"], None);
+    git(&up, &["push", "-q", "origin", "pma/add-greeting"], None);
+    let human = git_out(&origin, &["rev-parse", "pma/add-greeting"]);
+
+    env.ok(&["review", "1", "--approve"]);
+    let (_, _, success) = env.run(&["pr", "1"]);
+    assert!(!success);
+    assert_eq!(git_out(&origin, &["rev-parse", "pma/add-greeting"]), human);
+}
+
+/// An agent that leaves conflict markers fails the run rather than reaching
+/// review.
+#[test]
+fn conflict_markers_left_behind_fail_the_run() {
+    const IDLE_ON_FIX: &str = r#"#!/bin/sh
+case "$2" in
+  *"reviewer's feedback"*) ;;
+  *) echo hi > hello.txt ;;
+esac
+echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","total_cost_usd":0.1}'
+"#;
+    let s = Scratch::new("pr-markers");
+    let (env, origin, _alpha) = dispatch_env(&s, &[("claude", IDLE_ON_FIX), ("gh", FAKE_GH_PR)]);
+    env.ok(&["dispatch", "alpha:5"]);
+    env.ok(&["review", "1", "--approve"]);
+    env.ok(&["pr", "1"]);
+    conflict_on_origin(&s, &origin);
+    fs::write(env.home.join("pr-state"), "CONFLICTING\n").unwrap();
+    env.ok(&["merge", "1", "--fix"]);
+    let out = env.ok(&["review", "1"]);
+    assert!(out.starts_with("#1 failed"), "{out}");
+    assert!(
+        out.contains("conflict markers remain in hello.txt"),
+        "{out}"
+    );
+
+    // Retrying runs the fix again rather than dispatching a second run.
+    env.ok(&["review", "1", "--retry"]);
+    let out = env.ok(&["review", "1"]);
+    assert!(out.starts_with("#1 failed"), "{out}");
+    let (_, err, success) = env.run(&["review", "2"]);
+    assert!(!success, "no second run: {err}");
+    env.ok(&["review", "1", "--reject"]);
+    assert!(env.ok(&["review", "1"]).starts_with("#1 pr-open"));
+}
 
 #[test]
 fn a_pull_request_holds_its_task_until_merged_or_closed() {

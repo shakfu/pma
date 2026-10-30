@@ -470,11 +470,9 @@ impl Config {
                 Slot::Count(&mut self.activity_horizon[tier(t)?], 1, i64::MAX)
             }
             Some(("projects", rest)) => {
+                // The field is the last component, so a name may contain dots.
                 let (name, field) = rest.rsplit_once('.')?;
-                if name.is_empty() || name.contains('.') {
-                    return None;
-                }
-                if !matches!(field, "verify" | "sandbox") {
+                if name.is_empty() || !matches!(field, "verify" | "sandbox") {
                     return None;
                 }
                 let settings = self.projects.entry(name.to_string()).or_default();
@@ -558,6 +556,9 @@ mod tests {
         assert_eq!(cfg.workspace, Workspace::Worktree);
         assert_eq!(cfg.get("workspace").as_deref(), Some("worktree"));
         assert!(cfg.set("workspace", "branch").is_err());
+        cfg.set("projects.socket.io.verify", "npm test").unwrap();
+        assert_eq!(cfg.project("socket.io").verify.as_deref(), Some("npm test"));
+        assert_eq!(cfg.project("socket").verify, None);
         // Where a run goes is the command now, so both settings are retired.
         for key in ["publish", "projects.cyllama.publish"] {
             let e = cfg.set(key, "pr").unwrap_err();
@@ -611,7 +612,7 @@ mod tests {
             ("max_parallel", "0"),
             ("timeout", "241"),
             ("timeout", "9223372036854775807"),
-            ("projects.a.b.verify", "x"),
+            ("projects..verify", "x"),
             ("projects.a.colour", "x"),
             ("projects.a.sandbox", "no"),
             ("nope", "1"),

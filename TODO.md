@@ -72,7 +72,7 @@
 
 - [ ] Per-project session locks One agent command and one job run at a time across all projects (`docs/dev/async_dispatch.md`, open question 1), so a detached job on one project blocks a dispatch on another. Needs a shared `batch_budget` ledger. (REVIEW.md U8)
 
-- [ ] A project whose name contains a dot can take `projects.<name>.verify` #agent
+- [x] A project whose name contains a dot can take `projects.<name>.verify` #agent
 
 - [x] `pma review 3 4 --approve --minutes 5` drops the minutes #agent
 

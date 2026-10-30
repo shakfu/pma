@@ -209,7 +209,7 @@ function pickNamed(open) {
   if (i < 0 || !v) return null;
   if (["run", "job", "scan"].includes(kind) && !Number.isInteger(n)) return null;
   return {
-    run: { kind, id: n, clean: false, state: "", project: "" },
+    run: { kind, id: n, clean: false, fixing: false, state: "", project: "" },
     job: { kind, id: n, awaiting: false },
     scan: { kind, id: n },
     route: { kind, revision: n, active: false },
@@ -857,7 +857,7 @@ function onKey(e) {
   // Tab moves between panes only where the table binds it and nothing has
   // focus; from a button or a link it moves the browser's focus as usual.
   if (e.key === "Tab" && e.target !== document.body) return;
-  const b = lookup(e.key);
+  const b = lookup(e.key === "Tab" && e.shiftKey ? "BackTab" : e.key);
   if (!b) return;
   if (e.key === "Enter" && e.target instanceof HTMLButtonElement) return;
   // Space on a focused button or checkbox presses it, as the browser does.

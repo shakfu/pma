@@ -1981,7 +1981,12 @@ pub fn approve(store: &Store, run: &mut Run, by: &str) -> Result<()> {
 /// snapshot again, so rejecting does not quietly lift what `clone_unchanged`
 /// holds. Returns how many files the run's change held.
 pub fn reject(store: &Store, run: &mut Run, keep: bool, infra: bool) -> Result<usize> {
+    let fix = run.fixing_pr().is_some();
     let files = discard(store, run, keep)?;
+    // Only the fix was refused. The pull request still holds the task.
+    if fix {
+        return Ok(files);
+    }
     run.infra = infra;
     store.update_run(run)?;
     let attempts = store.attempts(Some(run.id))?;
@@ -2049,8 +2054,19 @@ pub fn discard(store: &Store, run: &mut Run, keep: bool) -> Result<usize> {
     }
     // Written first, and only over the state that was read: a run another
     // front end approved meanwhile is refused with its worktree intact.
-    run.enter(RunState::Rejected);
+    if run.fixing_pr().is_some() {
+        run.state = RunState::PrOpen;
+        run.error = None;
+        run.approved_tree = None;
+        run.approved_head = None;
+        run.approved_by = None;
+    } else {
+        run.enter(RunState::Rejected);
+    }
     store.update_run_from(run, read)?;
+    if run.state == RunState::PrOpen {
+        git(&run.repo, &["update-ref", "-d", &pr_tip_ref(run)])?;
+    }
     remove_worktree(&run.repo, &run.worktree, &run.branch)
         .map_err(|e| format!("run #{} is rejected, but its worktree stays: {e}", run.id))?;
     Ok(files)
@@ -2152,6 +2168,86 @@ pub fn rework(
     run.state = RunState::Running;
     store.update_run(run)?;
     let a = attempt(home, cfg, &store.agents()?, run, Some(feedback));
+    store.update_run(run)?;
+    store.insert_attempt(&a)?;
+    if consumes(run) {
+        store.consume_attempt(&run.project, &attempt_key(run))?;
+    }
+    Ok(())
+}
+
+/// Where a conflict fix records the pull request branch's tip, as the lease
+/// its publish pushes over.
+pub fn pr_tip_ref(run: &Run) -> String {
+    format!("refs/pma/pr-tip/{}", run.id)
+}
+
+/// Sends a `pr-open` run back to review with its pull request's conflicts
+/// resolved by the agent. The run's worktree is rebuilt from the branch, with
+/// the default branch merged in and the markers left for the agent. Publishing
+/// then updates the same pull request.
+pub fn fix_conflicts(store: &Store, home: &Path, cfg: &Config, run: &mut Run) -> Result<()> {
+    if run.state != RunState::PrOpen {
+        return Err(format!(
+            "run #{} is {}; it has no open pull request",
+            run.id,
+            run.state.name()
+        )
+        .into());
+    }
+    let url = run.outcome.clone().unwrap_or_default();
+    if !crate::publish::conflicting(&url)? {
+        return Err(format!("pull request has no conflicts: {url}").into());
+    }
+    clone_unchanged(store, &run.repo)?;
+    git(&run.repo, &["fetch", "--quiet", "origin"])?;
+    let onto = format!("refs/remotes/origin/{}", run.default_branch);
+    let base = git(&run.repo, &["rev-parse", &onto])?;
+    let tip = git(
+        &run.repo,
+        &["rev-parse", &format!("refs/remotes/origin/{}", run.branch)],
+    )?;
+    git(
+        &run.repo,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-B",
+            &run.branch,
+            path_arg(&run.worktree)?,
+            &tip,
+        ],
+    )?;
+    git(&run.repo, &["update-ref", &pr_tip_ref(run), &tip])?;
+    // Fails on the conflicts it leaves; the list below is what matters.
+    let _ = wt_git(run, &["merge", "--quiet", "--no-commit", "--no-ff", &onto]);
+    let conflicted = wt_git(run, &["diff", "--name-only", "--diff-filter=U"])?;
+    // The branch's tick is on a stale copy. Publishing ticks the new one.
+    let _ = wt_git(run, &["checkout", &onto, "--", "TODO.md"]);
+    let feedback = format!(
+        "This change's pull request conflicts with `{}`, now merged into the working tree. \
+         Resolve the conflict markers in these files, keeping both sides' intent, and run \
+         the tests. Do not commit:\n{conflicted}",
+        run.default_branch
+    );
+    run.base = base;
+    run.feedback = Some(feedback.clone());
+    run.approved_tree = None;
+    run.approved_head = None;
+    run.approved_by = None;
+    run.state = RunState::Running;
+    store.update_run(run)?;
+    let mut a = attempt(home, cfg, &store.agents()?, run, Some(&feedback));
+    let marked = conflicted.lines().find(|f| {
+        std::fs::read_to_string(run.worktree.join(f))
+            .is_ok_and(|text| text.lines().any(|l| l.starts_with("<<<<<<< ")))
+    });
+    if run.state == RunState::Ready
+        && let Some(file) = marked
+    {
+        fail(run, &mut a, format!("conflict markers remain in {file}"));
+    }
     store.update_run(run)?;
     store.insert_attempt(&a)?;
     if consumes(run) {

@@ -63,6 +63,8 @@ pma workflow run find-issues --tag nightly --unattended
 
 ### Fixed
 
+- `pma prune` closes the gap a removed item leaves. Items separated by blank lines kept both neighbours of each removal, so a run of removed items left a run of blank lines. Blank lines no removal touched stay as written.
+
 - **A commit pushed by hand no longer holds its clone.** A `committed` run stayed so after `git push`, because `pma push` refuses a `HEAD` that has moved past it, so every later clone dispatch was refused. `pma review` and a clone dispatch now move it to `pushed` once `origin/<default branch>` holds the commit. Matching the commit's ancestry over a new column settles runs already stuck; a rebased or squashed commit is not recognised.
 
 - The clone-busy refusal names the step that ends the hold, by the run's state. It said "approve or reject" to a run already committed.

@@ -759,12 +759,7 @@ pub fn prune(text: &str) -> Pruned {
         drop[start..last].fill(true);
     }
     Pruned {
-        text: lines
-            .iter()
-            .zip(&drop)
-            .filter(|(_, d)| !**d)
-            .map(|(l, _)| *l)
-            .collect(),
+        text: without(&lines, &drop),
         items,
         done_sections: parsed.done_sections,
         held,
@@ -784,13 +779,32 @@ pub fn remove_done(text: &str, key: &str, task_text: &str) -> Result<String, Str
         return Err(format!("`{task_text}` is kept: line {n} under it is open"));
     }
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    let span = item.line - 1..item.line + item.description.len();
-    Ok(lines
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !span.contains(i))
-        .map(|(_, l)| *l)
-        .collect())
+    let mut drop = vec![false; lines.len()];
+    drop[item.line - 1..item.line + item.description.len()].fill(true);
+    Ok(without(&lines, &drop))
+}
+
+/// `lines` less those `drop` marks. A removal between two blank lines keeps one
+/// of them, and one at the end of the file keeps neither; blank lines no removal
+/// touches stay as written.
+fn without(lines: &[&str], drop: &[bool]) -> String {
+    let blank = |l: &str| l.trim().is_empty();
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut removed = false;
+    for (line, &dropped) in lines.iter().zip(drop) {
+        if dropped {
+            removed = true;
+        } else if !(removed && blank(line) && kept.last().is_none_or(|l| blank(l))) {
+            kept.push(line);
+            removed = false;
+        }
+    }
+    if removed {
+        while kept.last().is_some_and(|l| blank(l)) {
+            kept.pop();
+        }
+    }
+    kept.concat()
 }
 
 /// Inserts an item into its priority section, with its description indented
@@ -1345,6 +1359,28 @@ mod tests {
         assert!(pruned.done_sections.is_empty());
         assert_clean(&pruned.text);
         assert_eq!(prune(&pruned.text).text, pruned.text);
+    }
+
+    /// Items are often separated by blank lines, and each removal left its own.
+    #[test]
+    fn prune_closes_the_gap_a_removed_item_leaves() {
+        let text = "# TODO\n\n## High\n\n- [x] a\n\n- [ ] b\n\n- [x] c\n\n- [x] d\n  why\n\n- [ ] e\n\n\n### group\n\n- [x] f\n\n### next\n\n- [ ] g\n\n- [x] h\n\n";
+        let pruned = prune(text);
+        assert_eq!(
+            pruned.text,
+            "# TODO\n\n## High\n\n- [ ] b\n\n- [ ] e\n\n\n### group\n\n### next\n\n- [ ] g\n"
+        );
+        assert_clean(&pruned.text);
+        assert_eq!(prune(&pruned.text).text, pruned.text);
+    }
+
+    #[test]
+    fn remove_done_closes_the_gap_too() {
+        let text = "## High\n\n- [ ] a\n\n- [x] b\n\n- [ ] c\n";
+        assert_eq!(
+            remove_done(text, "b", "b").unwrap(),
+            "## High\n\n- [ ] a\n\n- [ ] c\n"
+        );
     }
 
     #[test]

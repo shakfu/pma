@@ -140,6 +140,9 @@ fn prune_apply_exits_one_for_a_file_it_skips() {
     let bad = s.project("bad", "## High\n\n- [x] kept\n");
     let out = pma(&["prune".as_ref(), "--apply".as_ref(), bad.as_os_str()]);
     assert_eq!(out.status.code(), Some(1));
+    // A dry run changes nothing, so a skip is no failure.
+    let out = pma(&["prune".as_ref(), bad.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
 }
 
 #[test]

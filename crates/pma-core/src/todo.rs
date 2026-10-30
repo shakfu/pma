@@ -1178,6 +1178,21 @@ mod tests {
         assert_eq!(parse(inline).items.len(), 2);
     }
 
+    /// `insert` follows the parser on an indented fence, or it writes an item
+    /// the parser cannot see.
+    #[test]
+    fn insert_skips_headings_in_indented_fences() {
+        let text = "# TODO\n\n## Notes\n\n  ```\n## High\n  ```\n\n## High\n\n- [ ] old\n";
+        let out = insert(text, Priority::High, "new", None).unwrap();
+        assert!(out.contains("  ```\n## High\n  ```\n\n## High\n"), "{out}");
+        let new = parse(&out).items.into_iter().find(|i| i.text == "new");
+        assert_eq!(new.map(|i| i.priority), Some(Priority::High), "{out}");
+        // A heading in one does not end the section either.
+        let text = "# TODO\n\n## High\n\n- [ ] old\n\n   ```\n## Low\n   ```\n";
+        let out = insert(text, Priority::High, "new", None).unwrap();
+        assert!(out.ends_with("   ```\n## Low\n   ```\n\n- [ ] new\n"), "{out}");
+    }
+
     #[test]
     fn a_fence_closes_only_on_its_own_kind_and_length() {
         let item = |text: &str| parse(text).items.len();

@@ -63,6 +63,18 @@ pma workflow run find-issues --tag nightly --unattended
 
 ### Fixed
 
+- `pma prune --apply` exits 1 when it skips a file for lint errors. It printed a message and exited 0, so a script read the file as pruned. The dry run still exits 0, because it changes nothing.
+
+- **`pma project export` refuses a CSV row that would not read back.** A comma in a tag split it into two tags, and a project named `#x` read back as a comment and was lost. A refused row points to `.json`. Refusal over quoting keeps rows hand-editable, as the format already did for a comma in a name.
+
+- **One failed dependency tool leaves the outdated count unmeasured.** The count summed the tools that succeeded, so a failed tool beside a clean one stored 0 outdated. Any failure now stores no count, because a partial count understates the total. The other tools' packages stay in the detail.
+
+- **A code fence indented 1-3 spaces hides its content from the `TODO.md` parser.** Indented lines never reached the fence check, so such a fence opened nothing, and an indented closer left a fence open. The parser and item insertion now follow CommonMark's 0-3 spaces. A backtick line with a backtick in its info string no longer opens a fence, so inline code in a description stays inline.
+
+- **`pma review 3 4 --approve --minutes 5` records the minutes.** The batch path approved the runs without reading `--minutes`, so the time was lost with no message. Each run named gets the full N minutes, matching the per-run total `--minutes` adds to. Splitting N across the list would need sub-minute shares and a new action. A refused list records nothing, so rerunning it does not count the time twice.
+
+- `make test` passes when run from a pma job. Each `pma` the CLI tests started inherited `PMA_JOB`, so it printed `pma job approve <id>` where the tests expect `--approve <plan>`.
+
 - `pma prune` closes the gap a removed item leaves. Items separated by blank lines kept both neighbours of each removal, so a run of removed items left a run of blank lines. Blank lines no removal touched stay as written.
 
 - **A commit pushed by hand no longer holds its clone.** A `committed` run stayed so after `git push`, because `pma push` refuses a `HEAD` that has moved past it, so every later clone dispatch was refused. `pma review` and a clone dispatch now move it to `pushed` once `origin/<default branch>` holds the commit. Matching the commit's ancestry over a new column settles runs already stuck; a rebased or squashed commit is not recognised.

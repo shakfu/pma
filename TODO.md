@@ -84,7 +84,9 @@
 
 - [x] A code fence indented 1-3 spaces does not hide its content from the TODO.md parser #agent
 
-- [ ] `pma merge <id>...` merges a run's pull request and settles it #agent Today a `pr-open` run is merged on GitHub by hand, and the next `pma review` settles it. `pma merge` runs `gh pr merge <url> --squash --delete-branch` for each named `pr-open` run, then settles it to `merged` at once, as `publish::settle` does for a merge it observes. Refuse a run that is not `pr-open`. Refuse one whose pull request has failing or pending checks; allow one with no checks. Refuse one whose head is no longer the commit pma pushed, since that merges commits no one approved: record the pushed commit at `pma pr`, which today records only the URL. Tests in `tests/cli.rs` with the fake `gh` (`FAKE_GH_PR`): a merge, each refusal, and the run merged afterwards.
+- [x] `pma merge <id>` merges a run's pull request and settles it #agent Built in `58001cb`, with `--fix`. The guards are the next item.
+
+- [ ] `pma merge` refuses a pull request with failing checks or a moved head #agent `publish::merge` refuses only a conflict, so it merges a pull request with failing or pending checks, and commits pushed after review. Refuse failing or pending checks; allow none. Refuse a head that is not the commit pma pushed: record that commit at `pma pr`, which today records only the URL, and pass it to `gh pr merge --match-head-commit`. Tests in `tests/cli.rs` with the fake `gh` (`FAKE_GH_PR`): each refusal. Also from the original item and not built: several ids in one `pma merge`, and `--delete-branch`.
 
 - [x] **Render `gh:N` as a link**: the inbox, matrix and project rows and the run and task details link the issue to its page from the stored `owner/name`; `pma review` prints the number.
 

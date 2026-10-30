@@ -1349,6 +1349,7 @@ fn prune(paths: &[PathBuf], apply: bool) -> ExitCode {
         };
         if todo::parse(&text).has_errors() {
             println!("{}: skipped: lint errors; see `pma lint`", file.display());
+            failed |= apply;
             continue;
         }
         let pruned = todo::prune(&text);

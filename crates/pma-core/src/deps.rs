@@ -36,8 +36,14 @@ pub struct Outdated {
 }
 
 /// Runs every tool the project's root files call for. `outdated` is `None`
-/// when no ecosystem applies or every tool failed.
+/// when no ecosystem applies or any tool failed: a partial sum reads as the
+/// whole count. `detail` still lists what the other tools found.
 pub fn measure(dir: &Path) -> DepsFacts {
+    measure_with(dir, run)
+}
+
+fn measure_with(dir: &Path, run: impl Fn(&str, &Path) -> Result<String, String>) -> DepsFacts {
+    let mut failed = false;
     let mut found: Option<i64> = None;
     let mut held_back: Option<i64> = None;
     let mut detail = Vec::new();
@@ -61,11 +67,14 @@ pub fn measure(dir: &Path) -> DepsFacts {
                         .map(|o| format!("{ecosystem}: {} {} -> {}", o.name, o.current, o.latest)),
                 );
             }
-            Err(e) => detail.push(format!("{ecosystem}: error: {e}")),
+            Err(e) => {
+                failed = true;
+                detail.push(format!("{ecosystem}: error: {e}"));
+            }
         }
     }
     DepsFacts {
-        outdated: found,
+        outdated: found.filter(|_| !failed),
         held_back,
         detail: detail.join("\n"),
     }
@@ -302,6 +311,23 @@ mod tests {
         assert_eq!(fixes("cargo"), [["cargo", "update"]]);
         assert_eq!(fixes("uv"), [["uv", "lock", "--upgrade"]]);
         assert_eq!(fixes("go").len(), 2);
+    }
+
+    #[test]
+    fn one_failed_tool_leaves_the_count_unmeasured() {
+        let dir = std::env::temp_dir().join(format!("pma-deps-partial-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.lock"), "").unwrap();
+        std::fs::write(dir.join("uv.lock"), "").unwrap();
+        let facts = measure_with(&dir, |ecosystem, _| match ecosystem {
+            "cargo" => Err("no network".to_string()),
+            _ => Ok("Update ruff v1 -> v2\n".to_string()),
+        });
+        assert_eq!(facts.outdated, None);
+        assert_eq!(facts.detail, "cargo: error: no network\nuv: ruff v1 -> v2");
+        let facts = measure_with(&dir, |_, _| Ok(String::new()));
+        assert_eq!(facts.outdated, Some(0));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

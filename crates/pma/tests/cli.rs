@@ -135,6 +135,14 @@ fn prune_lists_then_removes_finished_items() {
 }
 
 #[test]
+fn prune_apply_exits_one_for_a_file_it_skips() {
+    let s = Scratch::new("prune-skip");
+    let bad = s.project("bad", "## High\n\n- [x] kept\n");
+    let out = pma(&["prune".as_ref(), "--apply".as_ref(), bad.as_os_str()]);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
 fn errors_in_any_file_exit_one_and_every_file_is_checked() {
     let s = Scratch::new("errors");
     let bad = s.project("bad", "## High\n");

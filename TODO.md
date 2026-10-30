@@ -76,13 +76,13 @@
 
 - [x] `pma review 3 4 --approve --minutes 5` drops the minutes #agent
 
-- [ ] `pma prune --apply` exits 0 when it skips a file for lint errors #agent
+- [x] `pma prune --apply` exits 0 when it skips a file for lint errors #agent
 
-- [ ] `pma project export` writes a CSV that does not read back when a tag holds a comma or a project is named `#x` #agent
+- [x] `pma project export` writes a CSV that does not read back when a tag holds a comma or a project is named `#x` #agent
 
-- [ ] One failed dependency tool is counted as zero outdated when another succeeds #agent
+- [x] One failed dependency tool is counted as zero outdated when another succeeds #agent
 
-- [ ] A code fence indented 1-3 spaces does not hide its content from the TODO.md parser #agent
+- [x] A code fence indented 1-3 spaces does not hide its content from the TODO.md parser #agent
 
 - [ ] `pma merge <id>...` merges a run's pull request and settles it #agent Today a `pr-open` run is merged on GitHub by hand, and the next `pma review` settles it. `pma merge` runs `gh pr merge <url> --squash --delete-branch` for each named `pr-open` run, then settles it to `merged` at once, as `publish::settle` does for a merge it observes. Refuse a run that is not `pr-open`. Refuse one whose pull request has failing or pending checks; allow one with no checks. Refuse one whose head is no longer the commit pma pushed, since that merges commits no one approved: record the pushed commit at `pma pr`, which today records only the URL. Tests in `tests/cli.rs` with the fake `gh` (`FAKE_GH_PR`): a merge, each refusal, and the run merged afterwards.
 

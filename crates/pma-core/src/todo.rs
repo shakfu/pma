@@ -210,13 +210,14 @@ pub fn parse(text: &str) -> Parsed {
 
         let indented = line.starts_with(' ') || line.starts_with('\t');
         if indented {
+            let fenced = fence.step(line, n);
             match open.as_mut() {
                 Some(item) => {
                     item.description
                         .extend(std::iter::repeat_n(String::new(), blanks));
                     item.description.push(raw.to_string());
                 }
-                None if matches!(place, Place::Known(_)) && fence.0.is_none() => {
+                None if matches!(place, Place::Known(_)) && !fenced => {
                     out.report(n, Severity::Warning, "indented line is not under an item");
                 }
                 None => {}
@@ -354,9 +355,15 @@ pub fn parse(text: &str) -> Parsed {
 struct Fence(Option<(u8, usize, usize)>);
 
 impl Fence {
-    /// Whether `line`, trimmed and unindented, opens, is inside or closes a
-    /// fence. `n` is its line number.
+    /// Whether `line`, trimmed at its end, opens, is inside or closes a fence.
+    /// A fence mark may be indented up to 3 spaces. `n` is its line number.
     fn step(&mut self, line: &str, n: usize) -> bool {
+        let unindented = line.trim_start_matches(' ');
+        let line = if line.len() - unindented.len() <= 3 {
+            unindented
+        } else {
+            line
+        };
         match self.0 {
             Some((mark, len, _)) => {
                 if fence_run(line, mark).is_some_and(|k| k >= len && k == line.len()) {
@@ -368,6 +375,8 @@ impl Fence {
                 .iter()
                 .copied()
                 .find_map(|m| fence_run(line, m).filter(|k| *k >= 3).map(|k| (m, k)))
+                // A backtick in the info string makes the line inline code.
+                .filter(|(m, k)| *m != b'`' || !line[*k..].contains('`'))
             {
                 Some((mark, len)) => {
                     self.0 = Some((mark, len, n));
@@ -830,8 +839,7 @@ pub fn insert(
         .enumerate()
         .filter_map(|(i, l)| {
             let line = l.trim_end();
-            let plain = !line.is_empty() && !line.starts_with([' ', '\t']);
-            (plain && !fence.step(line, i + 1)).then_some((i, line))
+            (!line.is_empty() && !fence.step(line, i + 1)).then_some((i, line))
         })
         .filter(|(_, l)| l.starts_with("## ") || l.starts_with("### "))
         .collect();
@@ -1150,6 +1158,24 @@ mod tests {
         );
         assert_eq!(parsed.items.len(), 1);
         assert_eq!(parsed.items[0].priority, Priority::High);
+    }
+
+    #[test]
+    fn a_fence_indented_up_to_three_spaces_hides_its_content() {
+        let text = "# TODO\n\n## High\n\n   ```\n## Done\n- [ ] hidden\n  ```\n\n- [ ] real\n";
+        let parsed = parse(text);
+        assert!(!parsed.has_errors());
+        assert_eq!(parsed.items.len(), 1);
+        // Four spaces opens nothing.
+        assert_eq!(
+            parse("# TODO\n\n## High\n\n    ```\n- [ ] seen\n")
+                .items
+                .len(),
+            1
+        );
+        // Inline code in a description opens nothing.
+        let inline = "# TODO\n\n## High\n\n- [ ] a\n  ```x``` here\n- [ ] b\n";
+        assert_eq!(parse(inline).items.len(), 2);
     }
 
     #[test]

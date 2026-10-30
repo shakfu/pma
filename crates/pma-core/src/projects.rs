@@ -82,24 +82,27 @@ pub fn read(text: &str, format: Format) -> Result<Vec<Entry>, String> {
 }
 
 /// `name,tier,tag,tag,...`: tags are the remaining fields, so nothing needs
-/// quoting and a row is editable by hand. A name holding a comma has no such
-/// row, and is refused rather than written ambiguously.
+/// quoting and a row is editable by hand. An entry whose row would read back
+/// differently, such as a comma in a tag or a name starting `#`, is refused.
 fn to_csv(entries: &[Entry]) -> Result<String, String> {
     let mut out = String::from("name,tier,tags\n");
     for e in entries {
-        if e.name.contains(',') {
-            return Err(format!("`{}` holds a comma; export to .json", e.name));
-        }
-        out.push_str(&e.name);
-        out.push(',');
+        let mut row = format!("{},", e.name);
         if let Some(t) = e.tier {
-            out.push_str(&t.to_string());
+            row.push_str(&t.to_string());
         }
         for tag in &e.tags {
-            out.push(',');
-            out.push_str(tag);
+            row.push(',');
+            row.push_str(tag);
         }
-        out.push('\n');
+        row.push('\n');
+        if from_csv(&row).ok().as_deref() != Some(std::slice::from_ref(e)) {
+            return Err(format!(
+                "`{}`: a .csv row cannot hold this name or its tags; export to .json",
+                e.name
+            ));
+        }
+        out.push_str(&row);
     }
     Ok(out)
 }
@@ -261,6 +264,18 @@ mod tests {
         }];
         assert!(to_csv(&odd).is_err());
         assert!(write(&odd, Format::Json).is_ok());
+    }
+
+    #[test]
+    fn a_row_that_would_read_back_differently_is_refused_in_csv() {
+        for (name, tag) in [("#x", "rust"), ("alpha", "a,b"), (" alpha", "rust")] {
+            let odd = [Entry {
+                name: name.into(),
+                tier: Some(1),
+                tags: vec![tag.into()],
+            }];
+            assert!(to_csv(&odd).is_err(), "{name} {tag}");
+        }
     }
 
     #[test]

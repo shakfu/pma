@@ -2244,6 +2244,7 @@ pub fn question(act: Act, pick: &Pick) -> String {
         Act::RunCampaign => "run campaign",
         Act::RemoveCampaign => "remove campaign",
         Act::ApproveRuns => "approve every clean run",
+        Act::PushApproved => "push every approved run",
         Act::Sync => "sync critical items to GitHub issues",
         Act::ResetSetting => "reset to its default:",
         Act::RemoveRoot => "remove root",
@@ -2577,6 +2578,28 @@ pub fn action_in(
             }
             Action::ApproveRuns { ids }
         }
+        (Act::PushApproved, _) => {
+            let ids: Vec<i64> = pane
+                .iter()
+                .filter_map(|i| match &i.pick {
+                    // Not a ready run: no one has read it yet.
+                    Pick::Run { id, state, .. } if state != "ready" && fits(Act::Push, &i.pick) => {
+                        Some(*id)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if ids.is_empty() {
+                return Err("no approved run to push".into());
+            }
+            Action::Publish {
+                ids,
+                all_approved: false,
+                target: publish::Target::Push,
+                subject: None,
+                drop: None,
+            }
+        }
         (Act::Dispatch, Pick::Task { target, retry, .. }) => Action::Dispatch {
             targets: vec![target.clone()],
             tags: Vec::new(),
@@ -2652,20 +2675,26 @@ pub fn action_in(
                 .parse()
                 .map_err(|_| "type the minutes as a whole number".to_string())?,
         },
-        (Act::Stage | Act::Commit | Act::Pr | Act::Push, Pick::Run { id, .. }) => Action::Publish {
-            ids: vec![*id],
-            all_approved: false,
-            target: match act {
-                Act::Stage => publish::Target::Stage,
-                Act::Commit => publish::Target::Commit,
-                Act::Pr => publish::Target::Pr,
-                _ => publish::Target::Push,
-            },
-            // Only commit prompts; a blank subject keeps the task text.
-            subject: Some(input)
-                .filter(|s| act == Act::Commit && !s.is_empty())
-                .map(str::to_string),
-        },
+        (Act::Stage | Act::Commit | Act::Pr | Act::Push, Pick::Run { id, state, .. }) => {
+            Action::Publish {
+                ids: vec![*id],
+                all_approved: false,
+                target: match act {
+                    Act::Stage => publish::Target::Stage,
+                    Act::Commit => publish::Target::Commit,
+                    Act::Pr => publish::Target::Pr,
+                    _ => publish::Target::Push,
+                },
+                // Only commit prompts; a blank subject keeps the task text.
+                subject: Some(input)
+                    .filter(|s| act == Act::Commit && !s.is_empty())
+                    .map(str::to_string),
+                // `u` on a ready run asked which items are done.
+                drop: (act == Act::Push && state == "ready")
+                    .then(|| unchecked(input))
+                    .transpose()?,
+            }
+        }
         (Act::Merge, Pick::Run { id, .. }) => Action::MergePr { id: *id },
         (Act::FixConflicts, Pick::Run { id, .. }) => Action::FixConflicts { id: *id },
         (
@@ -2754,6 +2783,60 @@ mod tests {
                 project: "p".into(),
             },
         }
+    }
+
+    /// `U` pushes what has been read: never a ready run, nor one fixing a
+    /// pull request's conflicts.
+    #[test]
+    fn push_approved_takes_only_what_was_read() {
+        let row = |id, state: &str, fixing| Item {
+            cells: vec![],
+            pick: Pick::Run {
+                fixing,
+                id,
+                clean: true,
+                state: state.into(),
+                project: "p".into(),
+            },
+        };
+        let pane = [
+            row(1, "ready", false),
+            row(2, "approved", false),
+            row(3, "staged", false),
+            row(4, "committed", false),
+            row(5, "approved", true),
+            row(6, "failed", false),
+        ];
+        let Ok(Action::Publish { ids, target, .. }) =
+            action(Act::PushApproved, &Pick::Nothing, &pane, "")
+        else {
+            panic!("a publish");
+        };
+        assert_eq!(ids, [2, 3, 4]);
+        assert_eq!(target, publish::Target::Push);
+        assert!(action(Act::PushApproved, &Pick::Nothing, &pane[..1], "").is_err());
+    }
+
+    /// `u` carries what a ready run's approver left unchecked, and asks
+    /// nothing of a run already approved.
+    #[test]
+    fn push_carries_the_items_left_open() {
+        let drop = |state: &str, input| {
+            let pick = Pick::Run {
+                fixing: false,
+                id: 1,
+                clean: false,
+                state: state.into(),
+                project: "p".into(),
+            };
+            match action(Act::Push, &pick, &[], input) {
+                Ok(Action::Publish { drop, .. }) => drop,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(drop("ready", "2,3"), Some(vec![2, 3]));
+        assert_eq!(drop("ready", ""), Some(vec![]));
+        assert_eq!(drop("approved", ""), None);
     }
 
     /// The act that moves a run on follows its state.

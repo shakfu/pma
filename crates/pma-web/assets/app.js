@@ -751,7 +751,7 @@ async function act(b) {
   try {
     if (b.ask.kind !== "nothing") {
       const asked = await api("/api/ask", { tab: S.tab, act: name, pick, project: S.project });
-      if (b.ask.kind === "confirm") {
+      if (b.ask.kind === "confirm" || (b.ask.confirm && !asked.items.length)) {
         const yes = await dialog({
           title: label(asked.question),
           ok: label(b.label),

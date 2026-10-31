@@ -363,7 +363,13 @@ impl App {
         match items {
             Ok(items) if items.is_empty() => {
                 let (_, pane) = self.pick();
-                self.ask_done(act, &pick, &pane, "")
+                let confirms = pma_core::keys::BINDINGS.iter().any(|b| {
+                    b.command == Command::Act(act) && matches!(b.ask, Ask::CheckOrConfirm(_))
+                });
+                match confirms {
+                    true => self.begin(act, Ask::Confirm, pick, pane),
+                    false => self.ask_done(act, &pick, &pane, ""),
+                }
             }
             Ok(items) => {
                 let (items, on) = items.into_iter().unzip();
@@ -733,7 +739,9 @@ impl App {
                 None
             }
             Ask::Choose(label) => Some(Request::Choose { act, pick, label }),
-            Ask::Check(label) => Some(Request::Check { act, pick, label }),
+            Ask::Check(label) | Ask::CheckOrConfirm(label) => {
+                Some(Request::Check { act, pick, label })
+            }
             Ask::Confirm => match screen::action_in(act, &pick, &pane, "", &self.project) {
                 Ok(action) => {
                     self.mode = Mode::Confirm {
@@ -2009,6 +2017,28 @@ mod tests {
         assert!(app.marks.is_empty(), "another view clears them");
     }
 
+    /// `u` on a ready bundle asks what `a` asks, then pushes: the checklist
+    /// is the one question.
+    #[test]
+    fn a_bundle_push_checks_its_items() {
+        let mut app = App::new();
+        app.loaded(Ok(next_view()));
+        app.key("Tab");
+        let Some(Request::Check { act, pick, label }) = app.key("u") else {
+            panic!("a checklist request");
+        };
+        assert_eq!(act, Act::Push);
+        let items = vec![("one".to_string(), true), ("two".to_string(), true)];
+        assert_eq!(app.checking(act, pick, label, Ok(items)), None);
+        app.key("j");
+        app.key(" ");
+        let Some(Request::Act(Action::Publish { drop, target, .. })) = app.key("Enter") else {
+            panic!("a push");
+        };
+        assert_eq!(drop, Some(vec![2]));
+        assert_eq!(target, pma_core::publish::Target::Push);
+    }
+
     /// Approving a run asks for its checklist first. A bundle's items come
     /// back checked or not; what is left unchecked is dropped. A run with
     /// none is approved without a question.
@@ -2436,7 +2466,12 @@ mod tests {
             text.contains("u push") && text.contains("+hi"),
             "the footer offers the run's acts: {text}"
         );
-        assert_eq!(app.key("u"), None);
+        // Not a bundle: no rows, so a yes or no.
+        let Some(Request::Check { act, pick, label }) = app.key("u") else {
+            panic!("a checklist from the store");
+        };
+        assert_eq!(act, Act::Push);
+        assert_eq!(app.checking(act, pick, label, Ok(vec![])), None);
         assert!(screen_text(&mut app).contains("approve and push #4?"));
         let Some(Request::Act(Action::Publish { ids, target, .. })) = app.key("y") else {
             panic!("a push");

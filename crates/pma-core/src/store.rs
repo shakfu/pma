@@ -24,7 +24,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 43;
+const VERSION: i64 = 44;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -464,6 +464,15 @@ const READ_RUNS_DONE: &str = "
 UPDATE runs SET state = 'done'
 WHERE state = 'ready' AND branch = '' AND workflow_instance IS NOT NULL;
 ";
+
+/// Version 44. Every worker that runs `claude` moves from `acceptEdits` to
+/// `auto`. Only that pair is rewritten, so an otherwise edited row keeps its
+/// edits and one on another mode stays there.
+const CLAUDE_AUTO_MODE: &str = r#"
+UPDATE agents
+SET args = replace(args, '"--permission-mode","acceptEdits"', '"--permission-mode","auto"')
+WHERE command = 'claude';
+"#;
 
 /// Version 33. The command a job that stopped at a workflow plan would run
 /// to approve it, as a JSON array. And the `claude` worker streams its
@@ -1013,6 +1022,7 @@ impl Store {
                     WORKSPACE,
                     JOB_PROJECT,
                     RUN_ITEMS,
+                    CLAUDE_AUTO_MODE,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -3984,6 +3994,46 @@ mod tests {
             if streams {
                 assert_eq!(got, Worker::claude().args);
             }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Schema 44 moves each `claude` row off `acceptEdits`, whatever else was
+    /// edited in it, and leaves another mode or another command alone.
+    #[test]
+    fn claude_rows_move_to_auto_mode_and_keep_their_edits() {
+        let accept = r#"["-p","{prompt}","--permission-mode","acceptEdits","--budget"]"#;
+        let plan = r#"["-p","{prompt}","--permission-mode","plan"]"#;
+        for (command, args, want) in [
+            (
+                "claude",
+                accept,
+                r#"["-p","{prompt}","--permission-mode","auto","--budget"]"#,
+            ),
+            ("claude", plan, plan),
+            ("other", accept, accept),
+        ] {
+            let dir = scratch("auto-mode");
+            let path = dir.join("p.db");
+            {
+                let store = Store::open(&path).unwrap();
+                store
+                    .conn
+                    .execute(
+                        "UPDATE agents SET command = ?1, args = ?2 WHERE name = 'claude'",
+                        [command, args],
+                    )
+                    .unwrap();
+                store.conn.pragma_update(None, "user_version", 43).unwrap();
+            }
+            let store = Store::open(&path).unwrap();
+            let got: String = store
+                .conn
+                .query_row("SELECT args FROM agents WHERE name = 'claude'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(got, want);
             let _ = std::fs::remove_dir_all(dir);
         }
     }

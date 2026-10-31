@@ -412,8 +412,10 @@ impl Worker {
                 "--output-format",
                 "stream-json",
                 "--verbose",
+                // Over `acceptEdits`: in `-p` there is no one to ask, so a command
+                // outside the verify allowlist was denied, not raised.
                 "--permission-mode",
-                "acceptEdits",
+                "auto",
                 "--model",
                 "{model}",
                 "--max-budget-usd",
@@ -603,7 +605,7 @@ mod tests {
                 "stream-json",
                 "--verbose",
                 "--permission-mode",
-                "acceptEdits",
+                "auto",
                 "--model",
                 "haiku",
                 "--max-budget-usd",

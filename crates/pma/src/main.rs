@@ -518,6 +518,14 @@ enum Command {
         /// Every approved run instead of named ones.
         #[arg(long, conflicts_with = "ids")]
         all_approved: bool,
+        /// Approve each ready run named first, as `u` does. A bundle needs
+        /// `--drop`, or `pma review <id> --approve` when every item is done.
+        #[arg(long, conflicts_with = "all_approved")]
+        approve: bool,
+        /// With --approve on a bundle, the items left open, as `pma review`
+        /// numbers them.
+        #[arg(long, value_delimiter = ',', requires = "approve")]
+        drop: Vec<usize>,
     },
     /// Dependency locks.
     Deps {
@@ -1116,8 +1124,14 @@ fn main() -> ExitCode {
             all_approved,
             subject,
         } => run_publish(&ids, all_approved, publish::Target::Commit, subject),
-        Command::Push { ids, all_approved } => {
-            run_publish(&ids, all_approved, publish::Target::Push, None)
+        Command::Push {
+            ids,
+            all_approved,
+            approve,
+            drop,
+        } => {
+            let approve = approve.then_some(drop);
+            run_publish_approving(&ids, all_approved, publish::Target::Push, None, approve)
         }
         Command::Verify { projects, tags } => run_verify(&projects, &tags),
         Command::Sync {
@@ -4108,6 +4122,18 @@ fn run_publish(
     target: publish::Target,
     subject: Option<String>,
 ) -> Result<()> {
+    run_publish_approving(ids, all, target, subject, None)
+}
+
+/// `run_publish`, approving each ready run named first when `approve` holds
+/// the items to leave open.
+fn run_publish_approving(
+    ids: &[i64],
+    all: bool,
+    target: publish::Target,
+    subject: Option<String>,
+    approve: Option<Vec<usize>>,
+) -> Result<()> {
     let subject = subject.map(|s| s.trim().to_string());
     if let Some(s) = &subject {
         if ids.len() != 1 {
@@ -4120,6 +4146,13 @@ fn run_publish(
     let store = Store::open_default()?;
     let _session = Session::acquire(&store::home()?)?;
     let cfg = api::config(&store)?;
+    if let Some(drop) = &approve {
+        if !drop.is_empty() && ids.len() != 1 {
+            return Err("--drop names one run".into());
+        }
+        let drop = (!drop.is_empty()).then_some(drop.as_slice());
+        api::approve_ready(&store, ids, target, drop)?;
+    }
     let mut runs = Vec::new();
     if all {
         runs = store.runs()?;
@@ -4905,18 +4938,21 @@ mod tests {
                 all_approved: true,
                 target: publish::Target::Push,
                 subject: None,
+                drop: None,
             },
             Action::Publish {
                 ids: vec![4, 5],
                 all_approved: false,
                 target: publish::Target::Pr,
                 subject: None,
+                drop: None,
             },
             Action::Publish {
                 ids: vec![4],
                 all_approved: false,
                 target: publish::Target::Commit,
                 subject: Some("--fix: the parser".into()),
+                drop: None,
             },
             Action::RunCampaign {
                 name: "c".into(),

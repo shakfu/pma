@@ -1449,6 +1449,41 @@ fn a_bundle_is_one_run_and_its_approver_says_what_it_closes() {
     assert_eq!(git_out(&origin, &["show", "main:third.txt"]), "three\n");
 }
 
+/// `--approve` makes one command of reading done and pushing, which `pma push`
+/// alone refuses for a ready run.
+#[test]
+fn push_approve_approves_a_ready_run_first() {
+    let s = Scratch::new("pushapprove");
+    let (env, origin, _) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    env.ok(&["config", "workspace", "clone"]);
+    env.ok(&["dispatch", "alpha:5"]);
+    let (_, err, success) = env.run(&["push", "1"]);
+    assert!(!success && err.contains("run #1 is ready"), "{err}");
+    env.ok(&["push", "1", "--approve"]);
+    assert_eq!(git_out(&origin, &["show", "main:hello.txt"]), "hi\n");
+}
+
+/// A bundle still has its approver say what it closed, and nothing moves
+/// until they have.
+#[test]
+fn push_approve_on_a_bundle_needs_its_items() {
+    let s = Scratch::new("pushbundle");
+    let (env, origin, _) = dispatch_env(&s, &[("claude", BUNDLE_CLAUDE)]);
+    env.ok(&["dispatch", "alpha:5", "alpha:high", "alpha:12"]);
+    let (_, err, success) = env.run(&["push", "1", "--approve"]);
+    assert!(
+        !success && err.contains("run #1 is a bundle; approve it first"),
+        "{err}"
+    );
+    assert!(env.ok(&["review"]).contains("#1  ready"));
+    env.ok(&["push", "1", "--approve", "--drop", "3"]);
+    let todo = git_out(&origin, &["show", "main:TODO.md"]);
+    assert!(
+        todo.contains("- [x] add greeting") && todo.contains("- [ ] third task"),
+        "{todo}"
+    );
+}
+
 /// A bundle's failures count against the bundle, which stops at the attempt
 /// limit as one task does, until --retry.
 #[test]

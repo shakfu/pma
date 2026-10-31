@@ -24,7 +24,7 @@ sanduk-rs is the Rust rewrite of sanduk, published as three crates. Its CLI take
 
 - **`verify`.** Every verify run goes through `verify_once` (`src/dispatch.rs:1229`): the head check (`dispatch.rs:1196`), the base check (`dispatch.rs:1280`) and the check before publishing (`src/publish.rs:182`). It runs the project's command with `sh -c` in the worktree, so a `Makefile`, `build.rs` or `conftest.py` the agent edited runs unconfined on the host. That is the gap [using-containers.md](using-containers.md) records for stage (a).
 
-- **Host workers.** `claude` runs on the host under `--permission-mode acceptEdits`. `opencode --auto` and `omp` approve every command, which is why [pilot.md](pilot.md) left them out. Under `sanduk-sandbox`, with the worktree as the root, their writes are bounded, which may be enough to admit them. Rejected 2026-09-29: see problem 3.
+- **Host workers.** `claude` runs on the host under `--permission-mode auto`. `opencode --auto` and `omp` approve every command, which is why [pilot.md](pilot.md) left them out. Under `sanduk-sandbox`, with the worktree as the root, their writes are bounded, which may be enough to admit them. Rejected 2026-09-29: see problem 3.
 
 - **`scan`** runs `git` and `gh`, which only read. Not worth confining.
 

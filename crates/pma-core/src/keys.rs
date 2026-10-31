@@ -119,6 +119,8 @@ pub enum Act {
     Commit,
     Pr,
     Push,
+    /// Pushes every approved, staged or committed run in the list.
+    PushApproved,
     /// Merges the run's open pull request.
     Merge,
     /// Has an agent resolve the conflicts of the run's open pull request.
@@ -161,7 +163,7 @@ pub enum Act {
 }
 
 impl Act {
-    pub const ALL: [Act; 46] = [
+    pub const ALL: [Act; 47] = [
         Act::ApproveRun,
         Act::ApproveRuns,
         Act::RejectRun,
@@ -184,6 +186,7 @@ impl Act {
         Act::Commit,
         Act::Pr,
         Act::Push,
+        Act::PushApproved,
         Act::Merge,
         Act::FixConflicts,
         Act::RunCampaign,
@@ -225,6 +228,7 @@ impl Act {
                 | Act::AddNote
                 | Act::SettlePrs
                 | Act::ApproveRuns
+                | Act::PushApproved
                 | Act::StartWorkflow
                 | Act::Run
                 | Act::AddRoot
@@ -251,6 +255,7 @@ impl Act {
             | Act::StopWorkflow
             | Act::RemoveNote
             | Act::Push
+            | Act::PushApproved
             | Act::Merge
             | Act::ResetSetting
             | Act::RemoveRoot
@@ -285,7 +290,13 @@ impl Act {
             Action::ReworkRun { .. } => &[Act::ReworkRun],
             Action::RetryRun { .. } => &[Act::RetryRun],
             Action::Run { .. } => &[Act::Run],
-            Action::Publish { .. } => &[Act::Stage, Act::Commit, Act::Pr, Act::Push],
+            Action::Publish { .. } => &[
+                Act::Stage,
+                Act::Commit,
+                Act::Pr,
+                Act::Push,
+                Act::PushApproved,
+            ],
             Action::RunCampaign { .. } => &[Act::RunCampaign],
             Action::Sync { .. } => &[Act::Sync],
             Action::Verify { .. } => &[Act::Verify],
@@ -357,6 +368,8 @@ pub enum Ask {
     /// input is the 1-based numbers left unchecked, comma-separated. An
     /// empty list asks nothing.
     Check(&'static str),
+    /// As `Check`, but an empty list asks yes or no.
+    CheckOrConfirm(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -543,7 +556,14 @@ pub const BINDINGS: &[Binding] = &[
         "commit",
     ),
     on("p", RUNS, Act::Pr, Ask::Confirm, "pull request"),
-    on("u", RUNS, Act::Push, Ask::Confirm, "push"),
+    on(
+        "u",
+        RUNS,
+        Act::Push,
+        Ask::CheckOrConfirm("items done"),
+        "push",
+    ),
+    on("U", RUNS, Act::PushApproved, Ask::Confirm, "push approved"),
     on("y", RUNS, Act::SettlePrs, Ask::Nothing, "check PRs"),
     on("M", RUNS, Act::Merge, Ask::Confirm, "merge PR"),
     on("F", RUNS, Act::FixConflicts, Ask::Confirm, "fix conflicts"),

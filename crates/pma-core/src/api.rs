@@ -446,6 +446,9 @@ pub enum Action {
     Publish {
         ids: Vec<i64>,
         all_approved: bool,
+        /// A ready bundle's items to leave open, once its approver has said;
+        /// `None` when no one was asked.
+        drop: Option<Vec<usize>>,
         target: publish::Target,
         /// Replaces the task text as the commit's subject.
         subject: Option<String>,
@@ -990,7 +993,8 @@ pub fn initial_input(store: &Store, act: Act, pick: &screen::Pick) -> Result<Str
 /// an earlier approval dropped start unchecked.
 pub fn checklist(store: &Store, act: Act, pick: &screen::Pick) -> Result<Vec<(String, bool)>> {
     match (act, pick) {
-        (Act::ApproveRun, screen::Pick::Run { id, .. }) => Ok(store
+        (Act::Push, screen::Pick::Run { state, .. }) if state != "ready" => Ok(Vec::new()),
+        (Act::ApproveRun | Act::Push, screen::Pick::Run { id, .. }) => Ok(store
             .run(*id)?
             .items
             .into_iter()
@@ -1450,6 +1454,43 @@ fn unmoved(run: &Run, seen: Option<&str>) -> Result<()> {
     }
 }
 
+/// Approves the ready runs among `ids`, for `target` to publish, or none of
+/// them. A bundle's approver must have said which items are done: `drop`.
+pub fn approve_ready(
+    store: &Store,
+    ids: &[i64],
+    target: publish::Target,
+    drop: Option<&[usize]>,
+) -> Result<()> {
+    let by = whoami();
+    let runs = ids
+        .iter()
+        .map(|id| store.run(*id))
+        .collect::<Result<Vec<_>>>()?;
+    for run in runs.iter().filter(|r| r.state == RunState::Ready) {
+        match drop {
+            Some(drop) => dispatch::check_drops(run, drop)?,
+            None => {
+                if let Some(why) = dispatch::needs_approval(run) {
+                    return Err(why.into());
+                }
+            }
+        }
+    }
+    if let Some(why) = runs.iter().find_map(|r| publish::keeps_pr(r, target)) {
+        return Err(why.into());
+    }
+    for mut run in runs {
+        if run.state == RunState::Ready {
+            if let Some(drop) = drop.filter(|_| !run.items.is_empty()) {
+                store.set_dropped(run.id, drop)?;
+            }
+            dispatch::approve(store, &mut run, &by)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn act(store: &Store, a: Action) -> Result<Outcome> {
     // A reviewer who commits, pushes or opens a pull request for a ready
     // run from a view has read it: it is approved first, as one act. Staging
@@ -1458,26 +1499,12 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
         ids,
         all_approved: false,
         target,
+        drop,
         ..
     } = &a
         && *target != publish::Target::Stage
     {
-        let by = whoami();
-        let runs = ids
-            .iter()
-            .map(|id| store.run(*id))
-            .collect::<Result<Vec<_>>>()?;
-        if let Some(why) = runs.iter().find_map(dispatch::needs_approval) {
-            return Err(why.into());
-        }
-        if let Some(why) = runs.iter().find_map(|r| publish::keeps_pr(r, *target)) {
-            return Err(why.into());
-        }
-        for mut run in runs {
-            if run.state == RunState::Ready {
-                dispatch::approve(store, &mut run, &by)?;
-            }
-        }
+        approve_ready(store, ids, *target, drop.as_deref())?;
     }
     let note_text = |t: String| -> Result<String> {
         let t = t.trim().to_string();
@@ -1963,6 +1990,7 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
             all_approved,
             target,
             subject,
+            drop: _,
         } => {
             push(target.name());
             v.extend(ids.iter().map(i64::to_string));
@@ -2116,6 +2144,7 @@ mod tests {
                 all_approved: false,
                 target: publish::Target::Pr,
                 subject: None,
+                drop: None,
             }),
             ["pr", "4"]
         );

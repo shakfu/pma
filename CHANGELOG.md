@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `U` in the TUI and web pushes every approved, staged or committed run in the list. Publishing several runs was CLI-only, so M runs took 2M keys.
+
+- `pma push <id> --approve [--drop N,...]` approves a ready run and pushes it in one command, as `u` does.
+
 - **`pma merge <id>`** merges a run's open pull request; `M` does so in the TUI and web. A conflicting one is refused, and `pma merge <id> --fix` or `F` has an agent resolve the conflicts on the default branch. The run returns to review, so its diff is read before anything is pushed, and `pma pr` updates the same pull request. That push is forced only over the tip the fix read, so a commit pushed since is refused rather than lost. `stage`, `commit` and `push` refuse a fix, which would leave the pull request open and untracked, and the TUI and web do not offer them on one. Rejecting a fix returns the run to `pr-open` and charges no attempt, and retrying a failed one runs the fix again. Rebuilding on the branch was chosen over closing and redispatching, which charges an attempt and discards the pull request's discussion.
 
 - `Shift+Tab` moves to the previous list in the TUI and the web. The TUI ignored it; the web treated it as `Tab` and moved forward.
@@ -48,6 +52,10 @@ pma workflow run find-issues --tag nightly --unattended
 - `/` in the TUI's run list filters it by name; the web's list has a filter box, and the arrows move among what it keeps. The web's names and descriptions line up in columns.
 
 ### Changed
+
+- **`claude` runs with `--permission-mode auto`** instead of `acceptEdits`. Headless runs have no one to ask, so any command outside the verify allowlist was denied: 10 denials across 5 recorded runs, 2 of them the changelog draft pma's own prompt asks for. Auto over a wider allowlist because the denied commands were compound. Schema 44 rewrites that flag in every row running `claude`, and leaves another mode alone. A model without auto mode starts in Manual, where `-p` denies what needs approval.
+
+- `u` on a ready bundle shows the checklist `a` shows, then pushes. It used to refuse the bundle, so a push took `a`, then `u`.
 
 - `pma dispatch` with several items of one project starts one bundle, not one run per item; `--separate` restores one run each.
 

@@ -224,9 +224,10 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
             answer(ctx, |store| {
                 // As the TUI does: an act that cannot apply to the pick is
                 // refused before the question, not after the answer.
-                let confirm = keys::BINDINGS
-                    .iter()
-                    .any(|b| b.command == Command::Act(act) && b.ask == Ask::Confirm);
+                let confirm = keys::BINDINGS.iter().any(|b| {
+                    b.command == Command::Act(act)
+                        && matches!(b.ask, Ask::Confirm | Ask::CheckOrConfirm(_))
+                });
                 if confirm {
                     screen::action_in(
                         act,
@@ -243,9 +244,10 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
                 let chooses = keys::BINDINGS
                     .iter()
                     .any(|b| b.command == Command::Act(act) && matches!(b.ask, Ask::Choose(_)));
-                let checks = keys::BINDINGS
-                    .iter()
-                    .any(|b| b.command == Command::Act(act) && matches!(b.ask, Ask::Check(_)));
+                let checks = keys::BINDINGS.iter().any(|b| {
+                    b.command == Command::Act(act)
+                        && matches!(b.ask, Ask::Check(_) | Ask::CheckOrConfirm(_))
+                });
                 if checks {
                     out["items"] = api::checklist(store, act, &pick)?
                         .into_iter()
@@ -320,7 +322,7 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
 /// The rows an act over many reads, as the store has them now rather than as
 /// the page last drew them. Other acts read none.
 fn rows(store: &Store, tab: Tab, act: Act, body: &Value) -> Result<Vec<Item>> {
-    if act != Act::ApproveRuns {
+    if !matches!(act, Act::ApproveRuns | Act::PushApproved) {
         return Ok(Vec::new());
     }
     let project = body["project"].as_str().unwrap_or("");
@@ -425,6 +427,9 @@ fn keys_json() -> Value {
                 Ask::Text(label) => json!({ "kind": "text", "label": label }),
                 Ask::Choose(label) => json!({ "kind": "choose", "label": label }),
                 Ask::Check(label) => json!({ "kind": "check", "label": label }),
+                Ask::CheckOrConfirm(label) => {
+                    json!({ "kind": "check", "label": label, "confirm": true })
+                }
             };
             json!({
                 "key": b.key,

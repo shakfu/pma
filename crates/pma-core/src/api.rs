@@ -358,7 +358,8 @@ pub enum Action {
     RejectRun {
         id: i64,
         keep_git_changes: bool,
-        /// Closes the run and leaves the clone's files as they are.
+        /// `pma close`: the clone's files stay as they are, and the run is left
+        /// out of the accepted share.
         leave_files: bool,
         infra: bool,
         seen: Option<String>,
@@ -1580,7 +1581,15 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
             store.fail_interrupted_runs(&session)?;
             let mut run = store.run(id)?;
             unmoved(&run, seen.as_deref())?;
-            let files = dispatch::reject(store, &mut run, keep_git_changes, infra, leave_files)?;
+            // Closing judges neither the task nor the agent.
+            let judged_by_none = infra || leave_files;
+            let files = dispatch::reject(
+                store,
+                &mut run,
+                keep_git_changes,
+                judged_by_none,
+                leave_files,
+            )?;
             let plural = if files == 1 { "" } else { "s" };
             Outcome::said(match run.workspace {
                 Workspace::Clone if leave_files => {

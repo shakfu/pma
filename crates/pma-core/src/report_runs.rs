@@ -52,7 +52,7 @@ struct Tally {
     /// they have not landed, so they are in no share.
     applied: i64,
     open: i64,
-    /// Runs rejected for infrastructure, in no share.
+    /// Runs closed or rejected for infrastructure, in no share.
     infra: Vec<i64>,
     attempts: i64,
     cost: f64,
@@ -177,7 +177,7 @@ pub fn table_of(runs: &[Run], attempts: &[Attempt], by: By) -> Option<(String, V
     let infra = match total.infra.as_slice() {
         [] => String::new(),
         ids => format!(
-            "; rejected for infrastructure, in no share: {}",
+            "; closed or rejected for infrastructure, in no share: {}",
             ids.iter()
                 .map(|id| format!("#{id}"))
                 .collect::<Vec<_>>()
@@ -293,7 +293,7 @@ mod tests {
         let out = report(&runs, &[], By::Class);
         assert!(out.contains("50% of 2 decided runs accepted"), "{out}");
         assert!(
-            out.contains("rejected for infrastructure, in no share: #2\n"),
+            out.contains("closed or rejected for infrastructure, in no share: #2\n"),
             "{out}"
         );
     }

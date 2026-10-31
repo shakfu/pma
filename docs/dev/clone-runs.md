@@ -30,7 +30,7 @@ The agent edits the clone, from the working tree as it is. Nothing is staged, co
 
 - A revert that no longer applies, because the user edited the same lines since, is refused with the patch's path; the run stays as it was.
 
-- Each attempt records its change as `runs/<id>/ready.patch`. A reject reverses that record, never the tree as it stands, which holds whatever came later. Once `HEAD` leaves the base, a reject is refused, and `--no-revert` or `X` closes the run with its files as they are. The diff reads the record from then on; until then it stays live, so a reviewer's tweak is in what they read and publish. Found 2026-10-31: rejecting a run whose change had been committed by hand reversed every later commit and all uncommitted work in the tree.
+- Each attempt records its change as `runs/<id>/ready.patch`. A reject reverses that record, never the tree as it stands, which holds whatever came later. Once `HEAD` leaves the base, a reject is refused, and `pma close` or `X` ends the run with its files as they are. The diff reads the record from then on; until then it stays live, so a reviewer's tweak is in what they read and publish. Found 2026-10-31: rejecting a run whose change had been committed by hand reversed every later commit and all uncommitted work in the tree.
 
 ## Rejected
 

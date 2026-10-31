@@ -29,8 +29,8 @@ const GROUPS: [(&str, &[&str]); 6] = [
     (
         "The loop",
         &[
-            "next", "run", "scan", "matrix", "dispatch", "review", "stage", "commit", "push", "pr",
-            "merge",
+            "next", "run", "scan", "matrix", "dispatch", "review", "close", "stage", "commit",
+            "push", "pr", "merge",
         ],
     ),
     (
@@ -367,10 +367,6 @@ enum Command {
         /// restored.
         #[arg(long, requires = "reject")]
         keep_git_changes: bool,
-        /// With --reject, close the run and leave the clone's files as they
-        /// are: for a change that already landed, or a clone that moved on.
-        #[arg(long, requires = "reject")]
-        no_revert: bool,
         /// With --reject, the check or the machine failed, not the agent. The
         /// run is left out of the accepted share and uses no attempt.
         #[arg(long, requires = "reject")]
@@ -537,6 +533,16 @@ enum Command {
         /// numbers them.
         #[arg(long, value_delimiter = ',', requires = "approve")]
         drop: Vec<usize>,
+    },
+    /// End a run and leave your files as they are.
+    ///
+    /// For a change that already landed, or a clone that has moved on, where a
+    /// rejection would refuse. The run is left out of the accepted share and
+    /// uses no attempt. A worktree run's worktree is still removed.
+    Close {
+        /// Run ids, as `pma review` lists them.
+        #[arg(required = true)]
+        ids: Vec<i64>,
     },
     /// What agents run in: a `herdr` pane, or `none`
     ///
@@ -1114,7 +1120,6 @@ fn main() -> ExitCode {
             approve,
             reject,
             keep_git_changes,
-            no_revert,
             infra,
             rework,
             minutes,
@@ -1125,7 +1130,6 @@ fn main() -> ExitCode {
             approve,
             reject,
             keep_git_changes,
-            no_revert,
             infra,
             rework.as_deref(),
             minutes,
@@ -1167,6 +1171,7 @@ fn main() -> ExitCode {
             let approve = approve.then_some(drop);
             run_publish_approving(&ids, all_approved, publish::Target::Push, None, approve)
         }
+        Command::Close { ids } => run_close(&ids),
         Command::Integrate { name } => run_integrate(name.as_deref()),
         Command::PaneView => run_pane_view(),
         Command::PaneStop {
@@ -2864,7 +2869,6 @@ fn run_review(
     approve: bool,
     reject: bool,
     keep_git_changes: bool,
-    no_revert: bool,
     infra: bool,
     rework: Option<&str>,
     minutes: Option<u32>,
@@ -2913,7 +2917,7 @@ fn run_review(
             Action::RejectRun {
                 id,
                 keep_git_changes,
-                leave_files: no_revert,
+                leave_files: false,
                 infra,
                 seen: None,
             },
@@ -4172,6 +4176,23 @@ fn run_verify(projects: &[String], tags: &[String]) -> Result<()> {
 /// Publishes the named runs one way: `pma pr` or `pma push`. Every run is
 /// checked before any is published, so a list with one run that is not
 /// approved changes nothing. `all` takes every approved run instead.
+fn run_close(ids: &[i64]) -> Result<()> {
+    let store = Store::open_default()?;
+    for id in ids {
+        say(api::act(
+            &store,
+            Action::RejectRun {
+                id: *id,
+                keep_git_changes: false,
+                leave_files: true,
+                infra: false,
+                seen: None,
+            },
+        )?);
+    }
+    Ok(())
+}
+
 /// Sets or shows `integration`, and says whether a server answers.
 fn run_integrate(name: Option<&str>) -> Result<()> {
     let store = Store::open_default()?;

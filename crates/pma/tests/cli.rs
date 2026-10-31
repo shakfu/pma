@@ -1047,7 +1047,7 @@ fn an_infrastructure_rejection_uses_no_attempt_and_is_in_no_share() {
     let report = env.ok(&["report"]);
     assert!(report.starts_with("nothing decided yet"), "{report}");
     assert!(
-        report.contains("rejected for infrastructure, in no share: #1"),
+        report.contains("closed or rejected for infrastructure, in no share: #1"),
         "{report}"
     );
 
@@ -1452,7 +1452,7 @@ fn a_bundle_is_one_run_and_its_approver_says_what_it_closes() {
 }
 
 /// A clone that moved on holds later work beside the run's change, so a reject
-/// must not reverse the two together. `--no-revert` closes the run as it is,
+/// must not reverse the two together. `pma close` ends the run as it is,
 /// and the review keeps showing the run's own change.
 #[test]
 fn a_reject_never_takes_out_later_work() {
@@ -1481,10 +1481,16 @@ fn a_reject_never_takes_out_later_work() {
     assert!(kept());
     assert!(env.ok(&["review"]).contains("#1  ready"));
 
-    let out = env.ok(&["review", "1", "--reject", "--no-revert"]);
+    let out = env.ok(&["close", "1"]);
     assert!(out.contains("left as they are"), "{out}");
     assert!(kept());
     assert!(!env.ok(&["review"]).contains("#1"));
+    assert!(env.ok(&["review", "1"]).contains("closed; its files"));
+    // Neither accepted nor refused: no decided run to count.
+    let report = env.ok(&["report"]);
+    assert!(!report.contains("0% of 1"), "{report}");
+    let (_, err, success) = env.run(&["close", "1"]);
+    assert!(!success && err.contains("cannot be rejected"), "{err}");
     // The clone is free again.
     assert!(env.run(&["dispatch", "alpha:7"]).2);
 }
@@ -1526,7 +1532,7 @@ fn a_run_with_no_record_is_not_reverted() {
     let (_, err, success) = env.run(&["review", "1", "--reject"]);
     assert!(!success && err.contains("no record"), "{err}");
     assert!(alpha.join("hello.txt").exists());
-    env.ok(&["review", "1", "--reject", "--no-revert"]);
+    env.ok(&["close", "1"]);
     assert!(alpha.join("hello.txt").exists());
 }
 
@@ -4968,7 +4974,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","total
     let report = env.ok(&["report"]);
     assert!(report.starts_with("nothing decided yet"), "{report}");
     assert!(
-        report.contains("rejected for infrastructure, in no share: #"),
+        report.contains("closed or rejected for infrastructure, in no share: #"),
         "{report}"
     );
 }

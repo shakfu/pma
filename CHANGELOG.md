@@ -83,7 +83,7 @@ pma workflow run find-issues --tag nightly --unattended
 
 ### Fixed
 
-- **Rejecting a clone run could remove later work.** The revert was built from the working tree at the moment of rejecting, not from what the agent changed, so once the clone had moved on it reversed every later commit and all uncommitted work, and reported success. Each attempt now records its change, and a reject reverses only that. A clone past the run's base refuses; `pma review <id> --reject --no-revert`, or `X`, closes the run and leaves the files alone. A run from before this has no record and can only be closed that way.
+- **Rejecting a clone run could remove later work.** The revert was built from the working tree at the moment of rejecting, not from what the agent changed, so once the clone had moved on it reversed every later commit and all uncommitted work, and reported success. Each attempt now records its change, and a reject reverses only that. A clone past the run's base refuses; `pma close <id>`, or `X`, ends the run, leaves the files alone and stays out of the accepted share, over a flag on `--reject`: rejecting means taking the change out. A run from before this has no record and can only be closed that way.
 
 - An agent could still reach herdr, and through it type into panes that hold credentials: with `HERDR_SOCKET_PATH` removed, herdr falls back to its default socket. The variable now names a path that does not exist, which outranks the default.
 

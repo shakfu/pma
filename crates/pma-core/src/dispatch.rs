@@ -2192,8 +2192,7 @@ pub fn discard(store: &Store, run: &mut Run, keep: bool, leave_files: bool) -> R
         let files = patch_files(&record);
         if !leave_files {
             let close = format!(
-                "`pma review {} --reject --no-revert`, or `X`, closes the run and \
-                 leaves your files alone",
+                "`pma close {}`, or `X`, ends the run and leaves your files alone",
                 run.id
             );
             if clone_moved(run) {
@@ -2214,6 +2213,9 @@ pub fn discard(store: &Store, run: &mut Run, keep: bool, leave_files: bool) -> R
                 .into());
             }
             revert(run, Some(&record))?;
+        }
+        if leave_files {
+            run.outcome = Some("closed; its files were left as they are".into());
         }
         run.enter(RunState::Rejected);
         store.update_run_from(run, read)?;

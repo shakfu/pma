@@ -4,57 +4,27 @@
 
 ## High
 
-- [x] The web page opens blank, its footer stays on "Connecting", and its project list is empty Done 2026-10-27: `app.js` still named the tabs `next` and `status` from before the 2026-10-26 merge. The first draw threw on `TABS["next"]`, which stopped `start()` before it opened the event stream; `tab=status` got a 400. A test now holds that every tab `app.js` names is one the server parses.
-
-- [x] Enter in a web prompt cancelled it Done 2026-10-27: the form's default button was its first, Cancel. Found driving the page in headless Chromium.
-
-- [x] Keep the web view in the URL, so a reload keeps it Done 2026-10-27: `?tab=project&project=x&open=run:52`, each change a history entry. No React: the page has no build step by design. Not the fragment: the launch token is there.
-
-- [x] Say what a reject did: "Run #52 rejected; reverted 2 files." Done 2026-10-27, in the CLI and both front ends.
-
-- [x] A pull request's body holds the agent's summary, the verify result and the run number Done 2026-10-27. It was the commit message after its first blank line, empty when the message is one line.
-
-- [x] Show the commit message before committing, and let it be changed Done 2026-10-27: `m` prompts for the subject, prefilled with the task text; `pma commit --subject`. The trailers (`Closes #N`, `Co-Authored-By`) stay and are not shown. A multi-line editor would need a new `Ask` kind in both front ends.
-
-- [x] Refuse a queued action already queued or running Done 2026-10-27: the same command from the same directory is refused while one is queued or running, in one statement.
-
-- [x] One click opens a row's detail in the web Done 2026-10-27: a row with a detail opens on one click, since the detail carries its acts; other rows select.
-
-- [x] `z` in both front ends filters by name as well as moving with the arrows; the web aligns names and descriptions as the TUI does Done 2026-10-27: `/` filters in the TUI; a filter box in the web.
-
-- [x] Admin from the TUI and the web Done 2026-10-26: a settings tab (keys, roots, agents, presets, routes), project tier, tags, verify and sandbox from the project view, prune, campaign add and remove, rescan with dependencies or offline, deps refresh, scan history and route documents. Still CLI-only: `project export`, `import`, `forget` and `clone`, `route replay`, `lint --ids` (`docs/dev/frontends.md`).
-
-- [x] `pma report` counts `applied` runs as neither accepted nor landed 21 runs in state `applied` (`--local` workflow fixes on `xtgen` and `argdec`) are missing from the headline, which reads "25% of 8 decided runs accepted, 2 landed". Count `applied` as landed, or give it its own column, and name it in the headline. (REVIEW.md U2)
+- [ ] Add `pma integrate <name>`: pma should integration adapters to integrate
+    with [herdr](https://herdr.dev/tui/docs/cli-reference/) and also see
+    <https://herdr.dev/tui/docs/socket-api/>; and also with
+    [minos](https://github.com/shakfu/minos). Such integrations are mutually
+    exclusive.
 
 - [ ] Finish the pilot cohort and apply its gate #manual 1 of 20 items shipped since 2026-09-24 (`docs/dev/pilot.md`). Fix the `report` count above first, or the shares will mislead. (REVIEW.md U1)
 
-- [x] Rank untiered projects instead of leaving them out 77 of 80 projects are untiered, so `pma next` holds 12 of about 1,200 open items. Rank them at a default tier, below every tiered project. Optionally, propose tiers from idle days, CI and fork state. (REVIEW.md U3)
-
 - [ ] Decide whether pma is the dashboard or the dispatch loop #manual The evidence supports `scan`/`status`/`history`; most of the code serves dispatch and workflows. pma is for other developers, one per install, so the adoption items below are in scope; multi-user use comes later. (REVIEW.md, Questions)
-
-- [x] `pma lint --fix` for mechanical errors `nanosrv` has 46 errors, all "a list entry in this section must be a `- [ ]` item", and a broken file hides every item it holds. Rewrite `- text` to `- [ ] text` under a priority heading; keep the parser strict. (REVIEW.md U9)
 
 - [ ] npm or pnpm dependency signals, and a better Python verify fallback deps covers `cargo`, `uv` and `go` (`crates/pma-core/src/deps.rs:24-26`). Without `uv.lock`, verify detection picks `python3 -m pytest` (`crates/pma-core/src/agent.rs:263-268`), likely without the project's dependencies (unverified). The README's Requirements now state what is supported. (REVIEW.md U7)
 
 ## Medium
 
-- [x] Offer only the acts a run's state allows Done 2026-10-27: `screen::fits` reads the run's state, as `dispatch` and `publish` check it. A pushed or rejected run offers review time alone; it offered approve, reject and push, each refused only when tried.
-
 - [ ] Retest live updates in the web after the blank-page fix #manual The event stream existed but was never opened (see High). Many of the out-of-sync views reported on 2026-10-27 likely came from that. Retest before building more.
-
-- [x] Group a row's acts under one menu in the web toolbar Done 2026-10-27: primary and danger acts stay visible, the rest go under More; scan, sync and add note moved to the sidebar. A ready run's detail at 1100 px: Back, Approve, Reject, Push, More, on one 35 px row.
-
-- [x] Finished runs (rejected, pushed, merged) in the activity tab, with a filter by state Done 2026-10-27: newest 100, `b` cycles the state.
-
-- [x] Say where to go after staging Done 2026-10-27: staged and committed runs are notices naming the next step; the CLI prints the next command.
 
 - [ ] Show a hint of a workflow's state machine when it is selected in `z` The server would send a short form of the graph with each choice.
 
 - [ ] Project settings as one field per setting, not one typed line Fields need a new `Ask` kind in `keys`, built in both front ends. Cheaper: one row per setting in the project view, each edited alone, as the settings tab does.
 
 - [ ] Make the worktree option easier to find It exists: "edit in a worktree" in `z`, `--worktree`, and `pma config workspace worktree`. Colleagues asked to revisit the clone default; `docs/dev/clone-runs.md` holds why it was chosen. Ask which of its reasons fails for them before changing the default.
-
-- [x] Re-run a failed task as it was, from the failed run Done 2026-10-27: `pma review <id> --retry`, `R` in both front ends. A failed run held its task, so `retry` on the task pick did not reach it.
 
 - [ ] Undo the last rework: return to the previous attempt rather than rejecting the run Reject reverts every attempt. Attempts are append-only rows, but a clone run reverts one patch, so this needs each attempt's patch kept. Open: is the need "discard the latest rework, keep the earlier one approvable"?
 
@@ -72,23 +42,7 @@
 
 - [ ] Per-project session locks One agent command and one job run at a time across all projects (`docs/dev/async_dispatch.md`, open question 1), so a detached job on one project blocks a dispatch on another. Needs a shared `batch_budget` ledger. (REVIEW.md U8)
 
-- [x] A project whose name contains a dot can take `projects.<name>.verify` #agent
-
-- [x] `pma review 3 4 --approve --minutes 5` drops the minutes #agent
-
-- [x] `pma prune --apply` exits 0 when it skips a file for lint errors #agent
-
-- [x] `pma project export` writes a CSV that does not read back when a tag holds a comma or a project is named `#x` #agent
-
-- [x] One failed dependency tool is counted as zero outdated when another succeeds #agent
-
-- [x] A code fence indented 1-3 spaces does not hide its content from the TODO.md parser #agent
-
-- [x] `pma merge <id>` merges a run's pull request and settles it #agent Built in `58001cb`, with `--fix`. The guards are the next item.
-
 - [ ] `pma merge` refuses a pull request with failing checks or a moved head #agent `publish::merge` refuses only a conflict, so it merges a pull request with failing or pending checks, and commits pushed after review. Refuse failing or pending checks; allow none. Refuse a head that is not the commit pma pushed: record that commit at `pma pr`, which today records only the URL, and pass it to `gh pr merge --match-head-commit`. Tests in `tests/cli.rs` with the fake `gh` (`FAKE_GH_PR`): each refusal. Also from the original item and not built: several ids in one `pma merge`, and `--delete-branch`.
-
-- [x] **Render `gh:N` as a link**: the inbox, matrix and project rows and the run and task details link the issue to its page from the stored `owner/name`; `pma review` prints the number.
 
 - [ ] The process-group kill does not reach a child that calls `setsid` (`src/agent.rs:105-106`, `119`). `docs/dev/design.md:377` says no agent outlives the session. A survivor's writes to the worktree no longer reach an approval or a publish: an approval must match the tree last shown, and publishing starts from the approved tree. It still runs, reads what the user can, and writes outside the worktree. A cgroup or PID namespace would bound it; `sanduk` does. (REVIEW.md M10)
 
@@ -97,10 +51,6 @@
 - [ ] Calibrate bundles after 10 bundled runs #manual A bundle runs under one task's `agent_budget` ($1.00) and `timeout` (30 min), holds at most 8 items (`dispatch::BUNDLE_MAX`), and a failure uses an attempt of the bundle, not of each item. All four are defaults no run has tested (`docs/dev/bundled-dispatch.md`, "Defaulted, open"). For each bundled run record cost, time, items, items dropped at approval, and whether one item's failure failed the run. Then decide whether budget and timeout scale with item count. If most bundles end with items dropped, reconsider one commit per item, which the one-diff limit rules out today.
 
 ## Low
-
-- [x] The TUI footer names only the last transition of a batch #agent `App::noticed` keeps the last of what one `Watch::poll` returned. Three runs reaching review within a second name one. Queue them, or name the count.
-
-- [x] A CLI command that opens a task in full #agent `Query::Task` serves the TUI and the web only. `pma project show` lists tasks one line each. A `pma task <project:line>` would print what the detail shows.
 
 - [ ] Mark commands without a recorded pilot as experimental in `--help` and the README 34 top-level commands; routes and campaigns have no recorded runs. (REVIEW.md U11)
 

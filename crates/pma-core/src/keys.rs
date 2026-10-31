@@ -217,18 +217,12 @@ impl Act {
     ];
 
     /// Whether the act settles a run a reviewer has open, so the next one to
-    /// read can follow.
+    /// read can follow. Not stage or commit: those leave a next step on this
+    /// run, which their notice offers to open.
     pub fn decides(self) -> bool {
         matches!(
             self,
-            Act::ApproveRun
-                | Act::RejectRun
-                | Act::ReworkRun
-                | Act::RetryRun
-                | Act::Stage
-                | Act::Commit
-                | Act::Pr
-                | Act::Push
+            Act::ApproveRun | Act::RejectRun | Act::ReworkRun | Act::RetryRun | Act::Pr | Act::Push
         )
     }
 
@@ -885,6 +879,12 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn stage_and_commit_stay_on_their_run() {
+        assert!(Act::Push.decides() && Act::ApproveRun.decides());
+        assert!(!Act::Stage.decides() && !Act::Commit.decides());
     }
 
     #[test]

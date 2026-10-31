@@ -802,7 +802,8 @@ async function act(b) {
   // The detail's run or job has moved on; the tab shows where it went.
   S.detail = null;
   await Promise.all([load(), loadProjects()]);
-  if (decided !== null) {
+  // Not over a detail opened meanwhile, as from a notice.
+  if (decided !== null && !S.detail) {
     const next = panes().flatMap((p) => p.items).map((i) => i.pick)
       .find((p) => p.kind === "run" && p.state === "ready" && p.id !== decided);
     if (next) await openDetail(next);

@@ -10,7 +10,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - On the projects tab, Space marks projects and `z` runs one name over them. `pma run --tag` was the only way to run over several.
 
-- A decision from a run's detail opens the next ready run in the view, so reviewing M runs takes no navigation between them.
+- A decision from a run's detail opens the next ready run in the view, so reviewing M runs takes no navigation between them. Stage and commit stay on their run: it has a next step, and their notice offers to open it.
 
 - `pma report` measures review time: from a run's first reading to the decision on it, at most 30 minutes a reading. It stayed at 0 when `t` and `--minutes` were the only way in; a stated figure still wins, over adding the two, which would count one reading twice. A run staged and never approved is not timed.
 

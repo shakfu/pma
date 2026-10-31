@@ -110,6 +110,14 @@ pub enum Act {
     Dispatch,
     /// Dispatches, then approves and pushes each run whose gates are clean.
     DispatchPush,
+    /// Dispatches, for a person to drive the agent in a herdr pane.
+    DispatchInteractive,
+    /// Brings the run's herdr pane to the front.
+    OpenPane,
+    /// Opens an interactive agent on the run's directory, in herdr.
+    TakeOver,
+    /// Rejects a run and leaves the clone's files as they are.
+    ForgetRun,
     /// Resumes the selected instance.
     ResumeWorkflow,
     /// Starts an instance from a typed `<workflow> <target> [flags]`.
@@ -165,7 +173,7 @@ pub enum Act {
 }
 
 impl Act {
-    pub const ALL: [Act; 48] = [
+    pub const ALL: [Act; 52] = [
         Act::ApproveRun,
         Act::ApproveRuns,
         Act::RejectRun,
@@ -181,6 +189,9 @@ impl Act {
         Act::ScanProject,
         Act::Dispatch,
         Act::DispatchPush,
+        Act::DispatchInteractive,
+        Act::OpenPane,
+        Act::TakeOver,
         Act::ResumeWorkflow,
         Act::StartWorkflow,
         Act::ReworkRun,
@@ -214,6 +225,7 @@ impl Act {
         Act::Configure,
         Act::Prune,
         Act::Prompt,
+        Act::ForgetRun,
     ];
 
     /// Whether the act settles a run a reviewer has open, so the next one to
@@ -222,7 +234,13 @@ impl Act {
     pub fn decides(self) -> bool {
         matches!(
             self,
-            Act::ApproveRun | Act::RejectRun | Act::ReworkRun | Act::RetryRun | Act::Pr | Act::Push
+            Act::ApproveRun
+                | Act::RejectRun
+                | Act::ForgetRun
+                | Act::ReworkRun
+                | Act::RetryRun
+                | Act::Pr
+                | Act::Push
         )
     }
 
@@ -287,7 +305,7 @@ impl Act {
         match a {
             Action::ApproveRun { .. } => &[Act::ApproveRun],
             Action::ApproveRuns { .. } => &[Act::ApproveRuns],
-            Action::RejectRun { .. } => &[Act::RejectRun],
+            Action::RejectRun { .. } => &[Act::RejectRun, Act::ForgetRun],
             Action::AddReviewTime { .. } => &[Act::AddReviewTime],
             Action::SettlePrs => &[Act::SettlePrs],
             Action::MergePr { .. } => &[Act::Merge],
@@ -299,7 +317,14 @@ impl Act {
             Action::EditNote { .. } => &[Act::EditNote],
             Action::RemoveNote { .. } => &[Act::RemoveNote],
             Action::Scan { .. } => &[Act::Scan, Act::ScanProject],
-            Action::Dispatch { .. } => &[Act::Dispatch, Act::DispatchPush, Act::Prompt],
+            Action::Dispatch { .. } => &[
+                Act::Dispatch,
+                Act::DispatchPush,
+                Act::DispatchInteractive,
+                Act::Prompt,
+            ],
+            Action::FocusPane { .. } => &[Act::OpenPane],
+            Action::TakeOver { .. } => &[Act::TakeOver],
             Action::WorkflowRun { .. } => &[Act::ResumeWorkflow, Act::StartWorkflow],
             Action::ReworkRun { .. } => &[Act::ReworkRun],
             Action::RetryRun { .. } => &[Act::RetryRun],
@@ -550,6 +575,13 @@ pub const BINDINGS: &[Binding] = &[
         "dispatch and push",
     ),
     on("v", TASKS, Act::Verify, Ask::Nothing, "verify project"),
+    on(
+        "I",
+        TASKS,
+        Act::DispatchInteractive,
+        Ask::Confirm,
+        "dispatch to drive in herdr",
+    ),
     // A run.
     on(
         "a",
@@ -589,6 +621,15 @@ pub const BINDINGS: &[Binding] = &[
     on("y", RUNS, Act::SettlePrs, Ask::Nothing, "check PRs"),
     on("M", RUNS, Act::Merge, Ask::Confirm, "merge PR"),
     on("F", RUNS, Act::FixConflicts, Ask::Confirm, "fix conflicts"),
+    on("H", RUNS, Act::OpenPane, Ask::Nothing, "open in herdr"),
+    on("T", RUNS, Act::TakeOver, Ask::Confirm, "take over in herdr"),
+    on(
+        "X",
+        RUNS,
+        Act::ForgetRun,
+        Ask::Confirm,
+        "close, leave files",
+    ),
     // A job. `a` and `s` are a run's keys too: a key means one thing for
     // the row it is pressed on, and `lookup` tells them apart by the row.
     on("a", JOBS, Act::ApproveJob, Ask::Nothing, "approve plan"),

@@ -41,7 +41,10 @@ const GROUPS: [(&str, &[&str]); 6] = [
         "Reading",
         &["status", "history", "report", "tui", "web", "watch"],
     ),
-    ("Setup", &["root", "project", "config", "verify"]),
+    (
+        "Setup",
+        &["root", "project", "config", "verify", "integrate"],
+    ),
     ("Agents", &["agent", "preset", "route"]),
     ("Many at once", &["campaign", "workflow", "job"]),
 ];
@@ -332,6 +335,10 @@ enum Command {
         /// rest wait in `pma review`.
         #[arg(long, conflicts_with = "local")]
         push: bool,
+        /// Run `claude` for you to drive in a herdr pane, not headless. It
+        /// needs `pma integrate herdr`, and reports no cost or summary.
+        #[arg(long, conflicts_with = "push")]
+        interactive: bool,
         /// One run per task named. Without it, the TODO.md items named in one
         /// project are one run, a bundle, reviewed and published together.
         #[arg(long, conflicts_with = "auto")]
@@ -360,6 +367,10 @@ enum Command {
         /// restored.
         #[arg(long, requires = "reject")]
         keep_git_changes: bool,
+        /// With --reject, close the run and leave the clone's files as they
+        /// are: for a change that already landed, or a clone that moved on.
+        #[arg(long, requires = "reject")]
+        no_revert: bool,
         /// With --reject, the check or the machine failed, not the agent. The
         /// run is left out of the accepted share and uses no attempt.
         #[arg(long, requires = "reject")]
@@ -526,6 +537,25 @@ enum Command {
         /// numbers them.
         #[arg(long, value_delimiter = ',', requires = "approve")]
         drop: Vec<usize>,
+    },
+    /// What agents run in: a `herdr` pane, or `none`
+    ///
+    /// Bare, it says which is on. One at a time. Under `herdr`, each run gets a
+    /// tab in a `pma: <project>` workspace; with no server, a run goes on
+    /// without a pane and warns.
+    Integrate {
+        /// `herdr` or `none`.
+        name: Option<String>,
+    },
+    /// Renders a headless agent's output, in the pane it runs in.
+    #[command(hide = true)]
+    PaneView,
+    /// Closes a pane if the `pma` that opened it dies.
+    #[command(hide = true)]
+    PaneStop {
+        owner: u32,
+        status: PathBuf,
+        pane: String,
     },
     /// Dependency locks.
     Deps {
@@ -1053,6 +1083,7 @@ fn main() -> ExitCode {
             local,
             worktree,
             push,
+            interactive,
             separate,
             prompt,
             detach: false,
@@ -1065,6 +1096,7 @@ fn main() -> ExitCode {
                 retry,
                 DispatchFlags {
                     separate,
+                    interactive,
                     ..dispatch_flags(local, worktree, push)
                 },
                 &over,
@@ -1082,6 +1114,7 @@ fn main() -> ExitCode {
             approve,
             reject,
             keep_git_changes,
+            no_revert,
             infra,
             rework,
             minutes,
@@ -1092,6 +1125,7 @@ fn main() -> ExitCode {
             approve,
             reject,
             keep_git_changes,
+            no_revert,
             infra,
             rework.as_deref(),
             minutes,
@@ -1132,6 +1166,16 @@ fn main() -> ExitCode {
         } => {
             let approve = approve.then_some(drop);
             run_publish_approving(&ids, all_approved, publish::Target::Push, None, approve)
+        }
+        Command::Integrate { name } => run_integrate(name.as_deref()),
+        Command::PaneView => run_pane_view(),
+        Command::PaneStop {
+            owner,
+            status,
+            pane,
+        } => {
+            pma_core::herdr::guard_until(owner, &status, &pane);
+            Ok(())
         }
         Command::Verify { projects, tags } => run_verify(&projects, &tags),
         Command::Sync {
@@ -2108,6 +2152,8 @@ pub struct DispatchFlags {
     pub push: bool,
     /// One run per task, not one bundle per project.
     pub separate: bool,
+    /// A person drives each agent in a herdr pane.
+    pub interactive: bool,
 }
 
 pub fn dispatch_flags(local: bool, worktree: bool, push: bool) -> DispatchFlags {
@@ -2116,6 +2162,7 @@ pub fn dispatch_flags(local: bool, worktree: bool, push: bool) -> DispatchFlags 
         worktree,
         push,
         separate: false,
+        interactive: false,
     }
 }
 
@@ -2217,6 +2264,7 @@ pub fn run_dispatch(
                 details: None,
                 quadrant: Some(format!("{:?}", x.quadrant)),
                 local: false,
+                interactive: false,
                 workspace: config::Workspace::Worktree,
                 items: Vec::new(),
             });
@@ -2269,6 +2317,7 @@ pub fn run_dispatch(
             details: Some(format!("{text}\n")),
             quadrant: None,
             local: false,
+            interactive: false,
             workspace: config::Workspace::Worktree,
             items: Vec::new(),
         });
@@ -2400,6 +2449,7 @@ pub fn run_dispatch(
                     text,
                     gh,
                     local: false,
+                    interactive: false,
                     workspace: config::Workspace::Worktree,
                     items: Vec::new(),
                 });
@@ -2457,6 +2507,7 @@ pub fn run_dispatch(
     };
     for pick in &mut picks {
         pick.local = flags.local;
+        pick.interactive = flags.interactive;
         pick.workspace = workspace;
     }
     let finished = run_picks(&store, &home, &p.cfg, over, &picks, wanted, retry)?;
@@ -2813,6 +2864,7 @@ fn run_review(
     approve: bool,
     reject: bool,
     keep_git_changes: bool,
+    no_revert: bool,
     infra: bool,
     rework: Option<&str>,
     minutes: Option<u32>,
@@ -2861,6 +2913,7 @@ fn run_review(
             Action::RejectRun {
                 id,
                 keep_git_changes,
+                leave_files: no_revert,
                 infra,
                 seen: None,
             },
@@ -2917,6 +2970,7 @@ fn retry_run(id: i64) -> Result<()> {
             Action::RejectRun {
                 id,
                 keep_git_changes: false,
+                leave_files: false,
                 infra: false,
                 seen: Some(RunState::Failed.name().to_string()),
             },
@@ -2968,6 +3022,7 @@ fn retry_run(id: i64) -> Result<()> {
         Action::RejectRun {
             id,
             keep_git_changes: false,
+            leave_files: false,
             infra: false,
             seen: Some(RunState::Failed.name().to_string()),
         },
@@ -3101,6 +3156,7 @@ fn run_campaign(name: &str, count: Option<usize>) -> Result<()> {
                 .then(|| format!("{}\n", campaign.description.trim_end())),
             quadrant: None,
             local: false,
+            interactive: false,
             workspace: cfg.workspace,
             items: Vec::new(),
         });
@@ -4116,6 +4172,43 @@ fn run_verify(projects: &[String], tags: &[String]) -> Result<()> {
 /// Publishes the named runs one way: `pma pr` or `pma push`. Every run is
 /// checked before any is published, so a list with one run that is not
 /// approved changes nothing. `all` takes every approved run instead.
+/// Sets or shows `integration`, and says whether a server answers.
+fn run_integrate(name: Option<&str>) -> Result<()> {
+    let store = Store::open_default()?;
+    if let Some(name) = name {
+        if config::Integration::parse(name).is_none() {
+            return Err(format!("unknown integration `{name}`; expected herdr or none").into());
+        }
+        api::act(
+            &store,
+            Action::SetConfig {
+                key: "integration".into(),
+                value: name.into(),
+            },
+        )?;
+    }
+    let cfg = api::config(&store)?;
+    println!("integration = {}", cfg.integration.name());
+    if cfg.integration == config::Integration::Herdr {
+        match pma_core::herdr::check() {
+            Ok(()) => println!("herdr answers; each run opens a tab in `pma: <project>`"),
+            Err(e) => println!("herdr: {e}; runs go on without a pane until it answers"),
+        }
+    }
+    Ok(())
+}
+
+/// Reads an agent's output on stdin and prints what a person would read.
+fn run_pane_view() -> Result<()> {
+    for line in std::io::stdin().lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        if let Some(text) = pma_core::herdr::view_line(&line) {
+            println!("{text}");
+        }
+    }
+    Ok(())
+}
+
 fn run_publish(
     ids: &[i64],
     all: bool,
@@ -4806,6 +4899,7 @@ mod tests {
             details: None,
             quadrant: None,
             local: false,
+            interactive: false,
             workspace: config::Workspace::Clone,
             items: Vec::new(),
         }
@@ -4885,6 +4979,7 @@ mod tests {
                 worker: worker.clone(),
                 prompt: None,
                 push: false,
+                interactive: false,
             },
             Action::Dispatch {
                 targets: vec!["a:3".into()],
@@ -4895,6 +4990,7 @@ mod tests {
                 worker: worker.clone(),
                 prompt: None,
                 push: false,
+                interactive: false,
             },
             Action::Dispatch {
                 targets: vec!["a".into()],
@@ -4905,6 +5001,7 @@ mod tests {
                 worker: worker.clone(),
                 prompt: Some("-audit the error paths\nand fix them".into()),
                 push: false,
+                interactive: false,
             },
             Action::WorkflowRun {
                 name: "w".into(),

@@ -97,7 +97,7 @@ function lookup(key) {
   const fit = S.keys.bindings.filter((b) => b.key === key);
   const onTab = fit.filter((b) => b.tabs.includes(S.tab));
   const cands = onTab.length ? onTab : fit.filter((b) => b.tabs.length === 0);
-  const fits = S.marks.length && !S.detail ? currentActs().concat("Dispatch", "DispatchPush") : currentActs();
+  const fits = S.marks.length && !S.detail ? currentActs().concat(MARK_ACTS) : currentActs();
   return cands.find((b) => b.command.kind === "act" && fits.includes(b.command.act))
     || cands.find((b) => b.command.kind !== "act")
     || cands[0];
@@ -154,6 +154,7 @@ function currentPick() {
 
 const sameTask = (a, b) => (a.kind === "task" && b.kind === "task" && a.target === b.target)
   || (a.kind === "manual" && b.kind === "manual" && a.project === b.project);
+const MARK_ACTS = ["Dispatch", "DispatchPush", "DispatchInteractive"];
 const markable = (pick) => pick.kind === "task" || (pick.kind === "manual" && S.tab === "projects");
 const isMarked = (pick) => S.marks.some((m) => sameTask(m, pick));
 
@@ -457,7 +458,7 @@ function draw() {
   // With tasks marked, dispatch is theirs, above.
   const sel = selected();
   if (sel) {
-    const fit = sel.item.acts.filter((a) => !(S.marks.length && (a === "Dispatch" || a === "DispatchPush")));
+    const fit = sel.item.acts.filter((a) => !(S.marks.length && MARK_ACTS.includes(a)));
     const own = acts(true).filter((b) => fit.includes(b.command.act));
     const proj = onTab().find((b) => b.command.kind === "OpenProject");
     const open = onTab().find((b) => b.command.kind === "Open");
@@ -753,7 +754,7 @@ function shortcuts() {
 
 async function act(b) {
   const name = b.command.act;
-  const overMarks = name === "Dispatch" || name === "DispatchPush" || (name === "Run" && S.tab === "projects");
+  const overMarks = MARK_ACTS.includes(name) || (name === "Run" && S.tab === "projects");
   const marked = overMarks && S.marks.length > 0 && !S.detail;
   // A decision from a run's detail: the next ready run follows it.
   let decided = S.detail && b.command.decides ? S.detail.pick.id : null;

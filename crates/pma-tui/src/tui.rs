@@ -717,8 +717,10 @@ impl App {
             }
             Command::Act(act) => {
                 let (mut pick, pane) = self.pick();
-                let over_marks = matches!(act, Act::Dispatch | Act::DispatchPush)
-                    || (act == Act::Run && self.tab == Tab::Projects);
+                let over_marks = matches!(
+                    act,
+                    Act::Dispatch | Act::DispatchPush | Act::DispatchInteractive
+                ) || (act == Act::Run && self.tab == Tab::Projects);
                 if over_marks && !self.marks.is_empty() {
                     pick = screen::marked(&self.marks);
                 }

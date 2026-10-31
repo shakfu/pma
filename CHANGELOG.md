@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`pma integrate herdr`** runs every agent in a herdr pane: a tab per run in a `pma: <project>` workspace, closed when the run is decided. Headless by default, which keeps cost, budget and verdict; `I` or `--interactive` gives a live `claude` that reports none of them. `H` opens a run's pane and `T` opens an interactive agent on its directory. A single `integration` setting, since integrations exclude each other. Over the socket API, with an `events.subscribe` connection per run: a blocked agent shows on the run and raises a toast, and closing a pane ends its run at once. Design: `docs/dev/herdr-integration.md`.
+
 - `D` in the TUI and web dispatches a task and pushes the run if its gates are clean, as `pma dispatch --push` does.
 
 - On the projects tab, Space marks projects and `z` runs one name over them. `pma run --tag` was the only way to run over several.
@@ -80,6 +82,10 @@ pma workflow run find-issues --tag nightly --unattended
 - The TUI footer queues transitions: three runs reaching review within a second name the first with "2 more", and each Enter opens the next. Before, only the last was named.
 
 ### Fixed
+
+- **Rejecting a clone run could remove later work.** The revert was built from the working tree at the moment of rejecting, not from what the agent changed, so once the clone had moved on it reversed every later commit and all uncommitted work, and reported success. Each attempt now records its change, and a reject reverses only that. A clone past the run's base refuses; `pma review <id> --reject --no-revert`, or `X`, closes the run and leaves the files alone. A run from before this has no record and can only be closed that way.
+
+- An agent could still reach herdr, and through it type into panes that hold credentials: with `HERDR_SOCKET_PATH` removed, herdr falls back to its default socket. The variable now names a path that does not exist, which outranks the default.
 
 - `pma prune --apply` exits 1 when it skips a file for lint errors. It printed a message and exited 0, so a script read the file as pruned. The dry run still exits 0, because it changes nothing.
 

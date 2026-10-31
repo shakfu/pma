@@ -41,6 +41,8 @@ pub struct Pick {
     /// Start from the clone's `HEAD` rather than the fetched default branch.
     /// A local run never reaches the remote.
     pub local: bool,
+    /// A person drives the agent in a herdr pane.
+    pub interactive: bool,
     /// Where the agent edits. `Clone` ignores `local`: a clone run always
     /// starts from the working tree, and waits there for review.
     pub workspace: Workspace,
@@ -1097,6 +1099,9 @@ fn queue(
         start,
         denied: Vec::new(),
         review_measured: None,
+        pane: None,
+        interactive: pick.interactive,
+        agent_state: None,
         items: pick.items.clone(),
     };
     run.prompt = prompt(&run, &details, verify.as_deref());
@@ -1470,7 +1475,51 @@ fn attempt_price(cfg: &Config, run: &Run) -> f64 {
 /// attempt's own values; the caller appends it, because the worker threads
 /// have no store.
 #[must_use]
+/// One attempt, then, for a clone run, a record of what it changed: the working
+/// tree is the developer's from here on, so nothing later can say which edits
+/// were the agent's.
 fn attempt(
+    home: &Path,
+    cfg: &Config,
+    workers: &[Worker],
+    run: &mut Run,
+    feedback: Option<&str>,
+) -> Attempt {
+    let a = attempt_once(home, cfg, workers, run, feedback);
+    if run.workspace == Workspace::Clone
+        && let Err(e) = record_change(home, run)
+    {
+        eprintln!("warning: #{}: its change was not recorded: {e}", run.id);
+    }
+    a
+}
+
+/// Where a clone run's change is kept, as a patch: a file rather than a commit,
+/// which `git gc` would in time remove.
+fn change_record(home: &Path, run: &Run) -> PathBuf {
+    home.join("runs")
+        .join(run.id.to_string())
+        .join("ready.patch")
+}
+
+fn record_change(home: &Path, run: &Run) -> Result<()> {
+    let record = change_record(home, run);
+    let _ = std::fs::remove_file(&record);
+    let tree = working_tree_commit(&run.repo)?;
+    let patch = crate::publish::write_patch(home, run, &tree)?;
+    // A copy: `change.patch` is what a publish or a reject last wrote, and stays.
+    std::fs::copy(&patch, &record).map_err(|e| format!("{}: {e}", record.display()))?;
+    Ok(())
+}
+
+/// Whether a clone run's `HEAD` has left its base: the working tree then holds
+/// later commits as well as the run's change.
+fn clone_moved(run: &Run) -> bool {
+    run.workspace == Workspace::Clone
+        && git(&run.repo, &["rev-parse", "HEAD"]).is_ok_and(|head| head != run.base)
+}
+
+fn attempt_once(
     home: &Path,
     cfg: &Config,
     workers: &[Worker],
@@ -1538,17 +1587,52 @@ fn attempt(
     a.started_at = crate::dates::now();
     run.error = None;
     let log = logs.join(format!("agent-{n}.log"));
-    let finished = match agent::run_limited(cmd, None, &log, timeout) {
+    let title = format!("#{} {}", run.id, run.text);
+    let id = run.id;
+    let hosted = crate::herdr::host(
+        cfg,
+        crate::herdr::Host {
+            project: &run.project,
+            title: &title,
+            interactive: run.interactive,
+            close_after: false,
+        },
+        cmd,
+        &log,
+        timeout,
+        // On a worker thread, with no store. At once rather than at the end,
+        // so a running agent's pane can be opened.
+        |pane| {
+            if let Err(e) = Store::open_default().and_then(|s| s.set_pane(id, pane)) {
+                eprintln!("warning: #{id}: {e}");
+            }
+        },
+        move |state| {
+            if let Err(e) = Store::open_default().and_then(|s| s.set_agent_state(id, state)) {
+                eprintln!("warning: #{id}: {e}");
+            }
+        },
+    );
+    let finished = match hosted {
         Ok(f) => f,
         Err(e) => {
             fail(run, &mut a, format!("{}: {e}", worker.command));
             return a;
         }
     };
-    let report = worker.parse.report(
-        &agent::read_log(&log).unwrap_or_default(),
-        finished.success == Some(true),
-    );
+    // A person drove it in a terminal, so there is no event stream to read.
+    let report = match run.interactive {
+        true => agent::Report {
+            ok: finished.success == Some(true),
+            summary: "interactive session in herdr; it reports no summary or cost".into(),
+            cost_usd: None,
+            denied: Vec::new(),
+        },
+        false => worker.parse.report(
+            &agent::read_log(&log).unwrap_or_default(),
+            finished.success == Some(true),
+        ),
+    };
     a.seconds = Some(finished.seconds);
     run.seconds = Some(run.seconds.unwrap_or(0) + finished.seconds);
     // An agent that reports no cost leaves both null. Zero would read as free.
@@ -1916,6 +2000,22 @@ fn changed_paths(run: &Run) -> Result<Vec<String>> {
 /// `git diff` of the run's change: the worktree against the base, or a
 /// clone's working tree against `start`.
 pub fn diff(run: &Run) -> Result<String> {
+    // Not `start` against the tree: that would show every later commit as the
+    // run's. While `HEAD` holds, the live tree stays right: a reviewer's tweak
+    // belongs in what they read and publish.
+    if clone_moved(run)
+        && matches!(
+            run.state,
+            RunState::Ready | RunState::Approved | RunState::Failed
+        )
+    {
+        let record = change_record(&crate::store::state_home()?, run);
+        return Ok(std::fs::read_to_string(record).unwrap_or_else(|_| {
+            "(none recorded: the clone has moved since this run, so its change \
+             can no longer be told from later work)"
+                .to_string()
+        }));
+    }
     let to = to(run)?;
     if to.is_none() && !run.worktree.is_dir() {
         return Err(format!(
@@ -1955,7 +2055,11 @@ pub fn tree(run: &Run) -> Result<String> {
 /// lunch is not half a day of review.
 const REVIEW_CAP_SECONDS: i64 = 30 * 60;
 
+/// A decision ends what its pane was kept open for.
 fn settle_review(store: &Store, run: &Run) -> Result<()> {
+    if let Some(pane) = &run.pane {
+        crate::herdr::close(pane);
+    }
     store.settle_review(run.id, crate::dates::now(), REVIEW_CAP_SECONDS)
 }
 
@@ -2008,9 +2112,18 @@ pub fn approve(store: &Store, run: &mut Run, by: &str) -> Result<()> {
 /// Without it, such a run is rejected only once the clone matches its
 /// snapshot again, so rejecting does not quietly lift what `clone_unchanged`
 /// holds. Returns how many files the run's change held.
-pub fn reject(store: &Store, run: &mut Run, keep: bool, infra: bool) -> Result<usize> {
+///
+/// `leave_files` closes the run and touches nothing: for a change that has
+/// already landed, or a clone that has moved on.
+pub fn reject(
+    store: &Store,
+    run: &mut Run,
+    keep: bool,
+    infra: bool,
+    leave_files: bool,
+) -> Result<usize> {
     let fix = run.fixing_pr().is_some();
-    let files = discard(store, run, keep)?;
+    let files = discard(store, run, keep, leave_files)?;
     settle_review(store, run)?;
     // Only the fix was refused. The pull request still holds the task.
     if fix {
@@ -2038,7 +2151,7 @@ pub fn reject(store: &Store, run: &mut Run, keep: bool, infra: bool) -> Result<u
 /// `reject` does before a reviewer's judgement is counted. A local edit that
 /// failed verify was counted by verify; one that did not apply was judged by
 /// no one. Returns how many files the change held.
-pub fn discard(store: &Store, run: &mut Run, keep: bool) -> Result<usize> {
+pub fn discard(store: &Store, run: &mut Run, keep: bool, leave_files: bool) -> Result<usize> {
     let read = run.state;
     if run.state == RunState::PrOpen {
         return Err(format!(
@@ -2072,15 +2185,43 @@ pub fn discard(store: &Store, run: &mut Run, keep: bool) -> Result<usize> {
         )
         .into());
     }
-    // The patch stays in the run's log directory either way.
-    let patch = keep_patch(run);
-    let files = patch.as_deref().map_or(0, patch_files);
     if run.workspace == Workspace::Clone {
-        revert(run, patch.as_deref())?;
+        // Only the recorded change. A patch of the tree as it is now would hold
+        // later work too, and reversing it would remove that without a word.
+        let record = change_record(&crate::store::state_home()?, run);
+        let files = patch_files(&record);
+        if !leave_files {
+            let close = format!(
+                "`pma review {} --reject --no-revert`, or `X`, closes the run and \
+                 leaves your files alone",
+                run.id
+            );
+            if clone_moved(run) {
+                return Err(format!(
+                    "{} has moved past run #{}'s base, so taking its change out could \
+                     remove later work. {close}",
+                    run.repo.display(),
+                    run.id
+                )
+                .into());
+            }
+            if !record.exists() {
+                return Err(format!(
+                    "run #{} has no record of its change, so it cannot be told from \
+                     your own edits. Take it out yourself if you want it gone. {close}",
+                    run.id
+                )
+                .into());
+            }
+            revert(run, Some(&record))?;
+        }
         run.enter(RunState::Rejected);
         store.update_run_from(run, read)?;
         return Ok(files);
     }
+    // The patch stays in the run's log directory either way.
+    let patch = keep_patch(run);
+    let files = patch.as_deref().map_or(0, patch_files);
     // Written first, and only over the state that was read: a run another
     // front end approved meanwhile is refused with its worktree intact.
     if run.fixing_pr().is_some() {
@@ -2452,6 +2593,9 @@ mod tests {
             start: None,
             denied: Vec::new(),
             review_measured: None,
+            pane: None,
+            interactive: false,
+            agent_state: None,
             items: Vec::new(),
         };
         let p = prompt(&run, "for all classes\n", Some("make test"));

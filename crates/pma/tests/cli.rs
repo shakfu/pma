@@ -1451,6 +1451,326 @@ fn a_bundle_is_one_run_and_its_approver_says_what_it_closes() {
     assert_eq!(git_out(&origin, &["show", "main:third.txt"]), "three\n");
 }
 
+/// A clone that moved on holds later work beside the run's change, so a reject
+/// must not reverse the two together. `--no-revert` closes the run as it is,
+/// and the review keeps showing the run's own change.
+#[test]
+fn a_reject_never_takes_out_later_work() {
+    let s = Scratch::new("rejectmoved");
+    let (env, _, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    env.ok(&["config", "workspace", "clone"]);
+    env.ok(&["dispatch", "alpha:5"]);
+    git(&alpha, &["add", "hello.txt"], None);
+    git(&alpha, &["commit", "-qm", "by hand"], None);
+    fs::write(alpha.join("later.txt"), "later\n").unwrap();
+    git(&alpha, &["add", "later.txt"], None);
+    git(&alpha, &["commit", "-qm", "later work"], None);
+    fs::write(alpha.join("uncommitted.txt"), "mine\n").unwrap();
+
+    let detail = env.ok(&["review", "1"]);
+    assert!(detail.contains("hello.txt"), "{detail}");
+    assert!(!detail.contains("uncommitted.txt"), "{detail}");
+
+    let (_, err, success) = env.run(&["review", "1", "--reject"]);
+    assert!(!success && err.contains("has moved past"), "{err}");
+    let kept = || {
+        ["hello.txt", "later.txt", "uncommitted.txt"]
+            .iter()
+            .all(|f| alpha.join(f).exists())
+    };
+    assert!(kept());
+    assert!(env.ok(&["review"]).contains("#1  ready"));
+
+    let out = env.ok(&["review", "1", "--reject", "--no-revert"]);
+    assert!(out.contains("left as they are"), "{out}");
+    assert!(kept());
+    assert!(!env.ok(&["review"]).contains("#1"));
+    // The clone is free again.
+    assert!(env.run(&["dispatch", "alpha:7"]).2);
+}
+
+/// With `HEAD` in place, a reject takes out the run's change alone: an edit
+/// made since, in another file, stays. One in the same file refuses the revert.
+#[test]
+fn a_reject_takes_out_only_the_runs_change() {
+    let s = Scratch::new("rejectown");
+    let (env, _, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    env.ok(&["config", "workspace", "clone"]);
+    env.ok(&["dispatch", "alpha:5"]);
+    fs::write(alpha.join("mine.txt"), "mine\n").unwrap();
+    fs::write(alpha.join("hello.txt"), "edited since\n").unwrap();
+    let (_, err, success) = env.run(&["review", "1", "--reject"]);
+    assert!(
+        !success && err.contains("no longer reverts cleanly"),
+        "{err}"
+    );
+    assert!(alpha.join("mine.txt").exists());
+
+    fs::write(alpha.join("hello.txt"), "hi\n").unwrap();
+    env.ok(&["review", "1", "--reject"]);
+    assert!(!alpha.join("hello.txt").exists());
+    assert_eq!(
+        fs::read_to_string(alpha.join("mine.txt")).unwrap(),
+        "mine\n"
+    );
+}
+
+/// A run from before the record has nothing safe to reverse.
+#[test]
+fn a_run_with_no_record_is_not_reverted() {
+    let s = Scratch::new("rejectold");
+    let (env, _, alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    env.ok(&["config", "workspace", "clone"]);
+    env.ok(&["dispatch", "alpha:5"]);
+    fs::remove_file(env.home.join("state/runs/1/ready.patch")).unwrap();
+    let (_, err, success) = env.run(&["review", "1", "--reject"]);
+    assert!(!success && err.contains("no record"), "{err}");
+    assert!(alpha.join("hello.txt").exists());
+    env.ok(&["review", "1", "--reject", "--no-revert"]);
+    assert!(alpha.join("hello.txt").exists());
+}
+
+/// A herdr server on a socket, speaking the protocol as 0.9.5 does: one
+/// request per connection, and subscriptions that stay open. Each line typed
+/// into a pane runs as a background process.
+struct FakeHerdr {
+    socket: PathBuf,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    subscribers: std::sync::Arc<std::sync::Mutex<Vec<std::os::unix::net::UnixStream>>>,
+}
+
+impl FakeHerdr {
+    fn start(name: &str) -> FakeHerdr {
+        use std::io::{BufRead, BufReader, Write};
+        // Under /tmp: a socket's path is limited to about 100 bytes.
+        let socket = PathBuf::from(format!("/tmp/pma-{name}-{}.sock", std::process::id()));
+        let _ = fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscribers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (c, subs) = (calls.clone(), subscribers.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut line = String::new();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                c.lock().unwrap().push(request.clone());
+                let result = match request["method"].as_str().unwrap() {
+                    "workspace.list" => serde_json::json!({"workspaces": []}),
+                    "workspace.create" => serde_json::json!({"workspace": {"workspace_id": "w1"}}),
+                    "tab.create" => serde_json::json!({"root_pane": {"pane_id": "w1:p2"}}),
+                    "events.subscribe" => {
+                        subs.lock().unwrap().push(stream.try_clone().unwrap());
+                        serde_json::json!({"type": "subscription_started"})
+                    }
+                    "pane.send_input" => {
+                        let text = request["params"]["text"].as_str().unwrap();
+                        let mut pane = command("sh")
+                            .args(["-c", text])
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                            .unwrap();
+                        std::thread::spawn(move || pane.wait());
+                        serde_json::json!({"type": "ok"})
+                    }
+                    _ => serde_json::json!({"type": "ok"}),
+                };
+                let mut out = stream;
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    serde_json::json!({"id": "pma", "result": result})
+                );
+            }
+        });
+        FakeHerdr {
+            socket,
+            calls,
+            subscribers,
+        }
+    }
+
+    fn pma(&self, env: &Env, args: &[&str]) -> (String, String, bool) {
+        let out = env
+            .command(args)
+            .env("HERDR_SOCKET_PATH", &self.socket)
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.success(),
+        )
+    }
+
+    fn called(&self, method: &str) -> Vec<serde_json::Value> {
+        let calls = self.calls.lock().unwrap();
+        calls
+            .iter()
+            .filter(|r| r["method"] == method)
+            .map(|r| r["params"].clone())
+            .collect()
+    }
+
+    /// Sends an event to every subscriber, once one has subscribed.
+    fn emit_soon(&self, event: serde_json::Value) {
+        use std::io::Write;
+        let subs = self.subscribers.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let mut subs = subs.lock().unwrap();
+                if !subs.is_empty() {
+                    for s in subs.iter_mut() {
+                        let _ = writeln!(s, "{event}");
+                    }
+                    return;
+                }
+            }
+        });
+    }
+}
+
+impl Drop for FakeHerdr {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.socket);
+    }
+}
+
+/// A dispatch under `pma integrate herdr` runs in a tab of the project's
+/// workspace, over the socket, with the environment a child would have, and
+/// reports as a child does. The decision closes the tab.
+#[test]
+fn an_integrated_dispatch_runs_in_a_herdr_pane() {
+    const SEES_ENV: &str = r#"#!/bin/sh
+echo hi > hello.txt
+echo "ssh=${SSH_AUTH_SOCK-unset} sock=$HERDR_SOCKET_PATH" > "$(dirname "$0")/agent.env"
+echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","total_cost_usd":0.1}'
+"#;
+    let s = Scratch::new("herdrpane");
+    let (env, _, _) = dispatch_env(&s, &[("claude", SEES_ENV)]);
+    let herdr = FakeHerdr::start("pane");
+    env.ok(&["config", "workspace", "clone"]);
+    let (out, _, _) = herdr.pma(&env, &["integrate", "herdr"]);
+    assert!(
+        out.contains("integration = herdr") && out.contains("answers"),
+        "{out}"
+    );
+    let (out, err, success) = herdr.pma(&env, &["dispatch", "alpha:5"]);
+    assert!(success, "{out}{err}");
+
+    assert_eq!(herdr.called("workspace.create")[0]["label"], "pma: alpha");
+    let tab = &herdr.called("tab.create")[0];
+    assert_eq!(
+        (&tab["workspace_id"], &tab["focus"]),
+        (&"w1".into(), &false.into())
+    );
+    assert_eq!(tab["label"], "#1 add greeting");
+    let typed = &herdr.called("pane.send_input")[0];
+    assert_eq!(typed["pane_id"], "w1:p2");
+    assert_eq!(typed["keys"], serde_json::json!(["Enter"]));
+    let subscribed = serde_json::to_string(&herdr.called("events.subscribe")).unwrap();
+    assert!(subscribed.contains("pane.agent_status_changed") && subscribed.contains("w1:p2"));
+    let states: Vec<_> = herdr.called("pane.report_agent");
+    assert_eq!(states.first().unwrap()["state"], "working");
+    assert_eq!(states.last().unwrap()["state"], "idle");
+
+    let seen = fs::read_to_string(env.bin.join("agent.env")).unwrap();
+    assert!(seen.contains("sock=/nonexistent/"), "{seen}");
+
+    let detail = env.ok(&["review", "1"]);
+    assert!(
+        detail.contains("$0.10") && detail.contains("did it"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("herdr") && detail.contains("w1:p2"),
+        "{detail}"
+    );
+    let (_, err, success) = herdr.pma(&env, &["review", "1", "--approve"]);
+    assert!(success, "{err}");
+    assert_eq!(herdr.called("pane.close")[0]["pane_id"], "w1:p2");
+}
+
+/// Events drive what a person sees: a blocked agent is recorded and raises a
+/// toast, and closing the pane ends the run at once, not at its timeout.
+#[test]
+fn herdr_events_reach_the_run() {
+    const SLOW: &str = "#!/bin/sh\nexec sleep 60\n";
+    let s = Scratch::new("herdrevents");
+    let (env, _, _) = dispatch_env(&s, &[("claude", SLOW)]);
+    let herdr = FakeHerdr::start("events");
+    env.ok(&["config", "workspace", "clone"]);
+    herdr.pma(&env, &["integrate", "herdr"]);
+    herdr.emit_soon(serde_json::json!({
+        "event": "pane.agent_status_changed",
+        "data": {"pane_id": "w1:p2", "workspace_id": "w1", "agent_status": "blocked"},
+    }));
+    let closer = {
+        let subs = herdr.subscribers.clone();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            for s in subs.lock().unwrap().iter_mut() {
+                let _ = writeln!(
+                    s,
+                    "{}",
+                    serde_json::json!({
+                        "event": "pane_closed",
+                        "data": {"pane_id": "w1:p2", "type": "pane_closed", "workspace_id": "w1"},
+                    })
+                );
+            }
+        })
+    };
+    let started = std::time::Instant::now();
+    let (out, err, _) = herdr.pma(&env, &["dispatch", "alpha:5"]);
+    closer.join().unwrap();
+    assert!(started.elapsed().as_secs() < 30, "{out}{err}");
+    assert_eq!(herdr.called("notification.show").len(), 1);
+    let detail = env.ok(&["review", "1"]);
+    assert!(detail.contains("w1:p2, blocked"), "{detail}");
+    assert!(detail.contains("pane closed"), "{detail}");
+}
+
+/// With no server a run goes on as a child and warns, so unattended work does
+/// not stop. An interactive run needs the pane, so it fails.
+#[test]
+fn with_no_herdr_server_a_run_goes_on_without_a_pane() {
+    let s = Scratch::new("herdrdown");
+    let (env, _, _) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    env.ok(&["config", "workspace", "clone"]);
+    let none = |args: &[&str]| {
+        let out = env
+            .command(args)
+            .env("HERDR_SOCKET_PATH", "/nonexistent/herdr.sock")
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.success(),
+        )
+    };
+    let (out, _, _) = none(&["integrate", "herdr"]);
+    assert!(out.contains("no herdr server"), "{out}");
+    let (out, err, success) = none(&["dispatch", "alpha:5"]);
+    assert!(success, "{out}{err}");
+    assert!(err.contains("without a pane"), "{err}");
+    assert!(env.ok(&["review"]).contains("#1  ready"));
+
+    env.ok(&["review", "1", "--reject"]);
+    let (out, err, _) = none(&["dispatch", "alpha:7", "--interactive"]);
+    assert!(
+        format!("{out}{err}").contains("an interactive run needs herdr"),
+        "{out}{err}"
+    );
+}
+
 /// An agent refused an action carries on and reports success, so its run looks
 /// finished. `--push` leaves it, and the review names what was refused.
 #[test]

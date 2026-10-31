@@ -45,7 +45,9 @@ Done 2026-10-29: the six variables below are removed, and so are the control-soc
 
 Fix: add `HERDR_ENV`, `HERDR_SOCKET_PATH`, `HERDR_PANE_ID`, `HERDR_TAB_ID`, `HERDR_WORKSPACE_ID` and `HERDR_BIN_PATH` to the removal list in `restrict`, with a case in the existing scrub test (`agent.rs:442`). `SSH_AUTH_SOCK` is already removed.
 
-Limit: the socket path is fixed and readable by the user, so a process that looks for `~/.config/herdr/herdr.sock` still reaches it. This matches the README's stated bound, "this stops an accidental push, not a determined one". The `sanduk` worker is the boundary for a determined one, since the container does not mount the socket.
+Limit, measured 2026-10-31 and more serious than first written: herdr needs no variable. Its [socket lookup](https://herdr.dev/tui/docs/socket-api/) ends at a default path, and `herdr workspace list` succeeded in a shell with no `HERDR_*` variable. `claude` now runs under `auto`, so no allowlist stops it running `herdr`; only the classifier might. `HERDR_SOCKET_PATH=/nonexistent/herdr.sock` makes the same command fail with `server_not_running`, since that variable outranks the default. Setting it in `restrict`, over removing it, closes the accidental route. Untested: what `claude`'s state hook does with a dead path.
+
+Earlier wording: the socket path is fixed and readable by the user, so a process that looks for `~/.config/herdr/herdr.sock` still reaches it. This matches the README's stated bound, "this stops an accidental push, not a determined one". The `sanduk` worker is the boundary for a determined one, since the container does not mount the socket.
 
 On macOS, Ghostty (1.3.0 and later, on by default), iTerm2 and Terminal.app accept `input text` or its equivalent over AppleScript. No variable carries this, so `restrict` cannot remove it; an agent that may run `osascript` (`opencode --auto`, `omp`) can try it, gated only by macOS Automation permission. Ghostty's `macos-applescript = false` turns it off.
 
@@ -63,7 +65,14 @@ pma config notify 'herdr notification show "pma job $PMA_JOB_ID $PMA_JOB_STATE" 
 
 `workspace.report_metadata` and `pane.report_metadata` set up to 16 display tokens on a workspace or pane, with a `ttl_ms` of at most 24 h. `pma` could report counts such as `review=2 failed=1` from the runner after each job, or from `pma tui` on refresh. Cost: a socket client or a `herdr` subprocess, gated on `HERDR_ENV`, about 40 lines. Open: how herdr renders the tokens, which the schema does not say. Value is low while `pma tui` already shows the same counts.
 
-## 4. Runs as herdr panes (not recommended)
+## 4. Runs as herdr panes (built 2026-10-31; the objections below are the first analysis)
+
+An agent in a pane gets `PATH`, `GIT_*` and `PMA_*` from `pma`, and the rest from the pane's shell, not `pma`'s full environment: the script is a file, and a provider key must not land in it. So a key set only where `pma` started does not reach the agent; it needs to be in the shell herdr starts.
+
+Socket API, not the CLI. A connection takes one request. Each run holds an `events.subscribe` connection for its pane. Captured from 0.9.5, and not in the schema: `pane.closed` arrives as `pane_closed`, `pane.agent_status_changed` needs a `pane_id`, and `pane.report_agent` refuses `done`. The exit status stays in a file, since herdr reports none for a line typed into a shell. A named session outside a pane is not handled.
+
+The user chose this. A live test showed most objections do not hold when the pane runs a generated script rather than `agent.start`: the script unsets what `restrict` removed, `claude -p` keeps its event stream through `tee`, and `pane close` kills the process. A guard process closes the pane if `pma` dies. The last point, coupling, still holds: this depends on a pre-1.0 CLI. An interactive run does lose cost, budget and summary, and it needs a person at Claude's folder-trust prompt in a directory not yet trusted.
+
 
 `pma` could start an agent with `pane.split` and `agent.start` instead of a child process, so the user watches and steers it live. This breaks five things `pma` relies on:
 
@@ -82,6 +91,14 @@ pma config notify 'herdr notification show "pma job $PMA_JOB_ID $PMA_JOB_STATE" 
 ## 5. Front ends in herdr panes (works today)
 
 `pma tui` and `pma watch` run in herdr panes like any TUI, and the server keeps them alive across detach and SSH drops. `--remote`/`--machine` reach `pma tui` on another host. No code.
+
+## 6. `pma integrate herdr` (built 2026-10-31)
+
+Takeover: open a run's clone or worktree in a new herdr pane with an interactive agent, so a person can question or correct it. This answers the weakness a headless run has, and keeps section 4's guarantees because the run itself stays headless. `pane split --cwd`, `agent start --kind claude` and `agent prompt` exist in 0.9.5; none was driven for this note. Edits made there change the tree, so `dispatch::approve` refuses the run until it is read again. The pane holds the user's credentials and no `restrict`: a person is at the keyboard. `pane.split` has only an additive `env`.
+
+Also available: notices (section 2, which can report `no_foreground_client`, so `osascript` still suits detached jobs) and `workspace report-metadata` tokens (section 3, display-only, lost on a server restart).
+
+minos gives steering during a run and herdr after one, which is the likely reason they exclude each other. Inference: `TODO.md` does not say why.
 
 ## Alternative framing
 

@@ -24,7 +24,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 45;
+const VERSION: i64 = 47;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -463,6 +463,16 @@ CREATE TABLE IF NOT EXISTS settings_sync (text TEXT NOT NULL);
 const READ_RUNS_DONE: &str = "
 UPDATE runs SET state = 'done'
 WHERE state = 'ready' AND branch = '' AND workflow_instance IS NOT NULL;
+";
+
+/// Version 47. What herdr last said of the agent in a run's pane.
+const HERDR_AGENT_STATE: &str = "ALTER TABLE runs ADD COLUMN agent_state TEXT;";
+
+/// Version 46. The herdr pane a run's last attempt ran in, and whether a
+/// person drives its agent there.
+const HERDR_PANES: &str = "
+ALTER TABLE runs ADD COLUMN pane TEXT;
+ALTER TABLE runs ADD COLUMN interactive INTEGER NOT NULL DEFAULT 0;
 ";
 
 /// Version 45. What the agent was refused in its last attempt, as a JSON array;
@@ -1033,6 +1043,8 @@ impl Store {
                     RUN_ITEMS,
                     CLAUDE_AUTO_MODE,
                     DENIED_AND_REVIEW_CLOCK,
+                    HERDR_PANES,
+                    HERDR_AGENT_STATE,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -1988,10 +2000,10 @@ impl Store {
                                complexity, features, estimator,
                                route_revision, route, approval,
                                workflow_instance, node, unit, lap, preset, extra_args,
-                               git_snapshot, workspace, start)
+                               git_snapshot, workspace, start, interactive)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
                      ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-                     ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)",
+                     ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)",
             params![
                 run.project,
                 run.task_key,
@@ -2032,6 +2044,7 @@ impl Store {
                 run.git_snapshot,
                 run.workspace.name(),
                 run.start,
+                run.interactive,
             ],
         )?;
         run.id = tx.last_insert_rowid();
@@ -2157,6 +2170,22 @@ impl Store {
             .pragma_query_value(None, "data_version", |r| r.get(0))?)
     }
 
+    pub fn set_pane(&self, id: i64, pane: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET pane = ?2, agent_state = NULL WHERE id = ?1",
+            params![id, pane],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_agent_state(&self, id: i64, state: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET agent_state = ?2 WHERE id = ?1",
+            params![id, state],
+        )?;
+        Ok(())
+    }
+
     /// Starts the review clock, unless a reading already did.
     pub fn start_review(&self, id: i64, now: i64) -> Result<()> {
         self.conn.execute(
@@ -2198,7 +2227,7 @@ impl Store {
                     approved_tree, approved_head, approved_by,
                     workflow_instance, node, unit, lap, preset, extra_args, git_snapshot,
                     reviewed_tree, infra, workspace, start, denied,
-                    review_measured
+                    review_measured, pane, interactive, agent_state
              FROM runs ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -2289,6 +2318,9 @@ impl Store {
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default(),
                 review_measured: r.get(61)?,
+                pane: r.get(62)?,
+                interactive: r.get(63)?,
+                agent_state: r.get(64)?,
                 items: Vec::new(),
             })
         })?;
@@ -3348,6 +3380,12 @@ pub struct Run {
     pub denied: Vec<String>,
     /// Seconds from each first reading to the decision on it.
     pub review_measured: Option<i64>,
+    /// The herdr pane of the last attempt; it may since have closed.
+    pub pane: Option<String>,
+    /// A person drives the agent in a pane: it reports no cost or summary.
+    pub interactive: bool,
+    /// What herdr last said of the agent in `pane`: `blocked` needs a person.
+    pub agent_state: Option<String>,
     /// A bundle's items, in prompt order; empty for any other run.
     pub items: Vec<RunItem>,
 }
@@ -3447,6 +3485,9 @@ impl Run {
             start: None,
             denied: Vec::new(),
             review_measured: None,
+            pane: None,
+            interactive: false,
+            agent_state: None,
             items: Vec::new(),
         }
     }
@@ -4079,7 +4120,10 @@ mod tests {
                     .execute_batch(
                         "ALTER TABLE runs DROP COLUMN denied;
                          ALTER TABLE runs DROP COLUMN review_started;
-                         ALTER TABLE runs DROP COLUMN review_measured;",
+                         ALTER TABLE runs DROP COLUMN review_measured;
+                         ALTER TABLE runs DROP COLUMN agent_state;
+                         ALTER TABLE runs DROP COLUMN pane;
+                         ALTER TABLE runs DROP COLUMN interactive;",
                     )
                     .unwrap();
                 store.conn.pragma_update(None, "user_version", 43).unwrap();
@@ -4147,9 +4191,12 @@ mod tests {
     /// Undoes versions 40 to 43, for a test that rewinds the schema past
     /// them.
     const BEFORE_SCAN_FAULTS: &str = "
+        ALTER TABLE runs DROP COLUMN agent_state;
         ALTER TABLE runs DROP COLUMN denied;
         ALTER TABLE runs DROP COLUMN review_started;
         ALTER TABLE runs DROP COLUMN review_measured;
+        ALTER TABLE runs DROP COLUMN pane;
+        ALTER TABLE runs DROP COLUMN interactive;
         DROP TABLE run_items;
         ALTER TABLE jobs DROP COLUMN project;
         ALTER TABLE runs DROP COLUMN workspace;
@@ -4647,6 +4694,9 @@ mod tests {
             start: None,
             denied: Vec::new(),
             review_measured: None,
+            pane: None,
+            interactive: false,
+            agent_state: None,
             items: vec![
                 RunItem {
                     key: "a".into(),

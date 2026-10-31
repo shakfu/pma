@@ -55,7 +55,7 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 - `sanduk` is the same agent in a disposable container: the key stays on the host, the worktree is mounted at its own path, and the box is the bound. Needs [sanduk](https://github.com/shakfu/sanduk-rs) (`cargo install sanduk`) and a container engine; `pma agent show sanduk` prints what it runs.
 
-- By default an agent edits your clone, from the working tree as it is, and its change waits there unstaged: `git diff` shows it, `pma review` approves it, and a rejection reverts it. Your own files are left alone. One run per project at a time. `pma config workspace worktree`, or `--worktree` on one command, gives each run a worktree of the remote default branch instead, so your checkout is never touched and runs can share a project.
+- By default an agent edits your clone, from the working tree as it is, and its change waits there unstaged: `git diff` shows it, `pma review` approves it, and a rejection reverts it. Your own files are left alone: a rejection reverses only what the agent changed, and refuses once the clone has moved past the run. `pma review <id> --reject --no-revert`, or `X`, closes a run and touches nothing. One run per project at a time. `pma config workspace worktree`, or `--worktree` on one command, gives each run a worktree of the remote default branch instead, so your checkout is never touched and runs can share a project.
 
 - The agent's environment holds no push credentials: tokens, the SSH agent, askpass helpers and the control sockets of terminal multiplexers (herdr, tmux, screen, zellij, kitty, WezTerm, Neovim) are removed, and git's pushes are redirected. Credentials on disk, such as `~/.ssh` keys or `~/.git-credentials`, stay readable, and a terminal scripted through AppleScript (Ghostty, iTerm2, Terminal.app) has no variable to remove; this stops an accidental push, not a determined one. `pma` runs the project's test command itself, before and after, and reports both ends.
 
@@ -72,6 +72,12 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 - `pma report` says what dispatching has produced: first-attempt passes, reworks, merges, cost, review time. Review time runs from a run's first reading to the decision on it, at most 30 minutes a reading. A figure given with `t` or `--minutes` replaces it.
 
 - An agent drafts a changelog entry per change in `.pma/changelog.md`, not in `CHANGELOG.md`, so changes running together do not conflict; `pma review` shows the draft, or says there is none.
+
+**Running in herdr**
+
+- `pma integrate herdr` runs every agent in a [herdr](https://herdr.dev) pane you can watch: a tab per run, in a `pma: <project>` workspace. Cost, verdict and review stay as they are. With no server, a run goes on without a pane and warns. `pma integrate none` turns it off.
+
+- `H` opens a run's pane, and `T` opens an interactive `claude` on its directory. `I`, or `pma dispatch --interactive`, gives you a live `claude` to drive for the whole run; the run ends when you exit it, and reports no cost or summary.
 
 **Running unattended**
 

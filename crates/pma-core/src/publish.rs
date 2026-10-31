@@ -541,7 +541,7 @@ pub fn land_local(
         }
         Some(why) => {
             run.outcome = Some(format!("discarded: {why}"));
-            crate::dispatch::discard(store, run, false)?;
+            crate::dispatch::discard(store, run, false, false)?;
             let landed = match why.starts_with(NO_APPLY) {
                 true => Landed::Conflict,
                 false => Landed::Discarded,

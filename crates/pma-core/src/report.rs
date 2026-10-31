@@ -512,6 +512,10 @@ pub fn run_fields(run: &Run) -> Vec<Vec<String>> {
             ),
         ]);
     }
+    if let Some(pane) = &run.pane {
+        let state = run.agent_state.as_deref().unwrap_or("-");
+        rows.push(vec!["herdr".into(), format!("{pane}, {state}")]);
+    }
     if let Some(s) = run.review_time() {
         rows.push(vec!["reviewed".into(), duration(Some(s))]);
     }

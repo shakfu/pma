@@ -23,6 +23,10 @@ test: ## run every test
 	@cargo test
 	@uv run --no-project --with pytest pytest -q scripts
 
+.PHONY: herdr-check
+herdr-check: ## run a dispatch through a real herdr server against a fresh fixture
+	@sh scripts/herdr-check.sh
+
 .PHONY: web-check
 web-check: ## drive pma web in headless Chromium against a fresh fixture
 	@sh scripts/web-check.sh

@@ -358,8 +358,18 @@ pub enum Action {
     RejectRun {
         id: i64,
         keep_git_changes: bool,
+        /// Closes the run and leaves the clone's files as they are.
+        leave_files: bool,
         infra: bool,
         seen: Option<String>,
+    },
+    /// Brings the run's herdr pane to the front.
+    FocusPane {
+        id: i64,
+    },
+    /// Opens an interactive agent on the run's directory.
+    TakeOver {
+        id: i64,
     },
     AddReviewTime {
         id: i64,
@@ -413,6 +423,8 @@ pub enum Action {
         prompt: Option<String>,
         /// Approves and pushes each run whose gates are clean.
         push: bool,
+        /// A person drives the agent in a herdr pane.
+        interactive: bool,
     },
     /// Starts or resumes an instance; with `approve`, runs that plan.
     WorkflowRun {
@@ -1559,6 +1571,7 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
         Action::RejectRun {
             id,
             keep_git_changes,
+            leave_files,
             infra,
             seen,
         } => {
@@ -1567,9 +1580,12 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
             store.fail_interrupted_runs(&session)?;
             let mut run = store.run(id)?;
             unmoved(&run, seen.as_deref())?;
-            let files = dispatch::reject(store, &mut run, keep_git_changes, infra)?;
+            let files = dispatch::reject(store, &mut run, keep_git_changes, infra, leave_files)?;
             let plural = if files == 1 { "" } else { "s" };
             Outcome::said(match run.workspace {
+                Workspace::Clone if leave_files => {
+                    format!("Run #{id} closed; its files were left as they are.")
+                }
                 _ if run.state == RunState::PrOpen => format!(
                     "Fix of run #{id} rejected; its pull request stays open: {}",
                     run.outcome.as_deref().unwrap_or_default()
@@ -1588,6 +1604,37 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
             store.run(id)?;
             store.add_review_seconds(id, i64::from(minutes) * 60)?;
             Outcome::default()
+        }
+        Action::FocusPane { id } => {
+            let run = store.run(id)?;
+            let pane = run
+                .pane
+                .ok_or_else(|| format!("run #{id} has no herdr pane"))?;
+            crate::herdr::focus(&pane)?;
+            Outcome::default()
+        }
+        Action::TakeOver { id } => {
+            let run = store.run(id)?;
+            if run.agent != "claude" {
+                return Err(format!(
+                    "run #{id} used `{}`; only `claude` can take over",
+                    run.agent
+                )
+                .into());
+            }
+            let prompt = format!(
+                "An earlier agent worked on this task, and its change is uncommitted in this \
+                 directory. Read the diff, then wait for my instructions.\n\nTask: {}",
+                run.text
+            );
+            let title = format!("#{id} take over");
+            crate::herdr::take_over(&run.project, &title, &run.worktree, &prompt)?;
+            Outcome {
+                said: vec![format!(
+                    "An edit made there changes run #{id}: read it again before approving."
+                )],
+                ..Outcome::default()
+            }
         }
         Action::SettlePrs => {
             let mut out = Outcome::default();
@@ -1921,6 +1968,7 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
             worker: w,
             prompt,
             push: publish,
+            interactive,
         } => {
             push("dispatch");
             v.extend(targets.iter().cloned());
@@ -1930,6 +1978,7 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
             flag(&mut v, *retry, "--retry");
             opt(&mut v, "--prompt", prompt);
             flag(&mut v, *publish, "--push");
+            flag(&mut v, *interactive, "--interactive");
             worker(&mut v, w);
         }
         Action::WorkflowRun {
@@ -2049,7 +2098,9 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
         | Action::Prune { .. }
         | Action::FixTodo { .. }
         // Queued by `act` itself, with the project's path resolved.
-        | Action::RefreshDeps { .. } => return None,
+        | Action::RefreshDeps { .. }
+        | Action::FocusPane { .. }
+        | Action::TakeOver { .. } => return None,
     }
     Some(v)
 }
@@ -2137,6 +2188,7 @@ mod tests {
                 retry: false,
                 worker: w.clone(),
                 prompt: None,
+                interactive: false,
                 push: false,
             }),
             [
@@ -2166,6 +2218,7 @@ mod tests {
                 retry: false,
                 worker: WorkerChoice::default(),
                 prompt: None,
+                interactive: false,
                 push: true,
             }),
             ["dispatch", "a:5", "--push"]

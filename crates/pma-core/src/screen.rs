@@ -152,13 +152,21 @@ pub struct Cell {
 /// fits any. A front end offers only the acts that fit the selected row.
 pub fn fits(act: Act, pick: &Pick) -> bool {
     match act {
-        Act::Dispatch | Act::DispatchPush => {
+        Act::Dispatch | Act::DispatchPush | Act::DispatchInteractive => {
             matches!(pick, Pick::Task { .. } | Pick::Tasks { .. })
+        }
+        // A decision closes the pane, so later states have none to open.
+        Act::OpenPane => {
+            matches!(pick, Pick::Run { state, .. } if ["running", "ready", "failed"].contains(&state.as_str()))
+        }
+        Act::TakeOver => {
+            matches!(pick, Pick::Run { state, .. } if state == "ready" || state == "failed")
         }
         Act::Verify => matches!(pick, Pick::Task { .. } | Pick::Manual { .. }),
         Act::AddReviewTime => matches!(pick, Pick::Run { .. }),
         Act::ApproveRun
         | Act::RejectRun
+        | Act::ForgetRun
         | Act::ReworkRun
         | Act::RetryRun
         | Act::Pr
@@ -190,7 +198,7 @@ pub fn fits(act: Act, pick: &Pick) -> bool {
 fn run_allows(act: Act, state: &str) -> bool {
     let takes: &[&str] = match act {
         Act::ApproveRun => &["ready", "approved"],
-        Act::RejectRun => &["ready", "failed", "approved", "staged", "committed"],
+        Act::RejectRun | Act::ForgetRun => &["ready", "failed", "approved", "staged", "committed"],
         Act::ReworkRun => &["ready", "failed", "approved"],
         Act::RetryRun => &["failed"],
         Act::Stage | Act::Pr => &["ready", "approved"],
@@ -768,7 +776,10 @@ fn agents_pane(state: &std::path::Path, runs: &[Run], now: i64) -> Pane {
                 plain(a.run.project.clone()),
                 plain(a.run.node.clone().unwrap_or_else(|| "dispatch".into())),
                 muted(a.run.agent.clone()),
-                cell(a.running, Tone::Accent),
+                match a.run.agent_state.as_deref() {
+                    Some("blocked") => cell(format!("{}, blocked", a.running), Tone::Warn),
+                    _ => cell(a.running, Tone::Accent),
+                },
                 muted(a.quiet),
                 plain(a.progress.tool_calls.to_string()),
                 plain(
@@ -2242,7 +2253,10 @@ pub fn question(act: Act, pick: &Pick) -> String {
     let verb = match act {
         Act::Dispatch => "dispatch",
         Act::DispatchPush => "dispatch, and push when clean,",
+        Act::DispatchInteractive => "dispatch, to drive in herdr,",
+        Act::TakeOver => "open an interactive agent on",
         Act::RejectRun => "reject",
+        Act::ForgetRun => "close, leaving its files as they are,",
         Act::RetryRun => "retry the task of",
         Act::Stage => "stage in its clone",
         Act::Commit if ready => "approve and commit in its clone",
@@ -2615,7 +2629,13 @@ pub fn action_in(
                 drop: None,
             }
         }
-        (Act::Dispatch | Act::DispatchPush, Pick::Task { target, retry, .. }) => Action::Dispatch {
+        (Act::OpenPane, Pick::Run { id, .. }) => Action::FocusPane { id: *id },
+        (Act::TakeOver, Pick::Run { id, .. }) => Action::TakeOver { id: *id },
+        (Act::OpenPane | Act::TakeOver, _) => return need("a run"),
+        (
+            Act::Dispatch | Act::DispatchPush | Act::DispatchInteractive,
+            Pick::Task { target, retry, .. },
+        ) => Action::Dispatch {
             targets: vec![target.clone()],
             tags: Vec::new(),
             auto: false,
@@ -2624,8 +2644,12 @@ pub fn action_in(
             worker,
             prompt: None,
             push: act == Act::DispatchPush,
+            interactive: act == Act::DispatchInteractive,
         },
-        (Act::Dispatch | Act::DispatchPush, Pick::Tasks { targets, retry }) => Action::Dispatch {
+        (
+            Act::Dispatch | Act::DispatchPush | Act::DispatchInteractive,
+            Pick::Tasks { targets, retry },
+        ) => Action::Dispatch {
             targets: targets.clone(),
             tags: Vec::new(),
             auto: false,
@@ -2634,6 +2658,7 @@ pub fn action_in(
             worker,
             prompt: None,
             push: act == Act::DispatchPush,
+            interactive: act == Act::DispatchInteractive,
         },
         (Act::Prompt, _) => {
             if project.is_empty() {
@@ -2651,9 +2676,10 @@ pub fn action_in(
                 worker,
                 prompt: Some(input.to_string()),
                 push: false,
+                interactive: false,
             }
         }
-        (Act::Dispatch | Act::DispatchPush, Pick::Manual { .. }) => {
+        (Act::Dispatch | Act::DispatchPush | Act::DispatchInteractive, Pick::Manual { .. }) => {
             return Err("not a task for agents".into());
         }
         (Act::Verify, Pick::Task { project, .. } | Pick::Manual { project }) => Action::Verify {
@@ -2662,15 +2688,18 @@ pub fn action_in(
                 tags: Vec::new(),
             },
         },
-        (Act::Dispatch | Act::DispatchPush | Act::Verify, _) => return need("a task"),
+        (Act::Dispatch | Act::DispatchPush | Act::DispatchInteractive | Act::Verify, _) => {
+            return need("a task");
+        }
         (Act::ApproveRun, Pick::Run { id, state, .. }) => Action::ApproveRun {
             id: *id,
             seen: Some(state.clone()),
             drop: unchecked(input)?,
         },
-        (Act::RejectRun, Pick::Run { id, state, .. }) => Action::RejectRun {
+        (Act::RejectRun | Act::ForgetRun, Pick::Run { id, state, .. }) => Action::RejectRun {
             id: *id,
             keep_git_changes: false,
+            leave_files: act == Act::ForgetRun,
             infra: false,
             seen: Some(state.clone()),
         },
@@ -2720,6 +2749,7 @@ pub fn action_in(
         (
             Act::ApproveRun
             | Act::RejectRun
+            | Act::ForgetRun
             | Act::ReworkRun
             | Act::RetryRun
             | Act::AddReviewTime
@@ -2917,17 +2947,28 @@ mod tests {
         assert_eq!(offered("rejected"), [Act::AddReviewTime]);
         assert_eq!(
             offered("staged"),
-            [Act::RejectRun, Act::AddReviewTime, Act::Commit, Act::Push]
+            [
+                Act::RejectRun,
+                Act::AddReviewTime,
+                Act::Commit,
+                Act::Push,
+                Act::ForgetRun
+            ]
         );
         assert_eq!(
             offered("failed"),
             [
                 Act::RejectRun,
                 Act::AddReviewTime,
+                Act::OpenPane,
+                Act::TakeOver,
                 Act::ReworkRun,
-                Act::RetryRun
+                Act::RetryRun,
+                Act::ForgetRun
             ]
         );
+        assert!(offered("running").contains(&Act::OpenPane));
+        assert!(!offered("running").contains(&Act::TakeOver));
         assert!(!offered("ready").contains(&Act::RetryRun));
         assert!(!offered("running").contains(&Act::RejectRun));
     }
@@ -3085,6 +3126,7 @@ mod tests {
                 worker: WorkerChoice::default(),
                 prompt: None,
                 push: false,
+                interactive: false,
             })
         );
         let pane = [run(1, true), run(2, false), run(3, true)];

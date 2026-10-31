@@ -2280,9 +2280,23 @@ fn work(cfg: &Config, job: &Staged) -> Ran {
         timeout.saturating_sub(crate::dispatch::INNER_GRACE),
     );
     cmd.current_dir(&job.tree);
-    let finished = match crate::agent::restrict(&mut cmd, &job.agent_env)
-        .and_then(|()| crate::agent::run_limited(cmd, None, &job.log, timeout))
-    {
+    let title = job.run.node.as_deref().unwrap_or(job.run.text.as_str());
+    let finished = match crate::agent::restrict(&mut cmd, &job.agent_env).and_then(|()| {
+        crate::herdr::host(
+            cfg,
+            crate::herdr::Host {
+                project: &job.run.project,
+                title,
+                interactive: false,
+                close_after: true,
+            },
+            cmd,
+            &job.log,
+            timeout,
+            |_| {},
+            |_| {},
+        )
+    }) {
         Ok(f) => f,
         Err(e) => {
             return Ran {
@@ -2814,6 +2828,7 @@ fn run_edit(ctx: &Ctx<'_>, node: &Node, units: &[WorkflowUnit], known: &Known) -
                 details: Some(task),
                 quadrant: None,
                 local: ctx.local,
+                interactive: false,
                 workspace: ctx.workspace,
                 items: Vec::new(),
             };

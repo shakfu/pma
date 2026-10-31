@@ -33,7 +33,6 @@ pub fn restrict(cmd: &mut Command, dir: &Path) -> std::io::Result<()> {
         // A multiplexer's or terminal's control socket lets a child type into
         // other panes, which hold credentials.
         "HERDR_ENV",
-        "HERDR_SOCKET_PATH",
         "HERDR_PANE_ID",
         "HERDR_TAB_ID",
         "HERDR_WORKSPACE_ID",
@@ -49,6 +48,12 @@ pub fn restrict(cmd: &mut Command, dir: &Path) -> std::io::Result<()> {
     ] {
         cmd.env_remove(var);
     }
+    // Named rather than removed: with no variable, herdr falls back to its
+    // default socket, and this variable outranks that.
+    cmd.env(
+        "HERDR_SOCKET_PATH",
+        "/nonexistent/pma-agents-cannot-reach-herdr.sock",
+    );
     cmd.env("GH_CONFIG_DIR", &gh)
         .env("GIT_TERMINAL_PROMPT", "0");
     let settings: [(&str, &OsStr); 3] = [
@@ -556,7 +561,6 @@ mod tests {
     fn restricted_children_cannot_see_control_sockets() {
         let dir = scratch("sockets");
         let vars = [
-            "HERDR_SOCKET_PATH",
             "TMUX",
             "STY",
             "ZELLIJ",
@@ -604,7 +608,7 @@ mod tests {
         let out = cmd.output().unwrap();
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
-            "unset unset unset unset unset unset 0\n"
+            "unset unset unset unset /nonexistent/pma-agents-cannot-reach-herdr.sock unset 0\n"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

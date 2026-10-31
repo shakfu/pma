@@ -54,7 +54,36 @@ pub struct Config {
     pub notify: Option<String>,
     /// Where an agent edits: the clone itself, or a worktree of it.
     pub workspace: Workspace,
+    /// What agents run in. One setting because integrations exclude each other.
+    pub integration: Integration,
     pub projects: BTreeMap<String, ProjectSettings>,
+}
+
+/// What agents run in: `pma integrate`. See docs/dev/herdr-integration.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Integration {
+    /// A child process of `pma`.
+    #[default]
+    None,
+    /// A pane of a herdr server.
+    Herdr,
+}
+
+impl Integration {
+    pub fn name(self) -> &'static str {
+        match self {
+            Integration::None => "none",
+            Integration::Herdr => "herdr",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "none" => Some(Integration::None),
+            "herdr" => Some(Integration::Herdr),
+            _ => None,
+        }
+    }
 }
 
 /// Where a run's agent edits. See docs/dev/clone-runs.md. The derived
@@ -142,6 +171,7 @@ impl Default for Config {
             timeout: 30,
             notify: None,
             workspace: Workspace::Clone,
+            integration: Integration::None,
             projects: BTreeMap::new(),
         }
     }
@@ -161,6 +191,7 @@ enum Slot<'a> {
     List(&'a mut Vec<String>),
     Attribution(&'a mut Attribution),
     Workspace(&'a mut Workspace),
+    Integration(&'a mut Integration),
     /// Empty text is `None`.
     OptText(&'a mut Option<String>),
     /// Text that may not be empty.
@@ -271,6 +302,7 @@ impl Config {
                 "timeout",
                 "notify",
                 "workspace",
+                "integration",
             ]
             .map(String::from),
         );
@@ -306,6 +338,7 @@ impl Config {
             Slot::Priority(_)
             | Slot::Attribution(_)
             | Slot::Workspace(_)
+            | Slot::Integration(_)
             | Slot::OptText(_)
             | Slot::Text(_) => "text",
         })
@@ -325,6 +358,7 @@ impl Config {
                 Attribution::CoAuthor => "co-author".into(),
             },
             Slot::Workspace(w) => w.name().into(),
+            Slot::Integration(i) => i.name().into(),
             Slot::OptText(v) => v.clone().unwrap_or_default(),
             Slot::Text(v) => v.clone(),
             Slot::Switch(v) => if *v { "on" } else { "off" }.into(),
@@ -405,6 +439,9 @@ impl Config {
             Slot::Workspace(w) => {
                 *w = Workspace::parse(value).ok_or("expected clone or worktree")?;
             }
+            Slot::Integration(i) => {
+                *i = Integration::parse(value).ok_or("expected none or herdr")?;
+            }
             Slot::OptText(v) => *v = (!value.is_empty()).then(|| value.to_string()),
             Slot::Text(v) => {
                 if value.is_empty() {
@@ -449,6 +486,7 @@ impl Config {
                 "timeout" => Slot::Count(&mut self.timeout, 1, 240),
                 "notify" => Slot::OptText(&mut self.notify),
                 "workspace" => Slot::Workspace(&mut self.workspace),
+                "integration" => Slot::Integration(&mut self.integration),
                 _ => return None,
             },
             Some(("tiers", t)) => Slot::Number(&mut self.tiers[tier(t)?], 0.0),
@@ -505,7 +543,7 @@ mod tests {
     #[test]
     fn every_key_reads_and_round_trips() {
         let keys = Config::keys();
-        assert_eq!(keys.len(), 35);
+        assert_eq!(keys.len(), 36);
         let defaults = Config::default();
         let mut copy = Config::default();
         for key in &keys {

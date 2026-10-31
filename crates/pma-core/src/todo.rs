@@ -1190,7 +1190,10 @@ mod tests {
         // A heading in one does not end the section either.
         let text = "# TODO\n\n## High\n\n- [ ] old\n\n   ```\n## Low\n   ```\n";
         let out = insert(text, Priority::High, "new", None).unwrap();
-        assert!(out.ends_with("   ```\n## Low\n   ```\n\n- [ ] new\n"), "{out}");
+        assert!(
+            out.ends_with("   ```\n## Low\n   ```\n\n- [ ] new\n"),
+            "{out}"
+        );
     }
 
     #[test]

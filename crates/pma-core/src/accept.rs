@@ -100,6 +100,13 @@ pub fn review_reasons(run: &Run) -> Vec<String> {
     {
         reasons.push(format!("cost ${cost:.2} over the ${budget:.2} run budget"));
     }
+    if !run.denied.is_empty() {
+        reasons.push(format!(
+            "the agent was denied {} action(s), and may have left work undone: {}",
+            run.denied.len(),
+            run.denied.join("; ")
+        ));
+    }
     reasons.extend(verify_reason(run, class));
     reasons
 }
@@ -134,6 +141,19 @@ fn verify_reason(run: &Run, class: Class) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal leaves work undone without failing anything, so a person reads
+    /// the run.
+    #[test]
+    fn a_denied_action_is_worth_reading() {
+        let mut run = ready(Class::Mechanical, Some(true), Some(true));
+        run.denied = vec!["git status".into()];
+        let r = review_reasons(&run);
+        assert!(
+            r[0].contains("denied 1 action") && r[0].contains("git status"),
+            "{r:?}"
+        );
+    }
 
     fn ready(class: Class, base: Option<bool>, head: Option<bool>) -> Run {
         Run {

@@ -97,7 +97,7 @@ function lookup(key) {
   const fit = S.keys.bindings.filter((b) => b.key === key);
   const onTab = fit.filter((b) => b.tabs.includes(S.tab));
   const cands = onTab.length ? onTab : fit.filter((b) => b.tabs.length === 0);
-  const fits = S.marks.length && !S.detail ? currentActs().concat("Dispatch") : currentActs();
+  const fits = S.marks.length && !S.detail ? currentActs().concat("Dispatch", "DispatchPush") : currentActs();
   return cands.find((b) => b.command.kind === "act" && fits.includes(b.command.act))
     || cands.find((b) => b.command.kind !== "act")
     || cands[0];
@@ -152,12 +152,14 @@ function currentPick() {
 
 // ---------------------------------------------------------------- marks
 
-const sameTask = (a, b) => a.kind === "task" && b.kind === "task" && a.target === b.target;
+const sameTask = (a, b) => (a.kind === "task" && b.kind === "task" && a.target === b.target)
+  || (a.kind === "manual" && b.kind === "manual" && a.project === b.project);
+const markable = (pick) => pick.kind === "task" || (pick.kind === "manual" && S.tab === "projects");
 const isMarked = (pick) => S.marks.some((m) => sameTask(m, pick));
 
 function toggleMark(pick) {
-  if (pick.kind !== "task") {
-    toast("Only a task can be marked.", "warn");
+  if (!markable(pick)) {
+    toast("Only a task or a project can be marked.", "warn");
     return;
   }
   S.marks = isMarked(pick) ? S.marks.filter((m) => !sameTask(m, pick)) : S.marks.concat(pick);
@@ -166,6 +168,7 @@ function toggleMark(pick) {
 
 // The marked tasks as one pick, as `screen::marked` builds it.
 function markedPick() {
+  if (S.marks[0].kind === "manual") return { kind: "projects", names: S.marks.map((m) => m.project) };
   return { kind: "tasks", targets: S.marks.map((m) => m.target), retry: S.marks.some((m) => m.retry) };
 }
 
@@ -442,6 +445,11 @@ function draw() {
       toolbar.append(el("button", { class: "button primary", type: "button", onclick: () => act(dispatch) },
         `Dispatch ${S.marks.length} marked`, el("kbd", {}, dispatch.key)));
     }
+    const run = acts(false).find((b) => b.command.act === "Run");
+    if (run && S.tab === "projects") {
+      toolbar.append(el("button", { class: "button primary", type: "button", onclick: () => act(run) },
+        `Run on ${S.marks.length} marked`, el("kbd", {}, run.key)));
+    }
     toolbar.append(el("button", { class: "button", type: "button", onclick: () => { S.marks = []; draw(); } },
       "Clear marks", back ? el("kbd", {}, back.key) : null));
   }
@@ -449,7 +457,7 @@ function draw() {
   // With tasks marked, dispatch is theirs, above.
   const sel = selected();
   if (sel) {
-    const fit = sel.item.acts.filter((a) => !(S.marks.length && a === "Dispatch"));
+    const fit = sel.item.acts.filter((a) => !(S.marks.length && (a === "Dispatch" || a === "DispatchPush")));
     const own = acts(true).filter((b) => fit.includes(b.command.act));
     const proj = onTab().find((b) => b.command.kind === "OpenProject");
     const open = onTab().find((b) => b.command.kind === "Open");
@@ -560,9 +568,9 @@ function card(p, pi) {
   // A column no row fills says nothing; it is left out.
   const shown = p.columns.map((_, i) => i).filter((i) => p.items.some((it) => it.cells[i] && it.cells[i].text));
   // A checkbox per task, where the view binds marking.
-  const markable = onTab().some((b) => b.command.kind === "Mark") && p.items.some((it) => it.pick.kind === "task");
+  const marks = onTab().some((b) => b.command.kind === "Mark") && p.items.some((it) => markable(it.pick));
   const head = el("tr", {},
-    markable ? el("th", { scope: "col", class: "mark" }, el("span", { class: "visually-hidden" }, "Marked")) : null,
+    marks ? el("th", { scope: "col", class: "mark" }, el("span", { class: "visually-hidden" }, "Marked")) : null,
     shown.map((i) => el("th", { scope: "col", class: p.columns[i].kind }, p.columns[i].title)));
   const body = el("tbody");
   const foot = el("tfoot");
@@ -570,10 +578,10 @@ function card(p, pi) {
     const sel = focused && ii === S.sel[S.tab][pi];
     const total = item.cells.every((c) => c.tone === "strong");
     // A row with a detail opens on one click; any other row is selected.
-    const box = markable && item.pick.kind === "task"
+    const box = marks && markable(item.pick)
       ? el("input", {
         type: "checkbox",
-        "aria-label": `Mark ${item.pick.target}`,
+        "aria-label": `Mark ${item.pick.target || item.pick.project}`,
         onclick: (e) => { e.stopPropagation(); toggleMark(item.pick); },
       })
       : null;
@@ -745,7 +753,10 @@ function shortcuts() {
 
 async function act(b) {
   const name = b.command.act;
-  const marked = name === "Dispatch" && S.marks.length > 0 && !S.detail;
+  const overMarks = name === "Dispatch" || name === "DispatchPush" || (name === "Run" && S.tab === "projects");
+  const marked = overMarks && S.marks.length > 0 && !S.detail;
+  // A decision from a run's detail: the next ready run follows it.
+  let decided = S.detail && b.command.decides ? S.detail.pick.id : null;
   const pick = marked ? markedPick() : currentPick();
   let input = "";
   try {
@@ -786,10 +797,16 @@ async function act(b) {
     toast(lines.length ? lines.join("\n") : `${label(b.label)}: done.`, out.warnings.length ? "warn" : "good");
   } catch (e) {
     toast(e.message, "bad");
+    decided = null;
   }
   // The detail's run or job has moved on; the tab shows where it went.
   S.detail = null;
   await Promise.all([load(), loadProjects()]);
+  if (decided !== null) {
+    const next = panes().flatMap((p) => p.items).map((i) => i.pick)
+      .find((p) => p.kind === "run" && p.state === "ready" && p.id !== decided);
+    if (next) await openDetail(next);
+  }
 }
 
 async function run(b) {

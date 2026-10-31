@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `D` in the TUI and web dispatches a task and pushes the run if its gates are clean, as `pma dispatch --push` does.
+
+- On the projects tab, Space marks projects and `z` runs one name over them. `pma run --tag` was the only way to run over several.
+
+- A decision from a run's detail opens the next ready run in the view, so reviewing M runs takes no navigation between them.
+
+- `pma report` measures review time: from a run's first reading to the decision on it, at most 30 minutes a reading. It stayed at 0 when `t` and `--minutes` were the only way in; a stated figure still wins, over adding the two, which would count one reading twice. A run staged and never approved is not timed.
+
 - `U` in the TUI and web pushes every approved, staged or committed run in the list. Publishing several runs was CLI-only, so M runs took 2M keys.
 
 - `pma push <id> --approve [--drop N,...]` approves a ready run and pushes it in one command, as `u` does.
@@ -52,6 +60,8 @@ pma workflow run find-issues --tag nightly --unattended
 - `/` in the TUI's run list filters it by name; the web's list has a filter box, and the arrows move among what it keeps. The web's names and descriptions line up in columns.
 
 ### Changed
+
+- A run whose agent was denied an action is not clean, and `pma review` lists what was denied. Auto mode skips a blocked action and carries on, so such a run could otherwise pass `b` and `--push` with work undone. Reads the result's `permission_denials` and classifier tool results, since no run has yet shown the classifier filling that list.
 
 - **`claude` runs with `--permission-mode auto`** instead of `acceptEdits`. Headless runs have no one to ask, so any command outside the verify allowlist was denied: 10 denials across 5 recorded runs, 2 of them the changelog draft pma's own prompt asks for. Auto over a wider allowlist because the denied commands were compound. Schema 44 rewrites that flag in every row running `claude`, and leaves another mode alone. A model without auto mode starts in Manual, where `-p` denies what needs approval.
 

@@ -92,7 +92,7 @@ impl Tally {
             None => self.cost_unknown += 1,
         }
         self.seconds += run.seconds.unwrap_or(0);
-        self.review_seconds += run.review_seconds.unwrap_or(0);
+        self.review_seconds += run.review_time().unwrap_or(0);
     }
 
     fn cells(&self, label: String) -> Vec<String> {

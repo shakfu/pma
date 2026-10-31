@@ -992,6 +992,8 @@ fn dispatch_review_rework_and_push() {
     // batch budget, which is not decided because no one judged it. One passed
     // on its first attempt and one after a rework, so four attempts in all,
     // and the refused run reported no cost.
+    // A stated figure replaces what the clock measured, so the total is exact.
+    env.ok(&["review", "1", "--minutes", "0"]);
     let report = env.ok(&["report"]);
     assert!(
         report.contains("67% of 3 decided runs accepted"),
@@ -1447,6 +1449,41 @@ fn a_bundle_is_one_run_and_its_approver_says_what_it_closes() {
     );
     // A dropped item's changes are published with the rest.
     assert_eq!(git_out(&origin, &["show", "main:third.txt"]), "three\n");
+}
+
+/// An agent refused an action carries on and reports success, so its run looks
+/// finished. `--push` leaves it, and the review names what was refused.
+#[test]
+fn a_denied_action_keeps_a_run_from_pushing_itself() {
+    const DENIED_CLAUDE: &str = r#"#!/bin/sh
+echo hi > hello.txt
+echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","total_cost_usd":0.1,"permission_denials":[{"tool_name":"Bash","tool_use_id":"a","tool_input":{"command":"cargo fmt"}}]}'
+"#;
+    let s = Scratch::new("denied");
+    let (env, origin, _) = dispatch_env(&s, &[("claude", DENIED_CLAUDE)]);
+    env.ok(&["config", "workspace", "clone"]);
+    let out = env.ok(&["dispatch", "alpha:5", "--push"]);
+    assert!(
+        out.contains("waits in `pma review`") && out.contains("denied 1 action"),
+        "{out}"
+    );
+    assert!(git_out(&origin, &["show", "main:hello.txt"]).is_empty());
+    assert!(env.ok(&["review", "1"]).contains("cargo fmt"));
+}
+
+/// Reading a run and deciding on it counts as review time, across commands.
+#[test]
+fn review_time_runs_from_reading_to_decision() {
+    let s = Scratch::new("reviewclock");
+    let (env, _, _) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    env.ok(&["config", "workspace", "clone"]);
+    env.ok(&["dispatch", "alpha:5"]);
+    env.ok(&["review", "1"]);
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    env.ok(&["review", "1", "--approve"]);
+    let report = env.ok(&["report"]);
+    let review = report.lines().last().unwrap().split_whitespace().last();
+    assert!(review.is_some_and(|r| r != "0s"), "{report}");
 }
 
 /// `--approve` makes one command of reading done and pushing, which `pma push`

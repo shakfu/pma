@@ -31,7 +31,7 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 - Failing CI, outdated dependencies, idle repositories and dirty working trees appear as tasks beside the written ones.
 
-- Two front ends with the same views and actions: `pma tui` in a terminal, over SSH too, and `pma web` in a local browser, on 127.0.0.1 behind a one-time token. Both act on what is selected: dispatch a task, approve or reject a run, approve a plan, stop a job. Space marks tasks, and `d` dispatches the marked ones, one run per project. `P` in a project view dispatches a prompt you type.
+- Two front ends with the same views and actions: `pma tui` in a terminal, over SSH too, and `pma web` in a local browser, on 127.0.0.1 behind a one-time token. Both act on what is selected: dispatch a task, approve or reject a run, approve a plan, stop a job. Space marks tasks, and `d` dispatches the marked ones, one run per project. On the projects tab, Space marks projects, and `z` runs one name over them. `P` in a project view dispatches a prompt you type.
 
 - A view of each project: its state and why, CI, dependencies, local changes, open tasks and every run, with how old the scan behind it is. `pma project show <name>`, or `o` on any row.
 
@@ -59,7 +59,7 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 - The agent's environment holds no push credentials: tokens, the SSH agent, askpass helpers and the control sockets of terminal multiplexers (herdr, tmux, screen, zellij, kitty, WezTerm, Neovim) are removed, and git's pushes are redirected. Credentials on disk, such as `~/.ssh` keys or `~/.git-credentials`, stay readable, and a terminal scripted through AppleScript (Ghostty, iTerm2, Terminal.app) has no variable to remove; this stops an accidental push, not a determined one. `pma` runs the project's test command itself, before and after, and reports both ends.
 
-- `claude` runs with `--permission-mode auto`: a [classifier](https://code.claude.com/docs/en/permission-modes) reviews each action, and nothing stops to ask. A model or organization without auto mode starts in Manual, where `-p` denies what needs approval. `pma agent set claude args` changes it.
+- `claude` runs with `--permission-mode auto`: a [classifier](https://code.claude.com/docs/en/permission-modes) reviews each action, and nothing stops to ask. A model or organization without auto mode starts in Manual, where `-p` denies what needs approval. `pma agent set claude args` changes it. A refused action does not stop a run, so `pma review` lists what the agent was denied, and such a run is not clean: `b` and `--push` leave it for you to read.
 
 - With `pma config projects.<name>.sandbox on`, that test command runs able to write only to the worktree, the temp directories and the toolchain caches: Landlock on Linux 6.2 and later, Seatbelt on macOS. Reads and the network stay open. Off by default: a suite that writes elsewhere fails under it for no fault of the agent's.
 
@@ -69,7 +69,7 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 - Limits you set: agents at once, dollars per batch, minutes per run. The per-run dollar figure admits runs into a batch and flags a run that cost more; no shipped worker stops at it.
 
-- `pma report` says what dispatching has produced: first-attempt passes, reworks, merges, cost, review time.
+- `pma report` says what dispatching has produced: first-attempt passes, reworks, merges, cost, review time. Review time runs from a run's first reading to the decision on it, at most 30 minutes a reading. A figure given with `t` or `--minutes` replaces it.
 
 - An agent drafts a changelog entry per change in `.pma/changelog.md`, not in `CHANGELOG.md`, so changes running together do not conflict; `pma review` shows the draft, or says there is none.
 
@@ -255,7 +255,7 @@ A run edits the clone, or with `pma config workspace worktree` a worktree of the
 
 In a project with a `CHANGELOG.md`, the agent leaves that file alone and drafts one entry per separable change. `pma review <id>` shows the entries, or says none was drafted.
 
-`stage`, `commit` and `push` work in your clone, and each runs the steps before it that the run has not done. The clone must be at the run's base, the commit its check ran on; one that has moved is refused, and `pma pr` remains. `stage` refuses a clone with staged changes. `commit` and `push` need `--approve` for a run not yet staged: `pma review 4 --approve`, or `pma push 4 --approve --drop 3` as one command. In the TUI and web, `u` approves and pushes a ready run, asking first which items a bundle finished, and `U` pushes every approved run in the list. `push` pushes the run's commit only. Design: `docs/dev/stage-commit-push.md`.
+`stage`, `commit` and `push` work in your clone, and each runs the steps before it that the run has not done. The clone must be at the run's base, the commit its check ran on; one that has moved is refused, and `pma pr` remains. `stage` refuses a clone with staged changes. `commit` and `push` need `--approve` for a run not yet staged: `pma review 4 --approve`, or `pma push 4 --approve --drop 3` as one command. In the TUI and web, `u` approves and pushes a ready run, asking first which items a bundle finished, and `U` pushes every approved run in the list. `D` dispatches and pushes each run whose gates are clean, as `--push` does. A decision made from a run's detail opens the next ready run. `push` pushes the run's commit only. Design: `docs/dev/stage-commit-push.md`.
 
 A run opened with `pma pr` is `pr-open` until the pull request is merged or closed; `pma review` settles it and shows review activity meanwhile. `pma merge <id>` merges it, or `M` in the TUI and web. If it conflicts, `pma merge <id> --fix` or `F` has an agent resolve the conflicts and returns the run to review; `pma pr` then updates the same pull request, and `stage`, `commit` and `push` refuse it. Rejecting the fix returns the run to `pr-open`.
 

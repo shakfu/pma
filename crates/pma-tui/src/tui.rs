@@ -158,6 +158,9 @@ pub struct App {
     notices: Vec<api::Transition>,
     /// Tasks marked on the current view, which `d` dispatches together.
     marks: Vec<Pick>,
+    /// The run a decision was made on from its detail: the next to read
+    /// follows it.
+    advance: Option<i64>,
     busy: bool,
     palette: Palette,
 }
@@ -188,6 +191,7 @@ impl App {
             status: None,
             notices: Vec::new(),
             marks: Vec::new(),
+            advance: None,
             busy: false,
             palette: Palette::from_env(),
         }
@@ -459,6 +463,10 @@ impl App {
                             && act.on_row()
                             && screen::fits(act, &pick)
                         {
+                            self.advance = match pick {
+                                Pick::Run { id, .. } if act.decides() => Some(id),
+                                _ => None,
+                            };
                             return self.begin(act, b.ask, pick, Vec::new());
                         }
                     }
@@ -684,8 +692,13 @@ impl App {
             Command::Quit => return Some(Request::Quit),
             Command::Mark => {
                 let pick = self.pick().0;
-                if !matches!(pick, Pick::Task { .. }) {
-                    self.say("Only a task can be marked.", Tone::Warn);
+                let markable = match &pick {
+                    Pick::Task { .. } => true,
+                    Pick::Manual { .. } => self.tab == Tab::Projects,
+                    _ => false,
+                };
+                if !markable {
+                    self.say("Only a task or a project can be marked.", Tone::Warn);
                     return None;
                 }
                 match self.marks.iter().position(|m| same_task(m, &pick)) {
@@ -704,9 +717,12 @@ impl App {
             }
             Command::Act(act) => {
                 let (mut pick, pane) = self.pick();
-                if act == Act::Dispatch && !self.marks.is_empty() {
+                let over_marks = matches!(act, Act::Dispatch | Act::DispatchPush)
+                    || (act == Act::Run && self.tab == Tab::Projects);
+                if over_marks && !self.marks.is_empty() {
                     pick = screen::marked(&self.marks);
                 }
+                self.advance = None;
                 return self.begin(act, binding.ask, pick, pane);
             }
         }
@@ -762,6 +778,9 @@ impl App {
     fn ask_done(&mut self, act: Act, pick: &Pick, pane: &[Item], input: &str) -> Option<Request> {
         match screen::action_in(act, pick, pane, input, &self.project) {
             Ok(a) => {
+                if matches!(a, Action::Run { .. }) {
+                    self.marks.clear();
+                }
                 self.say("Working...", Tone::Accent);
                 Some(Request::Act(a))
             }
@@ -770,6 +789,20 @@ impl App {
                 None
             }
         }
+    }
+
+    /// After a decision from a detail, the next ready run in the view, if any.
+    fn next_review(&mut self) -> Option<Request> {
+        let decided = self.advance.take()?;
+        self.panes()
+            .iter()
+            .flat_map(|p| &p.items)
+            .find_map(|i| match &i.pick {
+                Pick::Run { id, state, .. } if state == "ready" && *id != decided => {
+                    Some(Request::Load(Query::Run { id: *id }))
+                }
+                _ => None,
+            })
     }
 
     pub fn render(&mut self, frame: &mut Frame) {
@@ -962,7 +995,10 @@ impl App {
                     ) || pick.project().is_some()
                 }
                 Command::OpenProject => pick.project().is_some(),
-                Command::Mark => matches!(pick, Pick::Task { .. }),
+                Command::Mark => {
+                    matches!(pick, Pick::Task { .. })
+                        || (self.tab == Tab::Projects && matches!(pick, Pick::Manual { .. }))
+                }
                 _ => false,
             })
             .chain(
@@ -1233,19 +1269,30 @@ impl App {
         let mut right = group(&format!("On {}", self.tab.title()), &|b| {
             matches!(b.command, Command::Act(_)) && !b.tabs.is_empty()
         });
-        right.extend(group("Anywhere", &|b| {
+        let mut third = group("Anywhere", &|b| {
             matches!(b.command, Command::Act(_)) && b.tabs.is_empty()
-        }));
-        let height = (left.len().max(right.len()) as u16 + 2).min(area.height);
-        let area = centered(area, 84.min(area.width), height);
+        });
+        // A third column where one list would run off the bottom and there is
+        // the width for it.
+        let wide = right.len() + third.len() + 2 > area.height as usize && area.width >= 108;
+        if !wide {
+            right.append(&mut third);
+        }
+        let tallest = left.len().max(right.len()).max(third.len());
+        let height = (tallest as u16 + 2).min(area.height);
+        let area = centered(area, if wide { 108 } else { 84.min(area.width) }, height);
         frame.render_widget(Clear, area);
         let block = dialog(p, " Keys ", p.accent());
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let [l, r] =
-            Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).areas(inner);
-        frame.render_widget(Paragraph::new(left), l);
-        frame.render_widget(Paragraph::new(right), r);
+        let columns = if wide { 3 } else { 2 };
+        let areas =
+            Layout::horizontal(vec![Constraint::Ratio(1, columns); columns as usize]).split(inner);
+        frame.render_widget(Paragraph::new(left), areas[0]);
+        frame.render_widget(Paragraph::new(right), areas[1]);
+        if wide {
+            frame.render_widget(Paragraph::new(third), areas[2]);
+        }
     }
 
     fn render_detail(
@@ -1636,7 +1683,11 @@ pub fn key_name(code: KeyCode) -> Option<String> {
 
 /// Whether two picks are the same task, whatever else about it changed.
 fn same_task(a: &Pick, b: &Pick) -> bool {
-    matches!((a, b), (Pick::Task { target: x, .. }, Pick::Task { target: y, .. }) if x == y)
+    match (a, b) {
+        (Pick::Task { target: x, .. }, Pick::Task { target: y, .. }) => x == y,
+        (Pick::Manual { project: x }, Pick::Manual { project: y }) => x == y,
+        _ => false,
+    }
 }
 
 /// Puts the act that moves `pick` on (`screen::next_act`) first, so a
@@ -1662,9 +1713,16 @@ fn execute(store: &Store, app: &mut App, request: Request) {
     match request {
         Request::Load(q) => app.loaded(api::query(store, q).map_err(|e| e.to_string())),
         Request::Act(a) => {
-            app.acted(api::act(store, a).map_err(|e| e.to_string()));
+            let outcome = api::act(store, a).map_err(|e| e.to_string());
+            if outcome.is_err() {
+                app.advance = None;
+            }
+            app.acted(outcome);
             let q = app.query();
             app.loaded(api::query(store, q).map_err(|e| e.to_string()));
+            if let Some(next) = app.next_review() {
+                execute(store, app, next);
+            }
         }
         Request::Choose { act, pick, label } => {
             app.offered(
@@ -2015,6 +2073,35 @@ mod tests {
         app.key(" ");
         app.key("2");
         assert!(app.marks.is_empty(), "another view clears them");
+    }
+
+    /// A decision from a detail opens the next ready run, not the one just
+    /// decided, which a queued act has not moved yet. From a list it opens
+    /// nothing.
+    #[test]
+    fn a_decision_opens_the_next_ready_run() {
+        let mut app = App::new();
+        app.loaded(Ok(next_view()));
+        let ready: Vec<i64> = app
+            .panes()
+            .iter()
+            .flat_map(|p| &p.items)
+            .filter_map(|i| match &i.pick {
+                Pick::Run { id, state, .. } if state == "ready" => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let first = ready[0];
+        app.advance = Some(first + 1000);
+        assert_eq!(
+            app.next_review(),
+            Some(Request::Load(Query::Run { id: first }))
+        );
+        assert_eq!(app.next_review(), None, "once");
+        app.advance = Some(first);
+        if ready.len() == 1 {
+            assert_eq!(app.next_review(), None, "not the run just decided");
+        }
     }
 
     /// `u` on a ready bundle asks what `a` asks, then pushes: the checklist
@@ -2408,7 +2495,7 @@ mod tests {
         assert!(screen_text(&mut app).contains("[x] p"));
         let Some(Request::Act(Action::Run {
             name,
-            project,
+            projects,
             push,
             ..
         })) = app.key("Enter")
@@ -2416,7 +2503,7 @@ mod tests {
             panic!("a run");
         };
         assert_eq!(
-            (name.as_str(), project.as_str(), push),
+            (name.as_str(), projects[0].as_str(), push),
             ("fix-ci", "spore", true)
         );
 

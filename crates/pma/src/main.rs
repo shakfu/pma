@@ -4884,6 +4884,7 @@ mod tests {
                 retry: false,
                 worker: worker.clone(),
                 prompt: None,
+                push: false,
             },
             Action::Dispatch {
                 targets: vec!["a:3".into()],
@@ -4893,6 +4894,7 @@ mod tests {
                 retry: true,
                 worker: worker.clone(),
                 prompt: None,
+                push: false,
             },
             Action::Dispatch {
                 targets: vec!["a".into()],
@@ -4902,6 +4904,7 @@ mod tests {
                 retry: false,
                 worker: worker.clone(),
                 prompt: Some("-audit the error paths\nand fix them".into()),
+                push: false,
             },
             Action::WorkflowRun {
                 name: "w".into(),

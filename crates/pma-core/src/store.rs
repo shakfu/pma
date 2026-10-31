@@ -24,7 +24,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 44;
+const VERSION: i64 = 45;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -463,6 +463,15 @@ CREATE TABLE IF NOT EXISTS settings_sync (text TEXT NOT NULL);
 const READ_RUNS_DONE: &str = "
 UPDATE runs SET state = 'done'
 WHERE state = 'ready' AND branch = '' AND workflow_instance IS NOT NULL;
+";
+
+/// Version 45. What the agent was refused in its last attempt, as a JSON array;
+/// when a reviewer first read the run, until they decide on it; and the time
+/// measured that way, apart from `review_seconds`, which a person states.
+const DENIED_AND_REVIEW_CLOCK: &str = "
+ALTER TABLE runs ADD COLUMN denied TEXT;
+ALTER TABLE runs ADD COLUMN review_started INTEGER;
+ALTER TABLE runs ADD COLUMN review_measured INTEGER;
 ";
 
 /// Version 44. Every worker that runs `claude` moves from `acceptEdits` to
@@ -1023,6 +1032,7 @@ impl Store {
                     JOB_PROJECT,
                     RUN_ITEMS,
                     CLAUDE_AUTO_MODE,
+                    DENIED_AND_REVIEW_CLOCK,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -2080,7 +2090,7 @@ impl Store {
                 decided_at = ?14, published_at = ?15, review_seconds = ?16,
                 changed_paths = ?17, scope_error = ?18, approved_tree = ?19,
                 approved_head = ?20, approved_by = ?21, reviewed_tree = ?22, infra = ?23,
-                base = ?25
+                base = ?25, denied = ?26
              WHERE id = ?1 AND (?24 IS NULL OR state = ?24)",
             params![
                 run.id,
@@ -2110,6 +2120,7 @@ impl Store {
                 run.infra,
                 read.map(RunState::name),
                 run.base,
+                serde_json::to_string(&run.denied).ok(),
             ],
         )?;
         if written == 0 {
@@ -2146,6 +2157,27 @@ impl Store {
             .pragma_query_value(None, "data_version", |r| r.get(0))?)
     }
 
+    /// Starts the review clock, unless a reading already did.
+    pub fn start_review(&self, id: i64, now: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET review_started = coalesce(review_started, ?2) WHERE id = ?1",
+            params![id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Stops the review clock and adds at most `cap` seconds to what it has
+    /// measured.
+    pub fn settle_review(&self, id: i64, now: i64, cap: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET review_measured = coalesce(review_measured, 0)
+                 + min(max(?2 - review_started, 0), ?3), review_started = NULL
+             WHERE id = ?1 AND review_started IS NOT NULL",
+            params![id, now, cap],
+        )?;
+        Ok(())
+    }
+
     pub fn set_reviewed_tree(&self, id: i64, tree: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE runs SET reviewed_tree = ?2 WHERE id = ?1",
@@ -2165,7 +2197,8 @@ impl Store {
                     complexity, features, estimator, route_revision, route, approval,
                     approved_tree, approved_head, approved_by,
                     workflow_instance, node, unit, lap, preset, extra_args, git_snapshot,
-                    reviewed_tree, infra, workspace, start
+                    reviewed_tree, infra, workspace, start, denied,
+                    review_measured
              FROM runs ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -2251,6 +2284,11 @@ impl Store {
                 infra: r.get(57)?,
                 workspace: Workspace::parse(&r.get::<_, String>(58)?).unwrap_or_default(),
                 start: r.get(59)?,
+                denied: r
+                    .get::<_, Option<String>>(60)?
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
+                review_measured: r.get(61)?,
                 items: Vec::new(),
             })
         })?;
@@ -3306,6 +3344,10 @@ pub struct Run {
     /// A clone run's working tree at dispatch, as a commit; `HEAD` itself
     /// when nothing differed. What its diff and its revert read against.
     pub start: Option<String>,
+    /// What the agent was refused in its last attempt.
+    pub denied: Vec<String>,
+    /// Seconds from each first reading to the decision on it.
+    pub review_measured: Option<i64>,
     /// A bundle's items, in prompt order; empty for any other run.
     pub items: Vec<RunItem>,
 }
@@ -3321,6 +3363,12 @@ pub struct RunItem {
 }
 
 impl Run {
+    /// Review time: what a person stated, else what was measured. Stated over
+    /// summed: someone who gives a figure has already counted the reading.
+    pub fn review_time(&self) -> Option<i64> {
+        self.review_seconds.or(self.review_measured)
+    }
+
     /// The open pull request a conflict fix under review will update. A
     /// publish to the clone would leave it open and untracked.
     pub fn fixing_pr(&self) -> Option<&str> {
@@ -3397,6 +3445,8 @@ impl Run {
             infra: false,
             workspace: Workspace::Worktree,
             start: None,
+            denied: Vec::new(),
+            review_measured: None,
             items: Vec::new(),
         }
     }
@@ -4024,6 +4074,14 @@ mod tests {
                         [command, args],
                     )
                     .unwrap();
+                store
+                    .conn
+                    .execute_batch(
+                        "ALTER TABLE runs DROP COLUMN denied;
+                         ALTER TABLE runs DROP COLUMN review_started;
+                         ALTER TABLE runs DROP COLUMN review_measured;",
+                    )
+                    .unwrap();
                 store.conn.pragma_update(None, "user_version", 43).unwrap();
             }
             let store = Store::open(&path).unwrap();
@@ -4038,9 +4096,60 @@ mod tests {
         }
     }
 
+    /// The clock starts at the first reading, stops at the decision, adds at
+    /// most the cap, and leaves a run no one opened at nothing. A later write
+    /// of the run keeps it, and a stated time wins over it.
+    #[test]
+    fn the_review_clock_runs_from_first_reading_to_decision() {
+        let dir = scratch("review-clock");
+        let store = Store::open(&dir.join("p.db")).unwrap();
+        let mut run = Run::blank();
+        store.insert_run(&mut run).unwrap();
+        let time = |store: &Store| store.run(run.id).unwrap().review_time();
+
+        store.settle_review(run.id, 500, 60).unwrap();
+        assert_eq!(time(&store), None, "never opened");
+
+        store.start_review(run.id, 100).unwrap();
+        store.start_review(run.id, 130).unwrap();
+        store.settle_review(run.id, 140, 60).unwrap();
+        assert_eq!(time(&store), Some(40), "from the first reading");
+
+        store.update_run(&run).unwrap();
+        assert_eq!(time(&store), Some(40), "a stale copy does not undo it");
+
+        store.start_review(run.id, 200).unwrap();
+        store.settle_review(run.id, 9000, 60).unwrap();
+        assert_eq!(time(&store), Some(100), "an idle window is capped");
+
+        store.settle_review(run.id, 9500, 60).unwrap();
+        assert_eq!(time(&store), Some(100), "already stopped");
+
+        store.add_review_seconds(run.id, 420).unwrap();
+        assert_eq!(time(&store), Some(420), "stated, not summed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A run's refusals read back as they were written.
+    #[test]
+    fn a_runs_denials_are_kept() {
+        let dir = scratch("denied");
+        let store = Store::open(&dir.join("p.db")).unwrap();
+        let mut run = Run::blank();
+        store.insert_run(&mut run).unwrap();
+        assert!(store.run(run.id).unwrap().denied.is_empty());
+        run.denied = vec!["git push".into()];
+        store.update_run(&run).unwrap();
+        assert_eq!(store.run(run.id).unwrap().denied, ["git push"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Undoes versions 40 to 43, for a test that rewinds the schema past
     /// them.
     const BEFORE_SCAN_FAULTS: &str = "
+        ALTER TABLE runs DROP COLUMN denied;
+        ALTER TABLE runs DROP COLUMN review_started;
+        ALTER TABLE runs DROP COLUMN review_measured;
         DROP TABLE run_items;
         ALTER TABLE jobs DROP COLUMN project;
         ALTER TABLE runs DROP COLUMN workspace;
@@ -4536,6 +4645,8 @@ mod tests {
             infra: false,
             workspace: Workspace::Worktree,
             start: None,
+            denied: Vec::new(),
+            review_measured: None,
             items: vec![
                 RunItem {
                     key: "a".into(),

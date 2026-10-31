@@ -512,7 +512,7 @@ pub fn run_fields(run: &Run) -> Vec<Vec<String>> {
             ),
         ]);
     }
-    if let Some(s) = run.review_seconds {
+    if let Some(s) = run.review_time() {
         rows.push(vec!["reviewed".into(), duration(Some(s))]);
     }
     for (label, value) in [

@@ -418,6 +418,7 @@ fn keys_json() -> Value {
                     "act": a.name(),
                     "row": a.on_row(),
                     "weight": a.weight(),
+                    "decides": a.decides(),
                 }),
                 other => json!({ "kind": format!("{other:?}") }),
             };
@@ -525,6 +526,7 @@ fn pick_json(p: &Pick) -> Value {
         Pick::Tasks { targets, retry } => {
             json!({ "kind": "tasks", "targets": targets, "retry": retry })
         }
+        Pick::Projects { names } => json!({ "kind": "projects", "names": names }),
         Pick::Manual { project } => json!({ "kind": "manual", "project": project }),
         Pick::Run {
             id,
@@ -580,6 +582,14 @@ fn pick_from(v: &Value) -> Option<Pick> {
                 .collect::<Option<Vec<_>>>()
                 .filter(|t| !t.is_empty())?,
             retry: b("retry")?,
+        },
+        "projects" => Pick::Projects {
+            names: v["names"]
+                .as_array()?
+                .iter()
+                .map(|t| t.as_str().map(String::from))
+                .collect::<Option<Vec<_>>>()
+                .filter(|t| !t.is_empty())?,
         },
         "manual" => Pick::Manual {
             project: s("project")?,

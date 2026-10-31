@@ -215,6 +215,65 @@ pub struct Report {
     pub ok: bool,
     pub summary: String,
     pub cost_usd: Option<f64>,
+    /// What the agent was refused, one line each. It carries on after a
+    /// refusal, so a run can look finished with the work undone.
+    pub denied: Vec<String>,
+}
+
+/// One line of at most 80 characters, for a reviewer to recognize.
+fn denial_line(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    let short: String = line.chars().take(80).collect();
+    match short.len() < line.len() {
+        true => format!("{short}..."),
+        false => short,
+    }
+}
+
+/// The result's `permission_denials`, then each tool result the auto mode
+/// classifier refused that they left out. Both are read because the classifier
+/// has not been seen to fill the result's list.
+fn denials(output: &str, result: &serde_json::Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut out = Vec::new();
+    for d in result["permission_denials"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        ids.push(d["tool_use_id"].as_str().unwrap_or_default().to_string());
+        let what = d["tool_input"]["command"]
+            .as_str()
+            .or(d["tool_name"].as_str())
+            .unwrap_or("a tool call");
+        out.push(denial_line(what));
+    }
+    const REFUSED: &str = "denied by the Claude Code auto mode classifier";
+    for line in output.lines().filter(|l| l.contains(REFUSED)) {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        for block in event["message"]["content"].as_array().into_iter().flatten() {
+            let id = block["tool_use_id"].as_str().unwrap_or_default();
+            if event["type"] != "user"
+                || block["type"] != "tool_result"
+                || block["is_error"] != true
+                || ids.iter().any(|seen| seen == id)
+            {
+                continue;
+            }
+            let text = match &block["content"] {
+                serde_json::Value::String(s) => s.clone(),
+                other => other[0]["text"].as_str().unwrap_or_default().to_string(),
+            };
+            if let Some((_, after)) = text.split_once(REFUSED) {
+                let reason = after.split_once("Reason: ").map_or("", |(_, r)| r);
+                let reason = reason.split_once('.').map_or(reason, |(r, _)| r);
+                out.push(denial_line(&format!("auto mode classifier: {reason}")));
+            }
+        }
+    }
+    out
 }
 
 /// Reads `claude -p --output-format json` output. Anything else is reported as
@@ -235,11 +294,13 @@ pub fn parse_claude(output: &str) -> Report {
                 .or_else(|| v["subtype"].as_str().map(String::from))
                 .unwrap_or_default(),
             cost_usd: v["total_cost_usd"].as_f64(),
+            denied: denials(output, &v),
         },
         None => Report {
             ok: false,
             summary: tail(output, 20),
             cost_usd: None,
+            denied: Vec::new(),
         },
     }
 }
@@ -290,6 +351,47 @@ pub fn detect_verify(dir: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Refusals come from the result's list and from classifier tool results,
+    /// and one in both counts once. A file quoting the words is no refusal.
+    #[test]
+    fn claude_refusals_are_read_from_both_places() {
+        let refused = "Permission for this action was denied by the Claude Code auto mode \
+                       classifier. Reason: [Code from External]. If you have other tasks";
+        let event = |id: &str, is_error: bool| {
+            serde_json::json!({"type": "user", "message": {"content": [{
+                "type": "tool_result", "tool_use_id": id, "is_error": is_error,
+                "content": refused,
+            }]}})
+            .to_string()
+        };
+        let result = serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false, "result": "done",
+            "permission_denials": [
+                {"tool_name": "Bash", "tool_use_id": "a",
+                 "tool_input": {"command": "git status\nmore"}},
+                {"tool_name": "Write", "tool_use_id": "b", "tool_input": {}},
+            ],
+        })
+        .to_string();
+        let log = [
+            event("a", true),
+            event("c", true),
+            event("d", false),
+            result,
+        ]
+        .join("\n");
+        assert_eq!(
+            parse_claude(&log).denied,
+            [
+                "git status",
+                "Write",
+                "auto mode classifier: [Code from External]"
+            ]
+        );
+        let long = "x".repeat(90);
+        assert_eq!(denial_line(&long), format!("{}...", "x".repeat(80)));
+    }
+
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("pma-agent-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -315,7 +417,8 @@ mod tests {
             Report {
                 ok: true,
                 summary: "Fixed it.".into(),
-                cost_usd: Some(0.42)
+                cost_usd: Some(0.42),
+                denied: Vec::new(),
             }
         );
         let over = r#"{"type":"result","subtype":"error_max_budget_usd","is_error":true,"total_cost_usd":1.01}"#;

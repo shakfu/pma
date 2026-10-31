@@ -1095,6 +1095,8 @@ fn queue(
         infra: false,
         workspace: pick.workspace,
         start,
+        denied: Vec::new(),
+        review_measured: None,
         items: pick.items.clone(),
     };
     run.prompt = prompt(&run, &details, verify.as_deref());
@@ -1556,6 +1558,7 @@ fn attempt(
     }
     a.summary = Some(report.summary.clone());
     run.summary = Some(report.summary);
+    run.denied = report.denied;
     // A regular file only: a symlink could copy any file pma can read into
     // the review.
     let drafted = run.worktree.join(CHANGELOG_DRAFT);
@@ -1948,6 +1951,14 @@ pub fn tree(run: &Run) -> Result<String> {
     wt_git(run, &["write-tree"])
 }
 
+/// The most one reading adds to a run's review time. A run left open over
+/// lunch is not half a day of review.
+const REVIEW_CAP_SECONDS: i64 = 30 * 60;
+
+fn settle_review(store: &Store, run: &Run) -> Result<()> {
+    store.settle_review(run.id, crate::dates::now(), REVIEW_CAP_SECONDS)
+}
+
 pub fn approve(store: &Store, run: &mut Run, by: &str) -> Result<()> {
     let read = run.state;
     // Approving an already approved run re-takes the evidence, which is how
@@ -1988,6 +1999,7 @@ pub fn approve(store: &Store, run: &mut Run, by: &str) -> Result<()> {
     run.approved_head = wt_git(run, &["rev-parse", "HEAD"]).ok();
     run.approved_by = Some(by.to_string());
     run.enter(RunState::Approved);
+    settle_review(store, run)?;
     // No session lock is held: a publish may have run since `run` was read.
     store.update_run_from(run, read)
 }
@@ -1999,6 +2011,7 @@ pub fn approve(store: &Store, run: &mut Run, by: &str) -> Result<()> {
 pub fn reject(store: &Store, run: &mut Run, keep: bool, infra: bool) -> Result<usize> {
     let fix = run.fixing_pr().is_some();
     let files = discard(store, run, keep)?;
+    settle_review(store, run)?;
     // Only the fix was refused. The pull request still holds the task.
     if fix {
         return Ok(files);
@@ -2169,6 +2182,7 @@ pub fn rework(
         )
         .into());
     }
+    settle_review(store, run)?;
     if !run.worktree.is_dir() {
         return Err(format!(
             "{} no longer exists; reject the run",
@@ -2436,6 +2450,8 @@ mod tests {
             infra: false,
             workspace: Workspace::Worktree,
             start: None,
+            denied: Vec::new(),
+            review_measured: None,
             items: Vec::new(),
         };
         let p = prompt(&run, "for all classes\n", Some("make test"));

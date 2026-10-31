@@ -108,6 +108,8 @@ pub enum Act {
     /// Scans the project the project view shows, and nothing else.
     ScanProject,
     Dispatch,
+    /// Dispatches, then approves and pushes each run whose gates are clean.
+    DispatchPush,
     /// Resumes the selected instance.
     ResumeWorkflow,
     /// Starts an instance from a typed `<workflow> <target> [flags]`.
@@ -163,7 +165,7 @@ pub enum Act {
 }
 
 impl Act {
-    pub const ALL: [Act; 47] = [
+    pub const ALL: [Act; 48] = [
         Act::ApproveRun,
         Act::ApproveRuns,
         Act::RejectRun,
@@ -178,6 +180,7 @@ impl Act {
         Act::Scan,
         Act::ScanProject,
         Act::Dispatch,
+        Act::DispatchPush,
         Act::ResumeWorkflow,
         Act::StartWorkflow,
         Act::ReworkRun,
@@ -212,6 +215,22 @@ impl Act {
         Act::Prune,
         Act::Prompt,
     ];
+
+    /// Whether the act settles a run a reviewer has open, so the next one to
+    /// read can follow.
+    pub fn decides(self) -> bool {
+        matches!(
+            self,
+            Act::ApproveRun
+                | Act::RejectRun
+                | Act::ReworkRun
+                | Act::RetryRun
+                | Act::Stage
+                | Act::Commit
+                | Act::Pr
+                | Act::Push
+        )
+    }
 
     pub fn name(self) -> String {
         format!("{self:?}")
@@ -256,6 +275,7 @@ impl Act {
             | Act::RemoveNote
             | Act::Push
             | Act::PushApproved
+            | Act::DispatchPush
             | Act::Merge
             | Act::ResetSetting
             | Act::RemoveRoot
@@ -285,7 +305,7 @@ impl Act {
             Action::EditNote { .. } => &[Act::EditNote],
             Action::RemoveNote { .. } => &[Act::RemoveNote],
             Action::Scan { .. } => &[Act::Scan, Act::ScanProject],
-            Action::Dispatch { .. } => &[Act::Dispatch, Act::Prompt],
+            Action::Dispatch { .. } => &[Act::Dispatch, Act::DispatchPush, Act::Prompt],
             Action::WorkflowRun { .. } => &[Act::ResumeWorkflow, Act::StartWorkflow],
             Action::ReworkRun { .. } => &[Act::ReworkRun],
             Action::RetryRun { .. } => &[Act::RetryRun],
@@ -347,7 +367,7 @@ pub enum Command {
     Finished,
     /// The project of the selected row.
     OpenProject,
-    /// Marks the selected task, or unmarks it, for a dispatch of several.
+    /// Marks the selected task or project, or unmarks it, for an act on several.
     Mark,
     Help,
     /// The TUI only; a browser tab is closed by the browser.
@@ -409,6 +429,7 @@ const fn on(
 }
 
 const TASKS: &[Tab] = &[Tab::Inbox, Tab::Matrix, Tab::Project];
+const MARKS: &[Tab] = &[Tab::Inbox, Tab::Matrix, Tab::Project, Tab::Projects];
 const PANES: &[Tab] = &[
     Tab::Inbox,
     Tab::Activity,
@@ -523,10 +544,17 @@ pub const BINDINGS: &[Binding] = &[
     ),
     // A task.
     Binding {
-        tabs: TASKS,
+        tabs: MARKS,
         ..bind(" ", Command::Mark, "mark")
     },
     on("d", TASKS, Act::Dispatch, Ask::Confirm, "dispatch"),
+    on(
+        "D",
+        TASKS,
+        Act::DispatchPush,
+        Ask::Confirm,
+        "dispatch and push",
+    ),
     on("v", TASKS, Act::Verify, Ask::Nothing, "verify project"),
     // A run.
     on(

@@ -411,6 +411,8 @@ pub enum Action {
         /// A prompt of the developer's own over the one project named, in
         /// place of a task.
         prompt: Option<String>,
+        /// Approves and pushes each run whose gates are clean.
+        push: bool,
     },
     /// Starts or resumes an instance; with `approve`, runs that plan.
     WorkflowRun {
@@ -437,7 +439,7 @@ pub enum Action {
     /// `pma run <name> <project>`: a named job over one project.
     Run {
         name: String,
-        project: String,
+        projects: Vec<String>,
         review: bool,
         worktree: bool,
         push: bool,
@@ -1195,6 +1197,9 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
             let before = approvable.then(|| dispatch::tree(&run).ok()).flatten();
             // A workflow node that is not an `edit` has no branch, and its tree
             // is gone once its output is read.
+            if run.state == RunState::Ready {
+                store.start_review(run.id, crate::dates::now())?;
+            }
             let diff = if run.branch.is_empty() {
                 "(none: this node changes no files)".to_string()
             } else {
@@ -1864,7 +1869,7 @@ pub fn one_project(names: &[String]) -> Option<String> {
 /// that project, so the job shows in that project's view.
 fn project_of(a: &Action) -> Option<String> {
     match a {
-        Action::Run { project, .. } => Some(project.clone()),
+        Action::Run { projects, .. } => one_project(projects),
         Action::Dispatch { targets, .. } => one_project(targets),
         Action::WorkflowRun { projects, .. } => one_project(projects),
         Action::Scan { of, .. } | Action::Sync { of, .. } | Action::Verify { of } => {
@@ -1915,6 +1920,7 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
             retry,
             worker: w,
             prompt,
+            push: publish,
         } => {
             push("dispatch");
             v.extend(targets.iter().cloned());
@@ -1923,6 +1929,7 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
             opt(&mut v, "--count", &count.map(|n| n.to_string()));
             flag(&mut v, *retry, "--retry");
             opt(&mut v, "--prompt", prompt);
+            flag(&mut v, *publish, "--push");
             worker(&mut v, w);
         }
         Action::WorkflowRun {
@@ -1954,13 +1961,14 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
         }
         Action::Run {
             name,
-            project,
+            projects,
             review,
             worktree,
             push,
             worker: w,
         } => {
-            v.extend(["run".to_string(), name.clone(), project.clone()]);
+            v.extend(["run".to_string(), name.clone()]);
+            v.extend(projects.iter().cloned());
             flag(&mut v, *review, "--review");
             flag(&mut v, *worktree, "--worktree");
             flag(&mut v, *push, "--push");
@@ -2076,7 +2084,7 @@ mod tests {
         assert_eq!(
             line(Action::Run {
                 name: "fix-ci".into(),
-                project: "spore".into(),
+                projects: vec!["spore".into()],
                 review: false,
                 worktree: true,
                 push: true,
@@ -2129,6 +2137,7 @@ mod tests {
                 retry: false,
                 worker: w.clone(),
                 prompt: None,
+                push: false,
             }),
             [
                 "dispatch",
@@ -2147,6 +2156,19 @@ mod tests {
                 drop: None,
             }),
             ["pr", "4"]
+        );
+        assert_eq!(
+            line(Action::Dispatch {
+                targets: vec!["a:5".into()],
+                tags: vec![],
+                auto: false,
+                count: None,
+                retry: false,
+                worker: WorkerChoice::default(),
+                prompt: None,
+                push: true,
+            }),
+            ["dispatch", "a:5", "--push"]
         );
     }
 

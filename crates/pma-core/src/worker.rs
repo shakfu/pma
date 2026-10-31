@@ -102,6 +102,7 @@ impl Parser {
                 ok: exit_ok,
                 summary: tail(output, 20),
                 cost_usd: None,
+                denied: Vec::new(),
             },
             Parser::Fields {
                 summary,
@@ -113,6 +114,7 @@ impl Parser {
                         ok: false,
                         summary: tail(output, 20),
                         cost_usd: None,
+                        denied: Vec::new(),
                     };
                 };
                 let flagged = error
@@ -129,6 +131,7 @@ impl Parser {
                         serde_json::Value::String(s) => s.parse().ok(),
                         _ => None,
                     }),
+                    denied: Vec::new(),
                 }
             }
         }
@@ -716,7 +719,8 @@ mod tests {
             Report {
                 ok: true,
                 summary: "line one\nline two".into(),
-                cost_usd: None
+                cost_usd: None,
+                denied: Vec::new(),
             }
         );
         assert!(!Parser::TextTail.report("boom", false).ok);
@@ -747,7 +751,8 @@ mod tests {
             Report {
                 ok: true,
                 summary: "did it".into(),
-                cost_usd: Some(0.42)
+                cost_usd: Some(0.42),
+                denied: Vec::new(),
             }
         );
         // The flag outranks a zero exit status, and a cost as text is read.

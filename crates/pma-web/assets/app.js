@@ -956,7 +956,7 @@ async function refresh() {
 }
 
 function transitionTone(t) {
-  if (t.state === "failed" || t.state === "stopped") return "bad";
+  if (t.state === "failed" || t.state === "stopped" || t.state === "blocked") return "bad";
   if (t.state === "pushed" || t.state === "merged" || t.state === "applied" || t.state === "done") return "good";
   return "accent";
 }

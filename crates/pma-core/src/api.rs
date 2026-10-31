@@ -6,7 +6,7 @@
 //! An action that runs agents or waits on the network is queued as a job
 //! running the same CLI command, so no front end blocks on it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::config::{Config, Workspace};
@@ -811,6 +811,10 @@ pub fn busy(store: &Store) -> Result<bool> {
         || store.runs()?.iter().any(|r| r.state == RunState::Running))
 }
 
+/// A `Transition`'s state for a running agent waiting on a person. herdr's word,
+/// and no `RunState`: the run is still running.
+const BLOCKED: &str = "blocked";
+
 /// A run or job that reached a state worth telling the user about.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Transition {
@@ -836,6 +840,7 @@ impl Transition {
                     "ready" => "ready for review",
                     "staged" => "staged in its clone, commit next",
                     "committed" => "committed in its clone, push next",
+                    BLOCKED => "needs you in herdr",
                     s => s,
                 },
                 self.text
@@ -851,7 +856,11 @@ impl Transition {
                 id: self.id,
                 clean: false,
                 fixing: false,
-                state: self.state.clone(),
+                // A blocked run is still running, which is what its acts go by.
+                state: match self.state.as_str() {
+                    BLOCKED => "running".into(),
+                    s => s.into(),
+                },
                 project: self.project.clone(),
             },
             _ => screen::Pick::Job {
@@ -870,6 +879,8 @@ pub struct Watch {
     version: i64,
     runs: BTreeMap<i64, String>,
     jobs: BTreeMap<i64, String>,
+    /// The runs herdr says are waiting on a person; `None` before the first look.
+    blocked: Option<BTreeSet<i64>>,
     /// Whether a job or a run is under way, as `busy` says.
     pub busy: bool,
 }
@@ -880,6 +891,7 @@ impl Watch {
             version: store.data_version()?,
             runs: BTreeMap::new(),
             jobs: BTreeMap::new(),
+            blocked: None,
             busy: false,
         };
         w.take(store)?;
@@ -933,6 +945,26 @@ impl Watch {
             seen.insert(r.id, state);
         }
         self.runs = seen;
+        let blocked: BTreeSet<i64> = runs
+            .iter()
+            .filter(|r| r.state == RunState::Running && r.agent_state.as_deref() == Some(BLOCKED))
+            .map(|r| r.id)
+            .collect();
+        if let Some(before) = &self.blocked {
+            for r in runs
+                .iter()
+                .filter(|r| blocked.contains(&r.id) && !before.contains(&r.id))
+            {
+                out.push(Transition {
+                    kind: "run",
+                    id: r.id,
+                    project: r.project.clone(),
+                    text: r.text.clone(),
+                    state: BLOCKED.into(),
+                });
+            }
+        }
+        self.blocked = Some(blocked);
         let mut seen = BTreeMap::new();
         for j in &jobs {
             let moved = self.jobs.get(&j.id) != Some(&j.state);
@@ -2294,6 +2326,24 @@ mod tests {
             "{}",
             moved[0].line()
         );
+
+        // An agent waiting on a person is news each time it starts to wait,
+        // and the notice's row still offers what a running run does.
+        writer.set_agent_state(second.id, "blocked").unwrap();
+        let moved = watch.poll(&reader).unwrap().expect("a commit was seen");
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].id, second.id);
+        assert!(moved[0].line().contains("needs you in herdr"));
+        assert!(screen::fits(crate::keys::Act::OpenPane, &moved[0].pick()));
+        assert_eq!(
+            Watch::new(&reader).unwrap().poll(&reader).unwrap(),
+            None,
+            "one already blocked at the first look is no news"
+        );
+        writer.set_agent_state(second.id, "working").unwrap();
+        assert_eq!(watch.poll(&reader).unwrap(), Some(Vec::new()));
+        writer.set_agent_state(second.id, "blocked").unwrap();
+        assert_eq!(watch.poll(&reader).unwrap().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`pma integrate herdr`** runs every agent in a herdr pane: a tab per run in a `pma: <project>` workspace, closed when the run is decided. Headless by default, which keeps cost, budget and verdict; `I` or `--interactive` gives a live `claude` that reports none of them. `H` opens a run's pane and `T` opens an interactive agent on its directory. A single `integration` setting, since integrations exclude each other. Over the socket API, with an `events.subscribe` connection per run: a blocked agent shows on the run and raises a toast, and closing a pane ends its run at once. Design: `docs/dev/herdr-integration.md`.
 
+- An interactive run brings its herdr tab to the front, and an agent blocked on a person raises a notice in the TUI and web, with `H` on the run to open its pane. Claude has no flag to skip its folder-trust question, and writing `hasTrustDialogAccepted` to `~/.claude.json` would edit an undocumented file and hide the warning about a repo's pre-approved permissions.
+
 - `D` in the TUI and web dispatches a task and pushes the run if its gates are clean, as `pma dispatch --push` does.
 
 - On the projects tab, Space marks projects and `z` runs one name over them. `pma run --tag` was the only way to run over several.

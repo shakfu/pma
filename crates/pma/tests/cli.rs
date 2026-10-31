@@ -1565,9 +1565,26 @@ impl FakeHerdr {
                 let request: serde_json::Value = serde_json::from_str(&line).unwrap();
                 c.lock().unwrap().push(request.clone());
                 let result = match request["method"].as_str().unwrap() {
-                    "workspace.list" => serde_json::json!({"workspaces": []}),
-                    "workspace.create" => serde_json::json!({"workspace": {"workspace_id": "w1"}}),
-                    "tab.create" => serde_json::json!({"root_pane": {"pane_id": "w1:p2"}}),
+                    "workspace.list" => {
+                        let made = c
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|r: &serde_json::Value| r["method"] == "workspace.create");
+                        match made {
+                            true => serde_json::json!({"workspaces": [
+                                {"workspace_id": "w1", "label": "pma: alpha"}
+                            ]}),
+                            false => serde_json::json!({"workspaces": []}),
+                        }
+                    }
+                    "workspace.create" => serde_json::json!({
+                        "workspace": {"workspace_id": "w1"},
+                        "tab": {"tab_id": "w1:t1"},
+                        "root_pane": {"pane_id": "w1:p2"},
+                    }),
+                    "tab.create" => serde_json::json!({"root_pane": {"pane_id": "w1:p3"}}),
+                    "pane.get" => serde_json::json!({"pane": {"tab_id": "w1:t1"}}),
                     "events.subscribe" => {
                         subs.lock().unwrap().push(stream.try_clone().unwrap());
                         serde_json::json!({"type": "subscription_started"})
@@ -1670,12 +1687,17 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","t
     assert!(success, "{out}{err}");
 
     assert_eq!(herdr.called("workspace.create")[0]["label"], "pma: alpha");
-    let tab = &herdr.called("tab.create")[0];
+    // The new workspace's own tab holds the run, so no idle shell is left.
+    assert!(herdr.called("tab.create").is_empty());
+    let tab = &herdr.called("tab.rename")[0];
     assert_eq!(
-        (&tab["workspace_id"], &tab["focus"]),
-        (&"w1".into(), &false.into())
+        (&tab["tab_id"], &tab["label"]),
+        (&"w1:t1".into(), &"#1 add greeting".into())
     );
-    assert_eq!(tab["label"], "#1 add greeting");
+    assert!(
+        herdr.called("tab.focus").is_empty(),
+        "a headless run stays in the background"
+    );
     let typed = &herdr.called("pane.send_input")[0];
     assert_eq!(typed["pane_id"], "w1:p2");
     assert_eq!(typed["keys"], serde_json::json!(["Enter"]));
@@ -1700,6 +1722,33 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","t
     let (_, err, success) = herdr.pma(&env, &["review", "1", "--approve"]);
     assert!(success, "{err}");
     assert_eq!(herdr.called("pane.close")[0]["pane_id"], "w1:p2");
+}
+
+/// An interactive run comes to the front, since Claude may ask a question at
+/// once. A later run in the workspace gets a tab of its own.
+#[test]
+fn an_interactive_run_comes_to_the_front() {
+    let s = Scratch::new("herdrfocus");
+    let (env, _, _) = dispatch_env(&s, &[("claude", "#!/bin/sh\nexit 0\n")]);
+    let herdr = FakeHerdr::start("focus");
+    env.ok(&["config", "workspace", "clone"]);
+    herdr.pma(&env, &["integrate", "herdr"]);
+    let (out, err, success) = herdr.pma(&env, &["dispatch", "alpha:5", "--interactive"]);
+    assert!(success, "{out}{err}");
+    assert_eq!(herdr.called("tab.focus")[0]["tab_id"], "w1:t1");
+    assert_eq!(herdr.called("pane.get")[0]["pane_id"], "w1:p2");
+
+    let (out, err, success) = herdr.pma(
+        &env,
+        &["dispatch", "alpha", "--prompt", "more", "--worktree"],
+    );
+    assert!(success, "{out}{err}");
+    let tab = &herdr.called("tab.create")[0];
+    assert_eq!(
+        (&tab["workspace_id"], &tab["focus"]),
+        (&"w1".into(), &false.into())
+    );
+    assert_eq!(herdr.called("workspace.create").len(), 1);
 }
 
 /// Events drive what a person sees: a blocked agent is recorded and raises a

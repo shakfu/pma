@@ -1,6 +1,6 @@
 # Integrating with herdr
 
-Design note, 2026-10-29. Whether `pma` should integrate with [herdr](https://github.com/herdrdev/herdr), and how. Checked against herdr 0.9.5 on this machine (protocol 22). No code is changed yet.
+Design note, 2026-10-29. Whether `pma` should integrate with [herdr](https://github.com/herdrdev/herdr), and how. Checked against herdr 0.9.5 on this machine (protocol 22). Sections 4 and 6 are built; the recommendation below predates them.
 
 ## What herdr is
 
@@ -71,7 +71,7 @@ An agent in a pane gets `PATH`, `GIT_*` and `PMA_*` from `pma`, and the rest fro
 
 Socket API, not the CLI. A connection takes one request. Each run holds an `events.subscribe` connection for its pane. Captured from 0.9.5, and not in the schema: `pane.closed` arrives as `pane_closed`, `pane.agent_status_changed` needs a `pane_id`, and `pane.report_agent` refuses `done`. The exit status stays in a file, since herdr reports none for a line typed into a shell. A named session outside a pane is not handled.
 
-The user chose this. A live test showed most objections do not hold when the pane runs a generated script rather than `agent.start`: the script unsets what `restrict` removed, `claude -p` keeps its event stream through `tee`, and `pane close` kills the process. A guard process closes the pane if `pma` dies. The last point, coupling, still holds: this depends on a pre-1.0 CLI. An interactive run does lose cost, budget and summary, and it needs a person at Claude's folder-trust prompt in a directory not yet trusted.
+The user chose this. A live test showed most objections do not hold when the pane runs a generated script rather than `agent.start`: the script unsets what `restrict` removed, `claude -p` keeps its event stream through `tee`, and `pane close` kills the process. A guard process closes the pane if `pma` dies. The last point, coupling, still holds: this depends on a pre-1.0 CLI. An interactive run does lose cost, budget and summary, and it needs a person at Claude's folder-trust prompt in a directory not yet trusted, so its tab comes to the front. `claude --help` says `-p` skips that prompt.
 
 
 `pma` could start an agent with `pane.split` and `agent.start` instead of a child process, so the user watches and steers it live. This breaks five things `pma` relies on:
@@ -109,4 +109,4 @@ Treat herdr as a user of `pma`, not a dependency. An interactive agent in a herd
 1. Do section 1 now. It is a hygiene fix whether or not herdr is ever integrated.
 2. Document section 2 in the README under notices.
 3. Defer section 3 until there is a reason the TUI's counts are not enough.
-4. Do not do section 4.
+4. Do not do section 4. Overruled: the user chose it, and it is built.

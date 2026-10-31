@@ -88,6 +88,7 @@ pub fn open(project: &str, title: &str, cwd: &Path) -> Result<String, String> {
         .flatten()
         .find(|w| w["label"] == label.as_str())
         .and_then(|w| w["workspace_id"].as_str().map(String::from));
+    let title: String = title.chars().take(40).collect();
     let workspace = match found {
         Some(id) => id,
         None => {
@@ -95,13 +96,18 @@ pub fn open(project: &str, title: &str, cwd: &Path) -> Result<String, String> {
                 "workspace.create",
                 json!({ "label": label, "cwd": cwd, "focus": false }),
             )?;
-            made["workspace"]["workspace_id"]
+            // A new workspace comes with a tab, which this run uses: a second
+            // would leave the first as an idle shell.
+            let _ = call(
+                "tab.rename",
+                json!({ "tab_id": made["tab"]["tab_id"], "label": title }),
+            );
+            return made["root_pane"]["pane_id"]
                 .as_str()
-                .ok_or("herdr made a workspace and named none")?
-                .to_string()
+                .map(String::from)
+                .ok_or_else(|| "herdr made a workspace and named no pane".to_string());
         }
     };
-    let title: String = title.chars().take(40).collect();
     let tab = call(
         "tab.create",
         json!({ "workspace_id": workspace, "label": title, "cwd": cwd, "focus": false }),
@@ -557,6 +563,11 @@ pub fn host(
     on_pane(&pane);
     let finished = match host.interactive {
         true => {
+            // A person drives it, and Claude may ask at once whether to trust
+            // the folder. The run goes on if the pane cannot come to the front.
+            if let Err(e) = focus(&pane) {
+                eprintln!("warning: {e}");
+            }
             let cmd = interactive(&cmd)
                 .ok_or_else(|| std::io::Error::other("only `claude` can run interactively"))?;
             run_in(&pane, &cmd, log, None, false, host.title, on_state)?

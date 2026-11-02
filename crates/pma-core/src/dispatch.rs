@@ -965,6 +965,9 @@ fn queue(
 ) -> Result<Prepared> {
     let repo = &pick.repo;
     let refuse = |why: String| Ok(Prepared::Refused(format!("{}: {why}", pick.project)));
+    if let Err(e) = exclude_pma(repo) {
+        eprintln!("warning: {e}");
+    }
     // Before base verify, which runs the project's code and could install a
     // hook of its own.
     let git_snapshot = git_snapshot(&Run {
@@ -1219,6 +1222,38 @@ fn failed_ci_logs(
 /// Where an agent drafts changelog entries, relative to its worktree. pma
 /// moves the file out before any diff, so it is never part of the change.
 const CHANGELOG_DRAFT: &str = ".pma/changelog.md";
+
+/// Lists `.pma/` in the repository's `info/exclude`, which the clone and
+/// every worktree share. Not `.gitignore`: that is a tracked file, and an
+/// edit to it would wait in `git status` for a commit.
+pub fn exclude_pma(repo: &Path) -> Result<()> {
+    let common = git(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let file = Path::new(&common).join("info").join("exclude");
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("{}: {e}", file.display()).into()),
+    };
+    if text
+        .lines()
+        .any(|l| matches!(l.trim(), ".pma" | ".pma/" | "/.pma" | "/.pma/"))
+    {
+        return Ok(());
+    }
+    let sep = if text.is_empty() || text.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    let dir = file.parent().expect("info/exclude has a parent");
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    std::fs::write(&file, format!("{text}{sep}.pma/\n"))
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    Ok(())
+}
 
 /// Whether a run's agent is asked for changelog entries: its project keeps a
 /// `CHANGELOG.md`.
@@ -2929,5 +2964,25 @@ mod tests {
         );
         assert_eq!(on_origin(Some(file), "other", "other"), OnOrigin::Absent);
         assert_eq!(on_origin(None, "open one", "open one"), OnOrigin::Absent);
+    }
+
+    /// `.pma/` is excluded once, in the file the clone and its worktrees
+    /// share, after whatever the file already held.
+    #[test]
+    fn pma_is_excluded_once() {
+        let dir = std::env::temp_dir().join(format!("pma-exclude-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]).unwrap();
+        let file = dir.join(".git/info/exclude");
+        std::fs::write(&file, "*.swp").unwrap();
+        exclude_pma(&dir).unwrap();
+        exclude_pma(&dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "*.swp\n.pma/\n");
+        std::fs::create_dir_all(dir.join(".pma")).unwrap();
+        std::fs::write(dir.join(".pma/changelog.md"), "x").unwrap();
+        let status = git(&dir, &["status", "--porcelain", "--untracked-files=all"]).unwrap();
+        assert!(!status.contains(".pma"), "{status}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

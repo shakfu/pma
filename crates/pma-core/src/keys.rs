@@ -466,10 +466,11 @@ const fn on(
     }
 }
 
-const TASKS: &[Tab] = &[Tab::Inbox, Tab::Matrix, Tab::Project];
+const TASKS: &[Tab] = &[Tab::Inbox, Tab::Matrix, Tab::Project, Tab::Projects];
 const MARKS: &[Tab] = &[Tab::Inbox, Tab::Matrix, Tab::Project, Tab::Projects];
 const PANES: &[Tab] = &[
     Tab::Inbox,
+    Tab::Projects,
     Tab::Activity,
     Tab::Matrix,
     Tab::Library,
@@ -899,6 +900,10 @@ mod tests {
             },
             Pick::Manual {
                 project: "p".into(),
+            },
+            Pick::Project {
+                project: "p".into(),
+                target: Some("p:ci".into()),
             },
             Pick::Run {
                 id: 1,

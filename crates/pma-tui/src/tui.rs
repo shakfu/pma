@@ -940,7 +940,7 @@ impl App {
     fn markable(&self, pick: &Pick) -> bool {
         match pick {
             Pick::Task { .. } => true,
-            Pick::Manual { .. } => self.tab == Tab::Projects,
+            Pick::Manual { .. } | Pick::Project { .. } => self.tab == Tab::Projects,
             Pick::Run { .. } => screen::fits(Act::ForgetRun, pick),
             _ => false,
         }
@@ -970,8 +970,10 @@ impl App {
                 format!("{n} marked; X closes them, leaving their files. Esc clears."),
                 Tone::Accent,
             ),
-            n if matches!(kind, Pick::Manual { .. }) => self.say(
-                format!("{n} marked; z runs one name over them. Esc clears."),
+            n if matches!(kind, Pick::Manual { .. } | Pick::Project { .. }) => self.say(
+                format!(
+                    "{n} marked; z runs one name over them, d or I dispatches each one's task. Esc clears."
+                ),
                 Tone::Accent,
             ),
             n => self.say(
@@ -2053,6 +2055,16 @@ fn same_task(a: &Pick, b: &Pick) -> bool {
     match (a, b) {
         (Pick::Task { target: x, .. }, Pick::Task { target: y, .. }) => x == y,
         (Pick::Manual { project: x }, Pick::Manual { project: y }) => x == y,
+        (
+            Pick::Project {
+                project: x,
+                target: s,
+            },
+            Pick::Project {
+                project: y,
+                target: t,
+            },
+        ) => x == y && s == t,
         (Pick::Run { id: x, .. }, Pick::Run { id: y, .. }) => x == y,
         _ => false,
     }

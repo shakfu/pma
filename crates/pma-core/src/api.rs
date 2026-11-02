@@ -2057,6 +2057,41 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
             deps: true,
             ..
         } => return Err("a scan is offline or reads dependencies, not both".into()),
+        // Interactive runs wait on a person. One job over several projects
+        // would lock them all until every session ends; one job per project
+        // opens the sessions side by side.
+        Action::Dispatch {
+            targets,
+            interactive: true,
+            auto: false,
+            prompt: None,
+            tags,
+            count,
+            retry,
+            worker,
+            push,
+        } if one_project(&targets).is_none() && !targets.is_empty() => {
+            let mut out = Outcome::default();
+            for targets in by_project(targets) {
+                let one = act(
+                    store,
+                    Action::Dispatch {
+                        targets,
+                        tags: tags.clone(),
+                        auto: false,
+                        count,
+                        retry,
+                        worker: worker.clone(),
+                        prompt: None,
+                        push,
+                        interactive: true,
+                    },
+                )?;
+                out.said.extend(one.said);
+                out.warnings.extend(one.warnings);
+            }
+            out
+        }
         queued => {
             let args = command_line(&queued).expect("every other action is queued");
             let project = project_of(&queued).or(run_project(store, &queued)?);
@@ -2159,6 +2194,19 @@ pub fn one_project(names: &[String]) -> Option<String> {
     let mut projects = names.iter().map(|n| n.split(':').next().unwrap_or(n));
     let first = projects.next()?;
     projects.all(|p| p == first).then(|| first.to_string())
+}
+
+/// `targets` grouped by project, in the order each project first appears.
+fn by_project(targets: Vec<String>) -> Vec<Vec<String>> {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for t in targets {
+        let project = t.split(':').next().unwrap_or(&t).to_string();
+        match groups.iter_mut().find(|(p, _)| *p == project) {
+            Some((_, ts)) => ts.push(t),
+            None => groups.push((project, vec![t])),
+        }
+    }
+    groups.into_iter().map(|(_, ts)| ts).collect()
 }
 
 /// The one project a queued action is about, when every name it holds is
@@ -2376,6 +2424,16 @@ mod tests {
         );
         assert_eq!(one_project(&names(&["a:5", "b:2"])), None);
         assert_eq!(one_project(&[]), None);
+    }
+
+    /// Interactive dispatches over several projects become one job each.
+    #[test]
+    fn targets_group_by_project_in_order() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            by_project(names(&["b:ci", "a:4", "b:7", "a"])),
+            [names(&["b:ci", "b:7"]), names(&["a:4", "a"])]
+        );
     }
 
     /// A queued action's command line is one the CLI parses, with each flag

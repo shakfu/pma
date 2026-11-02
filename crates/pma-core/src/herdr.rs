@@ -563,9 +563,12 @@ pub fn host(
     on_pane(&pane);
     let finished = match host.interactive {
         true => {
-            // A person drives it, and Claude may ask at once whether to trust
-            // the folder. The run goes on if the pane cannot come to the front.
-            if let Err(e) = focus(&pane) {
+            // From the command line the person is waiting on it, so it comes
+            // to the front. A job came from the TUI or web, where the person
+            // may be launching more; `H` brings it forward when they choose.
+            if crate::jobs::current().is_none()
+                && let Err(e) = focus(&pane)
+            {
                 eprintln!("warning: {e}");
             }
             let cmd = interactive(&cmd)

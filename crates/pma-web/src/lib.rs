@@ -549,7 +549,12 @@ fn pick_json(p: &Pick) -> Value {
         Pick::Tasks { targets, retry } => {
             json!({ "kind": "tasks", "targets": targets, "retry": retry })
         }
-        Pick::Projects { names } => json!({ "kind": "projects", "names": names }),
+        Pick::Projects { names, targets } => {
+            json!({ "kind": "projects", "names": names, "targets": targets })
+        }
+        Pick::Project { project, target } => {
+            json!({ "kind": "project", "project": project, "target": target })
+        }
         Pick::Runs { ids } => json!({ "kind": "runs", "ids": ids }),
         Pick::Manual { project } => json!({ "kind": "manual", "project": project }),
         Pick::Run {
@@ -621,6 +626,18 @@ fn pick_from(v: &Value) -> Option<Pick> {
                 .map(|t| t.as_str().map(String::from))
                 .collect::<Option<Vec<_>>>()
                 .filter(|t| !t.is_empty())?,
+            targets: v["targets"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|t| t.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        },
+        "project" => Pick::Project {
+            project: s("project")?,
+            target: s("target"),
         },
         "manual" => Pick::Manual {
             project: s("project")?,

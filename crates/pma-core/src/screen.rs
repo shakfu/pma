@@ -28,13 +28,21 @@ pub enum Pick {
         targets: Vec<String>,
         retry: bool,
     },
-    /// Projects marked together, for one `pma run` over them all.
     /// The runs marked to close.
     Runs {
         ids: Vec<i64>,
     },
+    /// Projects marked together, for one `pma run` over them all; `targets`
+    /// are what dispatching them takes.
     Projects {
         names: Vec<String>,
+        targets: Vec<String>,
+    },
+    /// A row of the projects tab. `target` is what dispatching it takes: the
+    /// failing-CI list's `project:ci`, else the first task an agent may take.
+    Project {
+        project: String,
+        target: Option<String>,
     },
     /// A task no agent may take.
     Manual {
@@ -159,9 +167,16 @@ pub struct Cell {
 /// fits any. A front end offers only the acts that fit the selected row.
 pub fn fits(act: Act, pick: &Pick) -> bool {
     match act {
-        Act::Dispatch | Act::DispatchPush | Act::DispatchInteractive => {
-            matches!(pick, Pick::Task { .. } | Pick::Tasks { .. })
-        }
+        Act::Dispatch | Act::DispatchPush | Act::DispatchInteractive => matches!(
+            pick,
+            Pick::Task { .. }
+                | Pick::Tasks { .. }
+                | Pick::Projects { .. }
+                | Pick::Project {
+                    target: Some(_),
+                    ..
+                }
+        ),
         // A decision closes the pane, so later states have none to open.
         Act::ForgetRun if matches!(pick, Pick::Runs { .. }) => true,
         Act::OpenPane => {
@@ -170,7 +185,10 @@ pub fn fits(act: Act, pick: &Pick) -> bool {
         Act::TakeOver => {
             matches!(pick, Pick::Run { state, .. } if state == "ready" || state == "failed")
         }
-        Act::Verify => matches!(pick, Pick::Task { .. } | Pick::Manual { .. }),
+        Act::Verify => matches!(
+            pick,
+            Pick::Task { .. } | Pick::Manual { .. } | Pick::Project { .. }
+        ),
         Act::AddReviewTime => matches!(pick, Pick::Run { .. }),
         // Nothing to approve or publish; `X` is what is left.
         Act::ApproveRun | Act::Stage | Act::Commit | Act::Pr | Act::Push
@@ -266,6 +284,7 @@ pub fn marked(marks: &[Pick]) -> Pick {
     let mut names = Vec::new();
     let mut again = false;
     let mut runs = Vec::new();
+    let mut dispatched = Vec::new();
     for m in marks {
         match m {
             Pick::Task { target, retry, .. } => {
@@ -273,6 +292,10 @@ pub fn marked(marks: &[Pick]) -> Pick {
                 again |= retry;
             }
             Pick::Manual { project } => names.push(project.clone()),
+            Pick::Project { project, target } => {
+                names.push(project.clone());
+                dispatched.extend(target.clone());
+            }
             Pick::Run { id, .. } => runs.push(*id),
             _ => {}
         }
@@ -282,7 +305,15 @@ pub fn marked(marks: &[Pick]) -> Pick {
             targets,
             retry: again,
         },
-        (true, false) => Pick::Projects { names },
+        (true, false) => {
+            // A project marked on both lists is one project to run over.
+            let mut seen = std::collections::HashSet::new();
+            names.retain(|n| seen.insert(n.clone()));
+            Pick::Projects {
+                names,
+                targets: dispatched,
+            }
+        }
         (true, true) if !runs.is_empty() => Pick::Runs { ids: runs },
         (true, true) => Pick::Nothing,
     }
@@ -292,9 +323,10 @@ impl Pick {
     /// The project a row is about, when it names one.
     pub fn project(&self) -> Option<&str> {
         match self {
-            Pick::Task { project, .. } | Pick::Manual { project } | Pick::Run { project, .. } => {
-                Some(project)
-            }
+            Pick::Task { project, .. }
+            | Pick::Manual { project }
+            | Pick::Project { project, .. }
+            | Pick::Run { project, .. } => Some(project),
             _ => None,
         }
     }
@@ -467,6 +499,18 @@ fn task_pick(p: &rank::Placed) -> Pick {
             project: t.project.clone(),
         },
     }
+}
+
+/// `project`'s first task in `placed` an agent may take, as its dispatch
+/// target and its text.
+fn top_task(placed: &[rank::Placed], project: &str) -> Option<(String, String)> {
+    placed
+        .iter()
+        .filter(|t| t.task.project == project && !t.task.manual)
+        .find_map(|t| match task_pick(t) {
+            Pick::Task { target, .. } => Some((target, t.task.text.clone())),
+            _ => None,
+        })
 }
 
 fn next_pick(s: &next::Subject) -> Pick {
@@ -1468,6 +1512,10 @@ pub fn screen(view: View) -> Screen {
                 })
                 .collect();
             let row_of = |name: &str| p.projects.iter().map(|(_, r)| r).find(|r| r.name == name);
+            // What `d` or `I` on a project row takes: its first task, in
+            // rank order, that an agent may take.
+            let placed = rank::place(&p.cfg, p.tasks.clone(), p.today);
+            let top = |name: &str| top_task(&placed, name);
             let repo = |name: &str| {
                 row_of(name)
                     .and_then(|r| r.slug.as_deref())
@@ -1489,8 +1537,16 @@ pub fn screen(view: View) -> Screen {
                         2,
                         muted(tags.get(&name).map_or(String::new(), |t| t.join(" "))),
                     );
+                    let next = top(&name);
+                    cells.push(muted(
+                        next.as_ref()
+                            .map_or(String::new(), |(t, text)| format!("{t}  {text}")),
+                    ));
                     Item {
-                        pick: Pick::Manual { project: name },
+                        pick: Pick::Project {
+                            project: name,
+                            target: next.map(|(t, _)| t),
+                        },
                         cells,
                     }
                 })
@@ -1498,7 +1554,7 @@ pub fn screen(view: View) -> Screen {
             let latest = scans.first().map(|s| s.at);
             let mut failing = Vec::new();
             for item in &items {
-                let Pick::Manual { project } = &item.pick else {
+                let Pick::Project { project, .. } = &item.pick else {
                     continue;
                 };
                 let Some(row) = row_of(project) else {
@@ -1522,8 +1578,9 @@ pub fn screen(view: View) -> Screen {
                             plain(history::since_text(since.get(project), latest, now)),
                             linked(muted(run.clone().unwrap_or_default()), run.as_deref()),
                         ],
-                        pick: Pick::Manual {
+                        pick: Pick::Project {
                             project: project.clone(),
+                            target: Some(format!("{project}:ci")),
                         },
                     });
                 }
@@ -1545,6 +1602,7 @@ pub fn screen(view: View) -> Screen {
                             col("deps", Kind::Number),
                             col("local", Kind::Text),
                             col("todo", Kind::Text),
+                            col("next for an agent", Kind::Wide),
                         ],
                         items,
                         empty: "No tiered project. `pma project tier <1-5> <project>` ranks one.",
@@ -2297,7 +2355,7 @@ pub fn question(act: Act, pick: &Pick) -> String {
         Pick::Tasks { targets, .. } => {
             format!("{} tasks ({})", targets.len(), targets.join(", "))
         }
-        Pick::Projects { names } => names.join(", "),
+        Pick::Projects { names, .. } => names.join(", "),
         Pick::Runs { ids } => format!(
             "{} runs ({})",
             ids.len(),
@@ -2307,6 +2365,11 @@ pub fn question(act: Act, pick: &Pick) -> String {
                 .join(", ")
         ),
         Pick::Manual { project } => project.clone(),
+        Pick::Project {
+            target: Some(target),
+            ..
+        } => target.clone(),
+        Pick::Project { project, .. } => project.clone(),
         Pick::Run { id, .. } | Pick::Job { id, .. } | Pick::Note { id, .. } => format!("#{id}"),
         Pick::Instance { id, .. } => format!("instance {id}"),
         Pick::Campaign { name } => name.clone(),
@@ -2461,7 +2524,7 @@ pub fn action_scoped(
             // the scope's tags.
             let projects = match (tags.is_empty(), pick, pick.project()) {
                 (false, _, _) => Vec::new(),
-                (true, Pick::Projects { names }, _) => names.clone(),
+                (true, Pick::Projects { names, .. }, _) => names.clone(),
                 (true, _, Some(p)) => vec![p.to_string()],
                 (true, _, None) if !project.is_empty() => vec![project.to_string()],
                 (true, _, None) if !scope.is_empty() => {
@@ -2528,7 +2591,7 @@ pub fn action_scoped(
         (Act::Configure, pick) => {
             // The marked projects, else the row's, else the one in view.
             let projects = match (pick, pick.project()) {
-                (Pick::Projects { names }, _) => names.clone(),
+                (Pick::Projects { names, .. }, _) => names.clone(),
                 (_, Some(p)) => vec![p.to_string()],
                 (_, None) if !project.is_empty() => vec![project.to_string()],
                 (_, None) => return Err("open a project first".into()),
@@ -2789,10 +2852,69 @@ pub fn action_scoped(
                 interactive: false,
             }
         }
+        (
+            Act::Dispatch | Act::DispatchPush | Act::DispatchInteractive,
+            Pick::Project {
+                target: Some(target),
+                ..
+            },
+        ) => Action::Dispatch {
+            targets: vec![target.clone()],
+            tags: Vec::new(),
+            auto: false,
+            count: None,
+            retry: false,
+            worker,
+            prompt: None,
+            push: act == Act::DispatchPush,
+            interactive: act == Act::DispatchInteractive,
+        },
+        (
+            Act::Dispatch | Act::DispatchPush | Act::DispatchInteractive,
+            Pick::Projects { names, targets },
+        ) => {
+            // Refused whole rather than dispatching the rest: a marked
+            // project left out silently reads as dispatched.
+            let without: Vec<&str> = names
+                .iter()
+                .filter(|n| {
+                    !targets
+                        .iter()
+                        .any(|t| t.split(':').next() == Some(n.as_str()))
+                })
+                .map(String::as_str)
+                .collect();
+            if !without.is_empty() {
+                return Err(format!(
+                    "no task an agent may take in {}; unmark it",
+                    without.join(", ")
+                ));
+            }
+            Action::Dispatch {
+                targets: targets.clone(),
+                tags: Vec::new(),
+                auto: false,
+                count: None,
+                retry: false,
+                worker,
+                prompt: None,
+                push: act == Act::DispatchPush,
+                interactive: act == Act::DispatchInteractive,
+            }
+        }
+        (
+            Act::Dispatch | Act::DispatchPush | Act::DispatchInteractive,
+            Pick::Project { project, .. },
+        ) => {
+            return Err(format!("{project} has no task an agent may take"));
+        }
         (Act::Dispatch | Act::DispatchPush | Act::DispatchInteractive, Pick::Manual { .. }) => {
             return Err("not a task for agents".into());
         }
-        (Act::Verify, Pick::Task { project, .. } | Pick::Manual { project }) => Action::Verify {
+        (
+            Act::Verify,
+            Pick::Task { project, .. } | Pick::Manual { project } | Pick::Project { project, .. },
+        ) => Action::Verify {
             of: Selection {
                 projects: vec![project.clone()],
                 tags: Vec::new(),
@@ -3546,6 +3668,99 @@ mod tests {
         assert!(action(Act::Run, &row, &[], "review --nope").is_err());
     }
 
+    /// A project row dispatches its first task an agent may take, skipping
+    /// `#manual` items and items no agent can be named for.
+    #[test]
+    fn a_project_row_takes_its_first_task_for_an_agent() {
+        use crate::rank::{Placed, Quadrant, Task};
+        use crate::todo::Priority;
+        let task = |project: &str, line: Option<i64>, key: Option<&str>, manual| Placed {
+            task: Task {
+                project: project.into(),
+                tier: 1,
+                priority: Priority::High,
+                text: format!("{project} {line:?}"),
+                line,
+                key: key.map(String::from),
+                group: None,
+                due: None,
+                tagged_urgent: false,
+                signal_urgent: false,
+                eligible: false,
+                manual,
+                gh: None,
+                age_days: 0,
+            },
+            importance: 0.5,
+            urgency: None,
+            quadrant: Quadrant::Q2,
+        };
+        let placed = [
+            task("a", Some(3), Some("x"), true),
+            task("b", Some(1), Some("y"), false),
+            task("a", None, None, false),
+            task("a", None, Some("ci"), false),
+            task("a", Some(9), Some("z"), false),
+        ];
+        assert_eq!(
+            top_task(&placed, "a").map(|(t, _)| t).as_deref(),
+            Some("a:ci")
+        );
+        assert_eq!(
+            top_task(&placed, "b").map(|(t, _)| t).as_deref(),
+            Some("b:1")
+        );
+        assert_eq!(top_task(&placed, "c"), None);
+    }
+
+    /// A project row dispatches its target, interactively with `I`. Marked
+    /// projects dispatch every target, and are refused whole when one has
+    /// none: a project left out silently would read as dispatched.
+    #[test]
+    fn project_rows_dispatch_their_targets() {
+        let row = |p: &str, t: Option<&str>| Pick::Project {
+            project: p.into(),
+            target: t.map(String::from),
+        };
+        let Ok(Action::Dispatch {
+            targets,
+            interactive,
+            ..
+        }) = action(Act::DispatchInteractive, &row("a", Some("a:ci")), &[], "")
+        else {
+            panic!("a dispatch");
+        };
+        assert_eq!(targets, ["a:ci"]);
+        assert!(interactive);
+        assert!(fits(Act::Dispatch, &row("a", Some("a:4"))));
+        assert!(!fits(Act::Dispatch, &row("a", None)));
+        assert!(action(Act::Dispatch, &row("a", None), &[], "").is_err());
+        // The same project marked on both lists: one name, both targets.
+        let marks = [
+            row("a", Some("a:4")),
+            row("a", Some("a:ci")),
+            row("b", Some("b:ci")),
+        ];
+        let pick = marked(&marks);
+        let Ok(Action::Dispatch { targets, .. }) = action(Act::Dispatch, &pick, &[], "") else {
+            panic!("a dispatch of the marked");
+        };
+        assert_eq!(targets, ["a:4", "a:ci", "b:ci"]);
+        let Ok(Action::Run { projects, .. }) = action(Act::Run, &pick, &[], "review") else {
+            panic!("a run over the marked");
+        };
+        assert_eq!(projects, ["a", "b"]);
+        let Err(e) = action(
+            Act::Dispatch,
+            &marked(&[row("a", Some("a:4")), row("c", None)]),
+            &[],
+            "",
+        ) else {
+            panic!("refused");
+        };
+        assert!(e.contains('c'), "{e}");
+    }
+
     /// The inbox puts each thing in one place: plans awaiting approval
     /// wait with the runs, a running job is under way, a done one is
     /// neither.
@@ -3631,6 +3846,7 @@ mod tests {
         // one project's.
         let marked = Pick::Projects {
             names: vec!["a".into(), "b".into()],
+            targets: Vec::new(),
         };
         assert_eq!(
             action_in(Act::Configure, &marked, &[], "tier 1", ""),

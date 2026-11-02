@@ -214,12 +214,14 @@ function currentPick() {
 
 const sameTask = (a, b) => (a.kind === "task" && b.kind === "task" && a.target === b.target)
   || (a.kind === "manual" && b.kind === "manual" && a.project === b.project)
+  || (a.kind === "project" && b.kind === "project" && a.project === b.project && a.target === b.target)
   || (a.kind === "run" && b.kind === "run" && a.id === b.id);
 // The states `screen::run_allows` lets `ForgetRun` close.
 const CLOSABLE = ["ready", "failed", "approved", "staged", "committed"];
 const runsMarked = () => S.marks.some((m) => m.kind === "run");
 const MARK_ACTS = ["Dispatch", "DispatchPush", "DispatchInteractive"];
-const markable = (pick) => pick.kind === "task" || (pick.kind === "manual" && S.tab === "projects")
+const markable = (pick) => pick.kind === "task"
+  || ((pick.kind === "manual" || pick.kind === "project") && S.tab === "projects")
   || (pick.kind === "run" && CLOSABLE.includes(pick.state));
 const isMarked = (pick) => S.marks.some((m) => sameTask(m, pick));
 
@@ -257,7 +259,10 @@ function toggleAllMarks() {
 // The marked tasks as one pick, as `screen::marked` builds it.
 function markedPick() {
   if (runsMarked()) return { kind: "runs", ids: S.marks.map((m) => m.id) };
-  if (S.marks[0].kind === "manual") return { kind: "projects", names: S.marks.map((m) => m.project) };
+  if (S.marks[0].kind === "manual" || S.marks[0].kind === "project") {
+    const names = [...new Set(S.marks.map((m) => m.project))];
+    return { kind: "projects", names, targets: S.marks.map((m) => m.target).filter(Boolean) };
+  }
   return { kind: "tasks", targets: S.marks.map((m) => m.target), retry: S.marks.some((m) => m.retry) };
 }
 

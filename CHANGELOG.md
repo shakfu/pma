@@ -32,11 +32,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - The inbox header says how many open items are tagged `#agent` or `#manual`, since only those are listed.
 
-- An interactive run brings its herdr tab to the front, and an agent blocked on a person raises a notice in the TUI and web, with `H` on the run to open its pane. Claude has no flag to skip its folder-trust question, and writing `hasTrustDialogAccepted` to `~/.claude.json` would edit an undocumented file and hide the warning about a repo's pre-approved permissions.
+- An interactive run started from the command line brings its herdr tab to the front; one started from the TUI or web stays behind, so several can be launched in a row, and `H` brings one forward. An agent blocked on a person raises a notice in the TUI and web, with `H` on the run to open its pane. Claude has no flag to skip its folder-trust question, and writing `hasTrustDialogAccepted` to `~/.claude.json` would edit an undocumented file and hide the warning about a repo's pre-approved permissions.
 
 - `D` in the TUI and web dispatches a task and pushes the run if its gates are clean, as `pma dispatch --push` does.
 
 - On the projects tab, Space marks projects and `z` runs one name over them. `pma run --tag` was the only way to run over several.
+
+- **`d`, `D` and `I` work on the projects tab.** A project row dispatches its first task an agent may take, shown in a new `next for an agent` column; a row of the `Failing CI` list, now reached with Tab, dispatches `project:ci`. Marked rows dispatch together, refused whole if one has no task. `I` over several projects queues a job per project, so their sessions open side by side; one job over them all held every project's lock until each session ended.
+
+- `.pma/`, where an agent drafts its changelog entry, is listed in the repository's `.git/info/exclude` at dispatch, so it no longer shows in `git status`. Not `.gitignore`: that is a tracked file, and every repository would need a commit.
 
 - A decision from a run's detail opens the next ready run in the view, so reviewing M runs takes no navigation between them. Stage and commit stay on their run: it has a next step, and their notice offers to open it.
 

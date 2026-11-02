@@ -193,6 +193,7 @@ fn worker(name: &str, t: &Table) -> Result<Worker> {
             field,
             "command"
                 | "args"
+                | "interactive_args"
                 | "allow"
                 | "parse"
                 | "reports_cost"
@@ -224,6 +225,10 @@ fn worker(name: &str, t: &Table) -> Result<Worker> {
         args: match t.get("args") {
             None => Vec::new(),
             Some(v) => strings(v, &at("args"))?,
+        },
+        interactive_args: match t.get("interactive_args") {
+            None => Vec::new(),
+            Some(v) => strings(v, &at("interactive_args"))?,
         },
         allow: t
             .get("allow")
@@ -532,6 +537,10 @@ pub fn set_agent(doc: &mut DocumentMut, w: &Worker) {
     let mut t = Table::new();
     t["command"] = Item::Value(w.command.as_str().into());
     t["args"] = Item::Value(Value::Array(array(w.args.iter().cloned())));
+    if !w.interactive_args.is_empty() {
+        t["interactive_args"] =
+            Item::Value(Value::Array(array(w.interactive_args.iter().cloned())));
+    }
     if let Some(allow) = &w.allow {
         t["allow"] = Item::Value(allow.as_str().into());
     }

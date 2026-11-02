@@ -24,7 +24,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 48;
+const VERSION: i64 = 49;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -467,6 +467,10 @@ WHERE state = 'ready' AND branch = '' AND workflow_instance IS NOT NULL;
 
 /// Version 47. What herdr last said of the agent in a run's pane.
 const HERDR_AGENT_STATE: &str = "ALTER TABLE runs ADD COLUMN agent_state TEXT;";
+
+/// Version 49. How a worker starts a session a person drives, as a JSON array.
+const INTERACTIVE_ARGS: &str =
+    "ALTER TABLE agents ADD COLUMN interactive_args TEXT NOT NULL DEFAULT '[]';";
 
 /// What each project's files looked like when last read; `scan::stamp`.
 const PROJECT_STAMPS: &str = "
@@ -1129,6 +1133,7 @@ impl Store {
                     HERDR_PANES,
                     HERDR_AGENT_STATE,
                     PROJECT_STAMPS,
+                    INTERACTIVE_ARGS,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -1178,11 +1183,61 @@ impl Store {
         store.load_settings()?;
         // After the file is read, so the seed is written to it and survives
         // the next edit. A worker already of that name is left alone.
+        // Earlier migrations changed agent, preset and config rows in the
+        // tables alone, which the edits below would undo. They go to the file
+        // first.
+        if version < 49 {
+            let (_, file) = crate::settings::read(&store.settings)?;
+            let config: Vec<_> = store
+                .config_rows()?
+                .into_iter()
+                .filter(|row| !file.config.contains(row))
+                .collect();
+            let agents: Vec<_> = store
+                .agents()?
+                .into_iter()
+                .filter(|w| !file.agents.contains(w))
+                .collect();
+            let presets: Vec<_> = store
+                .presets()?
+                .into_iter()
+                .filter(|p| !file.presets.contains(p))
+                .collect();
+            if !(agents.is_empty() && presets.is_empty() && config.is_empty()) {
+                store.change_settings(|doc| {
+                    for (k, v) in &config {
+                        crate::settings::set_config(doc, k, v);
+                    }
+                    agents
+                        .iter()
+                        .for_each(|w| crate::settings::set_agent(doc, w));
+                    presets
+                        .iter()
+                        .for_each(|p| crate::settings::set_preset(doc, p));
+                })?;
+            }
+        }
         let named = |w: &Worker| w.name == crate::worker::REFRESH;
         if version < 39 && !store.agents()?.iter().any(named) {
             store.change_settings(|doc| {
                 crate::settings::set_agent(doc, &crate::worker::Worker::refresh())
             })?;
+        }
+        // `--interactive` derived claude's form from its headless one; the
+        // file now states it. Only a `claude` worker without one gets it.
+        if version < 49 {
+            let template = crate::worker::Worker::claude();
+            for mut w in store.agents()? {
+                if w.command == template.command && w.interactive_args.is_empty() {
+                    w.interactive_args = template.interactive_args.clone();
+                    store.change_settings(|doc| crate::settings::set_agent(doc, &w))?;
+                    eprintln!(
+                        "pma: wrote agents.{}.interactive_args to {}",
+                        w.name,
+                        store.settings.display()
+                    );
+                }
+            }
         }
         Ok(store)
     }
@@ -3017,7 +3072,7 @@ impl Store {
     pub fn agents(&self) -> Result<Vec<Worker>> {
         let mut stmt = self.conn.prepare(
             "SELECT name, command, args, allow, parse, reports_cost, enforces_budget,
-                    sandbox, resumes, env
+                    sandbox, resumes, env, interactive_args
              FROM agents ORDER BY name",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -3027,6 +3082,8 @@ impl Store {
                 name: r.get(0)?,
                 command: r.get(1)?,
                 args: serde_json::from_str(&args).unwrap_or_default(),
+                interactive_args: serde_json::from_str(&r.get::<_, String>(10)?)
+                    .unwrap_or_default(),
                 allow: r.get::<_, Option<String>>(3)?.filter(|a| !a.is_empty()),
                 parse: Parser::parse(&parse).unwrap_or(Parser::TextTail),
                 reports_cost: r.get(5)?,
@@ -3820,8 +3877,8 @@ fn seed_agent(conn: &Connection, w: &Worker) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO agents
             (name, command, args, allow, parse, reports_cost, enforces_budget, sandbox,
-             resumes, env)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             resumes, env, interactive_args)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             w.name,
             w.command,
@@ -3833,6 +3890,7 @@ fn seed_agent(conn: &Connection, w: &Worker) -> Result<()> {
             w.sandbox,
             w.resumes,
             serde_json::to_string(&w.env).unwrap_or_else(|_| "{}".into()),
+            serde_json::to_string(&w.interactive_args).unwrap_or_else(|_| "[]".into()),
         ],
     )?;
     Ok(())
@@ -4306,7 +4364,8 @@ mod tests {
                          ALTER TABLE runs DROP COLUMN review_measured;
                          ALTER TABLE runs DROP COLUMN agent_state;
                          ALTER TABLE runs DROP COLUMN pane;
-                         ALTER TABLE runs DROP COLUMN interactive;",
+                         ALTER TABLE runs DROP COLUMN interactive;
+                         ALTER TABLE agents DROP COLUMN interactive_args;",
                     )
                     .unwrap();
                 store.conn.pragma_update(None, "user_version", 43).unwrap();
@@ -4374,6 +4433,7 @@ mod tests {
     /// Undoes versions 40 to 43, for a test that rewinds the schema past
     /// them.
     const BEFORE_SCAN_FAULTS: &str = "
+        ALTER TABLE agents DROP COLUMN interactive_args;
         ALTER TABLE runs DROP COLUMN agent_state;
         ALTER TABLE runs DROP COLUMN denied;
         ALTER TABLE runs DROP COLUMN review_started;
@@ -5157,6 +5217,49 @@ mod tests {
             store.projects_tagged(&["ai".into()]).unwrap(),
             ["cyllama"],
             "removing one tag leaves the other"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Version 49 writes claude's interactive form into `settings.toml`, where
+    /// a `claude` worker has none. One that states its own keeps it, and a
+    /// worker of another command gets nothing.
+    #[test]
+    fn claude_gets_its_interactive_args_in_the_file() {
+        let dir = scratch("interactive-args");
+        let path = dir.join("p.db");
+        let file = dir.join(crate::settings::FILE);
+        {
+            let store = Store::open(&path).unwrap();
+            let mut mine = Worker::claude();
+            mine.name = "mine".into();
+            mine.interactive_args = vec!["{prompt}".into()];
+            store
+                .change_settings(|doc| crate::settings::set_agent(doc, &mine))
+                .unwrap();
+            let text = std::fs::read_to_string(&file).unwrap();
+            let start = text.find("[agents.claude]").unwrap();
+            let line = start + text[start..].find("interactive_args").unwrap();
+            let end = line + text[line..].find('\n').unwrap() + 1;
+            std::fs::write(&file, format!("{}{}", &text[..line], &text[end..])).unwrap();
+            store
+                .conn
+                .execute_batch("ALTER TABLE agents DROP COLUMN interactive_args;")
+                .unwrap();
+            store.conn.pragma_update(None, "user_version", 48).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let args = |name: &str| store.agent(name).unwrap().interactive_args;
+        assert_eq!(args("claude"), Worker::claude().interactive_args);
+        assert_eq!(args("mine"), ["{prompt}"]);
+        assert!(args("opencode").is_empty());
+        let text = std::fs::read_to_string(&file).unwrap();
+        let (_, settings) = crate::settings::read(&file).unwrap();
+        let claude = settings.agents.iter().find(|w| w.name == "claude").unwrap();
+        assert_eq!(
+            claude.interactive_args,
+            Worker::claude().interactive_args,
+            "{text}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

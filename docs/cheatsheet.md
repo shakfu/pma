@@ -49,7 +49,7 @@ pma preset set claude-haiku claude haiku   # cheap option for mechanical work
 | `--detach` | queue and return; follow with `pma job`, `pma watch` |
 | `--push` | push each run whose gates are clean; others wait in review |
 | `--retry` | reset used attempts on a target and dispatch again |
-| `--interactive` | drive `claude` yourself in a herdr pane |
+| `--interactive` | drive the agent yourself in a herdr pane; needs its `interactive_args` |
 
 Precedence: `-a`/`-m` > `-p` > active route > default preset.
 

@@ -77,7 +77,16 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 - `pma integrate herdr` runs every agent in a [herdr](https://herdr.dev) pane you can watch: a tab per run, in a `pma: <project>` workspace. Cost, verdict and review stay as they are. With no server, a run goes on without a pane and warns. `pma integrate none` turns it off.
 
-- `H` opens a run's pane, and `T` opens an interactive `claude` on its directory. `I`, or `pma dispatch --interactive`, gives you a live `claude` to drive for the whole run; the run ends when you exit it, and reports no cost or summary.
+- `H` opens a run's pane, and `T` opens an interactive agent on its directory: the run's own, or the default one if the run's agent has no interactive form. `I`, or `pma dispatch --interactive`, gives you a live agent to drive for the whole run; the run ends when you exit it, and reports no cost or summary.
+
+- An agent runs interactively from its `interactive_args` in `settings.toml`, with the same placeholders as `args`. An agent without them cannot. Only `claude` ships with them:
+
+  ```toml
+  [agents.codex]
+  command = "codex"
+  args = ["exec", "-C", "{dir}", "-m", "{model}", "{extra}", "{prompt}"]
+  interactive_args = ["-C", "{dir}", "-s", "workspace-write", "-a", "on-request", "-m", "{model}", "{extra}", "{prompt}"]
+  ```
 
 **Running unattended**
 

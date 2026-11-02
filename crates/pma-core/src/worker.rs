@@ -196,6 +196,9 @@ pub struct Worker {
     /// arguments a preset adds, and sits where a worker wants them: before a
     /// positional prompt for one that takes its message last.
     pub args: Vec<String>,
+    /// Arguments for a session a person drives, with the same placeholders.
+    /// Empty means the worker cannot run interactively.
+    pub interactive_args: Vec<String>,
     /// A flag and a rule template separated by a space, such as
     /// `--allowedTools Bash({cmd})`. The flag is emitted once, the rule once
     /// per subcommand of the verify command. `None` means the worker has no
@@ -228,6 +231,7 @@ pub fn blank(name: &str) -> Worker {
         name: name.to_string(),
         command: String::new(),
         args: Vec::new(),
+        interactive_args: Vec::new(),
         allow: None,
         parse: Parser::TextTail,
         reports_cost: false,
@@ -250,6 +254,10 @@ pub fn set_field(w: &mut Worker, field: &str, value: String) -> Result<(), Strin
         "args" => {
             w.args = serde_json::from_str(&value)
                 .map_err(|e| format!("args must be a JSON array of strings: {e}"))?;
+        }
+        "interactive-args" => {
+            w.interactive_args = serde_json::from_str(&value)
+                .map_err(|e| format!("interactive-args must be a JSON array of strings: {e}"))?;
         }
         "allow" => w.allow = (!value.is_empty()).then_some(value),
         "parse" => {
@@ -284,9 +292,13 @@ pub fn set_field(w: &mut Worker, field: &str, value: String) -> Result<(), Strin
     Ok(())
 }
 
-pub const FIELDS: [(&str, &str); 9] = [
+pub const FIELDS: [(&str, &str); 10] = [
     ("command", "the program to run"),
     ("args", "a JSON array of arguments"),
+    (
+        "interactive-args",
+        "a JSON array of arguments for a session a person drives, or [] for none",
+    ),
     ("allow", "an allowlist flag and rule, or empty for none"),
     (
         "parse",
@@ -333,6 +345,26 @@ fn fill(template: &str, values: &[(&str, Option<&str>)]) -> Option<String> {
 }
 
 impl Worker {
+    /// The command for a session a person drives, from `interactive_args`.
+    /// `None` when the worker has none. It has no budget or timeout, so those
+    /// placeholders read as zero.
+    pub fn build_interactive(
+        &self,
+        prompt: &str,
+        dir: &std::path::Path,
+        model: Option<&str>,
+        extra: &[String],
+    ) -> Option<Command> {
+        if self.interactive_args.is_empty() {
+            return None;
+        }
+        let w = Worker {
+            args: self.interactive_args.clone(),
+            ..self.clone()
+        };
+        Some(w.build(prompt, dir, model, 0.0, extra, std::time::Duration::ZERO))
+    }
+
     /// The command to run in `dir`. An argument whose placeholder has no
     /// value is dropped, and with it the argument before it when that one is
     /// a flag, so `--model {model}` disappears whole when no model is chosen.
@@ -428,6 +460,19 @@ impl Worker {
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
+            // The headless form without `-p` and what only `-p` reads: a
+            // positional prompt starts the session.
+            interactive_args: [
+                "--permission-mode",
+                "auto",
+                "--model",
+                "{model}",
+                "{extra}",
+                "{prompt}",
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
             allow: Some("--allowedTools Bash({cmd})".into()),
             parse: Parser::ClaudeJson,
             reports_cost: true,
@@ -460,6 +505,7 @@ impl Worker {
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
+            interactive_args: Vec::new(),
             // `--auto` approves every permission that is not explicitly
             // denied, so there is no per-command allowlist to emit.
             allow: None,
@@ -525,6 +571,7 @@ impl Worker {
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
+            interactive_args: Vec::new(),
             allow: None,
             parse: Parser::ClaudeJson,
             reports_cost: true,
@@ -548,6 +595,7 @@ impl Worker {
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
+            interactive_args: Vec::new(),
             allow: None,
             parse: Parser::TextTail,
             reports_cost: false,
@@ -569,6 +617,7 @@ impl Worker {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            interactive_args: Vec::new(),
             allow: None,
             parse: Parser::TextTail,
             reports_cost: false,
@@ -593,6 +642,41 @@ mod tests {
         cmd.get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// An interactive command comes from its own list, with the same
+    /// placeholders and the same dropped `--model` when none is chosen.
+    #[test]
+    fn an_interactive_command_is_built_from_its_own_args() {
+        let w = Worker::claude();
+        let cmd = w
+            .build_interactive(
+                "do it",
+                Path::new("/w/a"),
+                Some("opus"),
+                &["--effort".into()],
+            )
+            .unwrap();
+        assert_eq!(
+            args_of(&cmd),
+            [
+                "--permission-mode",
+                "auto",
+                "--model",
+                "opus",
+                "--effort",
+                "do it"
+            ]
+        );
+        let cmd = w
+            .build_interactive("do it", Path::new("/w/a"), None, &[])
+            .unwrap();
+        assert_eq!(args_of(&cmd), ["--permission-mode", "auto", "do it"]);
+        assert!(
+            Worker::omp()
+                .build_interactive("do it", Path::new("/w"), None, &[])
+                .is_none()
+        );
     }
 
     #[test]

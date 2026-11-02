@@ -1795,6 +1795,42 @@ fn an_interactive_run_skips_the_baseline_and_keeps_its_commit() {
     assert!(!env.ok(&["next"]).contains("alpha:5"));
 }
 
+/// Any worker with `interactive_args` runs interactively, from those args
+/// rather than its headless ones; one without them fails naming itself.
+#[test]
+fn a_worker_runs_interactively_from_its_own_args() {
+    const RECORDS: &str = "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PMA_HOME/codex-args\"\nexit 0\n";
+    let s = Scratch::new("interactiveargs");
+    let (env, _, _) = dispatch_env(&s, &[("codex", RECORDS)]);
+    env.ok(&["agent", "set", "codex", "command", "codex"]);
+    env.ok(&["agent", "set", "codex", "args", r#"["exec","{prompt}"]"#]);
+    env.ok(&["config", "agent", "codex"]);
+    env.ok(&["config", "workspace", "clone"]);
+    let herdr = FakeHerdr::start("iargs");
+    herdr.pma(&env, &["integrate", "herdr"]);
+
+    let (out, err, _) = herdr.pma(&env, &["dispatch", "alpha:5", "--interactive"]);
+    assert!(
+        format!("{out}{err}").contains("agent `codex` has no `interactive_args`"),
+        "{out}{err}"
+    );
+    env.ok(&["review", "1", "--reject"]);
+
+    env.ok(&[
+        "agent",
+        "set",
+        "codex",
+        "interactive-args",
+        r#"["-C","{dir}","{prompt}"]"#,
+    ]);
+    let (out, err, success) = herdr.pma(&env, &["dispatch", "alpha:7", "--interactive"]);
+    assert!(success, "{out}{err}");
+    let args = fs::read_to_string(env.home.join("codex-args")).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    assert_eq!(args[0], "-C", "{args:?}");
+    assert!(!args.contains(&"exec"), "{args:?}");
+}
+
 /// Jobs in different projects run at once, and what is live in one project is
 /// neither blocked by nor failed from the other.
 #[test]

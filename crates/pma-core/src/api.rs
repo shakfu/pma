@@ -1777,20 +1777,26 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
         }
         Action::TakeOver { id } => {
             let run = store.run(id)?;
-            if run.agent != "claude" {
-                return Err(format!(
-                    "run #{id} used `{}`; only `claude` can take over",
-                    run.agent
-                )
-                .into());
-            }
+            // The change is on disk, so any agent can read it: the run's own
+            // when it has an interactive form, else the default one.
+            let own = store
+                .agent(&run.agent)
+                .ok()
+                .filter(|w| !w.interactive_args.is_empty());
+            let (worker, model) = match own {
+                Some(w) => (w, run.model.as_deref()),
+                None => (store.agent(&config(store)?.agent)?, None),
+            };
             let prompt = format!(
                 "An earlier agent worked on this task, and its change is uncommitted in this \
                  directory. Read the diff, then wait for my instructions.\n\nTask: {}",
                 run.text
             );
             let title = format!("#{id} take over");
-            crate::herdr::take_over(&run.project, &title, &run.worktree, &prompt)?;
+            let cmd = worker
+                .build_interactive(&prompt, &run.worktree, model, &[])
+                .ok_or_else(|| crate::dispatch::no_interactive(&worker.name))?;
+            crate::herdr::take_over(&run.project, &title, &run.worktree, &cmd)?;
             Outcome {
                 said: vec![format!(
                     "An edit made there changes run #{id}: read it again before approving."

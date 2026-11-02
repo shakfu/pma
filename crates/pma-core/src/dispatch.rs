@@ -1700,14 +1700,26 @@ fn attempt_once(
         None => run.prompt.clone(),
     };
     a.verify = run.verify.clone();
-    let mut cmd = worker.build(
-        &a.prompt,
-        &run.worktree,
-        run.model.as_deref(),
-        cfg.agent_budget,
-        &run.extra_args,
-        timeout.saturating_sub(INNER_GRACE),
-    );
+    let built = match run.interactive {
+        true => worker.build_interactive(
+            &a.prompt,
+            &run.worktree,
+            run.model.as_deref(),
+            &run.extra_args,
+        ),
+        false => Some(worker.build(
+            &a.prompt,
+            &run.worktree,
+            run.model.as_deref(),
+            cfg.agent_budget,
+            &run.extra_args,
+            timeout.saturating_sub(INNER_GRACE),
+        )),
+    };
+    let Some(mut cmd) = built else {
+        fail(run, &mut a, no_interactive(&worker.name));
+        return a;
+    };
     worker.allow_verify(&mut cmd, run.verify.as_deref());
     cmd.current_dir(&run.worktree);
     if let Err(e) = agent::restrict(&mut cmd, &agent_env) {
@@ -1841,6 +1853,14 @@ fn attempt_once(
     run.enter(RunState::Ready);
     a.outcome = Some(RunState::Ready.name().into());
     a
+}
+
+/// Why a worker cannot start a session a person drives.
+pub fn no_interactive(agent: &str) -> String {
+    format!(
+        "agent `{agent}` has no `interactive_args`; set them in settings.toml or with \
+         `pma agent set {agent} interactive-args '[...]'`"
+    )
 }
 
 /// Files git tracks in the worktree, as a proxy for how far a change can

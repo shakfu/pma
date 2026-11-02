@@ -62,6 +62,10 @@ pub enum Request {
     Pager {
         id: i64,
     },
+    /// The project in `$VISUAL` or `$EDITOR`, with the terminal handed over.
+    Editor {
+        project: String,
+    },
     Quit,
 }
 
@@ -554,6 +558,13 @@ impl App {
                         {
                             return Some(Request::Pager { id });
                         }
+                        if b.command == Command::Edit
+                            && let Some(project) = pick.project()
+                        {
+                            return Some(Request::Editor {
+                                project: project.to_string(),
+                            });
+                        }
                         if let Command::Act(act) = b.command
                             && act.on_row()
                             && screen::fits(act, &pick)
@@ -821,6 +832,10 @@ impl App {
                 Pick::Run { id, .. } => return Some(Request::Pager { id }),
                 _ => self.say("Select a run first.", Tone::Warn),
             },
+            Command::Edit => match self.edit_target() {
+                Some(project) => return Some(Request::Editor { project }),
+                None => self.say("Select a row that names a project first.", Tone::Warn),
+            },
             Command::NextPane | Command::PrevPane => {
                 let n = self.panes().len().max(1);
                 self.pane[t] = match binding.command {
@@ -933,6 +948,17 @@ impl App {
             }
         }
         None
+    }
+
+    /// The project `E` opens: the selected row's, else the one in view.
+    fn edit_target(&self) -> Option<String> {
+        match self.pick().0.project() {
+            Some(p) => Some(p.to_string()),
+            None if self.tab == Tab::Project && !self.project.is_empty() => {
+                Some(self.project.clone())
+            }
+            None => None,
+        }
     }
 
     /// Whether a row can be marked here: a task, a project on the projects
@@ -1287,6 +1313,7 @@ impl App {
                 }
                 Command::OpenProject => pick.project().is_some(),
                 Command::ViewDiff => matches!(pick, Pick::Run { .. }),
+                Command::Edit => self.edit_target().is_some(),
                 Command::Mark => self.markable(&pick),
                 _ => false,
             })
@@ -2122,7 +2149,7 @@ fn execute(store: &Store, app: &mut App, request: Request) {
             }
         }
         // The run loop hands the terminal over for these.
-        Request::Pager { .. } | Request::Quit => {}
+        Request::Pager { .. } | Request::Editor { .. } | Request::Quit => {}
     }
 }
 
@@ -2176,6 +2203,23 @@ fn show_in_pager(id: i64, text: &str) -> Result<()> {
         Ok(s) if s.success() => Ok(()),
         Ok(s) => Err(format!("the pager exited with {s}").into()),
         Err(e) => Err(format!("could not start the pager: {e}").into()),
+    }
+}
+
+/// Opens `dir` in `$VISUAL`, else `$EDITOR`, else `vi`, from inside it, and
+/// waits for it to close. The caller has restored the terminal first.
+fn open_in_editor(dir: &std::path::Path) -> Result<()> {
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(r#"${VISUAL:-${EDITOR:-vi}} "$1""#)
+        .arg("sh")
+        .arg(dir)
+        .current_dir(dir)
+        .status();
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("the editor exited with {s}").into()),
+        Err(e) => Err(format!("could not start the editor: {e}").into()),
     }
 }
 
@@ -2251,6 +2295,32 @@ pub fn run(store: &Store) -> Result<()> {
                         Ok(()) => app.status = None,
                         Err(e) => app.say(e.to_string(), Tone::Bad),
                     }
+                }
+                Some(Request::Editor { project }) => {
+                    let edited = store
+                        .project(&project)
+                        .and_then(|row| {
+                            row.ok_or_else(|| format!("unknown project `{project}`").into())
+                        })
+                        .and_then(|row| {
+                            ratatui::try_restore()?;
+                            let edited = open_in_editor(&row.path);
+                            terminal = ratatui::try_init()?;
+                            terminal.clear()?;
+                            // Even after an editor error: a file may have
+                            // been saved before it.
+                            Store::open_default()
+                                .and_then(|mut s| {
+                                    pma_core::refresh::reread(&mut s, &[(project, row.path)])
+                                })
+                                .and(edited)
+                        });
+                    match edited {
+                        Ok(()) => app.status = None,
+                        Err(e) => app.say(e.to_string(), Tone::Bad),
+                    }
+                    let again = Request::Load(app.query());
+                    execute(store, &mut app, again);
                 }
                 Some(request) => {
                     // Draw "working" before a slow action blocks the loop.
@@ -3246,6 +3316,13 @@ mod tests {
         app.loaded(Ok(next_view()));
         app.key("Tab");
         assert_eq!(app.key("v"), Some(Request::Pager { id: 4 }));
+        assert_eq!(
+            app.key("E"),
+            Some(Request::Editor {
+                project: "b".into()
+            }),
+            "E opens the run's project"
+        );
         let pick = Pick::Run {
             id: 4,
             clean: false,
@@ -3293,6 +3370,13 @@ mod tests {
             app.key("v"),
             Some(Request::Pager { id: 4 }),
             "from the detail"
+        );
+        assert_eq!(
+            app.key("E"),
+            Some(Request::Editor {
+                project: "b".into()
+            }),
+            "E from the detail"
         );
     }
 

@@ -164,10 +164,11 @@ pma workflow run review-fix alpha --local --unattended --detach
 | `v` | diff in pager (run) / verify (task) | `e` | tier, tag, verify, sandbox |
 | `t` | record review minutes | `c` | scan |
 | `H` / `T` | herdr pane / take over | `Esc` | back |
+| `E` | project in `$EDITOR`, re-read on exit (TUI only) | | |
 
 ## Where things are
 
 - `~/.config/pma/settings.toml`: settings, roots, workers, presets, tiers.
 - `~/.config/pma/projects.db`: scans, runs, workflows.
 - `~/.local/state/pma`: worktrees, logs, artifacts.
-- `.pma/changelog.md` in the project: the agent's draft changelog entry.
+- `.pma/changelog.md` in the project: the agent's draft changelog entry. `.pma/` is listed in `.git/info/exclude`, so `git status` ignores it.

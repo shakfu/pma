@@ -118,6 +118,7 @@ Then decide:
 
 - **Approve** when the diff is right.
 - **Rework** when it is close. Feedback is one or two sentences naming the fix: "use `Config::load`, not a new parser". The agent continues in the same worktree.
+- **Fix it yourself** when the fix is quicker to make than to describe. `E` on the run opens the project in your editor. In a clone run the diff stays live until you commit, so your edit is part of what you approve and publish ([`clone-runs.md`](dev/clone-runs.md)). A later reject then refuses if you edited the agent's lines; use close.
 - **Reject** when the approach is wrong. Rewrite the task's indented lines before the next attempt.
 - **Retry** when it failed for no reason in the task: a flaky test, a timeout.
 - **`--reject --infra`** when the check or the machine failed. It uses no attempt and does not count against the agent.
@@ -183,6 +184,7 @@ Clean means nothing `pma` checks objects. It does not mean the change is correct
 3. A decision opens the next ready run.
 4. `O` jumps to a project; `Space` marks tasks; `d` dispatches the marked ones.
 5. `#` scopes every tab to a tag.
+6. `E` opens the selected row's project in `$VISUAL`, else `$EDITOR`. When the editor exits, `pma` re-reads the project, so an unstaged fix or a ticked item shows at once. TUI only.
 
 On the projects tab, `d` or `I` on a project row dispatches the task in its `next for an agent` column. `Tab` to the `Failing CI` list dispatches `project:ci` instead. Mark several rows and press `I` once: each project gets its own herdr session, opened in the background. `H` on a run brings its pane forward.
 
@@ -205,6 +207,10 @@ pma campaign run ci
 ```
 
 For multi-step work (review, confirm, fix), use a workflow. `pma workflow library` lists nine. Each run prints a priced plan and spends nothing until you approve it by id.
+
+### Skip the agent
+
+Some tasks take less time to do than to dispatch and review: a typo, a version bump, a one-line config change. Do those by hand. `E` on the task's row, make the edit, tick the item in `TODO.md`, and commit. A run costs a check before and after, plus your review; a hand edit costs neither.
 
 ## Measure, then adjust
 

@@ -1051,6 +1051,9 @@ async function run(b) {
       if (diff) diff.scrollIntoView({ block: "start" });
       return;
     }
+    case "Edit":
+      toast("An editor needs a terminal: press E in `pma tui`.", "warn");
+      return;
     case "NextPane": S.pane[t] = (p + 1) % Math.max(panes().length, 1); break;
     case "PrevPane": S.pane[t] = (p + panes().length - 1) % Math.max(panes().length, 1); break;
     case "Back":

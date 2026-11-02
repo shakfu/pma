@@ -400,6 +400,9 @@ pub enum Command {
     /// The selected run's diff in `$PAGER`, in the TUI; the web scrolls its
     /// detail to the diff. Reading is the long step, and a pager has search.
     ViewDiff,
+    /// The selected row's project, or the one in view, in `$VISUAL` or
+    /// `$EDITOR`, in the TUI: a fix by hand is sometimes quicker than a run.
+    Edit,
     /// Marks the selected task, project or run, or unmarks it, for an act on several.
     Mark,
     /// Marks every row the focused list shows, or unmarks them all.
@@ -501,6 +504,7 @@ pub const BINDINGS: &[Binding] = &[
     bind("/", Command::Filter, "filter"),
     bind("O", Command::Jump, "go to project"),
     bind("#", Command::Scope, "scope to a tag"),
+    bind("E", Command::Edit, "edit project in $EDITOR"),
     Binding {
         tabs: PANES,
         ..bind("Tab", Command::NextPane, "next list")

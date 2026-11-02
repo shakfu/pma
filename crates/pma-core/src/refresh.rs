@@ -67,6 +67,14 @@ pub fn rescan(store: &mut Store, projects: &[(String, PathBuf)]) -> Result<()> {
     Ok(())
 }
 
+/// Rereads `projects` as the timer does, leaving no row in `pma history`: after
+/// an edit by hand, whose unstaged changes no stamp sees.
+pub fn reread(store: &mut Store, projects: &[(String, PathBuf)]) -> Result<()> {
+    let facts = offline(store, projects)?;
+    store.save_quiet_scan(&facts, false, dates::now())?;
+    Ok(())
+}
+
 /// Rereads each project under a root whose files changed, and any new one.
 /// Nothing before the first scan, which a person starts. A clone an agent is
 /// working in waits until the run ends.
@@ -129,4 +137,55 @@ pub fn start(open: impl Fn() -> Result<Store> + Send + 'static) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    /// An unstaged edit changes no stamp, so the timer misses it; a reread
+    /// after the editor counts it, and adds no row to `pma history`.
+    #[test]
+    fn a_reread_sees_an_unstaged_edit() {
+        let dir = std::env::temp_dir().join(format!("pma-reread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = dir.join("p");
+        std::fs::create_dir_all(&repo).unwrap();
+        let sh = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        sh(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("TODO.md"), "# TODO\n\n## High\n\n- [ ] x\n").unwrap();
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        sh(&["add", "."]);
+        sh(&["commit", "-qm", "first"]);
+
+        let mut store = Store::open(&dir.join("p.db")).unwrap();
+        let projects = vec![("p".to_string(), repo.clone())];
+        let facts = scan::scan_all(&projects, &[], true, false, &|_| {});
+        store.save_scan(&facts, true, dates::now()).unwrap();
+        let dirty = |s: &Store| s.project("p").unwrap().unwrap().dirty;
+        assert_eq!(dirty(&store), 0);
+        let scans = store.scans(100).unwrap().len();
+
+        let before = scan::stamp(&repo);
+        std::fs::write(repo.join("a.txt"), "fixed by hand\n").unwrap();
+        assert_eq!(scan::stamp(&repo), before, "no stamp sees it");
+        reread(&mut store, &projects).unwrap();
+        assert_eq!(dirty(&store), 1);
+        assert_eq!(store.scans(100).unwrap().len(), scans, "no history row");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -40,6 +40,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`d`, `D` and `I` work on the projects tab.** A project row dispatches its first task an agent may take, shown in a new `next for an agent` column; a row of the `Failing CI` list, now reached with Tab, dispatches `project:ci`. Marked rows dispatch together, refused whole if one has no task. `I` over several projects queues a job per project, so their sessions open side by side; one job over them all held every project's lock until each session ended.
 
+- `E` in the TUI opens the selected row's project, or the one in view, in `$VISUAL`, else `$EDITOR`, else `vi`, from the project's directory. When it closes the project is re-read offline, so an unstaged fix shows at once; the 5-second refresh sees only files a stamp covers, and would leave it until the next full scan. For a fix quicker by hand than by dispatch. The web says to use the TUI: an editor needs a terminal.
+
+- A push now shows within 5 seconds in the TUI and web. A project's commits read as unpublished until the next full scan, up to `scan.every` minutes, because a push changes none of the files the quick refresh watched.
+
 - `.pma/`, where an agent drafts its changelog entry, is listed in the repository's `.git/info/exclude` at dispatch, so it no longer shows in `git status`. Not `.gitignore`: that is a tracked file, and every repository would need a commit.
 
 - A decision from a run's detail opens the next ready run in the view, so reviewing M runs takes no navigation between them. Stage and commit stay on their run: it has a next step, and their notice offers to open it.

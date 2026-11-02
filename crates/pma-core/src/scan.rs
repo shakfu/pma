@@ -114,8 +114,8 @@ pub struct Facts {
 }
 
 /// Changes when `TODO.md` or the repository's state does: a commit, a checkout,
-/// a stage, a fetch. An edit to a tracked file that is not staged does not
-/// change it, so `dirty` can lag until the next full scan.
+/// a stage, a fetch, a push. An edit to a tracked file that is not staged does
+/// not change it, so `dirty` can lag until the next full scan.
 pub fn stamp(path: &Path) -> String {
     [
         "TODO.md",
@@ -123,6 +123,10 @@ pub fn stamp(path: &Path) -> String {
         ".git/HEAD",
         ".git/logs/HEAD",
         ".git/FETCH_HEAD",
+        // A push writes neither of the above. Git renames a ref's lock file
+        // into this directory, which changes its time.
+        ".git/refs/remotes/origin",
+        ".git/packed-refs",
     ]
     .iter()
     .map(|f| match std::fs::metadata(path.join(f)) {
@@ -1187,6 +1191,48 @@ mod tests {
         let none = Status::parse("# branch.oid abc\n# branch.head main\n");
         assert_eq!((none.upstream, none.ahead), (None, None));
         assert!(Status::parse("# branch.oid (initial)\n# branch.head main\n").initial);
+    }
+
+    /// A push changes the stamp, so a view stops calling pushed commits
+    /// unpublished without waiting for a full scan.
+    #[test]
+    fn a_push_changes_the_stamp() {
+        let root = std::env::temp_dir().join(format!("pma-push-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (dir, bare) = (root.join("clone"), root.join("origin.git"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sh = |at: &Path, args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(at)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        sh(&root, &["init", "-q", "--bare", "-b", "main", "origin.git"]);
+        sh(&dir, &["init", "-q", "-b", "main"]);
+        sh(&dir, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        sh(&dir, &["commit", "-q", "--allow-empty", "-m", "first"]);
+        sh(&dir, &["push", "-q", "-u", "origin", "main"]);
+        sh(&dir, &["commit", "-q", "--allow-empty", "-m", "second"]);
+        let before = stamp(&dir);
+        // Coarse file times would hide a change made in the same tick.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        sh(&dir, &["push", "-q", "origin", "main"]);
+        assert_ne!(stamp(&dir), before, "the push went unseen");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Against real repositories: an empty one and one with no upstream lose

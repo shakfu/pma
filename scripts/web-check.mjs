@@ -128,7 +128,7 @@ await key("Escape");
 await wait(300);
 check("Escape clears the marks", (await js(`document.querySelectorAll("td.mark input:checked").length`)) === 0, null);
 
-// z: the chooser filters by name and aligns its columns.
+// z: the chooser filters by name and description and aligns its columns.
 await js(`document.activeElement && document.activeElement.blur()`);
 await key("z", "z");
 await wait(1000);
@@ -143,7 +143,8 @@ const probe = first[first.length - 1].slice(0, 3);
 await type(probe);
 await wait(300);
 const shown = await js(`[...document.querySelectorAll(".option:not([hidden]) .option-name")].map(e => e.textContent)`);
-check(`typing "${probe}" filters`, shown.length >= 1 && shown.length < all && shown.every((n) => n.toLowerCase().includes(probe.toLowerCase())), { all, shown });
+// Fuzzy over name and description, best first, as the TUI's chooser.
+check(`typing "${probe}" filters`, shown.length >= 1 && shown.length < all && shown[0].toLowerCase().includes(probe.toLowerCase()), { all, shown });
 check("the first match is chosen", (await js(`document.querySelector("input[name=choice]:checked").value`)) === shown[0], shown);
 await key("Escape");
 await wait(500);

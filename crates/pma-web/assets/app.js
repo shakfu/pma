@@ -259,11 +259,12 @@ function toggleAllMarks() {
 // The marked tasks as one pick, as `screen::marked` builds it.
 function markedPick() {
   if (runsMarked()) return { kind: "runs", ids: S.marks.map((m) => m.id) };
-  if (S.marks[0].kind === "manual" || S.marks[0].kind === "project") {
+  if (!S.marks.some((m) => m.kind === "task")) {
     const names = [...new Set(S.marks.map((m) => m.project))];
     return { kind: "projects", names, targets: S.marks.map((m) => m.target).filter(Boolean) };
   }
-  return { kind: "tasks", targets: S.marks.map((m) => m.target), retry: S.marks.some((m) => m.retry) };
+  const tasks = S.marks.filter((m) => m.kind === "task");
+  return { kind: "tasks", targets: tasks.map((m) => m.target), retry: tasks.some((m) => m.retry) };
 }
 
 function currentActs() {
@@ -841,8 +842,8 @@ function chooser(asked, name) {
       const kept = fuzzyRank(filter.value, rows, (r) => [r.dataset.name, r.dataset.about]);
       for (const r of rows) r.hidden = true;
       for (const i of kept) { rows[i].hidden = false; list.append(rows[i]); }
-      const c = box.querySelector("input[name=choice]:checked");
-      if (!c || c.closest(".option").hidden) choose(shown()[0]);
+      // The best match, as the TUI's chooser takes it on each key.
+      choose(shown()[0]);
     },
     onkeydown: (e) => {
       if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;

@@ -73,7 +73,6 @@ Socket API, not the CLI. A connection takes one request. Each run holds an `even
 
 The user chose this. A live test showed most objections do not hold when the pane runs a generated script rather than `agent.start`: the script unsets what `restrict` removed, `claude -p` keeps its event stream through `tee`, and `pane close` kills the process. A guard process closes the pane if `pma` dies. The last point, coupling, still holds: this depends on a pre-1.0 CLI. An interactive run does lose cost, budget and summary, and it needs a person at Claude's folder-trust prompt in a directory not yet trusted, so its tab comes to the front. `claude --help` says `-p` skips that prompt.
 
-
 `pma` could start an agent with `pane.split` and `agent.start` instead of a child process, so the user watches and steers it live. This breaks five things `pma` relies on:
 
 - **Environment.** `pane.split` takes an additive `env` map. It cannot remove what the server injects, so `restrict` cannot be applied.
@@ -107,6 +106,9 @@ Treat herdr as a user of `pma`, not a dependency. An interactive agent in a herd
 ## Recommendation
 
 1. Do section 1 now. It is a hygiene fix whether or not herdr is ever integrated.
+
 2. Document section 2 in the README under notices.
+
 3. Defer section 3 until there is a reason the TUI's counts are not enough.
+
 4. Do not do section 4. Overruled: the user chose it, and it is built.

@@ -34,7 +34,7 @@ Each long step records its phase in a file beside the run's logs. The CLI draws 
 
 ### What a line shows
 
-```
+```text
 pkgdb   verify head  make test  1m12s / ~2m12s  [ 92%] tests/test_service.py ....
 margo   agent        claude     0m41s           Edit src/server.go
 ```

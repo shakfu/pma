@@ -10,7 +10,7 @@ Two decisions below were corrected by the implementation rather than by review: 
 
 A workflow is a typed, parameterised function over bags of units:
 
-```
+```text
 find-issues        (in: [Project], review_doc = "REVIEW.md") -> [Finding]  !pure
 apply-fixes        (in: [Finding], laps = 2)                 -> [Finding]  !repo !writes
 review-fix-critical(in: [Project], severity = "critical")    -> [Finding]  !repo !writes
@@ -594,7 +594,7 @@ Computed on the flattened graph, at every parameter's declared maximum:
 
 A lap mints a unit and a retry does not: a retry is another attempt on the same run against the same unit, so it multiplies runs alone, while a lap hands a new unit to the node's successors.
 
-```
+```text
 bound(@input)        = the argument's unit count
 units_seen(node)     = bound(in) x (1 + sum of max_laps on incoming lap edges)
 bound(map 0..n)      = bound(in) x max_units, summed over depth <= max_depth
@@ -786,7 +786,7 @@ Runnable today: 15.1, 15.2, 15.4, 15.5, 15.8, 15.9, 15.12, 15.14 and 15.15. `pma
 
 Review, then confirm what the review claimed, then drop duplicates. Called by 15.10 and 15.12.
 
-```
+```text
 @input -> review -> confirm -> dedupe -> @output
 ```
 
@@ -826,7 +826,7 @@ Worst case: 1 review, 40 confirms, 0 for the rule. `!pure`, so it can run before
 
 Three reviewers at three models, joined. The shape a sequence cannot express. Drop-in replacement for 15.1 at any call site, because the signature matches.
 
-```
+```text
 @input -+-> bugs  -+
         +-> tests -+-> merge(rule) -> confirm -> @output
         \-> api   -+
@@ -915,7 +915,7 @@ Routes may give `ensemble-review/bugs` haiku and `ensemble-review/api` opus, whi
 
 Fix, audit the fix, and hand back what would not converge.
 
-```
+```text
 @input -> fix -> audit -+-> @output [verdict=accept]
                         +-> fix     [verdict=reject] (max_laps {$laps})
                         \-> handoff (default) => TODO.md
@@ -956,7 +956,7 @@ Fix, audit the fix, and hand back what would not converge.
 
 The read costs nothing: `open-issues` is a rule. Only the classification spends a model.
 
-```
+```text
 @input -> issues(rule) -> classify -> @output [actionable=true]
 ```
 
@@ -987,7 +987,7 @@ A `low` unit is settled at `classify` with the guard recorded, so why it was not
 
 For a one-liner an agent should not start coding against.
 
-```
+```text
 @input(item) -> seed(rule) -> write -> @output
 ```
 
@@ -1016,7 +1016,7 @@ For a one-liner an agent should not start coding against.
 
 ### 15.6 `decompose(in: [Task], depth = 2, width = 5) -> [Task] !pure`
 
-```
+```text
 @input -> split -+-> split   [depth < {$depth}]
                  \-> @output [children = 0]
 ```
@@ -1047,7 +1047,7 @@ Per-node worst case is 1 + 8 + 64 units at the declared maxima, so `caps.max_uni
 
 ### 15.7 `implement(in: [Task], retries = 1) -> [Task] !repo`
 
-```
+```text
 @input -> build -> @output
 ```
 
@@ -1095,7 +1095,7 @@ An effectful identity: it writes the items and returns its input, so a caller ca
 
 Waiting with no loop and no model. Every node is a rule or a check, so the worst-case cost is `$0.00` and `pma workflow propose` prints it as such.
 
-```
+```text
 @input -> open-runs(rule) -> merged(check) -> close => note -> @output
 ```
 
@@ -1127,7 +1127,7 @@ A check writes its verdict under its rule's name, so the guard reads `@pr-merged
 
 The original request, as a composition. One fork: everything confirmed is recorded for the human, and the severe ones are fixed.
 
-```
+```text
 @input -> call find-issues -+-> call record
                              \-> call apply-fixes [severity={$severity}] -> @output
 ```
@@ -1162,7 +1162,7 @@ Swapping `find-issues` for `ensemble-review` is a one-word change, because the s
 
 ### 15.11 `plan-and-build(in: [Item], depth = 2) -> [Task] !repo`
 
-```
+```text
 @input -> call specify -> call decompose -> call implement -> @output
 ```
 
@@ -1195,7 +1195,7 @@ Three workflows, none of which knows about the others. `depth` passes through fr
 
 Across a tag rather than one project: `pma workflow run portfolio-sweep --tag rust`. The argument bag holds one unit per tagged project, frozen at the start, which is what a campaign does (plan 5.1) with no second mechanism.
 
-```
+```text
 @input(tag) -> call ensemble-review -> call record -> @output
 ```
 
@@ -1233,7 +1233,7 @@ No `edit`, so `effects` is `writes` alone and this runs before phase 4b's gate. 
 
 Open `TODO.md` items the code already does. `docs/dev/pilot.md` excluded five `pkgdb` items that were built but still open. The pattern is 15.1's: one reviewer claims, a confirm per claim checks. Each confirmed claim becomes a note; the human ticks the item, since a wrong "done" would close open work.
 
-```
+```text
 @input -> claim -> confirm => note -> @output
 ```
 
@@ -1270,7 +1270,7 @@ Worst case: 1 claim, 40 confirms.
 
 Documentation that no longer matches the code: a README example the parser refuses, a design note naming a crate that is gone. Both were found by hand on 2026-10-18. 15.1's shape with a reviewer aimed at the documents; feed its output to 15.8 to record it.
 
-```
+```text
 @input -> review -> confirm -> dedupe -> @output
 ```
 
@@ -1303,7 +1303,7 @@ Documentation that no longer matches the code: a README example the parser refus
 
 A review aimed at one class of fault. Asked for everything, a reviewer lists what it notices; asked for security alone, it traces input to the sinks. 15.1's shape, with a `confirm` that must find the path from an entry point, so a claim with none is dropped.
 
-```
+```text
 @input -> review -> confirm -> dedupe -> @output
 ```
 
@@ -1338,7 +1338,7 @@ Worst case: 1 review, 40 confirms.
 
 What breaks unnoticed. `ensemble-review` (15.2) has a tests node among three; alone it costs a third, and its `confirm` searches the suite for a covering test rather than judging prose.
 
-```
+```text
 @input -> review -> confirm -> dedupe -> @output
 ```
 
@@ -1373,7 +1373,7 @@ Worst case: 1 review, 40 confirms.
 
 One line per project, for a portfolio nobody holds in their head: what it does, for whom, in what. A note per project, so `pma note` is the index. One unit per project, so the worst case is one run each.
 
-```
+```text
 @input -> describe => note -> @output
 ```
 
@@ -1402,7 +1402,7 @@ One line per project, for a portfolio nobody holds in their head: what it does, 
 
 15.3 without the lap and the retry, which the runtime does not take yet. One edit per finding, gated by `verify`; every edit waits in `pma review`. No audit node: the review is the audit.
 
-```
+```text
 @input -> fix -> @output
 ```
 
@@ -1429,7 +1429,7 @@ Worst case: 10 edits.
 
 15.10 made runnable: find, confirm, then fix the severe ones. A finding below the bar still reaches the output, so the run prints it. `severity` is the bar, and critical always clears it.
 
-```
+```text
 @input -> call find-issues -+-> call fix-findings [severity critical or {$severity}] -> @output
                              \-> @output (default)
 ```

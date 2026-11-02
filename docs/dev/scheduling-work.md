@@ -45,6 +45,7 @@ Verified against the code on 2026-10-27.
   | 100 | 700 runs, $700 | - |
 
   `find-issues` flattens early because its `max_units` is 60; `portfolio-sweep`'s is 400.
+
 - **`batch_budget` bounds one plan, not a pass.** A plan holds `floor(batch_budget / agent_budget)` runs, 5 at the defaults (`crates/pma-core/src/pass.rs:557`). `--unattended` approves each plan in turn until the instance finishes or waits (`pass.rs:1006`). No running total of spend is kept. The help text, "`batch_budget` sizes each plan", is accurate but bounds a night only by the pass's worst case.
 
 - **`agent_budget` is not a hard bound for any built-in worker.** `claude` gets `--max-budget-usd {budget}` (`crates/pma-core/src/worker.rs:419`) but checks it between turns: a $0.05 cap once cost $0.09. Every built-in worker has `enforces_budget: false` (`worker.rs:431`). The dollar figures above assume each run stays within `agent_budget`.

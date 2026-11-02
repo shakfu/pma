@@ -196,7 +196,7 @@ pma run fix-ci spore --push   # approve and push when the gates are clean
 
 **Configuring from the TUI and the web.** A settings tab lists every `pma config` key, the roots, the agents, the presets and the route revisions, and edits them in place: `e` edits, `x` resets or removes, `a` makes a default or activates a route, `r` adds a root, `p` a preset, `f` proposes a route from a file. On a project, `e` sets its tier, a tag, its verify command or its sandbox from one typed line, `f` prunes its finished items, and a TODO.md pane shows what lint and prune would say. `r` on a project lists a plain, dependency or offline rescan and `pma deps refresh`. On the library, `a` adds a campaign and `x` removes one. Enter opens a scan's changes, a campaign's members and a route's policy. Chosen over leaving configuring to `settings.toml` because the stated goal is a front end that needs no terminal; `project export`, `import`, `forget` and `clone` stay CLI-only as file and bulk operations. `docs/dev/frontends.md`.
 
-```
+```text
 8          settings: keys, roots, agents, presets, routes
 e          on a project: tier 2 | tag +oss | verify make test | sandbox on
 ```
@@ -769,7 +769,7 @@ The agent-loop entries below turn one prompt per task into a measured, gated pip
 
 **Review by exception.** `pma review` marks each run `clean` or `N to read`, and `pma review <id>` lists why:
 
-```
+```text
 read this run because:
   - outside class B: .github/workflows/ci.yml
 
@@ -782,7 +782,7 @@ What the two verify results must show depends on the class. A must leave a green
 
 **`pma report`** shows what dispatching produced, grouped by class, project or agent:
 
-```
+```text
 67% of 3 decided runs accepted
 
 by class  runs  1st pass  accepted  merged  open  attempts  cost      agent  review
@@ -822,7 +822,7 @@ The document is JSON, not the TOML the design named: this crate parses JSON alre
 
 **Campaigns: one task definition across many repositories.**
 
-```
+```text
 pma campaign add workflows "add a workflow" --projects a,b,c --class A- \
   --describe "Create .github/workflows/ci.yml that runs on push."
 pma campaign run workflows
@@ -911,4 +911,3 @@ pma dispatch cynn                            # the project's tasks, in a list wi
 An item's age is taken from the commit where its text first appeared in `TODO.md`, not from `git blame`. On real repos, blame dated every migrated item to the migration commit, because migration added a tag to each line. Every age restarted at 0, and no item could become urgent by age for a month.
 
 **`pma lint`.** Checks TODO.md files against format v1, defined in `docs/dev/design.md`. The parser works line by line, not through a markdown AST, so later stages can edit one line without re-rendering the file. A file with no items but with plain bullets elsewhere is flagged. Otherwise such a file lints clean while `pma` sees none of its tasks.
-

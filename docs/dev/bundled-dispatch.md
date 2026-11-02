@@ -5,14 +5,23 @@ Status: built, 2026-10-28.
 Where the build departs from the design below:
 
 - The key is `bundle`, not `bundle:<n>`. Nothing reads a bundle's number from its key.
+
 - `run_items` has `n` and `dropped INTEGER NOT NULL DEFAULT 0`, not `done`. An item is ticked unless dropped, so an approval without `--drop` ticks every item.
+
 - `--drop` takes the item numbers `pma review <id>` prints and the prompt uses, not TODO.md lines. A line goes stale when the file is edited; the number does not.
+
 - `pma stage` takes no `--drop`, and refuses a ready bundle, as commit, push and a pull request from a view do (`dispatch::needs_approval`). Approve with `--drop`, then publish.
+
 - Step 2 came with step 1. Without the clean-run exclusion, `--push` would tick every item of a bundle.
+
 - A bundle holds TODO.md items only. A signal named beside them keeps its own run.
+
 - `Ask::Check` serves every approval from the TUI and the web. A run with no items gives an empty list, which asks nothing, so a plain run is approved as before. The input is the numbers left unchecked, as `--drop` takes them. A re-approval starts with the earlier choice.
+
 - `pma task <project:line>` does not list a bundle among the runs holding the item. The busy check does see it.
+
 - A prompt's key is `prompt`, not `prompt:<n>`, as a bundle's is `bundle`. Its whole text is kept in `runs.description`, which `--retry` dispatches again. Its attempts count against its title, the first line cut at 80 characters.
+
 - Marks are a front end's, per view: a `Pick::Tasks` built from them is the pick `d` acts on (`screen::marked`). They clear on a dispatch, on Escape and on another view. A refresh drops a mark whose row is gone, so nothing unseen is dispatched. Retried when any marked task would be on its own.
 
 ## Problem

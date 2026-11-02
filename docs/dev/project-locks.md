@@ -20,8 +20,11 @@ Over a pid or a per-run file: the lock already existed, and a crash cannot leave
 The runner runs jobs on threads:
 
 - A job about one project needs that project. Jobs in a project keep their order.
+
 - `scan` needs nothing and runs beside anything.
+
 - Anything else needs everything, and later jobs cannot overtake it, so it cannot wait forever.
+
 - `max_parallel` caps headless project jobs. An interactive job does not count, since a person drives it.
 
 A dispatch whose clone holds another run stays queued instead of failing. A later job in the project still runs, since it may be the push that frees the clone.
@@ -29,6 +32,9 @@ A dispatch whose clone holds another run stays queued instead of failing. A late
 ## Limits
 
 - `max_parallel` caps jobs and also agents within a job, so a job with several projects can exceed it overall.
+
 - `settle_committed` looks at every project while holding none of their locks, so it writes a run only if the run is still in the state it read.
+
 - A dispatch waiting for its clone keeps the runner polling, and the front ends' `working` indicator on, until the run is decided.
+
 - Two runs in one project still run one after the other, worktree runs included.

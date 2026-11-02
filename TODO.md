@@ -4,11 +4,7 @@
 
 ## High
 
-- [ ] Add `pma integrate <name>`: pma should integration adapters to integrate
-    with [herdr](https://herdr.dev/tui/docs/cli-reference/) and also see
-    <https://herdr.dev/tui/docs/socket-api/>; and also with
-    [minos](https://github.com/shakfu/minos). Such integrations are mutually
-    exclusive.
+- [ ] Add `pma integrate <name>`: pma should integration adapters to integrate with [herdr](https://herdr.dev/tui/docs/cli-reference/) and also see <https://herdr.dev/tui/docs/socket-api/>; and also with [minos](https://github.com/shakfu/minos). Such integrations are mutually exclusive.
 
 - [ ] Finish the pilot cohort and apply its gate #manual 1 of 20 items shipped since 2026-09-24 (`docs/dev/pilot.md`). Fix the `report` count above first, or the shares will mislead. (REVIEW.md U1)
 

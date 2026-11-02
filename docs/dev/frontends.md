@@ -34,7 +34,6 @@ Phase 3, crates:
 
 - `crates/pma/src/main.rs` is 3,763 lines: the CLI's argument definitions and its rendering of each view, plus the configuring commands.
 
-
 Phase 4, the TUI:
 
 - A third shared module, `pma_core::screen`, sits between the API and both front ends. It turns a `View` into panes of rows, each with a `Pick` saying what it is about, or into text; and it builds the `Action` a key takes on a pick. The design had each front end do this. Shared, neither decides for itself what a row is or what a key does to it.
@@ -152,7 +151,7 @@ The CLI moves onto the same API over time. It keeps the configuring commands, wh
 
 ### Crates
 
-```
+```text
 crates/pma-core   store, scan, dispatch, pass, workflow, jobs, settings; Query and Action. No printing, no UI deps.
 crates/pma-tui    ratatui front end
 crates/pma-web    HTTP server and embedded HTML/JS; behind a cargo feature

@@ -38,7 +38,6 @@ References: implementation plan steps 2.1–2.2, 4.2, and 4.5; design section �
 
 Step 4.5 promises never to exceed `batch_budget`. The design explicitly records that a worker's native cap can overshoot, and the adapter permits workers that report no cost. Reserving a nominal run budget cannot enforce an absolute spend ceiling in either case. Automatic retries make the distinction more important.
 
-
 Choose an enforceable contract. Either describe `batch_budget` as an admission budget with disclosed overshoot and unknown spend, or restrict strict-budget routes to workers with a genuinely enforceable bound. Preserve unknown costs as unknown, reserve retry capacity, and specify whether `agent_budget` applies per attempt or across the whole task. A hard spend guarantee must not be inferred from timeout support.
 
 Acceptance should include a worker exceeding its reservation, a worker returning no cost, and concurrent attempts plus escalation at the batch limit.
@@ -46,7 +45,6 @@ Acceptance should include a worker exceeding its reservation, a worker returning
 ### 4. P1 — Add immutable attempt and decision records before collecting calibration data
 
 References: implementation plan phase 0 acceptance, steps 1.3–1.4, 2.3, 3.5, 4.3, and “Schema and compatibility”; `src/store.rs::update_run`; `src/dispatch.rs::attempt`.
-
 
 The current run row is mutable. Rework replaces the summary, verify result, feedback, and start time while accumulating cost and duration. Keeping run rows forever does not preserve individual attempts. The proposed migrations mention values “per attempt” without defining an attempt entity. Class and complexity features stored only on scanned tasks also cannot reconstruct historical decisions after a rescan or rewording.
 

@@ -198,4 +198,3 @@ pma note                                     # one note per confirmed finding
 ```
 
 Each run's `in.json` and `out.json` are kept under `$PMA_HOME/state/artifacts/<instance>/<node>/<n>/`, and the confirm step's reasoning for a dropped claim is in the run's summary: `sqlite3 $PMA_HOME/projects.db "select summary from runs where node = 'confirm'"`.
-

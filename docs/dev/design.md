@@ -471,7 +471,7 @@ Adding `gh:N` changes an item's key from its text to the issue number. Dispatch,
 
 - Processes: `std::process` and threads. The parallelism is child processes, so an async runtime is not needed.
 
-- TUI: `ratatui` with only its crossterm backend, 69 crates rather than the default features' 152. `pma tui` shows the matrix as a 2x2 layout, Q1 top left, and the selected task with its `pma dispatch` target. It reads the last scan and changes nothing. Focus is a thick border and selection a `> ` marker in reverse video, so neither depends on colour.
+- TUI: `ratatui` with only its crossterm backend, 69 crates rather than the default features' 152. `pma tui` shows the matrix as a 2x2 layout, Q1 top left, and the selected task with its `pma dispatch` target. It reads the last scan and changes nothing. Focus is a thick border and selection a `>` marker in reverse video, so neither depends on colour.
 
 ## Stages
 

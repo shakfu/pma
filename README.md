@@ -31,7 +31,7 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 - Failing CI, outdated dependencies, idle repositories and dirty working trees appear as tasks beside the written ones.
 
-- Two front ends with the same views and actions: `pma tui` in a terminal, over SSH too, and `pma web` in a local browser, on 127.0.0.1 behind a one-time token. Both act on what is selected: dispatch a task, approve or reject a run, approve a plan, stop a job. Space marks tasks, and `d` dispatches the marked ones, one run per project. On the projects tab, Space marks projects, `z` runs one name over them, `e` sets their tier or tag together, and `d` or `I` dispatches each one's next task, or `project:ci` from the `Failing CI` list. `P` in a project view dispatches a prompt you type. `O` opens a project by a few letters of its name or a tag, `/` filters any list the same way and `*` marks what it keeps, `#` scopes every view and portfolio act to a tag, `v` reads a run's diff in your pager, and `E` opens the project in `$EDITOR` for a fix by hand.
+- Two front ends with the same views and actions: `pma tui` in a terminal, over SSH too, and `pma web` in a local browser, on 127.0.0.1 behind a one-time token. Both act on what is selected: dispatch a task, approve or reject a run, approve a plan, stop a job. Space marks tasks, and `d` dispatches the marked ones, one run per project. On the projects tab, Space marks projects, `z` runs one name over them, `e` sets their tier or tag together, and `d` or `I` dispatches each one's next task, or `project:ci` from the `Failing CI` list. `P` in a project view dispatches a prompt you type. `O` opens a project by a few letters of its name or a tag, `/` filters any list the same way and `*` marks what it keeps, `#` scopes every view and portfolio act to a tag, `v` reads a run's diff in your pager, `E` opens the project in `$EDITOR` and `S` a shell in it, in herdr when integrated, for a fix by hand.
 
 - A view of each project: its state and why, CI, dependencies, local changes, open tasks and every run, with how old the scan behind it is. `pma project show <name>`, or `o` on any row.
 
@@ -209,6 +209,7 @@ pma web --app                   # as an app window, in Chrome or Chromium
 pma project show myproject      # one project: state, open tasks, runs and jobs; `o` in the TUI and web
 pma web --no-open --port 9000   # for `ssh -L 9000:127.0.0.1:9000 host` from another machine
 pma note add "move CI to a reusable workflow"
+pma shell myproject             # a shell in its clone, in herdr if integrated; re-read on exit
 ```
 
 After the first scan you rarely need to scan again. `next`, `matrix`, `status`, `task` and `dispatch` re-read a project whose `TODO.md` or git state changed, and the TUI and web do so every 5 seconds, plus a full scan with CI every `scan.every` minutes (30; 0 turns it off). An unstaged edit shows at the next full scan. See [docs/dev/refresh.md](docs/dev/refresh.md).

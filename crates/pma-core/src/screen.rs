@@ -2804,6 +2804,13 @@ pub fn action_scoped(
         }
         (Act::OpenPane, Pick::Run { id, .. }) => Action::FocusPane { id: *id },
         (Act::TakeOver, Pick::Run { id, .. }) => Action::TakeOver { id: *id },
+        (Act::Shell, pick) => Action::Shell {
+            project: match pick.project() {
+                Some(p) => p.to_string(),
+                None if !project.is_empty() => project.to_string(),
+                None => return Err("select a row that names a project, or open one".into()),
+            },
+        },
         (Act::OpenPane | Act::TakeOver, _) => return need("a run"),
         (
             Act::Dispatch | Act::DispatchPush | Act::DispatchInteractive,
@@ -3666,6 +3673,28 @@ mod tests {
         assert!(action(Act::Run, &Pick::Nothing, &[], "review").is_err());
         assert!(action(Act::Run, &row, &[], "").is_err());
         assert!(action(Act::Run, &row, &[], "review --nope").is_err());
+    }
+
+    /// `S` opens a shell on the row's project, else the one in view.
+    #[test]
+    fn a_shell_takes_the_rows_project_or_the_one_in_view() {
+        let row = Pick::Project {
+            project: "a".into(),
+            target: None,
+        };
+        assert_eq!(
+            action(Act::Shell, &row, &[], ""),
+            Ok(Action::Shell {
+                project: "a".into()
+            })
+        );
+        assert_eq!(
+            action_in(Act::Shell, &Pick::Nothing, &[], "", "b"),
+            Ok(Action::Shell {
+                project: "b".into()
+            })
+        );
+        assert!(action(Act::Shell, &Pick::Nothing, &[], "").is_err());
     }
 
     /// A project row dispatches its first task an agent may take, skipping

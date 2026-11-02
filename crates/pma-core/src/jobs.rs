@@ -104,7 +104,8 @@ enum Needs {
 fn needs(job: &Job) -> Needs {
     let command = job.args.first().map_or("", String::as_str);
     match (command, &job.project) {
-        ("scan", _) => Needs::Nothing,
+        // A person in a shell: it holds no lock, so other work goes on.
+        ("scan" | "shell", _) => Needs::Nothing,
         (
             "dispatch" | "review" | "push" | "pr" | "stage" | "commit" | "merge" | "verify"
             | "deps",
@@ -364,4 +365,39 @@ pub fn list(jobs: &[Job]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(args: &[&str], project: Option<&str>) -> Job {
+        Job {
+            id: 1,
+            args: args.iter().map(|a| a.to_string()).collect(),
+            cwd: "/".into(),
+            state: "queued".into(),
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            pid: None,
+            exit_code: None,
+            awaiting: None,
+            project: project.map(String::from),
+        }
+    }
+
+    /// A shell waits on a person for as long as they like, so it holds no
+    /// lock: the project's runs and other jobs go on beside it.
+    #[test]
+    fn a_shell_holds_no_lock() {
+        assert!(matches!(
+            needs(&job(&["shell", "p"], Some("p"))),
+            Needs::Nothing
+        ));
+        assert!(matches!(
+            needs(&job(&["dispatch", "p:1"], Some("p"))),
+            Needs::Project(_)
+        ));
+    }
 }

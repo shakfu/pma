@@ -185,6 +185,7 @@ Clean means nothing `pma` checks objects. It does not mean the change is correct
 4. `O` jumps to a project; `Space` marks tasks; `d` dispatches the marked ones.
 5. `#` scopes every tab to a tag.
 6. `E` opens the selected row's project in `$VISUAL`, else `$EDITOR`. When the editor exits, `pma` re-reads the project, so an unstaged fix or a ticked item shows at once. TUI only.
+7. `S` opens a shell in the project: a herdr pane when integrated, else this terminal. The project is re-read when the shell exits. `pma shell <project>` does the same from the command line.
 
 On the projects tab, `d` or `I` on a project row dispatches the task in its `next for an agent` column. `Tab` to the `Failing CI` list dispatches `project:ci` instead. Mark several rows and press `I` once: each project gets its own herdr session, opened in the background. `H` on a run brings its pane forward.
 
@@ -210,7 +211,7 @@ For multi-step work (review, confirm, fix), use a workflow. `pma workflow librar
 
 ### Skip the agent
 
-Some tasks take less time to do than to dispatch and review: a typo, a version bump, a one-line config change. Do those by hand. `E` on the task's row, make the edit, tick the item in `TODO.md`, and commit. A run costs a check before and after, plus your review; a hand edit costs neither.
+Some tasks take less time to do than to dispatch and review: a typo, a version bump, a one-line config change. Do those by hand. `E` on the task's row, or `S` for a shell, make the edit, tick the item in `TODO.md`, and commit. A run costs a check before and after, plus your review; a hand edit costs neither.
 
 ## Measure, then adjust
 

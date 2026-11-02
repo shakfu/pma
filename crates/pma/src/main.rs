@@ -35,7 +35,9 @@ const GROUPS: [(&str, &[&str]); 6] = [
     ),
     (
         "Tasks",
-        &["task", "lint", "prune", "stale", "sync", "note", "deps"],
+        &[
+            "task", "lint", "prune", "stale", "sync", "note", "deps", "shell",
+        ],
     ),
     (
         "Reading",
@@ -600,6 +602,14 @@ enum Command {
     Job {
         #[command(subcommand)]
         action: Option<JobAction>,
+    },
+    /// A shell in a project's clone, for a fix by hand.
+    ///
+    /// In a herdr pane under `pma integrate herdr`, else on this terminal.
+    /// When it ends the project is re-read, so an unstaged edit shows at once.
+    Shell {
+        /// The project's name.
+        project: String,
     },
     /// What running agents are doing, read from their logs.
     ///
@@ -1211,6 +1221,7 @@ fn main() -> ExitCode {
         Command::Job { action } => run_job(action),
         Command::Runner => jobs::run(),
         Command::Watch { once } => run_watch(once),
+        Command::Shell { project } => api::shell(&project),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

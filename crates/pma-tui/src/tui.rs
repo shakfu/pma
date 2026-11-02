@@ -2322,6 +2322,26 @@ pub fn run(store: &Store) -> Result<()> {
                     let again = Request::Load(app.query());
                     execute(store, &mut app, again);
                 }
+                // Without herdr the shell needs this terminal; with it, the
+                // act queues a job that waits on the pane.
+                Some(Request::Act(Action::Shell { project }))
+                    if api::config(store)
+                        .is_ok_and(|c| c.integration != pma_core::config::Integration::Herdr) =>
+                {
+                    let ended = (|| -> Result<()> {
+                        ratatui::try_restore()?;
+                        let ended = api::shell(&project);
+                        terminal = ratatui::try_init()?;
+                        terminal.clear()?;
+                        ended
+                    })();
+                    match ended {
+                        Ok(()) => app.status = None,
+                        Err(e) => app.say(e.to_string(), Tone::Bad),
+                    }
+                    let again = Request::Load(app.query());
+                    execute(store, &mut app, again);
+                }
                 Some(request) => {
                     // Draw "working" before a slow action blocks the loop.
                     terminal.draw(|f| app.render(f))?;
@@ -3322,6 +3342,13 @@ mod tests {
                 project: "b".into()
             }),
             "E opens the run's project"
+        );
+        assert_eq!(
+            app.key("S"),
+            Some(Request::Act(Action::Shell {
+                project: "b".into()
+            })),
+            "S opens a shell on it"
         );
         let pick = Pick::Run {
             id: 4,

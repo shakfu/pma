@@ -116,6 +116,9 @@ pub enum Act {
     OpenPane,
     /// Opens an interactive agent on the run's directory, in herdr.
     TakeOver,
+    /// A shell in the project's clone, for a fix by hand; the project is
+    /// re-read when it ends.
+    Shell,
     /// Rejects a run and leaves the clone's files as they are.
     ForgetRun,
     /// Resumes the selected instance.
@@ -173,7 +176,7 @@ pub enum Act {
 }
 
 impl Act {
-    pub const ALL: [Act; 52] = [
+    pub const ALL: [Act; 53] = [
         Act::ApproveRun,
         Act::ApproveRuns,
         Act::RejectRun,
@@ -192,6 +195,7 @@ impl Act {
         Act::DispatchInteractive,
         Act::OpenPane,
         Act::TakeOver,
+        Act::Shell,
         Act::ResumeWorkflow,
         Act::StartWorkflow,
         Act::ReworkRun,
@@ -262,6 +266,7 @@ impl Act {
                 | Act::PushApproved
                 | Act::StartWorkflow
                 | Act::Run
+                | Act::Shell
                 | Act::AddRoot
                 | Act::AddPreset
                 | Act::ProposeRoute
@@ -326,6 +331,7 @@ impl Act {
             ],
             Action::FocusPane { .. } => &[Act::OpenPane],
             Action::TakeOver { .. } => &[Act::TakeOver],
+            Action::Shell { .. } => &[Act::Shell],
             Action::WorkflowRun { .. } => &[Act::ResumeWorkflow, Act::StartWorkflow],
             Action::ReworkRun { .. } => &[Act::ReworkRun],
             Action::RetryRun { .. } => &[Act::RetryRun],
@@ -664,6 +670,14 @@ pub const BINDINGS: &[Binding] = &[
     on("H", RUNS, Act::OpenPane, Ask::Nothing, "open in herdr"),
     // Opening a pane publishes nothing and spends nothing until it is used.
     on("T", RUNS, Act::TakeOver, Ask::Nothing, "take over in herdr"),
+    // A project: the selected row's, or the one in view.
+    on(
+        "S",
+        &[Tab::Inbox, Tab::Projects, Tab::Matrix, Tab::Project],
+        Act::Shell,
+        Ask::Nothing,
+        "shell in project",
+    ),
     on(
         "X",
         RUNS,

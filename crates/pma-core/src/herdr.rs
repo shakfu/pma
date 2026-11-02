@@ -142,6 +142,12 @@ pub fn focus(pane: &str) -> Result<(), String> {
     call("tab.focus", json!({ "tab_id": tab })).map(|_| ())
 }
 
+/// Waits until `pane` has closed, or the server holding it has gone.
+pub fn wait_closed(pane: &str) {
+    let (closed, stop) = (AtomicBool::new(false), AtomicBool::new(false));
+    follow(pane, &closed, &stop, &|_| {});
+}
+
 /// Opens an interactive `claude` on a run's directory, in front. A person is
 /// at its keyboard, so it has their environment rather than `restrict`'s.
 pub fn take_over(project: &str, title: &str, cwd: &Path, prompt: &str) -> Result<String, String> {

@@ -42,6 +42,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - `E` in the TUI opens the selected row's project, or the one in view, in `$VISUAL`, else `$EDITOR`, else `vi`, from the project's directory. When it closes the project is re-read offline, so an unstaged fix shows at once; the 5-second refresh sees only files a stamp covers, and would leave it until the next full scan. For a fix quicker by hand than by dispatch. The web says to use the TUI: an editor needs a terminal.
 
+- **`S`, or `pma shell <project>`, opens a shell in a project's clone** for a fix by hand. Under `pma integrate herdr` it is a pane in the project's workspace, brought to the front; otherwise the TUI hands over its terminal, and the web says to use one of the two. When the shell ends the project is re-read, as after `E`. With herdr it runs as a job that holds no lock, so runs in that project go on and the TUI stays free.
+
 - A push now shows within 5 seconds in the TUI and web. A project's commits read as unpublished until the next full scan, up to `scan.every` minutes, because a push changes none of the files the quick refresh watched.
 
 - `.pma/`, where an agent drafts its changelog entry, is listed in the repository's `.git/info/exclude` at dispatch, so it no longer shows in `git status`. Not `.gitignore`: that is a tracked file, and every repository would need a commit.

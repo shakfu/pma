@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, Workspace};
+use crate::config::{Config, Integration, Workspace};
 use crate::keys::Act;
 use crate::store::{
     Attempt, Campaign, Job, Note, Preset, RouteRevision, Run, RunState, Session, Store,
@@ -557,6 +557,11 @@ pub enum Action {
     },
     /// Queued: `pma deps refresh <path>` over the project's clone.
     RefreshDeps {
+        project: String,
+    },
+    /// Queued: `pma shell <project>`, a shell in a herdr pane. Without herdr
+    /// a front end with a terminal runs [`shell`] itself.
+    Shell {
         project: String,
     },
     /// Rewrites the mechanical errors in the project's TODO.md, as
@@ -1793,6 +1798,13 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
                 ..Outcome::default()
             }
         }
+        Action::Shell { project } if config(store)?.integration != Integration::Herdr => {
+            return Err(format!(
+                "a shell for {project} needs a terminal: S in `pma tui`, \
+                 or `pma integrate herdr`"
+            )
+            .into());
+        }
         Action::SettlePrs => {
             let mut out = Outcome::default();
             publish::settle(store, |run, outcome| match outcome {
@@ -2196,6 +2208,38 @@ pub fn one_project(names: &[String]) -> Option<String> {
     projects.all(|p| p == first).then(|| first.to_string())
 }
 
+/// A shell in `project`'s clone, for a fix by hand: a herdr pane under `pma
+/// integrate herdr`, else `$SHELL` on this terminal. Waits for it to end, then
+/// re-reads the project, as the 5-second refresh would not see an unstaged edit.
+pub fn shell(project: &str) -> Result<()> {
+    let mut store = Store::open_default()?;
+    let row = store
+        .project(project)?
+        .ok_or_else(|| format!("unknown project `{project}`"))?;
+    let ended: Result<()> = match config(&store)?.integration {
+        Integration::Herdr => crate::herdr::open(project, "shell", &row.path)
+            .and_then(|pane| {
+                // Asked for by name, unlike a run: it comes to the front.
+                crate::herdr::focus(&pane)?;
+                crate::herdr::wait_closed(&pane);
+                Ok(())
+            })
+            .map_err(Into::into),
+        Integration::None => {
+            let shell = std::env::var_os("SHELL").unwrap_or_else(|| "sh".into());
+            // A shell exits with its last command's status, which says
+            // nothing about the session.
+            std::process::Command::new(&shell)
+                .current_dir(&row.path)
+                .status()
+                .map(|_| ())
+                .map_err(|e| format!("could not start {}: {e}", shell.to_string_lossy()).into())
+        }
+    };
+    crate::refresh::reread(&mut store, &[(project.to_string(), row.path)])?;
+    ended
+}
+
 /// `targets` grouped by project, in the order each project first appears.
 fn by_project(targets: Vec<String>) -> Vec<Vec<String>> {
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
@@ -2216,6 +2260,7 @@ fn project_of(a: &Action) -> Option<String> {
         Action::Run { projects, .. } => one_project(projects),
         Action::Dispatch { targets, .. } => one_project(targets),
         Action::WorkflowRun { projects, .. } => one_project(projects),
+        Action::Shell { project } => Some(project.clone()),
         Action::Scan { of, .. } | Action::Sync { of, .. } | Action::Verify { of } => {
             one_project(&of.projects)
         }
@@ -2304,6 +2349,10 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
                 v.push(format!("--cap={c}"));
             }
             worker(&mut v, w);
+        }
+        Action::Shell { project } => {
+            push("shell");
+            v.push(project.clone());
         }
         Action::Run {
             name,
@@ -2424,6 +2473,20 @@ mod tests {
         );
         assert_eq!(one_project(&names(&["a:5", "b:2"])), None);
         assert_eq!(one_project(&[]), None);
+    }
+
+    /// A shell is queued as the CLI command it is.
+    #[test]
+    fn a_shell_is_queued_as_pma_shell() {
+        let a = Action::Shell {
+            project: "p".into(),
+        };
+        assert_eq!(command_line(&a).expect("queued"), ["shell", "p"]);
+        assert_eq!(
+            project_of(&a).as_deref(),
+            Some("p"),
+            "in its project's view"
+        );
     }
 
     /// Interactive dispatches over several projects become one job each.

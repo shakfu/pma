@@ -164,7 +164,7 @@ pma workflow run review-fix alpha --local --unattended --detach
 | `v` | diff in pager (run) / verify (task) | `e` | tier, tag, verify, sandbox |
 | `t` | record review minutes | `c` | scan |
 | `H` / `T` | herdr pane / take over | `Esc` | back |
-| `E` | project in `$EDITOR`, re-read on exit (TUI only) | | |
+| `E` | project in `$EDITOR`, re-read on exit (TUI only) | `S` | shell in project, herdr pane if integrated; re-read on exit |
 
 ## Where things are
 

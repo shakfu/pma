@@ -4,6 +4,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.10.0]
+
+Upgrading from 0.9:
+
+- The database moves from schema 42 to 48 on first open. 0.9 refuses it afterwards; copy `~/.config/pma/projects.db` first if you may go back.
+
+- `claude` runs in auto mode. Schema 44 rewrites `acceptEdits` to `auto` in every stored worker that runs `claude`.
+
 ### Added
 
 - **Reaching a project, and acting on a set of them**, in the TUI and web. `O` opens a project by name or tag from a fuzzy chooser over every project. `/` filters any table by a fuzzy match over each row's cells, best first, and `*` marks every row it keeps, so the five `audio` projects are `/audio`, `*`, `z`. The projects tab gains a tags column. PageDown and PageUp move by a page. Fuzzy over substring because a few letters of a name are enough; a match is within one cell, since across a row five letters find a path through most rows. `e` on marked projects sets their tier or tag together.

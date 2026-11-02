@@ -3,7 +3,7 @@ members = ["crates/pma-core", "crates/pma-tui", "crates/pma-web", "crates/pma"]
 resolver = "3"
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -11,9 +11,9 @@ repository = "https://github.com/shakfu/pma"
 
 [workspace.dependencies]
 # A version beside each path, so `cargo publish` can name the published crate.
-pma-core = { path = "crates/pma-core", version = "0.9.0" }
-pma-tui = { path = "crates/pma-tui", version = "0.9.0" }
-pma-web = { path = "crates/pma-web", version = "0.9.0" }
+pma-core = { path = "crates/pma-core", version = "0.10.0" }
+pma-tui = { path = "crates/pma-tui", version = "0.10.0" }
+pma-web = { path = "crates/pma-web", version = "0.10.0" }
 # Parses request headers for `pma web`.
 httparse = "1.10.1"
 clap = { version = "4.6.6", features = ["derive"] }

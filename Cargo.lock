@@ -753,7 +753,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "pma"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "clap",
  "pma-core",
@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "pma-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "rhai",
  "rusqlite",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "pma-tui"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "pma-core",
  "ratatui",
@@ -784,7 +784,7 @@ dependencies = [
 
 [[package]]
 name = "pma-web"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "httparse",
  "pma-core",

@@ -172,3 +172,37 @@ fn the_page_names_only_real_tabs() {
         assert!(tab_named(n).is_some(), "app.js names no tab `{n}`");
     }
 }
+
+/// The page's usage events are checked at the boundary: a known kind, a
+/// real tab, a short plain name. Acts come from `/api/act`, not the page.
+#[test]
+fn usage_events_from_the_page_are_checked() {
+    let ok = |v: Value| usage_event(&v).is_some();
+    assert!(ok(json!({ "ev": "tab", "tab": "setup", "name": "click" })));
+    assert!(ok(
+        json!({ "ev": "pane", "tab": "inbox", "pane": "Working now" })
+    ));
+    assert!(ok(json!({ "ev": "find", "name": "#" })));
+    assert!(ok(json!({ "ev": "project", "name": "sidebar" })));
+    assert!(
+        !ok(json!({ "ev": "act", "tab": "inbox", "name": "Push" })),
+        "acts are the server's"
+    );
+    assert!(!ok(json!({ "ev": "rm", "name": "x" })), "unknown kind");
+    assert!(
+        !ok(json!({ "ev": "tab", "tab": "settings", "name": "key" })),
+        "a retired tab"
+    );
+    assert!(
+        !ok(json!({ "ev": "tab", "name": "key" })),
+        "a tab event names its tab"
+    );
+    assert!(
+        !ok(json!({ "ev": "open", "name": "run; rm -rf" })),
+        "a name is one plain word"
+    );
+    assert!(!ok(json!({ "ev": "open", "name": "x".repeat(33) })));
+    let long =
+        usage_event(&json!({ "ev": "pane", "tab": "inbox", "pane": "p".repeat(500) })).unwrap();
+    assert_eq!(long.pane.unwrap().len(), 500, "cut when written, not here");
+}

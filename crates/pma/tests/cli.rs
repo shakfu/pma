@@ -5339,7 +5339,7 @@ fn the_web_view_is_local_and_shares_the_store() {
     let keys = get("/api/keys", &host, &cookie);
     assert!(keys.contains("\"AddNote\""), "{keys}");
     let note =
-        r#"{"tab":"notes","act":"AddNote","pick":{"kind":"nothing"},"input":"from the web"}"#;
+        r#"{"tab":"inbox","act":"AddNote","pick":{"kind":"nothing"},"input":"from the web"}"#;
     assert!(
         post(port, "/api/act", "http://evil.example", &cookie, note).starts_with("HTTP/1.1 403")
     );
@@ -5358,7 +5358,8 @@ fn the_web_view_is_local_and_shares_the_store() {
         env.ok(&["note"]).contains("from the web"),
         "the CLI sees it"
     );
-    let notes = get("/api/screen?tab=notes", &host, &cookie);
+    // Notes show on the inbox once there is one.
+    let notes = get("/api/screen?tab=inbox", &host, &cookie);
     assert!(
         notes.contains("from the web") && notes.contains("\"kind\":\"note\""),
         "{notes}"
@@ -5689,22 +5690,30 @@ fn settings_are_edited_from_the_web() {
             })),
         )
     };
-    let (status, screen) = web(port, &cookie, "/api/screen?tab=settings", None);
+    let (status, screen) = web(port, &cookie, "/api/screen?tab=setup", None);
     assert_eq!(status, 200, "{screen}");
     let panes = screen["body"]["panes"].as_array().unwrap();
     let titles: Vec<&str> = panes.iter().map(|p| p["title"].as_str().unwrap()).collect();
     assert_eq!(
         titles,
-        ["Settings", "Roots", "Agents", "Presets", "Route revisions"]
+        [
+            "Agents",
+            "Settings",
+            "Roots",
+            "Presets",
+            "Route revisions",
+            "Workflow revisions",
+            "Campaigns"
+        ]
     );
-    let setting = panes[0]["items"]
+    let setting = panes[1]["items"]
         .as_array()
         .unwrap()
         .iter()
         .find(|i| i["pick"]["key"] == "batch_budget")
         .expect("batch_budget")["pick"]
         .clone();
-    let (status, body) = act("settings", "EditSetting", setting, "9", "");
+    let (status, body) = act("setup", "EditSetting", setting, "9", "");
     assert_eq!(status, 200, "{body}");
     assert_eq!(env.ok(&["config", "batch_budget"]).trim(), "9");
 
@@ -5727,7 +5736,7 @@ fn settings_are_edited_from_the_web() {
     assert_eq!(status, 400, "{body}");
 
     let (status, body) = act(
-        "library",
+        "setup",
         "AddCampaign",
         serde_json::json!({ "kind": "nothing" }),
         "greet alpha say hello",
@@ -5735,7 +5744,7 @@ fn settings_are_edited_from_the_web() {
     );
     assert_eq!(status, 200, "{body}");
     assert!(env.ok(&["campaign"]).contains("greet"), "the CLI lists it");
-    let (_, library) = web(port, &cookie, "/api/screen?tab=library", None);
+    let (_, library) = web(port, &cookie, "/api/screen?tab=setup", None);
     assert!(
         library.to_string().contains("\"kind\":\"campaign\""),
         "{library}"

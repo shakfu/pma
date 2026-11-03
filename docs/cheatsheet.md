@@ -118,6 +118,7 @@ pma workflow run review-fix alpha --local --unattended --detach
 | `default_tier` | 5 | rank of untiered projects |
 | `projects.<p>.verify` | detected | the test command `pma` trusts |
 | `projects.<p>.sandbox` | off | confine the check's writes |
+| `usage_log` | on | log tab, pane and act use locally; `pma usage` reads it |
 
 `pma config <key> <value>` sets one; `--reset` clears it.
 
@@ -154,7 +155,7 @@ pma workflow run review-fix alpha --local --unattended --detach
 
 | Key | Action | Key | Action |
 |-|-|-|-|
-| `1`-`8` | inbox, projects, activity, matrix, library, report, notes, settings | `Enter` | open row |
+| `1`-`6` | inbox, projects, activity, history, setup, matrix | `Enter` | open row |
 | `O` | jump to project by name or tag | `o` | open the row's project |
 | `/` | filter list | `#` | scope everything to a tag |
 | `Space` | mark | `*` | mark all shown |

@@ -41,7 +41,9 @@ const GROUPS: [(&str, &[&str]); 6] = [
     ),
     (
         "Reading",
-        &["status", "history", "report", "tui", "web", "watch"],
+        &[
+            "status", "history", "report", "usage", "tui", "web", "watch",
+        ],
     ),
     (
         "Setup",
@@ -411,6 +413,15 @@ enum Command {
         /// How many to show; defaults to `quadrant_limit`.
         #[arg(short = 'n', long)]
         count: Option<usize>,
+    },
+    /// Which tabs, panes and acts the TUI and web were used for.
+    ///
+    /// Reads the usage log (`usage_log` in settings). It holds no project
+    /// names, so it can be shared as printed.
+    Usage {
+        /// Days back to read.
+        #[arg(long, default_value_t = 30)]
+        since: i64,
     },
     /// One task across many repositories.
     Campaign {
@@ -1166,6 +1177,7 @@ fn main() -> ExitCode {
             tags,
             count,
         } => show_stale(&projects, &tags, count),
+        Command::Usage { since } => show_usage(since),
         Command::Campaign { action } => campaign_command(action),
         Command::Route { action } => route_command(action),
         Command::Workflow { action } => workflow_command(action),
@@ -2055,10 +2067,23 @@ fn write_status_html(names: &[String], tags: &[String], all: bool, file: &Path) 
         },
     )?;
     let mut screen = pma_core::screen::screen(view);
-    // A report is read top down: the changes and the scans before the long
-    // project list. The TUI and web keep the projects first.
-    if let pma_core::screen::Body::Panes(panes) = &mut screen.body {
+    // The scans are the history tab's in the TUI and web; a report adds
+    // them. It is read top down: failing CI, the changes and the scans
+    // before the long project list.
+    let history = pma_core::screen::screen(api::query(
+        &store,
+        Query::History {
+            by: pma_core::report_runs::By::Class,
+            of: selection(names, tags),
+        },
+    )?);
+    if let (pma_core::screen::Body::Panes(panes), pma_core::screen::Body::Panes(mut scans)) =
+        (&mut screen.body, history.body)
+    {
+        scans.remove(0);
         panes.rotate_left(1);
+        let at = panes.len() - 1;
+        panes.splice(at..at, scans);
     }
     let now = dates::now();
     let html = pma_web::page(&screen, "pma status", &dates::format(dates::day(now)));
@@ -3055,6 +3080,17 @@ fn retry_run(id: i64) -> Result<()> {
         },
         prompt.as_deref(),
     )
+}
+
+fn show_usage(days: i64) -> Result<()> {
+    use pma_core::usage;
+    let store = Store::open_default()?;
+    let events = usage::read_in(&usage::dir()?, dates::now() - days * 86_400)?;
+    if !api::config(&store)?.usage_log {
+        println!("usage_log is off; `pma config usage_log on` turns it back on");
+    }
+    print!("{}", usage::summary(&events, &usage::panes_now(&store)));
+    Ok(())
 }
 
 fn show_stale(names: &[String], tags: &[String], count: Option<usize>) -> Result<()> {
@@ -4625,6 +4661,7 @@ fn render(view: View) -> String {
             attempts,
             by,
             speed,
+            ..
         } => {
             let mut out = report_runs::report(&runs, &attempts, by);
             if let Some(speed) = speed {
@@ -4659,6 +4696,7 @@ fn render(view: View) -> String {
             runs,
             now,
             repos,
+            ..
         } => format!(
             "{}\n{}",
             render(View::Next {

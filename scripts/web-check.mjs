@@ -1,5 +1,7 @@
 // Drives `pma web` in headless Chromium over the DevTools protocol: tabs,
-// the address, one-click open, the `z` chooser, prompts, console errors.
+// the address, one-click open, the `z` chooser, prompts, the usage log,
+// console errors. Reads the store through `pma`, so it needs the fixture's
+// PMA_HOME, as web-check.sh exports it.
 // Expects a project `alpha` whose TODO.md has "add greeting" at line 5, as
 // web-fixture.sh makes. Adds a note to the store.
 //
@@ -7,7 +9,7 @@
 //
 // <token-url> is what `pma web --no-open` prints. $CHROME overrides the
 // browser; the default is Playwright's cached headless shell.
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -149,11 +151,36 @@ check("the first match is chosen", (await js(`document.querySelector("input[name
 await key("Escape");
 await wait(500);
 
-// Enter in a text prompt submits it rather than cancelling.
-await send("Page.navigate", { url: `${origin}/?tab=notes` });
+// History holds the report and the scans; setup lists agents first and
+// the library's panes. A tab key is a usage event.
+const titles = () => js(`[...document.querySelectorAll(".card-head h2")].map(h => h.textContent)`);
+await send("Page.navigate", { url: `${origin}/?tab=inbox` });
+await wait(1500);
+await key("4", "4");
+await wait(1200);
+let t = await titles();
+check("4 opens history with the scans", (await state()).search === "?tab=history"
+  && t[0].startsWith("Runs by") && t.includes("Changed at the last scan") && t.includes("Recent scans"), t);
+await key("5", "5");
+await wait(1200);
+t = await titles();
+check("5 opens setup, agents first", t[0] === "Agents" && t.includes("Workflow revisions") && t.includes("Campaigns"), t);
+await send("Page.navigate", { url: `${origin}/?tab=report` });
+await wait(1200);
+check("a retired tab in the address opens the inbox", (await state()).title === "Inbox", await state());
+await wait(500);
+const pma = new URL("../target/debug/pma", import.meta.url).pathname;
+let usage = "";
+try { usage = execFileSync(pma, ["usage", "--since", "1"]).toString(); } catch (e) { usage = String(e); }
+check("tab keys reach the usage log", /history\s+web\s+1/.test(usage) && /setup\s+web\s+1/.test(usage), usage);
+check("the usage log names no project", !usage.includes("alpha"), usage);
+
+// Enter in a text prompt submits it rather than cancelling. A note shows
+// on the inbox once there is one, one row more.
+await send("Page.navigate", { url: `${origin}/?tab=inbox` });
 await wait(1500);
 const before = (await state()).rows;
-const add = await js(`S.keys.bindings.find(b => b.command.act === "add-note" || b.command.act === "AddNote")?.key || S.keys.bindings.filter(b => b.tabs.includes("notes") && b.ask.kind === "text").map(b => b.key)[0]`);
+const add = await js(`S.keys.bindings.find(b => b.command.act === "AddNote")?.key`);
 await key(add, add);
 await wait(800);
 await type("hello from cdp");

@@ -28,6 +28,7 @@ use pma_core::keys::{self, Act, Ask, Command, Tab};
 use pma_core::report_runs::By;
 use pma_core::screen::{self, Body, Detail, Item, Kind, Pane, Pick, Screen, Section, Tone};
 use pma_core::store::Store;
+use pma_core::usage;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -201,6 +202,10 @@ pub struct App {
     advance: Option<i64>,
     busy: bool,
     palette: Palette,
+    /// Usage events since the loop last wrote them: docs/dev/usage-log.md.
+    pub usage: Vec<usage::Event>,
+    /// The act begun, written with its outcome once it runs.
+    acting: Option<usage::Event>,
 }
 
 impl Default for App {
@@ -237,6 +242,8 @@ impl App {
             advance: None,
             busy: false,
             palette: Palette::from_env(),
+            usage: Vec::new(),
+            acting: None,
         }
     }
 
@@ -267,6 +274,10 @@ impl App {
     /// Whether a job or an agent is under way, for the title bar.
     pub fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
+    }
+
+    fn note(&mut self, ev: usage::Event) {
+        self.usage.push(ev);
     }
 
     fn say(&mut self, text: impl Into<String>, tone: Tone) {
@@ -665,7 +676,7 @@ impl App {
                         let name = choices.options[i].name.clone();
                         let act = match what {
                             Choosing::Act(act) => act,
-                            Choosing::Project => return Some(self.open_project(name)),
+                            Choosing::Project => return Some(self.open_project(name, "O")),
                             Choosing::Scope => {
                                 self.scope = match name.as_str() {
                                     NO_SCOPE => Vec::new(),
@@ -783,6 +794,7 @@ impl App {
                 self.tab = tab;
                 self.status = None;
                 self.marks.clear();
+                self.note(usage::Event::new("tui", "tab").tab(tab).name("key"));
                 return Some(Request::Load(self.query()));
             }
             Command::Down
@@ -810,11 +822,13 @@ impl App {
                 }
             }
             Command::Filter => {
+                self.note(usage::Event::new("tui", "find").name("/"));
                 self.status = None;
                 self.filter[t].get_or_insert_default();
                 self.mode = Mode::Filter;
             }
             Command::Jump => {
+                self.note(usage::Event::new("tui", "find").name("O"));
                 return Some(Request::Choose {
                     what: Choosing::Project,
                     pick: Pick::Nothing,
@@ -822,6 +836,7 @@ impl App {
                 });
             }
             Command::Scope => {
+                self.note(usage::Event::new("tui", "find").name("#"));
                 return Some(Request::Choose {
                     what: Choosing::Scope,
                     pick: Pick::Nothing,
@@ -842,9 +857,16 @@ impl App {
                     Command::NextPane => (self.pane[t] + 1) % n,
                     _ => (self.pane[t] + n - 1) % n,
                 };
+                if let Some(title) = self.panes().get(self.pane[t]).map(|p| p.title.clone()) {
+                    self.note(usage::Event::new("tui", "pane").tab(self.tab).pane(&title));
+                }
             }
             Command::Open => {
-                return match self.pick().0 {
+                let pick = self.pick().0;
+                if let Some(kind) = detail_kind(&pick) {
+                    self.note(usage::Event::new("tui", "open").name(kind));
+                }
+                return match pick {
                     Pick::Run { id, .. } => Some(Request::Load(Query::Run { id })),
                     Pick::Job { id, .. } => Some(Request::Load(Query::JobLog { id })),
                     // A task opens in full wherever it is listed: its
@@ -858,7 +880,9 @@ impl App {
                         Some(Request::Load(Query::RouteDoc { revision }))
                     }
                     Pick::Campaign { name } => Some(Request::Load(Query::Campaign { name })),
-                    other => other.project().map(|p| self.open_project(p.to_string())),
+                    other => other
+                        .project()
+                        .map(|p| self.open_project(p.to_string(), "enter")),
                 };
             }
             Command::Back => {
@@ -872,11 +896,12 @@ impl App {
                     self.say("Filter cleared.", Tone::Muted);
                 } else if self.tab == Tab::Project {
                     self.tab = self.previous;
+                    self.note(usage::Event::new("tui", "tab").tab(self.tab).name("back"));
                     return Some(Request::Load(self.query()));
                 }
             }
             Command::OpenProject => match self.pick().0.project() {
-                Some(name) => return Some(self.open_project(name.to_string())),
+                Some(name) => return Some(self.open_project(name.to_string(), "o")),
                 None => self.say("Select a row that names a project.", Tone::Warn),
             },
             Command::ReportBy => {
@@ -1010,7 +1035,10 @@ impl App {
     }
 
     /// Opens `name`'s project view, remembering where it was opened from.
-    fn open_project(&mut self, name: String) -> Request {
+    /// Opens the project view; `via` is the key that reached it, for the
+    /// usage log.
+    fn open_project(&mut self, name: String, via: &str) -> Request {
+        self.note(usage::Event::new("tui", "project").name(via));
         self.project = name;
         self.marks.clear();
         self.filter[index(Tab::Project)] = None;
@@ -1024,6 +1052,17 @@ impl App {
 
     /// Starts an act on `pick`: asks what the binding asks, or does it.
     fn begin(&mut self, act: Act, ask: Ask, pick: Pick, pane: Vec<Item>) -> Option<Request> {
+        let title = self
+            .panes()
+            .get(self.pane[index(self.tab)])
+            .map(|p| p.title.clone());
+        let mut ev = usage::Event::new("tui", "act")
+            .tab(self.tab)
+            .name(&act.name());
+        if let Some(t) = title {
+            ev = ev.pane(&t);
+        }
+        self.acting = Some(ev);
         match ask {
             Ask::Text(label) if api::drafts(act) => Some(Request::Prompt { act, pick, label }),
             Ask::Text(label) => {
@@ -1376,7 +1415,7 @@ impl App {
                 );
                 continue;
             }
-            let table = self.table(pane, focused);
+            let table = self.table(pane, focused, inner.width);
             if let Some(state) = self.selected[t].get_mut(i) {
                 frame.render_stateful_widget(table, inner, state);
             }
@@ -1440,7 +1479,7 @@ impl App {
             .title(title)
     }
 
-    fn table(&self, pane: &Pane, focused: bool) -> Table<'static> {
+    fn table(&self, pane: &Pane, focused: bool, width: u16) -> Table<'static> {
         let p = self.palette;
         // A column no row fills says nothing; it is left out.
         let shown: Vec<usize> = (0..pane.columns.len())
@@ -1450,11 +1489,11 @@ impl App {
                     .any(|it| it.cells.get(*i).is_some_and(|c| !c.text.is_empty()))
             })
             .collect();
-        let widths: Vec<Constraint> = shown
+        let natural: Vec<Option<u16>> = shown
             .iter()
             .map(|i| (*i, &pane.columns[*i]))
             .map(|(i, c)| match c.kind {
-                Kind::Wide => Constraint::Fill(1),
+                Kind::Wide => None,
                 _ => {
                     let longest = pane
                         .items
@@ -1463,14 +1502,17 @@ impl App {
                         .max()
                         .unwrap_or(0)
                         .max(c.title.chars().count());
-                    Constraint::Length(longest.min(28) as u16)
+                    Some(longest.min(28) as u16)
                 }
             })
             .collect();
         // A column for marks, only while this pane holds one.
         let marked = |pick: &Pick| self.marks.iter().any(|m| same_task(m, pick));
         let marking = pane.items.iter().any(|it| marked(&it.pick));
-        let mut widths = widths;
+        let gaps = natural.len().saturating_sub(1) as u16 * SPACING;
+        let mark = u16::from(marking) * (1 + SPACING);
+        let room = width.saturating_sub(HIGHLIGHT + gaps + mark);
+        let mut widths = fit(&natural, room);
         if marking {
             widths.insert(0, Constraint::Length(1));
         }
@@ -1515,7 +1557,7 @@ impl App {
         });
         Table::new(rows, widths)
             .header(header)
-            .column_spacing(2)
+            .column_spacing(SPACING)
             // Only the focused pane marks its selection: one cursor on screen.
             .highlight_symbol(match focused {
                 true => Span::styled("> ", p.accent().add_modifier(Modifier::BOLD)),
@@ -2077,6 +2119,62 @@ pub fn key_name(code: KeyCode) -> Option<String> {
     })
 }
 
+/// A table's gap between columns, and the width of its `> ` cursor.
+const SPACING: u16 = 2;
+const HIGHLIGHT: u16 = 2;
+
+/// Widths for columns of these natural widths, `None` for a wide one, in
+/// `room` cells. ratatui shrinks overflowing lengths in whichever column its
+/// solver picks, so a one-cell change in an age cell moved the first column.
+/// Here the first keeps its width; the others share one cap until they fit.
+fn fit(natural: &[Option<u16>], room: u16) -> Vec<Constraint> {
+    let first = natural.first().copied().flatten().unwrap_or(0);
+    let rest = |cap: u16| -> u16 {
+        natural
+            .iter()
+            .skip(1)
+            .flatten()
+            .map(|w| (*w).min(cap))
+            .sum()
+    };
+    let widest = natural.iter().skip(1).flatten().max().copied().unwrap_or(0);
+    let cap = (0..=widest)
+        .rev()
+        .find(|c| first + rest(*c) <= room)
+        .unwrap_or(0);
+    natural
+        .iter()
+        .enumerate()
+        .map(|(i, w)| match (i, w) {
+            (_, None) => Constraint::Fill(1),
+            (0, Some(w)) => Constraint::Length((*w).min(room)),
+            (_, Some(w)) => Constraint::Length((*w).min(cap)),
+        })
+        .collect()
+}
+
+/// The kind of detail `Open` shows for a pick, for the usage log; `None`
+/// when it opens a project instead.
+fn detail_kind(pick: &Pick) -> Option<&'static str> {
+    Some(match pick {
+        Pick::Run { .. } => "run",
+        Pick::Job { .. } => "job",
+        Pick::Task { .. } => "task",
+        Pick::Scan { .. } => "scan",
+        Pick::Route { .. } => "route",
+        Pick::Campaign { .. } => "campaign",
+        _ => return None,
+    })
+}
+
+/// Writes the app's usage events. A failed write is dropped: losing an
+/// event must not fail a key.
+fn flush_usage(store: &Store, app: &mut App) {
+    for ev in app.usage.drain(..) {
+        let _ = usage::record(store, &ev);
+    }
+}
+
 /// Whether two picks are the same task, whatever else about it changed.
 fn same_task(a: &Pick, b: &Pick) -> bool {
     match (a, b) {
@@ -2121,7 +2219,17 @@ fn execute(store: &Store, app: &mut App, request: Request) {
     match request {
         Request::Load(q) => app.loaded(api::query(store, q).map_err(|e| e.to_string())),
         Request::Act(a) => {
+            // An act begun and then cancelled leaves `acting` behind; only
+            // the act this action is one of is recorded.
+            let begun = app
+                .acting
+                .take()
+                .filter(|ev| Act::of(&a).iter().any(|k| ev.name == Some(k.name())));
             let outcome = api::act(store, a).map_err(|e| e.to_string());
+            if let Some(ev) = begun {
+                app.note(ev.ok(outcome.is_ok()));
+            }
+            flush_usage(store, app);
             if outcome.is_err() {
                 app.advance = None;
             }
@@ -2281,7 +2389,9 @@ pub fn run(store: &Store) -> Result<()> {
             let Some(name) = key_name(k.code) else {
                 continue;
             };
-            match app.key(&name) {
+            let request = app.key(&name);
+            flush_usage(store, &mut app);
+            match request {
                 Some(Request::Quit) => return Ok(()),
                 Some(Request::Pager { id }) => {
                     // The pager has the terminal until it exits; the view is
@@ -2365,6 +2475,29 @@ mod tests {
     use pma_core::store::{Job, Note};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    /// An overflowing table keeps its first column's width whatever another
+    /// column's text does, and fits its room.
+    #[test]
+    fn the_first_column_holds_its_width_when_others_overflow() {
+        let len = |c: &Constraint| match c {
+            Constraint::Length(n) => *n,
+            _ => 0,
+        };
+        for idle in [3, 4, 5, 12] {
+            let natural = [Some(16), Some(4), Some(12), Some(idle), Some(9), None];
+            let w = fit(&natural, 40);
+            assert_eq!(w[0], Constraint::Length(16), "idle {idle}");
+            assert!(w.iter().map(len).sum::<u16>() <= 40, "idle {idle}: {w:?}");
+            assert_eq!(w[5], Constraint::Fill(1));
+        }
+        let roomy = fit(&[Some(16), Some(4), None], 80);
+        assert_eq!(roomy[..2], [Constraint::Length(16), Constraint::Length(4)]);
+        assert_eq!(
+            fit(&[Some(30), Some(4)], 20)[..],
+            [Constraint::Length(20), Constraint::Length(0)]
+        );
+    }
 
     fn screen_text(app: &mut App) -> String {
         let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
@@ -2822,12 +2955,46 @@ mod tests {
         assert_eq!(colour_of(&mut plain, "critical"), Some(Color::Reset));
     }
 
+    /// A tab key, a pane move and a project open are usage events; a
+    /// selection move is not. An act names its tab and pane.
+    #[test]
+    fn keys_note_usage_events() {
+        let mut app = App::new();
+        app.loaded(Ok(View::Notes(vec![Note {
+            id: 3,
+            created_at: 0,
+            updated_at: 0,
+            text: "old".into(),
+        }])));
+        app.key("j");
+        assert!(app.usage.is_empty(), "a move is not an event");
+        app.key("x");
+        let acting = app.acting.clone().expect("an act begun");
+        assert_eq!(
+            (
+                acting.tab.as_deref(),
+                acting.pane.as_deref(),
+                acting.name.as_deref()
+            ),
+            (Some("inbox"), Some("Notes"), Some("RemoveNote"))
+        );
+        app.key("n");
+        app.key("2");
+        let ev = app.usage.last().unwrap();
+        assert_eq!(
+            (ev.ev.as_str(), ev.tab.as_deref(), ev.name.as_deref()),
+            ("tab", Some("projects"), Some("key"))
+        );
+        app.key("O");
+        assert_eq!(app.usage.last().unwrap().name.as_deref(), Some("O"));
+        assert_eq!(app.usage.len(), 2);
+    }
+
     /// A prompt reads text, starts from the note's own, and builds the action
     /// on Enter; Escape leaves it.
     #[test]
     fn prompts_read_text_for_the_action() {
         let mut app = App::new();
-        app.key("7");
         app.loaded(Ok(View::Notes(vec![Note {
             id: 3,
             created_at: 0,

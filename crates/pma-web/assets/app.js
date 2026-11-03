@@ -7,14 +7,12 @@
 "use strict";
 
 const TABS = {
-  inbox: { label: "Inbox", about: "What waits on you, what is under way, and what agents can take." },
-  projects: { label: "Projects", about: "Every project, worst first, by what needs attention." },
+  inbox: { label: "Inbox", about: "What waits on you, what is under way, and your notes." },
+  projects: { label: "Projects", about: "Every project, worst first, and failing CI." },
   activity: { label: "Activity", about: "Jobs, running agents and workflow instances, newest first." },
+  history: { label: "History", about: "What dispatching produced, and what the scans found." },
+  setup: { label: "Setup", about: "Agents, settings, roots, presets, routes, workflows and campaigns." },
   matrix: { label: "Matrix", about: "Every open task, by urgency and importance." },
-  library: { label: "Library", about: "Workflow revisions and campaigns: what can be run." },
-  report: { label: "Report", about: "What dispatching produced." },
-  notes: { label: "Notes", about: "Notes that belong to no one project." },
-  settings: { label: "Settings", about: "Settings, roots, agents, presets and route revisions." },
   project: { label: "Project", about: "" },
 };
 
@@ -90,6 +88,18 @@ async function api(path, body) {
   try { data = await r.json(); } catch (_) { /* a status with no JSON */ }
   if (!r.ok) throw new Error((data && data.error) || `${r.status} ${r.statusText}`);
   return data;
+}
+
+// A usage event, for `pma usage` (docs/dev/usage-log.md). Fire and forget:
+// a lost event must not fail a key. Acts are recorded by /api/act.
+function note(ev) {
+  api("/api/usage", ev).catch(() => {});
+}
+
+// The focused pane's title, which usage events name.
+function paneTitle() {
+  const p = panes()[S.pane[S.tab] || 0];
+  return p ? p.title : "";
 }
 
 // The binding `key` has on the current tab for the row in hand: one for
@@ -282,7 +292,7 @@ function address() {
   const q = new URLSearchParams({ tab: S.tab });
   if (S.scope) q.set("scope", S.scope);
   if (S.tab === "project") q.set("project", S.project);
-  if (S.tab === "report" && S.by) q.set("by", S.keys.by[S.by]);
+  if (S.tab === "history" && S.by) q.set("by", S.keys.by[S.by]);
   if (S.tab === "activity" && S.finished) q.set("finished", S.keys.finished[S.finished]);
   const p = S.detail && S.detail.pick;
   const open = p && { run: p.id, job: p.id, scan: p.id, route: p.revision, campaign: p.name, task: p.target }[p.kind];
@@ -393,7 +403,7 @@ function drawNav() {
       type: "button",
       "data-tab": tab,
       "aria-keyshortcuts": b.key,
-      onclick: () => run(b),
+      onclick: () => run(b, "click"),
     }, el("span", {}, meta.label), el("kbd", {}, b.key === " " ? "Space" : b.key)));
   }
   nav.append(views);
@@ -428,7 +438,7 @@ function drawProjects() {
       role: "listitem",
       title: `${p.name}: ${p.state}`,
       "aria-current": current ? "page" : "false",
-      onclick: () => openProject(p.name),
+      onclick: () => openProject(p.name, "sidebar"),
     }, el("span", { class: "project-name" }, el("span", { class: `dot tone-${p.tone}`, "aria-hidden": "true" }), p.name),
        el("span", { class: "tier" }, p.tier === "-" ? "" : `T${p.tier}`)));
   }
@@ -456,7 +466,8 @@ async function loadProjects() {
   drawProjects();
 }
 
-function openProject(name) {
+function openProject(name, via) {
+  note({ ev: "project", name: via });
   S.marks = [];
   delete S.tfilter.project;
   if (S.tab !== "project") S.previous = S.tab;
@@ -476,8 +487,11 @@ function opens(pick) {
   return OPENABLE.includes(pick.kind);
 }
 
-async function openDetail(pick) {
+// `asked`: opened by a person, so a usage event; not on restore or the
+// next review.
+async function openDetail(pick, asked) {
   if (!OPENABLE.includes(pick.kind)) return;
+  if (asked) note({ ev: "open", name: pick.kind });
   try {
     const screen = await api("/api/open", { pick });
     const d = screen.body.detail;
@@ -538,7 +552,7 @@ function draw() {
 
 // The view's own acts, the filter, the marks' acts and the selected row's.
 function drawToolbar(toolbar) {
-  if (S.tab === "report") {
+  if (S.tab === "history") {
     S.keys.by.forEach((name, i) => {
       toolbar.append(el("button", {
         class: `button ${i === S.by ? "primary" : ""}`,
@@ -655,7 +669,7 @@ function drawContent(content) {
           id: `page-${pi}`,
           "aria-selected": String(pi === at),
           "aria-controls": `card-${pi}`,
-          onclick: () => { S.pane[S.tab] = pi; draw(); },
+          onclick: () => { S.pane[S.tab] = pi; note({ ev: "pane", tab: S.tab, pane: p.title }); draw(); },
         }, p.title, el("span", { class: "count" }, p.items.length)))));
       content.append(card(ps[at], at));
     } else {
@@ -719,7 +733,8 @@ function card(p, pi) {
   const box = el("section", { class: `card ${focused ? "focused" : ""}`, id: `card-${pi}`, "aria-labelledby": id },
     el("header", { class: "card-head" }, el("h2", { id }, p.title), el("span", { class: "count" }, count)));
   if (!p.items.length) {
-    box.append(el("p", { class: "empty" }, p.empty));
+    // One line, so an empty list takes no room from a full one.
+    box.append(el("p", { class: "empty small" }, p.empty));
     return box;
   }
   // A column no row fills says nothing; it is left out.
@@ -765,6 +780,7 @@ function select(pi, ii, scroll) {
   const was = S.pane[S.tab] || 0;
   S.pane[S.tab] = pi;
   S.sel[S.tab][pi] = ii;
+  if (was !== pi) note({ ev: "pane", tab: S.tab, pane: paneTitle() });
   const card = $(`card-${pi}`);
   if (was !== pi || !card || S.tab === "projects") {
     draw();
@@ -807,7 +823,7 @@ function diffNode(text) {
 function toast(text, tone, open) {
   const t = el("div", { class: `toast ${tone}`, role: tone === "bad" ? "alert" : "status" },
     el("p", {}, text),
-    open ? el("button", { class: "button act", type: "button", onclick: () => { t.remove(); openDetail(open); } },
+    open ? el("button", { class: "button act", type: "button", onclick: () => { t.remove(); openDetail(open, true); } },
       open.kind === "run" ? "Open run" : "Open log") : null,
     el("button", { type: "button", "aria-label": "Dismiss", onclick: () => t.remove() }, "Dismiss"));
   $("toasts").append(t);
@@ -974,7 +990,7 @@ async function act(b) {
       }
     }
     const pending = toast(`${label(b.label)}...`, "accent");
-    const out = await api("/api/act", { tab: S.tab, act: name, pick, input, project: S.project, tag: S.scope })
+    const out = await api("/api/act", { tab: S.tab, pane: paneTitle(), act: name, pick, input, project: S.project, tag: S.scope })
       .finally(() => pending.remove());
     if (marked) S.marks = [];
     const lines = out.said.concat(out.warnings.map((w) => `Warning: ${w}`));
@@ -994,7 +1010,8 @@ async function act(b) {
   }
 }
 
-async function run(b) {
+// `via`: how the binding was reached, `key` or `click`, for the usage log.
+async function run(b, via = "key") {
   if (!b) return;
   const t = S.tab;
   const p = S.pane[t] || 0;
@@ -1003,6 +1020,7 @@ async function run(b) {
   const move = (i) => { if (len) select(p, i, true); };
   switch (b.command.kind) {
     case "tab":
+      note({ ev: "tab", tab: b.command.tab, name: via });
       S.tab = b.command.tab;
       S.detail = null;
       S.marks = [];
@@ -1015,11 +1033,13 @@ async function run(b) {
     case "First": return move(0);
     case "Last": return move(len - 1);
     case "Filter":
+      note({ ev: "find", name: "/" });
       if (S.tfilter[t] === undefined) S.tfilter[t] = "";
       draw();
       $("table-filter").focus();
       return;
     case "Jump": {
+      note({ ev: "find", name: "O" });
       // Every project by name and tags, as the sidebar knows them.
       const asked = {
         options: S.projects.map((pr) => ({ name: pr.name, about: [pr.tags, pr.state].filter(Boolean).join("  ") })),
@@ -1027,11 +1047,12 @@ async function run(b) {
       };
       const node = chooser(asked, "Project");
       const chosen = await dialog({ title: "Go to project", text: node, ok: "Open", cancel: true, read: node.read });
-      if (chosen) openProject(chosen);
+      if (chosen) openProject(chosen, "O");
       return;
     }
     case "MarkAll": return toggleAllMarks();
     case "Scope": {
+      note({ ev: "find", name: "#" });
       // The tags in use, and no scope at all; the choice narrows every view.
       let asked;
       try { asked = await api("/api/tags"); } catch (e) { toast(e.message, "bad"); break; }
@@ -1047,7 +1068,7 @@ async function run(b) {
       // The detail, scrolled to its diff; the browser's find does the rest.
       const pick = currentPick();
       if (pick.kind !== "run") { toast("Select a run first.", "warn"); break; }
-      if (!S.detail) await openDetail(pick);
+      if (!S.detail) await openDetail(pick, true);
       const diff = document.querySelector(".diff");
       if (diff) diff.scrollIntoView({ block: "start" });
       return;
@@ -1055,8 +1076,13 @@ async function run(b) {
     case "Edit":
       toast("An editor needs a terminal: press E in `pma tui`.", "warn");
       return;
-    case "NextPane": S.pane[t] = (p + 1) % Math.max(panes().length, 1); break;
-    case "PrevPane": S.pane[t] = (p + panes().length - 1) % Math.max(panes().length, 1); break;
+    case "NextPane":
+    case "PrevPane": {
+      const n = Math.max(panes().length, 1);
+      S.pane[t] = b.command.kind === "NextPane" ? (p + 1) % n : (p + n - 1) % n;
+      note({ ev: "pane", tab: t, pane: paneTitle() });
+      break;
+    }
     case "Back":
       if (S.detail) {
         S.detail = null;
@@ -1066,12 +1092,13 @@ async function run(b) {
         delete S.tfilter[t];
       } else if (S.tab === "project") {
         S.tab = S.previous;
+        note({ ev: "tab", tab: S.tab, name: "back" });
         return load();
       }
       break;
     case "OpenProject": {
       const named = currentPick().project;
-      if (named) return openProject(named);
+      if (named) return openProject(named, "o");
       toast("Select a row that names a project.", "warn");
       break;
     }
@@ -1087,8 +1114,8 @@ async function run(b) {
     case "Quit": toast("Close the browser tab to leave. pma web runs until Ctrl-C in its terminal.", "accent"); break;
     case "Open": {
       const pick = currentPick();
-      if (OPENABLE.includes(pick.kind)) return openDetail(pick);
-      if (pick.project) return openProject(pick.project);
+      if (OPENABLE.includes(pick.kind)) return openDetail(pick, true);
+      if (pick.project) return openProject(pick.project, "enter");
       break;
     }
     case "Mark": return toggleMark(currentPick());

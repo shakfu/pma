@@ -212,7 +212,7 @@ pma status --all --html s.html  # the same, with the last scan's changes, as one
 pma history                     # past scans; `pma history last` for what the latest changed
 pma stale                       # open items by age, oldest first
 pma task myproject:12           # one task in full; Enter on it in the TUI and web
-pma tui                         # every view and action; 1-8 switch tabs, / filters, O jumps, # scopes, ? lists keys
+pma tui                         # every view and action; 1-6 switch tabs, / filters, O jumps, # scopes, ? lists keys
 pma web                         # the same in a browser, on 127.0.0.1 behind a one-time token
 pma web --app                   # as an app window, in Chrome or Chromium
 pma project show myproject      # one project: state, open tasks, runs and jobs; `o` in the TUI and web

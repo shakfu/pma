@@ -27,6 +27,7 @@ use pma_core::keys::{self, Act, Ask, Command, Tab};
 use pma_core::report_runs::By;
 use pma_core::screen::{self, Body, Item, Pick, Screen};
 use pma_core::store::Store;
+use pma_core::usage;
 
 use http::{Request, Response};
 
@@ -319,14 +320,61 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
                     b["project"].as_str().unwrap_or(""),
                     &scope(b["tag"].as_str()).tags,
                 )?;
-                let out = api::act(store, action)?;
+                let out = api::act(store, action);
+                let mut ev = usage::Event::new("web", "act").tab(tab).name(&act.name());
+                if let Some(pane) = b["pane"].as_str().filter(|p| !p.is_empty()) {
+                    ev = ev.pane(pane);
+                }
+                let _ = usage::record(store, &ev.ok(out.is_ok()));
+                let out = out?;
                 Ok(json!({ "said": out.said, "warnings": out.warnings }))
             })
         }
+        ("POST", "/api/usage") => {
+            let Some(ev) = body().ok().as_ref().and_then(usage_event) else {
+                return Response::status(400);
+            };
+            answer(ctx, |store| {
+                let _ = usage::record(store, &ev);
+                Ok(json!({}))
+            })
+        }
         (_, "/" | "/app.js" | "/app.css" | "/session" | "/api/keys" | "/api/screen")
-        | (_, "/api/ask" | "/api/open" | "/api/act" | "/api/tags") => Response::status(405),
+        | (_, "/api/ask" | "/api/open" | "/api/act" | "/api/tags" | "/api/usage") => {
+            Response::status(405)
+        }
         _ => Response::status(404),
     }
+}
+
+/// A usage event from the page, or `None` when it is not one the page
+/// sends. Acts are refused: `/api/act` records those itself.
+fn usage_event(b: &Value) -> Option<usage::Event> {
+    let ev = b["ev"]
+        .as_str()
+        .filter(|e| usage::KINDS.contains(e) && *e != "act")?;
+    let mut out = usage::Event::new("web", ev);
+    let word = |s: &&str| {
+        (1..=32).contains(&s.len())
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_-/#".contains(c))
+    };
+    match b["tab"].as_str() {
+        Some(t) => out = out.tab(tab_named(t)?),
+        None if matches!(ev, "tab" | "pane") => return None,
+        None => {}
+    }
+    match b["pane"].as_str() {
+        Some(p) => out = out.pane(p),
+        None if ev == "pane" => return None,
+        None => {}
+    }
+    match b["name"].as_str() {
+        Some(n) => out = out.name(Some(n).filter(word)?),
+        None if ev != "pane" => return None,
+        None => {}
+    }
+    Some(out)
 }
 
 /// The rows an act over many reads, as the store has them now rather than as

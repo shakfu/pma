@@ -10,13 +10,27 @@ Upgrading from 0.10:
 
 ### Added
 
+- **Usage log.** The TUI and web append which tabs, panes and details are opened and which acts run, with no project name or typed text, to `<state>/usage/YYYY-MM.jsonl`. `pma usage [--since 30]` counts them and lists the panes nothing reached. On by default; `pma config usage_log off` stops it. A file rather than a table in the store: every open front end reloads on any commit to the store, so each event would reload the others. Design: `docs/dev/usage-log.md`.
+
 - **Any agent can run interactively.** `interactive_args` in `[agents.<name>]` (`pma agent set <name> interactive-args`) holds how it starts a session a person drives; `--interactive`, `I` and `T` build from it. An explicit list over deriving it from `args`: the interactive form can change the subcommand (`codex exec` to `codex`) or the flag that takes the prompt (`opencode run <msg>` to `opencode --prompt <msg>`). `T` uses the run's agent where it has the list, else the default agent, since the change it reads is on disk.
 
 - `x` on the projects tab forgets a project whose checkout is deleted, as `pma project forget` does.
 
 - A `json:` parser takes the error field's message as the summary when the reply field is empty, as it is in a failed run of minima, hax or myra.
 
+### Changed
+
+- **Six tabs, not eight.** `1` inbox, `2` projects, `3` activity, `4` history, `5` setup, `6` matrix. History holds the run report and the scan panes that were on the projects tab; setup holds the settings tab's panes, agents first, and the library's. The inbox loses its `Tasks` list, which held 3 of 1,335 tasks, and shows notes when there are any. Rationale and usage figures: `docs/dev/views.md`, `docs/dev/views-refactor.md`.
+
+  Keys that moved: on setup, `z` runs a campaign and `C` adds one, since `r`, `a` and `f` there add a root, make a row the default, and propose a route. `f` starts a workflow from activity only. A bookmarked web URL with `tab=report`, `settings`, `library` or `notes` opens the inbox.
+
+- With no project above tier 5, the matrix shows one line saying how to set a tier. Tier 5 makes no task important, so its four quadrants were one list.
+
+- An empty list in the web takes one line, as in the TUI.
+
 ### Fixed
+
+- A TUI table wider than the terminal shrank whichever columns ratatui's solver picked, so its first column changed width when an age cell changed. While a job ran, that happened on every 2-second reload. The first column now keeps its width; the others share a common cap.
 
 - `pma project forget` refused a project whose directory was deleted until a full `pma scan` marked it absent. A missing checkout now counts as gone.
 

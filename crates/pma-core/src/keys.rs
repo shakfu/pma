@@ -14,34 +14,31 @@ use crate::store::RunState;
 /// A screen: one query, rendered as a list or as text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tab {
-    /// What waits on you, what is under way, and what agents can take.
+    /// What waits on you, what is under way, and notes.
     Inbox,
-    /// Every project, worst first.
+    /// Every project, worst first, and failing CI.
     Projects,
     /// Jobs, running agents and workflow instances, newest first.
     Activity,
+    /// The run report and the latest scans: what happened.
+    History,
+    /// Agents, settings, roots, presets, routes, workflow revisions and
+    /// campaigns.
+    Setup,
     Matrix,
-    /// Workflow revisions and campaigns: what can be run.
-    Library,
-    Report,
-    Notes,
-    /// Settings, roots, agents, presets and route revisions.
-    Settings,
     /// One project, opened from a row that names it. It has no key of its
     /// own: which project is the front end's to remember.
     Project,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 9] = [
+    pub const ALL: [Tab; 7] = [
         Tab::Inbox,
         Tab::Projects,
         Tab::Activity,
+        Tab::History,
+        Tab::Setup,
         Tab::Matrix,
-        Tab::Library,
-        Tab::Report,
-        Tab::Notes,
-        Tab::Settings,
         Tab::Project,
     ];
 
@@ -50,11 +47,9 @@ impl Tab {
             Tab::Inbox => "inbox",
             Tab::Projects => "projects",
             Tab::Activity => "activity",
+            Tab::History => "history",
+            Tab::Setup => "setup",
             Tab::Matrix => "matrix",
-            Tab::Library => "library",
-            Tab::Report => "report",
-            Tab::Notes => "notes",
-            Tab::Settings => "settings",
             Tab::Project => "project",
         }
     }
@@ -79,10 +74,8 @@ impl Tab {
                 quadrant: None,
                 all: true,
             },
-            Tab::Library => Query::Library,
-            Tab::Report => Query::Report { by },
-            Tab::Notes => Query::Notes,
-            Tab::Settings => Query::Settings,
+            Tab::History => Query::History { by, of },
+            Tab::Setup => Query::Settings,
             Tab::Project => Query::Project {
                 name: project.to_string(),
             },
@@ -487,7 +480,8 @@ const PANES: &[Tab] = &[
     Tab::Projects,
     Tab::Activity,
     Tab::Matrix,
-    Tab::Library,
+    Tab::History,
+    Tab::Setup,
     Tab::Project,
 ];
 const RUNS: &[Tab] = &[Tab::Inbox, Tab::Project];
@@ -497,11 +491,9 @@ pub const BINDINGS: &[Binding] = &[
     bind("1", Command::Tab(Tab::Inbox), "inbox"),
     bind("2", Command::Tab(Tab::Projects), "projects"),
     bind("3", Command::Tab(Tab::Activity), "activity"),
-    bind("4", Command::Tab(Tab::Matrix), "matrix"),
-    bind("5", Command::Tab(Tab::Library), "library"),
-    bind("6", Command::Tab(Tab::Report), "report"),
-    bind("7", Command::Tab(Tab::Notes), "notes"),
-    bind("8", Command::Tab(Tab::Settings), "settings"),
+    bind("4", Command::Tab(Tab::History), "history"),
+    bind("5", Command::Tab(Tab::Setup), "setup"),
+    bind("6", Command::Tab(Tab::Matrix), "matrix"),
     bind("j", Command::Down, "down"),
     bind("ArrowDown", Command::Down, "down"),
     bind("k", Command::Up, "up"),
@@ -540,19 +532,25 @@ pub const BINDINGS: &[Binding] = &[
             Tab::Projects,
             Tab::Activity,
             Tab::Matrix,
-            Tab::Library,
-            Tab::Settings,
+            Tab::History,
+            Tab::Setup,
             Tab::Project,
         ],
         ..bind("Enter", Command::Open, "open")
     },
     Binding {
-        tabs: &[Tab::Inbox, Tab::Projects, Tab::Activity, Tab::Matrix],
+        tabs: &[
+            Tab::Inbox,
+            Tab::Projects,
+            Tab::Activity,
+            Tab::Matrix,
+            Tab::History,
+        ],
         ..bind("o", Command::OpenProject, "open project")
     },
     bind("Escape", Command::Back, "back"),
     Binding {
-        tabs: &[Tab::Report],
+        tabs: &[Tab::History],
         ..bind("b", Command::ReportBy, "by")
     },
     Binding {
@@ -712,7 +710,7 @@ pub const BINDINGS: &[Binding] = &[
     ),
     on(
         "f",
-        &[Tab::Activity, Tab::Library],
+        &[Tab::Activity],
         Act::StartWorkflow,
         Ask::Text("workflow target [--local] [--unattended]"),
         "start workflow",
@@ -724,119 +722,102 @@ pub const BINDINGS: &[Binding] = &[
         Ask::Confirm,
         "stop",
     ),
-    // A campaign.
+    // A campaign. `r`, `a` and `f` are setup's add-root, use and propose,
+    // which fit any row, so a campaign takes `z`, as a run does elsewhere.
     on(
-        "r",
-        &[Tab::Library],
+        "z",
+        &[Tab::Setup],
         Act::RunCampaign,
         Ask::Confirm,
         "run campaign",
     ),
     on(
-        "a",
-        &[Tab::Library],
+        "C",
+        &[Tab::Setup],
         Act::AddCampaign,
         Ask::Text("name project,project text... [--class=A]"),
         "add campaign",
     ),
     on(
         "x",
-        &[Tab::Library],
+        &[Tab::Setup],
         Act::RemoveCampaign,
         Ask::Confirm,
         "remove",
     ),
     // A note.
-    on("e", &[Tab::Notes], Act::EditNote, Ask::Text("note"), "edit"),
-    on("x", &[Tab::Notes], Act::RemoveNote, Ask::Confirm, "remove"),
+    on("e", &[Tab::Inbox], Act::EditNote, Ask::Text("note"), "edit"),
+    on("x", &[Tab::Inbox], Act::RemoveNote, Ask::Confirm, "remove"),
     // Settings. `e`, `x` and `a` each mean one thing per row kind.
     on(
         "e",
-        &[Tab::Settings],
+        &[Tab::Setup],
         Act::EditSetting,
         Ask::Text("value"),
         "edit",
     ),
     on(
         "e",
-        &[Tab::Settings],
+        &[Tab::Setup],
         Act::EditAgent,
         Ask::Text("field value"),
         "set field",
     ),
     on(
         "e",
-        &[Tab::Settings],
+        &[Tab::Setup],
         Act::EditPreset,
         Ask::Text("agent[:model] [args...]"),
         "edit",
     ),
+    on("x", &[Tab::Setup], Act::ResetSetting, Ask::Confirm, "reset"),
+    on("x", &[Tab::Setup], Act::RemoveRoot, Ask::Confirm, "remove"),
+    on("x", &[Tab::Setup], Act::RemoveAgent, Ask::Confirm, "remove"),
     on(
         "x",
-        &[Tab::Settings],
-        Act::ResetSetting,
-        Ask::Confirm,
-        "reset",
-    ),
-    on(
-        "x",
-        &[Tab::Settings],
-        Act::RemoveRoot,
-        Ask::Confirm,
-        "remove",
-    ),
-    on(
-        "x",
-        &[Tab::Settings],
-        Act::RemoveAgent,
-        Ask::Confirm,
-        "remove",
-    ),
-    on(
-        "x",
-        &[Tab::Settings],
+        &[Tab::Setup],
         Act::RemovePreset,
         Ask::Confirm,
         "remove",
     ),
     on(
         "a",
-        &[Tab::Settings],
+        &[Tab::Setup],
         Act::UseAgent,
         Ask::Nothing,
         "make default",
     ),
     on(
         "a",
-        &[Tab::Settings],
+        &[Tab::Setup],
         Act::UsePreset,
         Ask::Nothing,
         "make default",
     ),
     on(
         "a",
-        &[Tab::Settings],
+        &[Tab::Setup],
         Act::ActivateRoute,
         Ask::Confirm,
         "activate",
     ),
     on(
         "r",
-        &[Tab::Settings],
+        &[Tab::Setup],
         Act::AddRoot,
         Ask::Text("directory"),
         "add root",
     ),
     on(
         "p",
-        &[Tab::Settings],
+        &[Tab::Setup],
         Act::AddPreset,
         Ask::Text("name agent[:model] [args...]"),
         "add preset",
     ),
     on(
         "f",
-        &[Tab::Settings],
+        &[Tab::Setup],
         Act::ProposeRoute,
         Ask::Text("policy file"),
         "propose route",
@@ -1053,9 +1034,9 @@ mod tests {
             Some(Command::Act(Act::ApproveRun)),
             "the first, so the error names a run"
         );
-        assert!(lookup("a", Tab::Notes, &run).is_none());
+        assert!(lookup("a", Tab::History, &run).is_none());
         assert_eq!(
-            lookup("c", Tab::Notes, &Pick::Nothing).map(|b| b.command),
+            lookup("c", Tab::History, &Pick::Nothing).map(|b| b.command),
             Some(Command::Act(Act::Scan))
         );
     }

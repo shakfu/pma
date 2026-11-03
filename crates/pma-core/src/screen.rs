@@ -1187,17 +1187,35 @@ pub fn change_tone(c: &history::Change) -> Tone {
     }
 }
 
-fn changes_pane(
-    changes: Vec<history::ProjectChange>,
-    projects: &[(rank::Project, crate::store::ProjectRow)],
-) -> Pane {
-    let repo = |name: &str| {
-        projects
-            .iter()
-            .find(|(_, r)| r.name == name)
-            .and_then(|(_, r)| r.slug.as_deref())
-            .and_then(scan::github_url)
-    };
+fn notes_pane(notes: Vec<crate::store::Note>) -> Pane {
+    let items = notes
+        .into_iter()
+        .map(|n| Item {
+            cells: vec![
+                muted(format!("#{}", n.id)),
+                muted(dates::format(dates::day(n.updated_at))),
+                plain(n.text.clone()),
+            ],
+            pick: Pick::Note {
+                id: n.id,
+                text: n.text,
+            },
+        })
+        .collect();
+    Pane {
+        title: "Notes".into(),
+        columns: vec![
+            col("note", Kind::Text),
+            col("updated", Kind::Text),
+            col("text", Kind::Wide),
+        ],
+        items,
+        empty: "No notes. Press n to add one.",
+    }
+}
+
+fn changes_pane(changes: Vec<history::ProjectChange>, repos: &BTreeMap<String, String>) -> Pane {
+    let repo = |name: &str| repos.get(name).cloned();
     Pane {
         title: "Changed at the last scan".into(),
         columns: vec![
@@ -1384,7 +1402,8 @@ pub fn screen(view: View) -> Screen {
             jobs,
             runs,
             now: at,
-            repos,
+            notes,
+            ..
         } => {
             // Runs waiting on a decision, then plans waiting for approval.
             let mut waiting = run_items(lists.runs);
@@ -1416,24 +1435,6 @@ pub fn screen(view: View) -> Screen {
             let mut working = activity_pane(&state, &running, &open, at, true);
             working.title = "Working now".into();
             working.empty = "No agent or job is under way.";
-            // Tasks agents may take, then the critical and urgent ones only
-            // you can.
-            let for_cell = |who: &str, items: Vec<Item>| -> Vec<Item> {
-                items
-                    .into_iter()
-                    .map(|mut i| {
-                        i.cells.push(match who {
-                            "agent" => cell("agent", Tone::Accent),
-                            _ => muted("you"),
-                        });
-                        i
-                    })
-                    .collect()
-            };
-            let mut tasks = for_cell("agent", next_items(lists.agents, &repos));
-            tasks.extend(for_cell("you", next_items(lists.tasks, &repos)));
-            let mut columns = TASK_COLUMNS.to_vec();
-            columns.push(col("for", Kind::Badge));
             panes(
                 Tab::Inbox,
                 Some(header),
@@ -1445,15 +1446,29 @@ pub fn screen(view: View) -> Screen {
                         empty: "Nothing waits on you.",
                     },
                     working,
-                    Pane {
-                        title: "Tasks".into(),
-                        columns,
-                        items: tasks,
-                        empty: "No task is ready for an agent, and none needs you now.",
-                    },
-                ],
+                ]
+                .into_iter()
+                // Notes are kept only by some; no note, no pane.
+                .chain((!notes.is_empty()).then(|| notes_pane(notes)))
+                .collect(),
             )
         }
+        View::Matrix {
+            header,
+            tiered: false,
+            ..
+        } => panes(
+            Tab::Matrix,
+            Some(header),
+            vec![Pane {
+                title: "Matrix".into(),
+                columns: vec![col("task", Kind::Text)],
+                items: Vec::new(),
+                empty: "No project ranks above tier 5, so no task is important and the \
+                        quadrants are one list. `e` on the projects tab, or `pma project \
+                        tier <1-5> <project>`, sets a tier.",
+            }],
+        ),
         View::Matrix {
             header,
             placed,
@@ -1501,7 +1516,6 @@ pub fn screen(view: View) -> Screen {
             portfolio: p,
             tags,
             scans,
-            changes,
             since,
             ..
         } => {
@@ -1626,8 +1640,6 @@ pub fn screen(view: View) -> Screen {
                         items: failing,
                         empty: "No workflow fails on a default branch.",
                     },
-                    changes_pane(changes, &p.projects),
-                    scans_pane(scans, now),
                 ],
             )
         }
@@ -1656,6 +1668,9 @@ pub fn screen(view: View) -> Screen {
             attempts,
             by,
             speed,
+            scans,
+            changes,
+            repos,
         } => {
             let by_name = report_runs::By::ALL
                 .iter()
@@ -1690,14 +1705,18 @@ pub fn screen(view: View) -> Screen {
             let mut columns = vec![col(by_name, Kind::Wide)];
             columns.extend(report_runs::HEADINGS.iter().map(|h| col(h, Kind::Number)));
             panes(
-                Tab::Report,
+                Tab::History,
                 Some(summary),
-                vec![Pane {
-                    title: format!("Runs by {by_name}"),
-                    columns,
-                    items,
-                    empty: "Dispatch some tasks first.",
-                }],
+                vec![
+                    Pane {
+                        title: format!("Runs by {by_name}"),
+                        columns,
+                        items,
+                        empty: "Dispatch some tasks first.",
+                    },
+                    changes_pane(changes, &repos),
+                    scans_pane(scans, now),
+                ],
             )
         }
         View::Runs(runs) => {
@@ -1785,41 +1804,12 @@ pub fn screen(view: View) -> Screen {
                 )],
             },
         ),
-        View::Notes(notes) => {
-            let items = notes
-                .into_iter()
-                .map(|n| Item {
-                    cells: vec![
-                        muted(format!("#{}", n.id)),
-                        muted(dates::format(dates::day(n.updated_at))),
-                        plain(n.text.clone()),
-                    ],
-                    pick: Pick::Note {
-                        id: n.id,
-                        text: n.text,
-                    },
-                })
-                .collect::<Vec<_>>();
-            panes(
-                Tab::Notes,
-                None,
-                vec![Pane {
-                    title: "Notes".into(),
-                    columns: vec![
-                        col("note", Kind::Text),
-                        col("updated", Kind::Text),
-                        col("text", Kind::Wide),
-                    ],
-                    items,
-                    empty: "No notes. Press n to add one.",
-                }],
-            )
-        }
+        View::Notes(notes) => panes(Tab::Inbox, None, vec![notes_pane(notes)]),
         View::Workflows {
             revisions,
             instances,
         } => panes(
-            Tab::Library,
+            Tab::Setup,
             None,
             vec![instances_pane(&instances, now), revisions_pane(&revisions)],
         ),
@@ -1827,11 +1817,11 @@ pub fn screen(view: View) -> Screen {
             revisions,
             campaigns,
         } => panes(
-            Tab::Library,
+            Tab::Setup,
             None,
             vec![revisions_pane(&revisions), campaigns_pane(&campaigns)],
         ),
-        View::Campaigns(all) => panes(Tab::Library, None, vec![campaigns_pane(&all)]),
+        View::Campaigns(all) => panes(Tab::Setup, None, vec![campaigns_pane(&all)]),
         View::Project {
             name,
             path,
@@ -1960,10 +1950,53 @@ pub fn screen(view: View) -> Screen {
             presets,
             default_preset,
             routes,
+            revisions,
+            campaigns,
         } => panes(
-            Tab::Settings,
+            Tab::Setup,
             None,
             vec![
+                Pane {
+                    title: "Agents".into(),
+                    columns: vec![
+                        col("agent", Kind::Text),
+                        col("default", Kind::Badge),
+                        col("command", Kind::Text),
+                        col("parse", Kind::Text),
+                        col("flags", Kind::Wide),
+                    ],
+                    items: agents
+                        .iter()
+                        .map(|w| {
+                            let flags: Vec<&str> = [
+                                (w.reports_cost, "cost"),
+                                (w.enforces_budget, "budget"),
+                                (w.sandbox, "sandbox"),
+                                (w.allow.is_some(), "allowlist"),
+                                (w.resumes, "resumes"),
+                            ]
+                            .into_iter()
+                            .filter_map(|(on, name)| on.then_some(name))
+                            .collect();
+                            Item {
+                                cells: vec![
+                                    plain(w.name.clone()),
+                                    match w.name == default_agent {
+                                        true => cell("default", Tone::Accent),
+                                        false => plain(""),
+                                    },
+                                    muted(w.command.clone()),
+                                    muted(w.parse.name()),
+                                    muted(flags.join(", ")),
+                                ],
+                                pick: Pick::Agent {
+                                    name: w.name.clone(),
+                                },
+                            }
+                        })
+                        .collect(),
+                    empty: "No agent. `pma agent set <name> command <program>` adds one.",
+                },
                 Pane {
                     title: "Settings".into(),
                     columns: vec![
@@ -2005,47 +2038,6 @@ pub fn screen(view: View) -> Screen {
                         })
                         .collect(),
                     empty: "No root. `r` adds a directory whose git repositories are projects.",
-                },
-                Pane {
-                    title: "Agents".into(),
-                    columns: vec![
-                        col("agent", Kind::Text),
-                        col("default", Kind::Badge),
-                        col("command", Kind::Text),
-                        col("parse", Kind::Text),
-                        col("flags", Kind::Wide),
-                    ],
-                    items: agents
-                        .iter()
-                        .map(|w| {
-                            let flags: Vec<&str> = [
-                                (w.reports_cost, "cost"),
-                                (w.enforces_budget, "budget"),
-                                (w.sandbox, "sandbox"),
-                                (w.allow.is_some(), "allowlist"),
-                                (w.resumes, "resumes"),
-                            ]
-                            .into_iter()
-                            .filter_map(|(on, name)| on.then_some(name))
-                            .collect();
-                            Item {
-                                cells: vec![
-                                    plain(w.name.clone()),
-                                    match w.name == default_agent {
-                                        true => cell("default", Tone::Accent),
-                                        false => plain(""),
-                                    },
-                                    muted(w.command.clone()),
-                                    muted(w.parse.name()),
-                                    muted(flags.join(", ")),
-                                ],
-                                pick: Pick::Agent {
-                                    name: w.name.clone(),
-                                },
-                            }
-                        })
-                        .collect(),
-                    empty: "No agent. `pma agent set <name> command <program>` adds one.",
                 },
                 Pane {
                     title: "Presets".into(),
@@ -2120,6 +2112,8 @@ pub fn screen(view: View) -> Screen {
                         .collect(),
                     empty: "No routing policy: dispatch uses the default agent and each task's class. `f` proposes one from a file.",
                 },
+                revisions_pane(&revisions),
+                campaigns_pane(&campaigns),
             ],
         ),
         View::Scan { scan: sc, changes } => {
@@ -3841,12 +3835,17 @@ mod tests {
                 ..Default::default()
             }],
             now: 0,
+            notes: Vec::new(),
         };
         let Body::Panes(p) = screen(view).body else {
             panic!("panes");
         };
         let titles: Vec<&str> = p.iter().map(|p| p.title.as_str()).collect();
-        assert_eq!(titles, ["Waiting on you", "Working now", "Tasks"]);
+        assert_eq!(
+            titles,
+            ["Waiting on you", "Working now"],
+            "no note, no pane"
+        );
         assert_eq!(
             p[0].items[0].texts()[..3],
             ["job 1", "awaiting-approval", "approve plan"]
@@ -3863,6 +3862,27 @@ mod tests {
             project: "p".into(),
         };
         assert_eq!(question(Act::Push, &ready), "approve and push #7?");
+
+        let noted = View::Inbox {
+            header: "h".into(),
+            lists: next::Next::default(),
+            repos: BTreeMap::new(),
+            state: std::env::temp_dir(),
+            jobs: Vec::new(),
+            runs: Vec::new(),
+            now: 0,
+            notes: vec![crate::store::Note {
+                id: 3,
+                created_at: 0,
+                updated_at: 0,
+                text: "call back".into(),
+            }],
+        };
+        let Body::Panes(p) = screen(noted).body else {
+            panic!("panes");
+        };
+        assert_eq!(p[2].title, "Notes");
+        assert!(matches!(p[2].items[0].pick, Pick::Note { id: 3, .. }));
     }
 
     /// `e` on a project reads one setting a line: a tier, a tag, the
@@ -4008,6 +4028,7 @@ mod tests {
             quadrant: None,
             today: 0,
             repos: BTreeMap::from([("a".to_string(), "https://github.com/o/a".to_string())]),
+            tiered: true,
         };
         let Body::Panes(p) = screen(view).body else {
             panic!("panes");
@@ -4051,6 +4072,96 @@ mod tests {
         assert_eq!(
             question(Act::ForgetProject, &row),
             "forget the record of gone?"
+        );
+    }
+
+    /// With no project above tier 5 the matrix is one list in four panes,
+    /// so it says how to set a tier instead.
+    #[test]
+    fn an_untiered_matrix_says_how_to_tier() {
+        let view = View::Matrix {
+            header: "h".into(),
+            placed: Vec::new(),
+            limit: None,
+            quadrant: None,
+            today: 0,
+            repos: BTreeMap::new(),
+            tiered: false,
+        };
+        let s = screen(view);
+        assert_eq!(s.tab, Some(Tab::Matrix));
+        let Body::Panes(p) = s.body else {
+            panic!("panes");
+        };
+        assert_eq!(p.len(), 1);
+        assert!(p[0].empty.contains("tier <1-5>"), "{}", p[0].empty);
+    }
+
+    /// The history tab holds the run report and the scans; setup lists
+    /// agents first, and the definitions the library held.
+    #[test]
+    fn history_and_setup_gather_their_panes() {
+        let scan = history::Scan {
+            id: 4,
+            at: 0,
+            full: true,
+            projects: 2,
+            failing: 0,
+            faults: [0; 7],
+            open: 1,
+            opened: 1,
+            closed: 0,
+            other: 0,
+        };
+        let view = View::Report {
+            runs: Vec::new(),
+            attempts: Vec::new(),
+            by: crate::report_runs::By::ALL[0].1,
+            speed: None,
+            scans: vec![scan],
+            changes: vec![history::ProjectChange {
+                project: "a".into(),
+                change: history::Change::Absent,
+            }],
+            repos: BTreeMap::new(),
+        };
+        let s = screen(view);
+        assert_eq!(s.tab, Some(Tab::History));
+        let Body::Panes(p) = s.body else {
+            panic!("panes");
+        };
+        let titles: Vec<&str> = p.iter().map(|p| &p.title[..]).collect();
+        assert_eq!(titles[1..], ["Changed at the last scan", "Recent scans"]);
+        assert_eq!(p[2].items[0].pick, Pick::Scan { id: 4 });
+
+        let view = View::Settings {
+            settings: Vec::new(),
+            roots: Vec::new(),
+            agents: Vec::new(),
+            default_agent: "claude".into(),
+            presets: Vec::new(),
+            default_preset: None,
+            routes: Vec::new(),
+            revisions: Vec::new(),
+            campaigns: Vec::new(),
+        };
+        let s = screen(view);
+        assert_eq!(s.tab, Some(Tab::Setup));
+        let Body::Panes(p) = s.body else {
+            panic!("panes");
+        };
+        let titles: Vec<&str> = p.iter().map(|p| &p.title[..]).collect();
+        assert_eq!(
+            titles,
+            [
+                "Agents",
+                "Settings",
+                "Roots",
+                "Presets",
+                "Route revisions",
+                "Workflow revisions",
+                "Campaigns"
+            ]
         );
     }
 }

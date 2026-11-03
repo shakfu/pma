@@ -2,6 +2,9 @@
 
 Status: phases 1-6 built, 2026-10-13.
 
+Each tab and pane's justification and usage class: `views.md` (2026-11-03).
+Six tabs since 2026-11-03: `views-refactor.md`. Usage log: `usage-log.md`.
+
 Where the build departs from the design below:
 
 Phase 1, settings:

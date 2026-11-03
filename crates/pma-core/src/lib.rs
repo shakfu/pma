@@ -38,6 +38,7 @@ pub mod settings;
 pub mod store;
 pub mod sync;
 pub mod todo;
+pub mod usage;
 pub mod watch;
 pub mod worker;
 pub mod workflow;

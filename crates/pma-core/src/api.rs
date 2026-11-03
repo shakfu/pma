@@ -50,6 +50,12 @@ pub enum Query {
     Report {
         by: report_runs::By,
     },
+    /// The report, with the latest scans and what the last one changed in
+    /// `of`'s projects: what happened, for the history tab.
+    History {
+        by: report_runs::By,
+        of: Selection,
+    },
     /// Runs that are not final: what waits on a reviewer.
     Runs,
     /// What waits on you, what is under way, and what agents can take.
@@ -90,7 +96,8 @@ pub enum Query {
         line: Option<i64>,
         key: Option<String>,
     },
-    /// Settings, roots, agents, presets and route revisions.
+    /// Settings, roots, agents, presets and route revisions, with workflow
+    /// revisions and campaigns.
     Settings,
     /// One recorded scan and what it changed.
     Scan {
@@ -140,6 +147,9 @@ pub enum View {
         quadrant: Option<rank::Quadrant>,
         today: i64,
         repos: BTreeMap<String, String>,
+        /// Whether any project ranks above tier 5. Tier 5 makes no task
+        /// important, so without one every task lands in Q3 or Q4.
+        tiered: bool,
     },
     Status {
         header: String,
@@ -165,6 +175,11 @@ pub enum View {
         by: report_runs::By,
         /// `speed_line`.
         speed: Option<String>,
+        /// The latest scans and the last one's changes; empty for
+        /// `Query::Report`.
+        scans: Vec<crate::history::Scan>,
+        changes: Vec<crate::history::ProjectChange>,
+        repos: BTreeMap<String, String>,
     },
     Runs(Vec<Run>),
     Inbox {
@@ -175,6 +190,7 @@ pub enum View {
         runs: Vec<Run>,
         now: i64,
         repos: BTreeMap<String, String>,
+        notes: Vec<Note>,
     },
     Activity {
         state: PathBuf,
@@ -260,6 +276,8 @@ pub enum View {
         presets: Vec<Preset>,
         default_preset: Option<String>,
         routes: Vec<RouteRevision>,
+        revisions: Vec<WorkflowRevision>,
+        campaigns: Vec<Campaign>,
     },
     Scan {
         scan: crate::history::Scan,
@@ -1236,6 +1254,28 @@ pub fn settle_interrupted(store: &Store) -> Result<()> {
 }
 
 /// Each project's GitHub page, by name, for issue links.
+/// The latest scans, newest first, and what the latest changed in `of`'s
+/// projects.
+fn scans_and_changes(
+    store: &Store,
+    of: &Selection,
+) -> Result<(
+    Vec<crate::history::Scan>,
+    Vec<crate::history::ProjectChange>,
+)> {
+    let scans = store.scans(SCANS_SHOWN)?;
+    let names = select(store, &of.projects, &of.tags)?;
+    let changes = match scans.first() {
+        Some(latest) => store
+            .scan_changes(latest.id)?
+            .into_iter()
+            .filter(|c| names.is_empty() || names.contains(&c.project))
+            .collect(),
+        None => Vec::new(),
+    };
+    Ok((scans, changes))
+}
+
 fn repos(store: &Store) -> Result<BTreeMap<String, String>> {
     Ok(store
         .projects()?
@@ -1269,20 +1309,12 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
                 placed: rank::place(&p.cfg, p.tasks, p.today),
                 quadrant,
                 repos: repos(store)?,
+                tiered: p.projects.iter().any(|(r, _)| r.tier < 5),
             }
         }
         Query::Status { of, explain, all } => {
             let p = portfolio(store, &of, all)?;
-            let scans = store.scans(SCANS_SHOWN)?;
-            let names = select(store, &of.projects, &of.tags)?;
-            let changes = match scans.first() {
-                Some(latest) => store
-                    .scan_changes(latest.id)?
-                    .into_iter()
-                    .filter(|c| names.is_empty() || names.contains(&c.project))
-                    .collect(),
-                None => Vec::new(),
-            };
+            let (scans, changes) = scans_and_changes(store, &of)?;
             View::Status {
                 header: p.header(),
                 portfolio: Box::new(p),
@@ -1306,7 +1338,22 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
             attempts: store.attempts(None)?,
             by,
             speed: speed_line(store)?,
+            scans: Vec::new(),
+            changes: Vec::new(),
+            repos: BTreeMap::new(),
         },
+        Query::History { by, of } => {
+            let (scans, changes) = scans_and_changes(store, &of)?;
+            View::Report {
+                runs: store.runs()?,
+                attempts: store.attempts(None)?,
+                by,
+                speed: speed_line(store)?,
+                scans,
+                changes,
+                repos: repos(store)?,
+            }
+        }
         Query::Inbox { of } => {
             settle_interrupted(store)?;
             // The first view a new store shows: it says to scan rather
@@ -1318,15 +1365,7 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
                 ),
                 Some(_) => {
                     let p = portfolio(store, &of, false)?;
-                    // Only tagged items are listed, which a long TODO.md hides.
-                    let items = || p.tasks.iter().filter(|t| t.line.is_some());
-                    let tagged = items().filter(|t| t.eligible || t.manual).count();
-                    let header = format!(
-                        "{}; {tagged} of {} open items tagged #agent or #manual",
-                        p.header(),
-                        items().count()
-                    );
-                    (header, next_lists(store, &p)?)
+                    (p.header(), next_lists(store, &p)?)
                 }
             };
             View::Inbox {
@@ -1337,6 +1376,7 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
                 jobs: store.jobs(50)?,
                 runs: store.runs()?,
                 now: dates::now(),
+                notes: store.notes()?,
             }
         }
         Query::Activity { finished } => View::Activity {
@@ -1457,6 +1497,8 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
                 presets: store.presets()?,
                 default_preset: cfg.preset.clone(),
                 routes: store.route_revisions()?,
+                revisions: store.workflow_revisions()?,
+                campaigns: store.campaigns()?,
             }
         }
         Query::Scan { id } => {

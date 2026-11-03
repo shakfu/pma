@@ -117,14 +117,18 @@ impl Parser {
                         denied: Vec::new(),
                     };
                 };
-                let flagged = error
-                    .as_deref()
-                    .and_then(|path| at(&value, path))
-                    .map(truthy);
+                let flag = error.as_deref().and_then(|path| at(&value, path));
+                let flagged = flag.map(truthy);
+                // A failed run's reply is often empty; an error message then says more.
+                let message = flag
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|m| !m.is_empty());
                 Report {
                     ok: exit_ok && flagged != Some(true),
                     summary: at(&value, summary)
                         .map(text)
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| message.map(String::from))
                         .unwrap_or_else(|| tail(output, 20)),
                     cost_usd: at(&value, cost).and_then(|v| match v {
                         serde_json::Value::Number(n) => n.as_f64(),
@@ -852,6 +856,29 @@ mod tests {
         assert_eq!(r.summary, "{\"other\":1}");
         // No JSON at all is a failure, whatever the status said.
         assert!(!p.report("command not found\n", true).ok);
+    }
+
+    /// The `result` record myra, minima and hax print: `error` is null or a
+    /// message, and an unreported cost is null. As captured from myra.
+    #[test]
+    fn a_result_record_with_a_nullable_error_is_read() {
+        let p = Parser::parse("json:text:cost:error").unwrap();
+        let done = r#"{"type":"result","outcome":"complete","text":"Fixed the build.","error":null,"cost":0.0123,"requests":1}"#;
+        let r = p.report(done, true);
+        assert!(r.ok);
+        assert_eq!(
+            (r.summary.as_str(), r.cost_usd),
+            ("Fixed the build.", Some(0.0123))
+        );
+        let failed = r#"{"type":"result","outcome":"error","text":"","error":"cannot change to /x","cost":null}"#;
+        let r = p.report(failed, false);
+        assert!(!r.ok);
+        assert_eq!(
+            (r.summary.as_str(), r.cost_usd),
+            ("cannot change to /x", None)
+        );
+        // A message outranks a zero exit status.
+        assert!(!p.report(failed, true).ok);
     }
 
     /// The environment a record carries is applied after the pipeline has

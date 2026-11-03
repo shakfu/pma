@@ -12,6 +12,30 @@
 
 - [ ] npm or pnpm dependency signals, and a better Python verify fallback deps covers `cargo`, `uv` and `go` (`crates/pma-core/src/deps.rs:24-26`). Without `uv.lock`, verify detection picks `python3 -m pytest` (`crates/pma-core/src/agent.rs:263-268`), likely without the project's dependencies (unverified). The README's Requirements now state what is supported. (REVIEW.md U7)
 
+- [ ] Install pma with schema 49 and the agent entries #manual Install this `pma`, then check that the upgrade wrote `agents.claude.interactive_args` to `~/.config/pma/settings.toml` and nothing else. `make install` gilda, minima, hax, myra and hilda: the installed minima is 0.4.0, and none of the installed five takes a positional prompt. Then append `docs/dev/agent-entries.md`. Each agent item below needs this first.
+
+- [ ] Test each agent as a pma worker #manual For every agent below, on a scratch project, check four things. A headless `pma dispatch` gives a run with a non-empty summary, a cost where the entry says `reports_cost`, and a failed verdict when the model name is wrong. `--interactive` (`I`) opens a pane where the task is already the first turn, and the run ends when the agent exits. `T` on a finished run opens that agent with the take-over prompt. herdr raises "an agent needs you" when the agent waits for input; unknown for every agent but claude. Record the results in `docs/dev/agent-entries.md` and correct the entries.
+
+- [ ] Test claude after the schema 49 upgrade #manual `--interactive` and `T` built their command from the headless one; both now read `interactive_args`. `T` now passes the run's model, which it did not.
+
+- [ ] Test codex as a pma worker #manual Unverified: that `codex` and `codex exec` take `--` before the prompt; what `--approve-for-me` asks of a person in a pane; whether `exec`'s stdout gives a readable `text-tail` summary. Cost is unknown: `exec --json` exists, but its result shape has not been read.
+
+- [ ] Test pi as a pma worker #manual Each positional word is a separate message and `@word` reads a file, so the entry passes `--` and the task as one word; check a task that starts with `@` or `-`. pi has no permission mode, so the worktree is its only bound. Cost is unknown.
+
+- [ ] Test opencode interactively #manual `interactive_args` comes from `opencode --help`: `{dir} --auto --prompt`. The TUI takes no `--model`, so an interactive run ignores the preset's model.
+
+- [ ] Decide omp's entry #manual omp is not installed. Install it and write `interactive_args`, or remove the worker.
+
+- [ ] Test gilda as a pma worker #manual Parser `json:text:usage.cost:error`. A `truncated` outcome exits 0 with a null error, so pma counts it as a success. Headless `--permissions auto` asks before touching secrets or writing outside the root; check that with no terminal it denies rather than hangs.
+
+- [ ] Test minima as a pma worker #manual Parser `json:text:cost:error`; a failed run's message is only in `.error`, which pma now shows as the summary. The entry leaves `--sandbox` off. With it on, `git` inside a linked worktree is probably denied, since the worktree's `.git` points outside the root (read from the code, untested).
+
+- [ ] Test hax as a pma worker #manual Parser `json:text:cost:error`. `.cost` is omitted when spend is 0, which pma records as unknown. hax has no permission mode. A first word that names a hax preset is taken as `--preset`; pma's args start with `--model=`, so check a run with no model chosen and a one-word task.
+
+- [ ] Test myra as a pma worker #manual Parser `json:text:cost:error`, with `-C {dir}` and `--json`. `truncated` covers a length cut and the 100-call cap, and exits 0. Cost is null on a local server. The Python port was tested only under Python 3.15.
+
+- [ ] Test hilda as a pma worker #manual Parser `json:result:usage.cost:error`; cost is in OpenRouter credits. The entry runs `-M yolo`, the only mode that works unattended, so bash runs with the user's permissions. hilda has no `-C`; pma sets the directory. Exit 2 (`--max-turns`) and 3 (`--max-cost`) are failures to pma.
+
 ## Medium
 
 - [ ] Retest live updates in the web after the blank-page fix #manual The event stream existed but was never opened (see High). Many of the out-of-sync views reported on 2026-10-27 likely came from that. Retest before building more.

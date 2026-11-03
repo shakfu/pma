@@ -12,6 +12,8 @@ Upgrading from 0.10:
 
 - **Any agent can run interactively.** `interactive_args` in `[agents.<name>]` (`pma agent set <name> interactive-args`) holds how it starts a session a person drives; `--interactive`, `I` and `T` build from it. An explicit list over deriving it from `args`: the interactive form can change the subcommand (`codex exec` to `codex`) or the flag that takes the prompt (`opencode run <msg>` to `opencode --prompt <msg>`). `T` uses the run's agent where it has the list, else the default agent, since the change it reads is on disk.
 
+- A `json:` parser takes the error field's message as the summary when the reply field is empty, as it is in a failed run of minima, hax or myra.
+
 ### Fixed
 
 - A migration that changed an agent, preset or config row wrote only to the tables, and the next edit of `settings.toml` reverted it. A store upgraded from schema 23 lost the preset that replaced its worker's model. The upgrade to schema 49 writes such rows to the file first.

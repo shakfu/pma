@@ -1521,28 +1521,8 @@ fn root(action: Option<RootAction>) -> Result<()> {
 }
 
 fn forget(name: &str, apply: bool) -> Result<()> {
-    let mut store = Store::open_default()?;
-    let row = store
-        .project(name)?
-        .ok_or_else(|| format!("unknown project `{name}`"))?;
-    if row.absent_since.is_none() {
-        return Err(format!(
-            "{name} is still under a root at {}; `pma root rm` its root or delete the \
-             checkout, run `pma scan`, then forget it",
-            row.path.display()
-        )
-        .into());
-    }
-    let f = store.project_footprint(name)?;
-    if !f.open_runs.is_empty() {
-        let ids: Vec<String> = f.open_runs.iter().map(|id| format!("#{id}")).collect();
-        return Err(format!(
-            "{name} has runs still open: {}. Each may own a worktree; \
-             settle them with `pma review` first",
-            ids.join(" ")
-        )
-        .into());
-    }
+    let store = Store::open_default()?;
+    let f = api::forgettable(&store, name)?;
 
     println!(
         "{name}: {} tasks, {} tags, {} campaign memberships",

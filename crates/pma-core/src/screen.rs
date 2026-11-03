@@ -40,9 +40,11 @@ pub enum Pick {
     },
     /// A row of the projects tab. `target` is what dispatching it takes: the
     /// failing-CI list's `project:ci`, else the first task an agent may take.
+    /// `gone` when its checkout is no longer on disk.
     Project {
         project: String,
         target: Option<String>,
+        gone: bool,
     },
     /// A task no agent may take.
     Manual {
@@ -215,6 +217,7 @@ pub fn fits(act: Act, pick: &Pick) -> bool {
         Act::EditNote | Act::RemoveNote => matches!(pick, Pick::Note { .. }),
         Act::EditSetting | Act::ResetSetting => matches!(pick, Pick::Setting { .. }),
         Act::RemoveRoot => matches!(pick, Pick::Root { .. }),
+        Act::ForgetProject => matches!(pick, Pick::Project { gone: true, .. }),
         Act::EditAgent | Act::RemoveAgent | Act::UseAgent => matches!(pick, Pick::Agent { .. }),
         Act::EditPreset | Act::RemovePreset | Act::UsePreset => {
             matches!(pick, Pick::Preset { .. })
@@ -292,7 +295,9 @@ pub fn marked(marks: &[Pick]) -> Pick {
                 again |= retry;
             }
             Pick::Manual { project } => names.push(project.clone()),
-            Pick::Project { project, target } => {
+            Pick::Project {
+                project, target, ..
+            } => {
                 names.push(project.clone());
                 dispatched.extend(target.clone());
             }
@@ -1538,6 +1543,7 @@ pub fn screen(view: View) -> Screen {
                         muted(tags.get(&name).map_or(String::new(), |t| t.join(" "))),
                     );
                     let next = top(&name);
+                    let gone = row_of(&name).is_some_and(|r| !r.path.exists());
                     cells.push(muted(
                         next.as_ref()
                             .map_or(String::new(), |(t, text)| format!("{t}  {text}")),
@@ -1546,6 +1552,7 @@ pub fn screen(view: View) -> Screen {
                         pick: Pick::Project {
                             project: name,
                             target: next.map(|(t, _)| t),
+                            gone,
                         },
                         cells,
                     }
@@ -1581,6 +1588,7 @@ pub fn screen(view: View) -> Screen {
                         pick: Pick::Project {
                             project: project.clone(),
                             target: Some(format!("{project}:ci")),
+                            gone: !row.path.exists(),
                         },
                     });
                 }
@@ -2368,7 +2376,7 @@ pub fn question(act: Act, pick: &Pick) -> String {
         Pick::Project {
             target: Some(target),
             ..
-        } => target.clone(),
+        } if act != Act::ForgetProject => target.clone(),
         Pick::Project { project, .. } => project.clone(),
         Pick::Run { id, .. } | Pick::Job { id, .. } | Pick::Note { id, .. } => format!("#{id}"),
         Pick::Instance { id, .. } => format!("instance {id}"),
@@ -2404,6 +2412,7 @@ pub fn question(act: Act, pick: &Pick) -> String {
         Act::RemoveNote => "remove note",
         Act::RunCampaign => "run campaign",
         Act::RemoveCampaign => "remove campaign",
+        Act::ForgetProject => "forget the record of",
         Act::ApproveRuns => "approve every clean run",
         Act::PushApproved => "push every approved run",
         Act::Sync => "sync critical items to GitHub issues",
@@ -2765,6 +2774,10 @@ pub fn action_scoped(
             Action::RemoveCampaign { name: name.clone() }
         }
         (Act::RemoveCampaign, _) => return need("a campaign"),
+        (Act::ForgetProject, Pick::Project { project, .. }) => Action::ForgetProject {
+            name: project.clone(),
+        },
+        (Act::ForgetProject, _) => return need("a project"),
         (Act::ApproveRuns, _) => {
             let ids: Vec<i64> = pane
                 .iter()
@@ -3681,6 +3694,7 @@ mod tests {
         let row = Pick::Project {
             project: "a".into(),
             target: None,
+            gone: false,
         };
         assert_eq!(
             action(Act::Shell, &row, &[], ""),
@@ -3750,6 +3764,7 @@ mod tests {
         let row = |p: &str, t: Option<&str>| Pick::Project {
             project: p.into(),
             target: t.map(String::from),
+            gone: false,
         };
         let Ok(Action::Dispatch {
             targets,
@@ -4018,6 +4033,24 @@ mod tests {
         assert_eq!(
             question(Act::ApproveRuns, &Pick::Nothing),
             "approve every clean run?"
+        );
+        // A project row names its next task, which forgetting does not take.
+        let row = Pick::Project {
+            project: "gone".into(),
+            target: Some("gone:4".into()),
+            gone: true,
+        };
+        assert!(fits(Act::ForgetProject, &row));
+        let here = Pick::Project {
+            project: "gone".into(),
+            target: None,
+            gone: false,
+        };
+        assert!(!fits(Act::ForgetProject, &here), "a checkout on disk stays");
+        assert_eq!(question(Act::Dispatch, &row), "dispatch gone:4?");
+        assert_eq!(
+            question(Act::ForgetProject, &row),
+            "forget the record of gone?"
         );
     }
 }

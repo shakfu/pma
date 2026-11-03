@@ -540,6 +540,10 @@ pub enum Action {
     RemoveCampaign {
         name: String,
     },
+    /// Deletes the record of a project whose checkout is gone.
+    ForgetProject {
+        name: String,
+    },
     /// One or several projects, as marks give them.
     SetTier {
         projects: Vec<String>,
@@ -1077,6 +1081,34 @@ pub fn project_tags(store: &Store) -> Result<BTreeMap<String, Vec<String>>> {
         tags.entry(project).or_default().push(tag);
     }
     Ok(tags)
+}
+
+/// What forgetting `name` would delete. Refused while its checkout is on
+/// disk under a root, or while a run of it is open and may own a worktree.
+/// A checkout deleted since the last full scan counts as gone.
+pub fn forgettable(store: &Store, name: &str) -> Result<store::Footprint> {
+    let row = store
+        .project(name)?
+        .ok_or_else(|| format!("unknown project `{name}`"))?;
+    if row.absent_since.is_none() && row.path.exists() {
+        return Err(format!(
+            "{name} is still under a root at {}; `pma root rm` its root or delete the \
+             checkout, run `pma scan`, then forget it",
+            row.path.display()
+        )
+        .into());
+    }
+    let f = store.project_footprint(name)?;
+    if !f.open_runs.is_empty() {
+        let ids: Vec<String> = f.open_runs.iter().map(|id| format!("#{id}")).collect();
+        return Err(format!(
+            "{name} has runs still open: {}. Each may own a worktree; \
+             settle them with `pma review` first",
+            ids.join(" ")
+        )
+        .into());
+    }
+    Ok(f)
 }
 
 /// Every present project, for a front end's `Jump`: its name, and its tags
@@ -1987,6 +2019,18 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
             }
             Outcome::default()
         }
+        Action::ForgetProject { name } => {
+            let f = forgettable(store, &name)?;
+            store.forget_project(&name)?;
+            let mut line = format!(
+                "{name} is forgotten: {} tasks, {} tags, {} campaign memberships",
+                f.tasks, f.tags, f.campaigns
+            );
+            if f.runs > 0 {
+                line.push_str(&format!("; its {} finished runs are kept", f.runs));
+            }
+            Outcome::said(line)
+        }
         Action::SetTier { projects, tier } => {
             let mut out = Outcome::default();
             for project in projects {
@@ -2452,6 +2496,7 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
         | Action::ProposeRoute { .. }
         | Action::AddCampaign { .. }
         | Action::RemoveCampaign { .. }
+        | Action::ForgetProject { .. }
         | Action::SetTier { .. }
         | Action::Tag { .. }
         | Action::Prune { .. }
@@ -2607,6 +2652,47 @@ mod tests {
             }),
             ["dispatch", "a:5", "--push"]
         );
+    }
+
+    /// A checkout deleted since the last full scan can be forgotten; one on
+    /// disk, or one with an open run, cannot.
+    #[test]
+    fn only_a_deleted_project_is_forgotten() {
+        let dir = std::env::temp_dir().join(format!("pma-forget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let checkout = dir.join("a");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let store = Store::open(&dir.join("p.db")).unwrap();
+        store.set_tier("a", &checkout, Some(2)).unwrap();
+        let forget = || act(&store, Action::ForgetProject { name: "a".into() });
+
+        let err = forget().unwrap_err().to_string();
+        assert!(err.contains("still under a root"), "{err}");
+
+        std::fs::remove_dir_all(&checkout).unwrap();
+        let mut run = Run {
+            project: "a".into(),
+            state: RunState::Ready,
+            ..Run::default()
+        };
+        store.insert_run(&mut run).unwrap();
+        let err = forget().unwrap_err().to_string();
+        assert!(err.contains("runs still open"), "{err}");
+
+        run.state = RunState::Rejected;
+        store.update_run(&run).unwrap();
+        let out = forget().unwrap();
+        assert!(out.said[0].contains("a is forgotten"), "{:?}", out.said);
+        assert!(out.said[0].contains("1 finished runs are kept"));
+        assert!(store.project("a").unwrap().is_none());
+        assert!(
+            store
+                .config_rows()
+                .unwrap()
+                .iter()
+                .all(|(k, _)| !k.starts_with("projects.a."))
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A watch sees a commit by another connection, and names the runs that

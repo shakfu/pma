@@ -31,7 +31,7 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 - Failing CI, outdated dependencies, idle repositories and dirty working trees appear as tasks beside the written ones.
 
-- Two front ends with the same views and actions: `pma tui` in a terminal, over SSH too, and `pma web` in a local browser, on 127.0.0.1 behind a one-time token. Both act on what is selected: dispatch a task, approve or reject a run, approve a plan, stop a job. Space marks tasks, and `d` dispatches the marked ones, one run per project. On the projects tab, Space marks projects, `z` runs one name over them, `e` sets their tier or tag together, and `d` or `I` dispatches each one's next task, or `project:ci` from the `Failing CI` list. `P` in a project view dispatches a prompt you type. `O` opens a project by a few letters of its name or a tag, `/` filters any list the same way and `*` marks what it keeps, `#` scopes every view and portfolio act to a tag, `v` reads a run's diff in your pager, `E` opens the project in `$EDITOR` and `S` a shell in it, in herdr when integrated, for a fix by hand.
+- Two front ends with the same views and actions: `pma tui` in a terminal, over SSH too, and `pma web` in a local browser, on 127.0.0.1 behind a one-time token. Both act on what is selected: dispatch a task, approve or reject a run, approve a plan, stop a job. Space marks tasks, and `d` dispatches the marked ones, one run per project. On the projects tab, Space marks projects, `z` runs one name over them, `e` sets their tier or tag together, `x` forgets a deleted project, and `d` or `I` dispatches each one's next task, or `project:ci` from the `Failing CI` list. `P` in a project view dispatches a prompt you type. `O` opens a project by a few letters of its name or a tag, `/` filters any list the same way and `*` marks what it keeps, `#` scopes every view and portfolio act to a tag, `v` reads a run's diff in your pager, `E` opens the project in `$EDITOR` and `S` a shell in it, in herdr when integrated, for a fix by hand.
 
 - A view of each project: its state and why, CI, dependencies, local changes, open tasks and every run, with how old the scan behind it is. `pma project show <name>`, or `o` on any row.
 
@@ -199,7 +199,7 @@ pma project tier 1 alpha beta   # or `none`; untiered projects rank at default_t
 pma project export tiers.csv    # every project's tier and tags, to edit
 pma project import tiers.csv --apply   # read them back
 pma project tag add rust myproject     # private groups; --tag <t> elsewhere
-pma project forget gone         # an absent project's record
+pma project forget gone         # a deleted project's record; `x` on the projects tab
 pma project clone --tag work    # check out absent projects again; --apply to do it
 pma scan                        # TODO.md, git state, CI via gh
 pma scan --offline myproject    # one project, without GitHub

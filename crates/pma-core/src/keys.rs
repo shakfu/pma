@@ -121,6 +121,8 @@ pub enum Act {
     Shell,
     /// Rejects a run and leaves the clone's files as they are.
     ForgetRun,
+    /// Deletes the record of a project whose checkout is gone.
+    ForgetProject,
     /// Resumes the selected instance.
     ResumeWorkflow,
     /// Starts an instance from a typed `<workflow> <target> [flags]`.
@@ -176,7 +178,7 @@ pub enum Act {
 }
 
 impl Act {
-    pub const ALL: [Act; 53] = [
+    pub const ALL: [Act; 54] = [
         Act::ApproveRun,
         Act::ApproveRuns,
         Act::RejectRun,
@@ -230,6 +232,7 @@ impl Act {
         Act::Prune,
         Act::Prompt,
         Act::ForgetRun,
+        Act::ForgetProject,
     ];
 
     /// Whether the act settles a run a reviewer has open, so the next one to
@@ -299,6 +302,7 @@ impl Act {
             | Act::RemoveAgent
             | Act::RemovePreset
             | Act::RemoveCampaign
+            | Act::ForgetProject
             | Act::Prune => "danger",
             _ => "default",
         }
@@ -363,6 +367,7 @@ impl Act {
             Action::ProposeRoute { .. } => &[Act::ProposeRoute],
             Action::AddCampaign { .. } => &[Act::AddCampaign],
             Action::RemoveCampaign { .. } => &[Act::RemoveCampaign],
+            Action::ForgetProject { .. } => &[Act::ForgetProject],
             Action::SetTier { .. } | Action::Tag { .. } => &[Act::Configure],
             Action::Prune { .. } | Action::FixTodo { .. } => &[Act::Prune],
             Action::RefreshDeps { .. } => &[Act::ScanProject],
@@ -685,6 +690,14 @@ pub const BINDINGS: &[Binding] = &[
         Ask::Confirm,
         "close, leave files",
     ),
+    // `api::forgettable` refuses a project still on disk.
+    on(
+        "x",
+        &[Tab::Projects],
+        Act::ForgetProject,
+        Ask::Confirm,
+        "forget deleted project",
+    ),
     // A job. `a` and `s` are a run's keys too: a key means one thing for
     // the row it is pressed on, and `lookup` tells them apart by the row.
     on("a", JOBS, Act::ApproveJob, Ask::Nothing, "approve plan"),
@@ -922,6 +935,7 @@ mod tests {
             Pick::Project {
                 project: "p".into(),
                 target: Some("p:ci".into()),
+                gone: true,
             },
             Pick::Run {
                 id: 1,

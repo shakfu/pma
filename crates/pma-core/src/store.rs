@@ -1979,8 +1979,8 @@ impl Store {
     /// but its runs, whose worktrees may still exist and which the design
     /// keeps beyond a project's removal. Caller checks that nothing holds it
     /// back.
-    pub fn forget_project(&mut self, name: &str) -> Result<()> {
-        let tx = self.conn.transaction()?;
+    pub fn forget_project(&self, name: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
         for sql in [
             "DELETE FROM project_tags WHERE project = ?1",
             "DELETE FROM campaign_members WHERE project = ?1",

@@ -2086,10 +2086,12 @@ fn same_task(a: &Pick, b: &Pick) -> bool {
             Pick::Project {
                 project: x,
                 target: s,
+                ..
             },
             Pick::Project {
                 project: y,
                 target: t,
+                ..
             },
         ) => x == y && s == t,
         (Pick::Run { id: x, .. }, Pick::Run { id: y, .. }) => x == y,

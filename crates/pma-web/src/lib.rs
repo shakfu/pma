@@ -552,8 +552,12 @@ fn pick_json(p: &Pick) -> Value {
         Pick::Projects { names, targets } => {
             json!({ "kind": "projects", "names": names, "targets": targets })
         }
-        Pick::Project { project, target } => {
-            json!({ "kind": "project", "project": project, "target": target })
+        Pick::Project {
+            project,
+            target,
+            gone,
+        } => {
+            json!({ "kind": "project", "project": project, "target": target, "gone": gone })
         }
         Pick::Runs { ids } => json!({ "kind": "runs", "ids": ids }),
         Pick::Manual { project } => json!({ "kind": "manual", "project": project }),
@@ -638,6 +642,7 @@ fn pick_from(v: &Value) -> Option<Pick> {
         "project" => Pick::Project {
             project: s("project")?,
             target: s("target"),
+            gone: b("gone").unwrap_or(false),
         },
         "manual" => Pick::Manual {
             project: s("project")?,

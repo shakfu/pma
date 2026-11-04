@@ -8,7 +8,7 @@ sanduk-rs is the Rust rewrite of sanduk, published as three crates. Its CLI take
 
 2026-09-29: `pma` and `sanduk` stay two executables. `pma` does not link the `sanduk` crate; the `sanduk` worker runs the `sanduk` binary on `PATH`. Section 3 records the prototype and what it cost. Section 1, `sanduk-sandbox` for `verify`, is not covered by this decision.
 
-2026-11-04, later: superseded. pma copies sanduk-rs's library into `crates/pma-box` and maintains it apart from sanduk-rs: [pma-box.md](pma-box.md).
+2026-11-05: the 2026-09-29 decision holds again. `crates/pma-box`, a copy of sanduk-rs's library, was added on 2026-11-04 and removed before anything called it: [pma-box.md](pma-box.md). sanduk-rs's `sanduk` package is the binary the worker runs; the library is `sanduk-core`. Step 5 below holds, and `run --clone` is a flag on the worker.
 
 2026-11-04: under review. sanduk-rs is to become a library with an illustrative CLI, with pma as its main consumer: [refactor-as-library.md](https://github.com/shakfu/sanduk-rs/blob/main/docs/dev/refactor-as-library.md) in sanduk-rs. Section 3's blockers are its requirements. If it lands, step 5 below no longer holds. `run --clone` would then be an opt-in on the `sanduk` worker, off by default, so a dispatch still edits the user's own clone unless the option is set.
 
@@ -123,7 +123,7 @@ This gets stage (b) without tokio in `pma`. The toolchain images stay the real c
 
 `--kill-test` SIGKILLs `pma` while the agent's container runs. `pma`'s watchdog then SIGKILLs its process group, `sanduk` included, which runs no teardown; the engine's CLI is in a group of its own. With sanduk 0.1.0 the container kept running with the worktree mounted until a later `sanduk run` swept it. The key was not exposed: it lives in the relay, which died with `sanduk`.
 
-Fixed in sanduk-rs (Unreleased): each run starts `sanduk reap` in its own process group, blocked on a pipe the run holds. The pipe closing, at teardown or at death, deletes what the run's record still names. The kill test passes against that build. Not covered: the reaper dying too (reboot, OOM), which the next run's sweep still handles. Until a release carries the fix, `cargo install sanduk` installs a version that leaks.
+Fixed in sanduk 0.2.0 (2026-11-04): each run starts a reaper (`sh` and the engine's CLI) in its own process group, blocked on a pipe the run holds. The pipe closing, at teardown or at death, deletes what the run's record still names. The kill test passes against that build. Not covered: the reaper dying too (reboot, OOM), which the next run's sweep still handles. The kill test has not been rerun against the published 0.2.0.
 
 ## Order
 

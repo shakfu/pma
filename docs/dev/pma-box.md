@@ -1,6 +1,6 @@
 # pma-box: sanduk's library, copied into pma
 
-Decision record, 2026-11-04. Supersedes the decision in [sanduk-integration.md](sanduk-integration.md).
+Decision record, 2026-11-04. Reverted 2026-11-05: the crate was removed before anything called it, and pma runs the `sanduk` binary again ([sanduk-integration.md](sanduk-integration.md)). The copy is at commit `1af4a80`. Its divergence from sanduk was dependencies only (see "Changes since the copy"), so no pma-specific relay policy was lost.
 
 ## Decision
 

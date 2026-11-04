@@ -18,6 +18,8 @@ Upgrading from 0.10:
 
 - **`:` command line** in the TUI and web. It runs any key's command by name (`:dispatch`, `:history`, `:approve-run`). `Tab` completes the name to the longest shared prefix, then cycles the matches. An argument replaces the command's prompt or list: `:add-note text`, `:project audio`, `:run review --push`. Danger acts still ask for confirmation. Names come from the shared key table (`keys::Command::name`), so the two front ends offer the same commands. A full name never resolves as a prefix of another: `:approve-run` with no run selected is refused, not read as `approve-runs`.
 
+  Up and Down recall earlier `:` lines that begin with the typed text, as vim's history does; 50 are kept per session, in memory. The bottom line takes readline's `C-a`, `C-e`, and the kills `C-w`, `C-u` and `C-k`, with no kill ring, in both front ends. Outside macOS, browsers keep `C-w` to close the tab. The TUI also moves by word with `M-b`/`M-f`, Alt or Ctrl plus an arrow; the web uses the browser's native word motion. The TUI now names Ctrl and Alt keys (`C-a`), where it dropped the modifier and typed the letter.
+
 - `x` on the projects tab forgets a project whose checkout is deleted, as `pma project forget` does.
 
 - A `json:` parser takes the error field's message as the summary when the reply field is empty, as it is in a failed run of minima, hax or myra.
@@ -31,6 +33,10 @@ Upgrading from 0.10:
 - With no project above tier 5, the matrix shows one line saying how to set a tier. Tier 5 makes no task important, so its four quadrants were one list.
 
 - An empty list in the web takes one line, as in the TUI.
+
+- The projects tab shows `Failing CI` only while a workflow fails. Empty, it took three rows from the table and said what the `ci` column already shows.
+
+- The `:` and `/` lines carry no hint; the web keeps it in the line's accessible name. The TUI's `selected` strip shows its title in the accent colour and its values in plain text, where it muted both.
 
 ### Fixed
 

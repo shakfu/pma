@@ -1607,41 +1607,40 @@ pub fn screen(view: View) -> Screen {
                     });
                 }
             }
-            panes(
-                Tab::Projects,
-                Some(header),
-                vec![
-                    Pane {
-                        title: "Projects, worst first".into(),
-                        columns: vec![
-                            col("project", Kind::Text),
-                            col("tier", Kind::Text),
-                            col("tags", Kind::Text),
-                            col("state", Kind::Badge),
-                            col("open", Kind::Number),
-                            col("idle", Kind::Number),
-                            col("ci", Kind::Badge),
-                            col("deps", Kind::Number),
-                            col("local", Kind::Text),
-                            col("todo", Kind::Text),
-                            col("next for an agent", Kind::Wide),
-                        ],
-                        items,
-                        empty: "No tiered project. `pma project tier <1-5> <project>` ranks one.",
-                    },
-                    Pane {
-                        title: "Failing CI".into(),
-                        columns: vec![
-                            col("project", Kind::Text),
-                            col("workflow", Kind::Badge),
-                            col("failing", Kind::Text),
-                            col("run", Kind::Wide),
-                        ],
-                        items: failing,
-                        empty: "No workflow fails on a default branch.",
-                    },
+            let mut lists = vec![Pane {
+                title: "Projects, worst first".into(),
+                columns: vec![
+                    col("project", Kind::Text),
+                    col("tier", Kind::Text),
+                    col("tags", Kind::Text),
+                    col("state", Kind::Badge),
+                    col("open", Kind::Number),
+                    col("idle", Kind::Number),
+                    col("ci", Kind::Badge),
+                    col("deps", Kind::Number),
+                    col("local", Kind::Text),
+                    col("todo", Kind::Text),
+                    col("next for an agent", Kind::Wide),
                 ],
-            )
+                items,
+                empty: "No tiered project. `pma project tier <1-5> <project>` ranks one.",
+            }];
+            // Shown only when a workflow fails: the `ci` column already says
+            // when none does, and an empty pane cost three rows of the table.
+            if !failing.is_empty() {
+                lists.push(Pane {
+                    title: "Failing CI".into(),
+                    columns: vec![
+                        col("project", Kind::Text),
+                        col("workflow", Kind::Badge),
+                        col("failing", Kind::Text),
+                        col("run", Kind::Wide),
+                    ],
+                    items: failing,
+                    empty: "",
+                });
+            }
+            panes(Tab::Projects, Some(header), lists)
         }
         View::Stale {
             header,

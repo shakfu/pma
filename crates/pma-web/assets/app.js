@@ -1159,7 +1159,10 @@ function onKey(e) {
 const ALIASES = { q: "quit", h: "help" };
 // `lead`: `:` for a command, `/` for the tab's filter, `>` for an act's
 // text. `answer` settles the text's promise: the line, or null.
-const C = { names: [], at: -1, lead: ":", answer: null };
+// `recall`: the history entry Up put in the line, and the text typed before.
+const C = { names: [], at: -1, lead: ":", answer: null, recall: null };
+// `:` lines run this page, oldest first, each once; as the TUI's.
+const HISTORY = [];
 
 // The commands `:` offers here, by name, one binding each; a row act that
 // does not fit the row is left out. As pma_core::keys::commands.
@@ -1201,8 +1204,8 @@ function drawNames() {
 }
 
 const LINES = {
-  ":": { hint: "Tab completes, Enter runs, Esc cancels", aria: "Command; Tab completes" },
-  "/": { hint: "Up/Down move, Enter keeps, Esc clears", aria: "Filter rows" },
+  ":": { hint: "", aria: "Command; Tab completes, Up recalls" },
+  "/": { hint: "", aria: "Filter rows; Up and Down move, Enter keeps, Esc clears" },
   ">": { hint: "Enter submits, Esc cancels" },
 };
 
@@ -1213,6 +1216,7 @@ function openLine(lead = ":", label = "", input = "") {
   C.names = [];
   C.at = -1;
   C.lead = lead;
+  C.recall = null;
   drawNames();
   $("cmd-label").textContent = label;
   $("cmd-lead").textContent = lead;
@@ -1306,7 +1310,46 @@ function textKey(e) {
   }
 }
 
+// As vim's: Up and Down put the older or newer `:` lines that begin with
+// what was typed; Down past the newest gives it back.
+function recallLine(up) {
+  const input = $("cmd-input");
+  const [from, stem] = C.recall || [HISTORY.length, input.value];
+  const hit = (i) => HISTORY[i].startsWith(stem);
+  let i = from;
+  do i += up ? -1 : 1; while (i >= 0 && i < HISTORY.length && !hit(i));
+  if (i >= 0 && i < HISTORY.length) {
+    input.value = HISTORY[i];
+    C.recall = [i, stem];
+  } else if (!up) {
+    input.value = stem;
+    C.recall = null;
+  }
+  C.names = [];
+  C.at = -1;
+  drawNames();
+  input.setSelectionRange(input.value.length, input.value.length);
+}
+
 function lineKey(e) {
+  // Readline's keys, on every platform, as the TUI's: start and end of line,
+  // and kills with no kill ring. Words move natively with Alt or Ctrl and
+  // the arrows.
+  if (e.ctrlKey && !e.altKey && !e.metaKey && "aeuwk".includes(e.key) && e.key.length === 1) {
+    e.preventDefault();
+    const t = e.target;
+    const at = t.selectionStart;
+    if (e.key === "a" || e.key === "e") {
+      const to = e.key === "a" ? 0 : t.value.length;
+      return t.setSelectionRange(to, to);
+    }
+    // C-w: back to a space, past the spaces before the cursor.
+    const from = { u: 0, k: at, w: t.value.slice(0, at).search(/\S*\s*$/) }[e.key];
+    t.setRangeText("", from, e.key === "k" ? t.value.length : at, "end");
+    // As typing would: the filter narrows again, recall starts afresh.
+    t.dispatchEvent(new Event("input"));
+    return;
+  }
   if (C.lead === "/") return filterKey(e);
   if (C.lead === ">") return textKey(e);
   const input = $("cmd-input");
@@ -1316,11 +1359,18 @@ function lineKey(e) {
   } else if (e.key === "Tab") {
     e.preventDefault();
     completeLine(e.shiftKey);
+  } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+    e.preventDefault();
+    recallLine(e.key === "ArrowUp");
   } else if (e.key === "Enter") {
     e.preventDefault();
     const line = input.value;
     closeLine();
     if (!line.trim()) return;
+    const was = HISTORY.indexOf(line);
+    if (was >= 0) HISTORY.splice(was, 1);
+    HISTORY.push(line);
+    if (HISTORY.length > 50) HISTORY.shift();
     let got;
     try { got = resolveLine(line); } catch (err) { toast(err.message, "warn"); return; }
     run(got.b, ":", got.arg);
@@ -1364,6 +1414,7 @@ async function start() {
       return draw();
     }
     if (C.lead !== ":") return;
+    C.recall = null;
     C.names = [];
     C.at = -1;
     drawNames();

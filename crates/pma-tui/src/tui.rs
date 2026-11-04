@@ -114,11 +114,13 @@ enum Mode {
     /// Typing the tab's filter; Enter keeps it, Escape clears it.
     Filter,
     /// A `:` line: a command by name, and its argument. `names` are what
-    /// Tab offered, and `at` the one it put in the line.
+    /// Tab offered, and `at` the one it put in the line. `recall`: the
+    /// history entry Up put in the line, and the text typed before it.
     Command {
         input: String,
         names: Vec<String>,
         at: Option<usize>,
+        recall: Option<(usize, String)>,
     },
     /// Rows to check or uncheck for an act, such as a bundle's items before
     /// its approval.
@@ -202,6 +204,8 @@ pub struct App {
     /// The cursor, in chars, in the line being typed: a prompt's, the
     /// filter's or a command's. Past the end means at the end.
     caret: usize,
+    /// `:` lines run this session, oldest first, each once.
+    history: Vec<String>,
     status: Option<(String, Tone)>,
     /// Runs and jobs the footer names, oldest first; Enter opens the first.
     notices: Vec<api::Transition>,
@@ -247,6 +251,7 @@ impl App {
             scope: Vec::new(),
             mode: Mode::Normal,
             caret: 0,
+            history: Vec::new(),
             status: None,
             notices: Vec::new(),
             marks: Vec::new(),
@@ -810,10 +815,40 @@ impl App {
     fn line_key(&mut self, key: &str) -> Option<Request> {
         let pick = self.pick().0;
         let tab = self.tab;
-        let Mode::Command { input, names, at } = &mut self.mode else {
+        let Mode::Command {
+            input,
+            names,
+            at,
+            recall,
+        } = &mut self.mode
+        else {
             unreachable!("on a command line");
         };
+        // Any key but Up and Down keeps the line as it now is.
+        if !matches!(key, "ArrowUp" | "ArrowDown") {
+            *recall = None;
+        }
         match key {
+            // As vim's: the older or newer lines that begin with what was typed.
+            "ArrowUp" | "ArrowDown" => {
+                let (from, stem) = recall.take().unwrap_or((self.history.len(), input.clone()));
+                let hit = |i: &usize| self.history[*i].starts_with(&stem);
+                let next = match key {
+                    "ArrowUp" => (0..from).rev().find(hit),
+                    _ => (from + 1..self.history.len()).find(hit),
+                };
+                match next {
+                    Some(i) => {
+                        *input = self.history[i].clone();
+                        *recall = Some((i, stem));
+                    }
+                    None if key == "ArrowDown" => *input = stem,
+                    None => *recall = (from < self.history.len()).then_some((from, stem)),
+                }
+                names.clear();
+                *at = None;
+                self.caret = usize::MAX;
+            }
             "Escape" => self.mode = Mode::Normal,
             // As in vim: deleting past the colon leaves the line.
             "Backspace" if input.is_empty() => self.mode = Mode::Normal,
@@ -859,6 +894,11 @@ impl App {
                 };
                 if input.trim().is_empty() {
                     return None;
+                }
+                self.history.retain(|h| *h != input);
+                self.history.push(input.clone());
+                if self.history.len() > HISTORY {
+                    self.history.remove(0);
                 }
                 return match keys::resolve(&input, tab, &pick) {
                     Ok((b, arg)) => {
@@ -1046,6 +1086,7 @@ impl App {
                     input: String::new(),
                     names: Vec::new(),
                     at: None,
+                    recall: None,
                 };
             }
             Command::Mark => {
@@ -1431,7 +1472,7 @@ impl App {
     fn foot(&self, width: u16) -> Vec<Line<'static>> {
         let p = self.palette;
         let caret = self.caret;
-        let typed = |lead: &str, text: &str, hint: &str| {
+        let typed = |lead: &str, text: &str| {
             // Past the width, the part around the cursor shows.
             let chars: Vec<char> = text.chars().collect();
             let at = caret.min(chars.len());
@@ -1443,14 +1484,15 @@ impl App {
                 p.accent().add_modifier(Modifier::BOLD),
             )];
             spans.extend(caret_spans(shown, Some(at - skip)));
-            spans.push(Span::styled(format!("   {hint}"), p.muted()));
             Line::from(spans)
         };
         let (input, names, at) = match &self.mode {
-            Mode::Command { input, names, at } => (input, names, at),
+            Mode::Command {
+                input, names, at, ..
+            } => (input, names, at),
             Mode::Filter => {
                 let text = self.filter[index(self.tab)].as_deref().unwrap_or("");
-                return vec![typed("/", text, "Up/Down move, Enter keeps, Esc clears")];
+                return vec![typed("/", text)];
             }
             Mode::Prompt { label, input, .. } => {
                 let mut lines = fold(
@@ -1478,7 +1520,7 @@ impl App {
             }
             lines.extend(fold(Line::from(spans), width));
         }
-        lines.push(typed(":", input, "Tab completes, Enter runs, Esc cancels"));
+        lines.push(typed(":", input));
         lines
     }
 
@@ -1794,7 +1836,10 @@ impl App {
         let block = Block::new()
             .borders(Borders::TOP)
             .border_style(p.muted())
-            .title(Span::styled(" selected ", p.muted()));
+            .title(Span::styled(
+                " selected ",
+                p.accent().add_modifier(Modifier::BOLD),
+            ));
         let row = panes.get(self.pane[t]).and_then(|pane| {
             let i = self.selected[t].get(self.pane[t])?.selected()?;
             Some((pane, pane.items.get(i)?))
@@ -1814,7 +1859,12 @@ impl App {
                         continue;
                     }
                     spans.push(Span::styled(format!("{} ", col.title), p.muted()));
-                    spans.push(Span::styled(c.text.clone(), p.tone(c.tone)));
+                    // In full and to be read: a cell the table mutes is plain.
+                    let tone = match c.tone {
+                        Tone::Muted => Tone::Plain,
+                        t => t,
+                    };
+                    spans.push(Span::styled(c.text.clone(), p.tone(tone)));
                     spans.push(Span::raw("   "));
                 }
                 Line::from(spans)
@@ -2305,8 +2355,27 @@ fn edit(text: &mut String, caret: &mut usize, key: &str) -> bool {
     match key {
         "ArrowLeft" => *caret = caret.saturating_sub(1),
         "ArrowRight" => *caret = (*caret + 1).min(n),
-        "Home" => *caret = 0,
-        "End" => *caret = n,
+        "Home" | "C-a" => *caret = 0,
+        "End" | "C-e" => *caret = n,
+        // Words as readline's: runs of letters and digits.
+        "M-b" | "M-ArrowLeft" | "C-ArrowLeft" => {
+            let chars: Vec<char> = text.chars().collect();
+            while *caret > 0 && !chars[*caret - 1].is_alphanumeric() {
+                *caret -= 1;
+            }
+            while *caret > 0 && chars[*caret - 1].is_alphanumeric() {
+                *caret -= 1;
+            }
+        }
+        "M-f" | "M-ArrowRight" | "C-ArrowRight" => {
+            let chars: Vec<char> = text.chars().collect();
+            while *caret < n && !chars[*caret].is_alphanumeric() {
+                *caret += 1;
+            }
+            while *caret < n && chars[*caret].is_alphanumeric() {
+                *caret += 1;
+            }
+        }
         "Backspace" if *caret > 0 => {
             text.remove(byte(text, *caret - 1));
             *caret -= 1;
@@ -2315,6 +2384,25 @@ fn edit(text: &mut String, caret: &mut usize, key: &str) -> bool {
             text.remove(byte(text, *caret));
         }
         "Backspace" | "Delete" => {}
+        // Readline's kills, with no kill ring: C-w back to a space, C-u to
+        // the start, C-k to the end.
+        "C-w" => {
+            let chars: Vec<char> = text.chars().collect();
+            let mut from = *caret;
+            while from > 0 && chars[from - 1].is_whitespace() {
+                from -= 1;
+            }
+            while from > 0 && !chars[from - 1].is_whitespace() {
+                from -= 1;
+            }
+            text.replace_range(byte(text, from)..byte(text, *caret), "");
+            *caret = from;
+        }
+        "C-u" => {
+            text.replace_range(..byte(text, *caret), "");
+            *caret = 0;
+        }
+        "C-k" => text.truncate(byte(text, *caret)),
         k if k.chars().count() == 1 => {
             text.insert_str(byte(text, *caret), k);
             *caret += 1;
@@ -2323,6 +2411,9 @@ fn edit(text: &mut String, caret: &mut usize, key: &str) -> bool {
     }
     true
 }
+
+/// The most `:` lines kept, as vim's `history` default.
+const HISTORY: usize = 50;
 
 /// The most rows a prompt's text grows to; past them, its end shows.
 const PROMPT_ROWS: usize = 8;
@@ -2394,8 +2485,8 @@ fn common_prefix(names: &[String]) -> String {
     first[..end].to_string()
 }
 
-pub fn key_name(code: KeyCode) -> Option<String> {
-    Some(match code {
+pub fn key_name(code: KeyCode, mods: KeyModifiers) -> Option<String> {
+    let name = match code {
         KeyCode::Char(c) => c.to_string(),
         KeyCode::Enter => "Enter".into(),
         KeyCode::Esc => "Escape".into(),
@@ -2412,7 +2503,19 @@ pub fn key_name(code: KeyCode) -> Option<String> {
         KeyCode::PageUp => "PageUp".into(),
         KeyCode::PageDown => "PageDown".into(),
         _ => return None,
-    })
+    };
+    // Shift is in the character itself; Ctrl and Alt are named, as readline
+    // writes them, so `C-a` never types an `a`.
+    Some(
+        match (
+            mods.contains(KeyModifiers::CONTROL),
+            mods.contains(KeyModifiers::ALT),
+        ) {
+            (true, _) => format!("C-{name}"),
+            (false, true) => format!("M-{name}"),
+            _ => name,
+        },
+    )
 }
 
 /// A table's gap between columns, and the width of its `> ` cursor.
@@ -2682,7 +2785,7 @@ pub fn run(store: &Store) -> Result<()> {
             if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
                 return Ok(());
             }
-            let Some(name) = key_name(k.code) else {
+            let Some(name) = key_name(k.code, k.modifiers) else {
                 continue;
             };
             let request = app.key(&name);
@@ -3487,6 +3590,7 @@ mod tests {
                     input: "edit".into(),
                     names: vec!["edit".into(), "edit-note".into()],
                     at: Some(1),
+                    recall: None,
                 },
             ];
             for mode in modes {
@@ -3521,10 +3625,83 @@ mod tests {
         keys(&mut text, &mut at, &["Home", "Backspace", "ArrowLeft"]);
         assert_eq!((text.as_str(), at), ("élXl", 0), "nothing before the start");
         assert!(!edit(&mut text, &mut at, "Tab"));
+        assert!(
+            !edit(&mut text, &mut at, "C-x"),
+            "a control key types nothing"
+        );
+        // Readline's keys: C-a, C-e, and words back and forward.
+        let mut text = "run review --push".to_string();
+        let mut at = usize::MAX;
+        keys(&mut text, &mut at, &["M-b"]);
+        assert_eq!(at, 13, "the start of `push`");
+        keys(&mut text, &mut at, &["C-ArrowLeft", "M-ArrowLeft"]);
+        assert_eq!(at, 0);
+        keys(&mut text, &mut at, &["M-f", "C-ArrowRight"]);
+        assert_eq!(at, 10, "the end of `review`");
+        keys(&mut text, &mut at, &["C-a"]);
+        assert_eq!(at, 0);
+        keys(&mut text, &mut at, &["C-e"]);
+        assert_eq!(at, 17);
+        keys(&mut text, &mut at, &["C-w"]);
+        assert_eq!(
+            (text.as_str(), at),
+            ("run review ", 11),
+            "`--push` is one word"
+        );
+        keys(&mut text, &mut at, &["C-w"]);
+        assert_eq!((text.as_str(), at), ("run ", 4), "spaces before it go too");
+        let mut text = "héllo wörld".to_string();
+        let mut at = 7;
+        keys(&mut text, &mut at, &["C-k"]);
+        assert_eq!((text.as_str(), at), ("héllo w", 7));
+        keys(&mut text, &mut at, &["ArrowLeft", "C-u"]);
+        assert_eq!((text.as_str(), at), ("w", 0));
         // A long prompt shows the cursor's rows: the first, from the start.
         let rows = wrapped(Palette::from_env(), &"y".repeat(1000), 0, 20);
         assert_eq!(rows.len(), PROMPT_ROWS);
         assert_eq!(rows[0].spans[0].content, "> ");
+    }
+
+    /// Up and Down recall `:` lines, newest first, as vim's: only those that
+    /// begin with what was typed, and Down past the newest gives it back.
+    #[test]
+    fn a_command_line_recalls_its_history() {
+        let mut app = App::new();
+        app.loaded(Ok(next_view()));
+        let line = |app: &App| match &app.mode {
+            Mode::Command { input, .. } => input.clone(),
+            m => panic!("not on a line: {m:?}"),
+        };
+        for l in ["help", "scope rust", "help", "scope audio"] {
+            app.key(":");
+            typed(&mut app, l);
+            app.key("Enter");
+            app.mode = Mode::Normal;
+        }
+        app.key(":");
+        app.key("ArrowUp");
+        assert_eq!(line(&app), "scope audio");
+        app.key("ArrowUp");
+        assert_eq!(line(&app), "help", "a repeat is kept once, at its latest");
+        app.key("ArrowUp");
+        app.key("ArrowUp");
+        assert_eq!(line(&app), "scope rust", "the oldest stays");
+        app.key("ArrowDown");
+        app.key("ArrowDown");
+        app.key("ArrowDown");
+        assert_eq!(line(&app), "", "past the newest: what was typed");
+        typed(&mut app, "sc");
+        app.key("ArrowUp");
+        app.key("ArrowUp");
+        assert_eq!(line(&app), "scope rust", "only lines that begin `sc`");
+        app.key("C-a");
+        typed(&mut app, "x");
+        app.key("ArrowUp");
+        assert_eq!(
+            line(&app),
+            "xscope rust",
+            "an edit starts the search afresh"
+        );
     }
 
     /// Left and Right move the cursor in a prompt, the filter and a command,
@@ -3861,10 +4038,27 @@ mod tests {
 
     #[test]
     fn terminal_keys_take_the_table_names() {
-        assert_eq!(key_name(KeyCode::Esc).as_deref(), Some("Escape"));
-        assert_eq!(key_name(KeyCode::Down).as_deref(), Some("ArrowDown"));
-        assert_eq!(key_name(KeyCode::Char('G')).as_deref(), Some("G"));
-        assert_eq!(key_name(KeyCode::BackTab).as_deref(), Some("BackTab"));
+        assert_eq!(
+            key_name(KeyCode::Esc, KeyModifiers::NONE).as_deref(),
+            Some("Escape")
+        );
+        assert_eq!(
+            key_name(KeyCode::Down, KeyModifiers::NONE).as_deref(),
+            Some("ArrowDown")
+        );
+        assert_eq!(
+            key_name(KeyCode::Char('G'), KeyModifiers::NONE).as_deref(),
+            Some("G")
+        );
+        assert_eq!(
+            key_name(KeyCode::BackTab, KeyModifiers::NONE).as_deref(),
+            Some("BackTab")
+        );
+        let named = |c, m| key_name(c, m).unwrap();
+        assert_eq!(named(KeyCode::Char('a'), KeyModifiers::CONTROL), "C-a");
+        assert_eq!(named(KeyCode::Char('b'), KeyModifiers::ALT), "M-b");
+        assert_eq!(named(KeyCode::Left, KeyModifiers::ALT), "M-ArrowLeft");
+        assert_eq!(named(KeyCode::Char('G'), KeyModifiers::SHIFT), "G");
         for b in keys::BINDINGS {
             assert!(
                 b.key.chars().count() == 1
@@ -3935,8 +4129,8 @@ mod tests {
         let text = screen_text(&mut app);
         assert!(text.contains("1 of 12 /t12"));
         assert!(
-            text.lines().last().unwrap().starts_with("/t12"),
-            "typed on the bottom line, as in vim: {text}"
+            text.lines().last().unwrap().trim_end() == "/t12",
+            "typed on the bottom line, as in vim, with no hint: {text}"
         );
         app.key("Enter");
         assert_eq!(app.mode, Mode::Normal);

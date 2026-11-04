@@ -2737,6 +2737,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The projects tab lists failing CI only while a workflow fails.
+    #[test]
+    fn failing_ci_shows_only_when_a_workflow_fails() {
+        let dir = std::env::temp_dir().join(format!("pma-ci-pane-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = Store::open(&dir.join("p.db")).unwrap();
+        let mut facts = crate::scan::Facts {
+            name: "a".into(),
+            path: dir.clone(),
+            slug: None,
+            todo: None,
+            todo_unread: false,
+            dirty: 0,
+            pma_branches: vec![],
+            ahead: None,
+            last_activity: None,
+            ci: crate::scan::Ci::Passing,
+            ci_runs: vec![],
+            lock_at: None,
+            deps: None,
+            faults: vec![],
+            ci_read: true,
+            held: false,
+            stamp: String::new(),
+        };
+        let titles = |store: &Store| {
+            let q = Query::Status {
+                of: Selection::default(),
+                explain: false,
+                all: true,
+            };
+            match crate::screen::screen(query(store, q).unwrap()).body {
+                crate::screen::Body::Panes(p) => p.into_iter().map(|p| p.title).collect::<Vec<_>>(),
+                b => panic!("{b:?}"),
+            }
+        };
+        store.save_scan(&[facts.clone()], true, 1000).unwrap();
+        assert_eq!(titles(&store), ["Projects, worst first"]);
+        facts.ci = crate::scan::Ci::Failing(vec!["test".into()]);
+        store.save_scan(&[facts], true, 2000).unwrap();
+        assert_eq!(titles(&store), ["Projects, worst first", "Failing CI"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A watch sees a commit by another connection, and names the runs that
     /// reached review or left it; what it saw first is not news.
     #[test]

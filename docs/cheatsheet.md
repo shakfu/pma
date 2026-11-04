@@ -169,7 +169,7 @@ pma workflow run review-fix alpha --local --unattended --detach
 
 All typing happens on the bottom line, as in vim: `:` a command, `/` the list filter, `>` the text an act asks for.
 
-Type a command by name after `:`; `Tab` completes it, then cycles the matches. An argument takes the place of the prompt: `:add-note buy milk`, `:project audio`, `:scope rust`, `:filter ci`, `:run review --push`. A unique prefix runs (`:hist`); `:q` quits. Only commands that apply to the selected row are offered.
+Type a command by name after `:`; `Tab` completes it, then cycles the matches. An argument takes the place of the prompt: `:add-note buy milk`, `:project audio`, `:scope rust`, `:filter ci`, `:run review --push`. A unique prefix runs (`:hist`); `:q` quits. Only commands that apply to the selected row are offered. `Up`/`Down` recall earlier lines that begin with what is typed. The bottom line takes `C-a`, `C-e`, `C-w`, `C-u`, `C-k`, and word motion with Alt or Ctrl plus an arrow.
 
 ## Where things are
 

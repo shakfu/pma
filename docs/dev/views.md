@@ -70,6 +70,7 @@ Purpose: every project, worst state first; where a project is opened from.
   run link. `d` or `I` dispatches `project:ci`. 13 of 43 jobs name a `:ci`
   target, so this pane is a main source of dispatches. The `ci` column of the
   pane above shows the same fact without the workflow name or the target.
+  Shown only while a workflow fails (2026-11-04).
 - **Changed at the last scan.** What the latest scan found new, gone, failing,
   mended, opened or closed. It shows what moved since you last looked, which
   the worst-first order does not. The same data is `pma history last`.

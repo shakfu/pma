@@ -8,6 +8,8 @@ sanduk-rs is the Rust rewrite of sanduk, published as three crates. Its CLI take
 
 2026-09-29: `pma` and `sanduk` stay two executables. `pma` does not link the `sanduk` crate; the `sanduk` worker runs the `sanduk` binary on `PATH`. Section 3 records the prototype and what it cost. Section 1, `sanduk-sandbox` for `verify`, is not covered by this decision.
 
+2026-11-04: under review. sanduk-rs is to become a library with an illustrative CLI, with pma as its main consumer: [refactor-as-library.md](https://github.com/shakfu/sanduk-rs/blob/main/docs/dev/refactor-as-library.md) in sanduk-rs. Section 3's blockers are its requirements. If it lands, step 5 below no longer holds. `run --clone` would then be an opt-in on the `sanduk` worker, off by default, so a dispatch still edits the user's own clone unless the option is set.
+
 ## What each crate offers `pma`
 
 | Crate | Adds to `pma`'s build | What `pma` gains |

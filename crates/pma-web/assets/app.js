@@ -573,27 +573,12 @@ function drawToolbar(toolbar) {
     });
   }
   for (const b of acts(false).filter((b) => b.tabs.length)) toolbar.append(button(b));
-  // The tab's filter, while one is typed or kept; Escape in it clears it.
-  if (S.tfilter[S.tab] !== undefined) {
-    toolbar.append(el("input", {
-      id: "table-filter",
-      class: "filter",
-      type: "search",
-      value: S.tfilter[S.tab],
-      placeholder: "Filter rows",
-      "aria-label": "Filter rows",
-      oninput: (e) => {
-        S.tfilter[S.tab] = e.target.value;
-        draw();
-        const again = $("table-filter");
-        again.focus();
-        again.setSelectionRange(again.value.length, again.value.length);
-      },
-      onkeydown: (e) => {
-        if (e.key === "Escape") { delete S.tfilter[S.tab]; draw(); }
-        if (e.key === "Enter") { if (!e.target.value) delete S.tfilter[S.tab]; e.target.blur(); draw(); }
-      },
-    }));
+  // A kept filter: typed in the bar at the bottom, shown here.
+  const kept = S.tfilter[S.tab];
+  if (kept) {
+    toolbar.append(el("span", { class: "filter-chip" },
+      el("button", { class: "link", type: "button", "aria-label": `Filter rows: ${kept}; edit`, onclick: () => openLine("/") }, `/${kept}`),
+      el("button", { class: "link", type: "button", "aria-label": "Clear filter", onclick: () => { delete S.tfilter[S.tab]; draw(); } }, "clear")));
   }
   if (S.marks.length) {
     const dispatch = acts(true).find((b) => b.command.act === "Dispatch");
@@ -893,18 +878,16 @@ function checklist(items, name) {
   return box;
 }
 
-// One dialog serves a question, a prompt and a list. Resolves to the input's
-// value, what `read` gives, true for OK, or null when cancelled.
-function dialog({ title, text, field, input, ok, okClass, cancel, read }) {
+// One dialog serves a question and a list; text is typed on the bottom line
+// (`askLine`). Resolves to what `read` gives, true for OK, or null when
+// cancelled.
+function dialog({ title, text, ok, okClass, cancel, read }) {
   const d = $("dialog");
   $("dialog-title").textContent = title;
   const t = $("dialog-text");
   t.replaceChildren();
   if (text instanceof Node) t.append(text);
   else if (text) t.textContent = text;
-  $("dialog-label").classList.toggle("hidden", field === undefined);
-  $("dialog-label-text").textContent = field || "";
-  $("dialog-input").value = input || "";
   $("dialog-cancel").classList.toggle("hidden", !cancel);
   const okb = $("dialog-ok");
   okb.textContent = ok || "OK";
@@ -912,14 +895,13 @@ function dialog({ title, text, field, input, ok, okClass, cancel, read }) {
   d.returnValue = "";
   d.showModal();
   const search = t.querySelector("input[type=search]");
-  if (field !== undefined) $("dialog-input").focus();
-  else if (search) search.focus();
+  if (search) search.focus();
   else okb.focus();
   return new Promise((resolve) => {
     d.addEventListener("close", () => {
       if (d.returnValue !== "ok") return resolve(null);
       if (read) return resolve(read());
-      resolve(field === undefined ? true : $("dialog-input").value);
+      resolve(true);
     }, { once: true });
   });
 }
@@ -950,17 +932,29 @@ function shortcuts() {
 
 // ---------------------------------------------------------------- acting
 
-async function act(b) {
+// `typed`: the input given on a `:` line, in place of the prompt or list.
+async function act(b, typed = "") {
   const name = b.command.act;
+  if (typed && !["text", "choose"].includes(b.ask.kind)) {
+    toast(`\`${b.name}\` takes no argument.`, "warn");
+    return;
+  }
   const overMarks = runsMarked() ? name === "ForgetRun"
     : MARK_ACTS.includes(name) || ((name === "Run" || name === "Configure") && S.tab === "projects");
   const marked = overMarks && S.marks.length > 0 && !S.detail;
   // A decision from a run's detail: the next ready run follows it.
   let decided = S.detail && b.command.decides ? S.detail.pick.id : null;
   const pick = marked ? markedPick() : currentPick();
-  let input = "";
+  let input = typed;
   try {
-    if (b.ask.kind !== "nothing") {
+    if (typed) {
+      // A danger act is still confirmed.
+      if (b.command.weight === "danger") {
+        const asked = await api("/api/ask", { tab: S.tab, act: name, pick, project: S.project, tag: S.scope });
+        const yes = await dialog({ title: label(asked.question), ok: label(b.label), okClass: "danger", cancel: true });
+        if (!yes) return;
+      }
+    } else if (b.ask.kind !== "nothing") {
       const asked = await api("/api/ask", { tab: S.tab, act: name, pick, project: S.project, tag: S.scope });
       if (b.ask.kind === "confirm" || (b.ask.confirm && !asked.items.length)) {
         const yes = await dialog({
@@ -984,9 +978,9 @@ async function act(b) {
         if (chosen === null) return;
         input = chosen;
       } else {
-        const typed = await dialog({ title: label(b.label), field: label(b.ask.label), input: asked.input, ok: label(b.label), cancel: true });
-        if (typed === null) return;
-        input = typed;
+        const got = await askLine(`${label(b.label)}: ${label(b.ask.label)}`, asked.input);
+        if (got === null) return;
+        input = got;
       }
     }
     const pending = toast(`${label(b.label)}...`, "accent");
@@ -1010,9 +1004,15 @@ async function act(b) {
   }
 }
 
-// `via`: how the binding was reached, `key` or `click`, for the usage log.
-async function run(b, via = "key") {
+// `via`: how the binding was reached, `key`, `click` or `:`, for the usage
+// log. `arg`: what followed the command's name on a `:` line.
+async function run(b, via = "key", arg = "") {
   if (!b) return;
+  if (arg && !["Filter", "Scope", "Jump", "act"].includes(b.command.kind)) {
+    toast(`\`${b.name}\` takes no argument.`, "warn");
+    return;
+  }
+  const find = (key) => (via === ":" ? ":" : key);
   const t = S.tab;
   const p = S.pane[t] || 0;
   const sel = S.sel[t] || [];
@@ -1033,13 +1033,16 @@ async function run(b, via = "key") {
     case "First": return move(0);
     case "Last": return move(len - 1);
     case "Filter":
-      note({ ev: "find", name: "/" });
-      if (S.tfilter[t] === undefined) S.tfilter[t] = "";
-      draw();
-      $("table-filter").focus();
-      return;
+      note({ ev: "find", name: find("/") });
+      if (arg) { S.tfilter[t] = arg; break; }
+      return openLine("/");
     case "Jump": {
-      note({ ev: "find", name: "O" });
+      note({ ev: "find", name: find("O") });
+      if (arg) {
+        if (S.projects.some((pr) => pr.name === arg)) return openProject(arg, ":");
+        toast(`No project \`${arg}\`.`, "warn");
+        return;
+      }
       // Every project by name and tags, as the sidebar knows them.
       const asked = {
         options: S.projects.map((pr) => ({ name: pr.name, about: [pr.tags, pr.state].filter(Boolean).join("  ") })),
@@ -1052,7 +1055,12 @@ async function run(b, via = "key") {
     }
     case "MarkAll": return toggleAllMarks();
     case "Scope": {
-      note({ ev: "find", name: "#" });
+      note({ ev: "find", name: find("#") });
+      if (arg) {
+        S.scope = arg === "*" ? "" : arg;
+        S.marks = [];
+        return load();
+      }
       // The tags in use, and no scope at all; the choice narrows every view.
       let asked;
       try { asked = await api("/api/tags"); } catch (e) { toast(e.message, "bad"); break; }
@@ -1119,7 +1127,8 @@ async function run(b, via = "key") {
       break;
     }
     case "Mark": return toggleMark(currentPick());
-    case "act": return act(b);
+    case "Line": return openLine();
+    case "act": return act(b, arg);
   }
   draw();
 }
@@ -1142,6 +1151,180 @@ function onKey(e) {
     || (b.command.kind === "act" && S.detail.acts.includes(b.command.act)))) return;
   e.preventDefault();
   run(b);
+}
+
+// ---------------------------------------------------------------- command line
+
+// Names vim users type that a prefix alone would not settle.
+const ALIASES = { q: "quit", h: "help" };
+// `lead`: `:` for a command, `/` for the tab's filter, `>` for an act's
+// text. `answer` settles the text's promise: the line, or null.
+const C = { names: [], at: -1, lead: ":", answer: null };
+
+// The commands `:` offers here, by name, one binding each; a row act that
+// does not fit the row is left out. As pma_core::keys::commands.
+function commands() {
+  const fits = currentActs();
+  const out = new Map();
+  for (const b of onTab()) {
+    if (b.command.kind === "Line" || out.has(b.name)) continue;
+    if (b.command.kind === "act" && b.command.row && !fits.includes(b.command.act)) continue;
+    out.set(b.name, b);
+  }
+  return out;
+}
+
+// The binding a typed line names, and its argument. As
+// pma_core::keys::resolve: exact name or alias, else a unique prefix; a full
+// name is never read as the prefix of another.
+function resolveLine(line) {
+  const text = line.trim();
+  const at = text.search(/\s/);
+  const word = at < 0 ? text : text.slice(0, at);
+  const arg = at < 0 ? "" : text.slice(at).trim();
+  const offered = commands();
+  const exact = ALIASES[word] || word;
+  if (offered.has(exact)) return { b: offered.get(exact), arg };
+  if (S.keys.bindings.some((b) => b.name === exact)) throw new Error(`\`${word}\` does not apply here.`);
+  const many = [...offered.keys()].filter((n) => n.startsWith(word));
+  if (many.length === 1) return { b: offered.get(many[0]), arg };
+  if (!many.length) throw new Error(`No command \`${word}\` here.`);
+  throw new Error(`\`${word}\` could be ${many.join(", ")}.`);
+}
+
+function drawNames() {
+  $("cmd-names").replaceChildren(...C.names.map((n, i) => el("span", {
+    class: i === C.at ? "cmd-name current" : "cmd-name",
+    role: "option",
+    "aria-selected": String(i === C.at),
+  }, n)));
+}
+
+const LINES = {
+  ":": { hint: "Tab completes, Enter runs, Esc cancels", aria: "Command; Tab completes" },
+  "/": { hint: "Up/Down move, Enter keeps, Esc clears", aria: "Filter rows" },
+  ">": { hint: "Enter submits, Esc cancels" },
+};
+
+// Typed text goes in one bar at the bottom, as in vim. The filter narrows
+// the rows as it is typed, from the one already kept; an act's text starts
+// from `input`, under its `label`.
+function openLine(lead = ":", label = "", input = "") {
+  C.names = [];
+  C.at = -1;
+  C.lead = lead;
+  drawNames();
+  $("cmd-label").textContent = label;
+  $("cmd-lead").textContent = lead;
+  $("cmd-hint").textContent = LINES[lead].hint;
+  $("cmd-input").setAttribute("aria-label", LINES[lead].aria || label);
+  $("cmd-input").value = lead === "/" ? S.tfilter[S.tab] || "" : input;
+  // Only a prompt's text wraps; a command or a filter scrolls on one line.
+  $("cmd-input").setAttribute("wrap", lead === ">" ? "soft" : "off");
+  $("cmdline").classList.remove("hidden");
+  fitLine();
+  $("cmd-input").focus();
+}
+
+// The bar as tall as its text: one line, or a prompt's wrapped lines.
+function fitLine() {
+  const t = $("cmd-input");
+  t.style.height = "auto";
+  t.style.height = `${t.scrollHeight}px`;
+}
+
+// An act's text from the bottom bar: the line, or null when cancelled.
+function askLine(label, input) {
+  if (C.answer) C.answer(null);
+  return new Promise((resolve) => {
+    C.answer = resolve;
+    openLine(">", label, input);
+  });
+}
+
+// `answer`: the text an act asked for; anything but Enter cancels it.
+function closeLine(answer = null) {
+  if ($("cmdline").classList.contains("hidden")) return;
+  $("cmdline").classList.add("hidden");
+  const settle = C.answer;
+  C.answer = null;
+  if (document.activeElement === $("cmd-input")) $("cmd-input").blur();
+  if (settle) settle(answer);
+  // Leaving a filter keeps it, unless it is empty.
+  if (C.lead === "/" && !S.tfilter[S.tab]) delete S.tfilter[S.tab];
+  if (C.lead === "/") draw();
+}
+
+function filterKey(e) {
+  if (e.key === "Escape" || (e.key === "Backspace" && !e.target.value)) {
+    e.preventDefault();
+    delete S.tfilter[S.tab];
+    closeLine();
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    closeLine();
+  } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    run(lookup(e.key));
+  } else if (e.key === "Tab") {
+    e.preventDefault();
+  }
+}
+
+// Tab completes the name: to what every match shares, then through each
+// match; Shift+Tab goes back. Names only: an argument is free text.
+function completeLine(back) {
+  const input = $("cmd-input");
+  const n = C.names.length;
+  if (n) {
+    C.at = C.at < 0 ? (back ? n - 1 : 0) : (C.at + (back ? n - 1 : 1)) % n;
+    input.value = C.names[C.at];
+  } else if (!/\s/.test(input.value)) {
+    const found = [...commands().keys()].filter((k) => k.startsWith(input.value));
+    if (!found.length) toast(`No command begins \`${input.value}\` here.`, "warn");
+    else if (found.length === 1) input.value = found[0];
+    else {
+      let shared = found[0];
+      for (const f of found) while (!f.startsWith(shared)) shared = shared.slice(0, -1);
+      if (shared.length > input.value.length) input.value = shared;
+      else { C.at = 0; input.value = found[0]; }
+      C.names = found;
+    }
+  }
+  drawNames();
+}
+
+function textKey(e) {
+  if (e.key === "Escape") {
+    e.preventDefault();
+    closeLine();
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    closeLine(e.target.value);
+  } else if (e.key === "Tab") {
+    e.preventDefault();
+  }
+}
+
+function lineKey(e) {
+  if (C.lead === "/") return filterKey(e);
+  if (C.lead === ">") return textKey(e);
+  const input = $("cmd-input");
+  if (e.key === "Escape" || (e.key === "Backspace" && !input.value)) {
+    e.preventDefault();
+    closeLine();
+  } else if (e.key === "Tab") {
+    e.preventDefault();
+    completeLine(e.shiftKey);
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    const line = input.value;
+    closeLine();
+    if (!line.trim()) return;
+    let got;
+    try { got = resolveLine(line); } catch (err) { toast(err.message, "warn"); return; }
+    run(got.b, ":", got.arg);
+  }
 }
 
 function setBusy(text, cls) {
@@ -1171,6 +1354,22 @@ async function start() {
   drawNav();
   $("help-button").addEventListener("click", () => run(lookup("?")));
   document.addEventListener("keydown", onKey);
+  $("cmd-input").addEventListener("keydown", lineKey);
+  $("cmd-input").addEventListener("input", (e) => {
+    // A line holds no newline, pasted or not.
+    if (/[\r\n]/.test(e.target.value)) e.target.value = e.target.value.replace(/[\r\n]+/g, " ");
+    fitLine();
+    if (C.lead === "/") {
+      S.tfilter[S.tab] = e.target.value;
+      return draw();
+    }
+    if (C.lead !== ":") return;
+    C.names = [];
+    C.at = -1;
+    drawNames();
+  });
+  $("cmd-input").addEventListener("blur", closeLine);
+  $("cmdline").addEventListener("submit", (e) => e.preventDefault());
   // Enter in a field submits with OK. Left to the browser, the form's
   // default button is the first one, Cancel.
   $("dialog-form").addEventListener("keydown", (e) => {

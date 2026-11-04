@@ -75,9 +75,9 @@ await js(`document.querySelector(".more").open = false`);
 // The commit prompt starts from the task text; the subject typed is the commit's.
 await js(`document.activeElement && document.activeElement.blur()`);
 await key("m", "m");
-await waitFor(`document.getElementById("dialog").open`);
-check("m prompts for the subject", (await js(`document.getElementById("dialog-input").value`)) === "add greeting", await js(`document.getElementById("dialog-input").value`));
-await js(`document.getElementById("dialog-input").value = "Add the greeting"`);
+await waitFor(`!document.getElementById("cmdline").classList.contains("hidden")`);
+check("m prompts for the subject on the bottom line", (await js(`document.getElementById("cmd-input").value`)) === "add greeting", await js(`document.getElementById("cmd-input").value`));
+await js(`document.getElementById("cmd-input").value = "Add the greeting"`);
 await key("Enter", "\r");
 const committed = await waitFor(`[...document.querySelectorAll(".toast p")].some(p => p.textContent.includes("committed in its clone, push next"))`, 30000);
 check("a commit notice names the next step", committed, await toasts());

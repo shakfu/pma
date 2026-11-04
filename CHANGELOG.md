@@ -14,6 +14,10 @@ Upgrading from 0.10:
 
 - **Any agent can run interactively.** `interactive_args` in `[agents.<name>]` (`pma agent set <name> interactive-args`) holds how it starts a session a person drives; `--interactive`, `I` and `T` build from it. An explicit list over deriving it from `args`: the interactive form can change the subcommand (`codex exec` to `codex`) or the flag that takes the prompt (`opencode run <msg>` to `opencode --prompt <msg>`). `T` uses the run's agent where it has the list, else the default agent, since the change it reads is on disk.
 
+- All typed text goes on the bottom line, where `:` types commands, in the TUI and web. `/` types the filter there rather than in the pane title or a toolbar box; rows still narrow as you type, and a kept filter shows as its count in the TUI pane title and as a chip in the web toolbar. A text prompt (note, commit subject, rework feedback, project settings) shows its label above a `>` line rather than a centred dialog. Long text wraps and grows the line upward to eight rows, then scrolls; `:` and `/` stay one row, showing their end. Choosers and yes/no questions stay dialogs.
+
+- **`:` command line** in the TUI and web. It runs any key's command by name (`:dispatch`, `:history`, `:approve-run`). `Tab` completes the name to the longest shared prefix, then cycles the matches. An argument replaces the command's prompt or list: `:add-note text`, `:project audio`, `:run review --push`. Danger acts still ask for confirmation. Names come from the shared key table (`keys::Command::name`), so the two front ends offer the same commands. A full name never resolves as a prefix of another: `:approve-run` with no run selected is refused, not read as `approve-runs`.
+
 - `x` on the projects tab forgets a project whose checkout is deleted, as `pma project forget` does.
 
 - A `json:` parser takes the error field's message as the summary when the reply field is empty, as it is in a failed run of minima, hax or myra.
@@ -29,6 +33,8 @@ Upgrading from 0.10:
 - An empty list in the web takes one line, as in the TUI.
 
 ### Fixed
+
+- In the TUI, Left and Right typed `h` and `l` into a prompt, the filter or a chooser's search: the terminal key map sent the pane keys' names for the arrows. The arrows now move a cursor in the TUI's bottom line, with Home, End, Backspace and Delete editing at it; in a list they still move between panes.
 
 - A TUI table wider than the terminal shrank whichever columns ratatui's solver picked, so its first column changed width when an age cell changed. While a job ran, that happened on every 2-second reload. The first column now keeps its width; the others share a common cap.
 

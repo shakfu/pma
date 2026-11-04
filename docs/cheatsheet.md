@@ -167,6 +167,10 @@ pma workflow run review-fix alpha --local --unattended --detach
 | `H` / `T` | herdr pane / take over | `Esc` | back |
 | `E` | project in `$EDITOR`, re-read on exit (TUI only) | `S` | shell in project, herdr pane if integrated; re-read on exit |
 
+All typing happens on the bottom line, as in vim: `:` a command, `/` the list filter, `>` the text an act asks for.
+
+Type a command by name after `:`; `Tab` completes it, then cycles the matches. An argument takes the place of the prompt: `:add-note buy milk`, `:project audio`, `:scope rust`, `:filter ci`, `:run review --push`. A unique prefix runs (`:hist`); `:q` quits. Only commands that apply to the selected row are offered.
+
 ## Where things are
 
 - `~/.config/pma/settings.toml`: settings, roots, workers, presets, tiers.

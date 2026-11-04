@@ -368,7 +368,7 @@ impl Act {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Command {
     Tab(Tab),
     Act(Act),
@@ -417,6 +417,55 @@ pub enum Command {
     Help,
     /// The TUI only; a browser tab is closed by the browser.
     Quit,
+    /// A command typed by name, as `:` does in vim: `resolve` reads it.
+    Line,
+}
+
+impl Command {
+    /// The name `:` takes for the command. Typed by people, so these are
+    /// spelled out rather than derived from the variant.
+    pub fn name(self) -> String {
+        let s = match self {
+            Command::Tab(t) => t.title(),
+            Command::Act(a) => return kebab(&a.name()),
+            Command::Down => "down",
+            Command::Up => "up",
+            Command::First => "first",
+            Command::Last => "last",
+            Command::NextPane => "next-pane",
+            Command::PrevPane => "prev-pane",
+            Command::Open => "open",
+            Command::Back => "back",
+            Command::ReportBy => "report-by",
+            Command::Finished => "finished",
+            Command::OpenProject => "open-project",
+            Command::Jump => "project",
+            Command::Scope => "scope",
+            Command::Filter => "filter",
+            Command::ViewDiff => "diff",
+            Command::Edit => "edit",
+            Command::Mark => "mark",
+            Command::MarkAll => "mark-all",
+            Command::PageDown => "page-down",
+            Command::PageUp => "page-up",
+            Command::Help => "help",
+            Command::Quit => "quit",
+            Command::Line => "command",
+        };
+        s.to_string()
+    }
+}
+
+/// `ApproveRun` as `approve-run`.
+fn kebab(camel: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in camel.chars().enumerate() {
+        if c.is_ascii_uppercase() && i > 0 {
+            out.push('-');
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
 }
 
 /// What a front end asks before it acts.
@@ -558,6 +607,7 @@ pub const BINDINGS: &[Binding] = &[
         ..bind("b", Command::Finished, "finished state")
     },
     bind("?", Command::Help, "keys"),
+    bind(":", Command::Line, "command"),
     bind("q", Command::Quit, "quit"),
     // Anywhere.
     on("c", &[], Act::Scan, Ask::Nothing, "scan"),
@@ -872,6 +922,77 @@ pub fn shown(key: &str) -> &str {
     }
 }
 
+/// Names vim users type that a prefix alone would not settle.
+const ALIASES: [(&str, Command); 2] = [("q", Command::Quit), ("h", Command::Help)];
+
+/// The commands `:` offers on `tab` for a row about `pick`, one binding
+/// each, in table order. An act on a row that does not fit it is left out.
+pub fn commands(tab: Tab, pick: &Pick) -> Vec<(String, &'static Binding)> {
+    let mut out: Vec<(String, &'static Binding)> = Vec::new();
+    for b in on_tab(tab) {
+        let fits = match b.command {
+            Command::Line => false,
+            Command::Act(a) => !a.on_row() || screen::fits(a, pick),
+            _ => true,
+        };
+        let name = b.command.name();
+        if fits && !out.iter().any(|(n, _)| *n == name) {
+            out.push((name, b));
+        }
+    }
+    out
+}
+
+/// The names in `commands` that begin with `word`, for Tab to complete.
+pub fn complete(word: &str, tab: Tab, pick: &Pick) -> Vec<String> {
+    commands(tab, pick)
+        .into_iter()
+        .map(|(n, _)| n)
+        .filter(|n| n.starts_with(word))
+        .collect()
+}
+
+/// The binding a typed line names, and the argument after the name. A name
+/// matches exactly, as an alias, or as the prefix of one command alone.
+pub fn resolve<'a>(
+    line: &'a str,
+    tab: Tab,
+    pick: &Pick,
+) -> Result<(&'static Binding, &'a str), String> {
+    let line = line.trim();
+    let (word, arg) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    let offered = commands(tab, pick);
+    let alias = ALIASES
+        .iter()
+        .find(|(a, _)| *a == word)
+        .map(|(_, c)| c.name());
+    let exact = alias.as_deref().unwrap_or(word);
+    if let Some((_, b)) = offered.iter().find(|(n, _)| n == exact) {
+        return Ok((b, arg.trim()));
+    }
+    // A full name is never read as the prefix of another: `approve-run`
+    // off a run must not become `approve-runs`.
+    if BINDINGS.iter().any(|b| b.command.name() == exact) {
+        return Err(format!("`{word}` does not apply here."));
+    }
+    let prefixed: Vec<&(String, &Binding)> = offered
+        .iter()
+        .filter(|(n, _)| n.starts_with(word))
+        .collect();
+    match prefixed.as_slice() {
+        [(_, b)] => Ok((b, arg.trim())),
+        [] if word.is_empty() => Err("Type a command; Tab completes.".into()),
+        [] => Err(format!("No command `{word}` here.")),
+        many => Err(format!(
+            "`{word}` could be {}.",
+            many.iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,6 +1105,77 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every command has its own name, and no alias hides one.
+    #[test]
+    fn command_names_are_unique() {
+        let mut names: Vec<String> = BINDINGS.iter().map(|b| b.command.name()).collect();
+        names.sort();
+        names.dedup();
+        let distinct: std::collections::HashSet<Command> =
+            BINDINGS.iter().map(|b| b.command).collect();
+        assert_eq!(names.len(), distinct.len(), "two commands share a name");
+        for (alias, _) in ALIASES {
+            assert!(!names.iter().any(|n| n == alias), "`{alias}` is a name");
+        }
+        assert_eq!(Command::Act(Act::ApproveRun).name(), "approve-run");
+        assert_eq!(Command::Act(Act::Pr).name(), "pr");
+    }
+
+    #[test]
+    fn a_line_resolves_by_name_alias_or_unique_prefix() {
+        let run = Pick::Run {
+            id: 1,
+            clean: true,
+            fixing: false,
+            empty: false,
+            state: "ready".into(),
+            project: "p".into(),
+        };
+        let got = |line: &str, tab: Tab, pick: &Pick| {
+            resolve(line, tab, pick).map(|(b, arg)| (b.command, arg.to_string()))
+        };
+        assert_eq!(
+            got("q", Tab::Inbox, &Pick::Nothing),
+            Ok((Command::Quit, String::new()))
+        );
+        assert_eq!(
+            got("push", Tab::Inbox, &run),
+            Ok((Command::Act(Act::Push), String::new())),
+            "exact beats `push-approved`"
+        );
+        assert_eq!(
+            got("  rework  try again ", Tab::Inbox, &run),
+            Ok((Command::Act(Act::ReworkRun), "try again".into()))
+        );
+        assert_eq!(
+            got("proj", Tab::Inbox, &run).map(|(c, _)| c),
+            Err("`proj` could be projects, project.".into())
+        );
+        assert_eq!(
+            got("approve-run", Tab::Inbox, &Pick::Nothing),
+            Err("`approve-run` does not apply here.".into()),
+            "a row act needs its row"
+        );
+        assert_eq!(
+            got("history", Tab::Inbox, &Pick::Nothing),
+            Ok((Command::Tab(Tab::History), String::new()))
+        );
+        assert!(got("", Tab::Inbox, &Pick::Nothing).is_err());
+        assert!(!complete("", Tab::Inbox, &Pick::Nothing).contains(&"command".to_string()));
+        assert_eq!(
+            complete(
+                "dispatch",
+                Tab::Inbox,
+                &Pick::Task {
+                    project: "p".into(),
+                    target: "p:1".into(),
+                    retry: false,
+                }
+            ),
+            ["dispatch", "dispatch-push", "dispatch-interactive"]
+        );
     }
 
     #[test]

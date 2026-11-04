@@ -32,6 +32,11 @@
       <div id="toolbar" class="toolbar" role="toolbar" aria-label="Actions on this view"></div>
     </header>
     <div id="content" class="content"></div>
+    <form id="cmdline" class="cmdline hidden" autocomplete="off">
+      <div id="cmd-names" class="cmd-names" role="listbox" aria-label="Completions"></div>
+      <div id="cmd-label" class="cmd-label"></div>
+      <label class="cmd-row"><span id="cmd-lead" aria-hidden="true">:</span><textarea id="cmd-input" rows="1" wrap="off" spellcheck="false" aria-label="Command; Tab completes"></textarea><span id="cmd-hint" class="cmd-hint"></span></label>
+    </form>
   </main>
 
 </div>
@@ -42,10 +47,6 @@
   <form id="dialog-form" method="dialog">
     <h2 id="dialog-title"></h2>
     <div id="dialog-text" class="dialog-text"></div>
-    <label id="dialog-label" class="field">
-      <span id="dialog-label-text"></span>
-      <input id="dialog-input" type="text" autocomplete="off">
-    </label>
     <div class="dialog-buttons">
       <button id="dialog-cancel" class="button" value="cancel" type="submit">Cancel</button>
       <button id="dialog-ok" class="button primary" value="ok" type="submit">OK</button>

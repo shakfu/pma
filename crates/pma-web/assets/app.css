@@ -172,7 +172,6 @@ nav { display: flex; flex-direction: column; gap: 14px; }
 .heading p { margin: 2px 0 0; color: var(--text-3); font-size: 13px; }
 .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .toolbar .sep { width: 1px; height: 22px; background: var(--border-strong); margin: 0 4px; }
-.toolbar .filter { width: 18ch; margin: 0; }
 .more { position: relative; }
 .more summary { list-style: none; }
 .more summary::-webkit-details-marker { display: none; }
@@ -322,11 +321,19 @@ dialog h2 { margin: 0; font-size: 17px; font-weight: 650; }
 .dialog-text:empty { display: none; }
 .dialog-text table { font-size: 13px; }
 .dialog-text td { white-space: normal; padding: 5px 8px; }
-.field { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--text-2); }
-.field input { font: inherit; padding: 8px 10px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); }
-.field input:focus { outline: 2px solid var(--accent); outline-offset: 0; border-color: var(--accent); }
 .dialog-buttons { display: flex; justify-content: flex-end; gap: 8px; }
 .hidden { display: none !important; }
+.cmdline { position: fixed; left: 0; right: 0; bottom: 0; z-index: 40; padding: 6px 12px; background: var(--surface); border-top: 1px solid var(--border-strong); font-family: ui-monospace, monospace; font-size: 13px; }
+.cmd-names { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-bottom: 4px; color: var(--text-2); }
+.cmd-names:empty, .cmd-label:empty { display: none; }
+.cmd-label { margin-bottom: 4px; color: var(--accent); font-weight: 600; }
+.cmd-name.current { color: var(--surface); background: var(--accent); padding: 0 4px; border-radius: 3px; }
+.cmd-row { display: flex; align-items: flex-start; gap: 4px; }
+.cmd-row textarea { flex: 1; font: inherit; line-height: 1.4; border: 0; outline: 0; padding: 0; background: transparent; color: var(--text); resize: none; overflow: hidden; }
+/* A prompt's text grows upward to eight lines, then scrolls. */
+.cmd-row textarea[wrap="soft"] { max-height: calc(8 * 1.4em); overflow-y: auto; }
+.cmd-hint { color: var(--text-2); }
+.filter-chip { display: inline-flex; gap: 8px; align-items: center; font-family: ui-monospace, monospace; font-size: 13px; }
 .chooser { display: flex; flex-direction: column; gap: 12px; }
 /* One grid for every option, so names and descriptions line up. */
 .options { display: grid; grid-template-columns: auto max-content 1fr; max-height: 50vh; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); }

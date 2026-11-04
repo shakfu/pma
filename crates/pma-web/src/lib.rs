@@ -505,6 +505,7 @@ fn keys_json() -> Value {
             };
             json!({
                 "key": b.key,
+                "name": b.command.name(),
                 "command": command,
                 "tabs": b.tabs.iter().map(|t| t.title()).collect::<Vec<_>>(),
                 "ask": ask,

@@ -113,6 +113,13 @@ enum Mode {
     },
     /// Typing the tab's filter; Enter keeps it, Escape clears it.
     Filter,
+    /// A `:` line: a command by name, and its argument. `names` are what
+    /// Tab offered, and `at` the one it put in the line.
+    Command {
+        input: String,
+        names: Vec<String>,
+        at: Option<usize>,
+    },
     /// Rows to check or uncheck for an act, such as a bundle's items before
     /// its approval.
     Check {
@@ -192,6 +199,9 @@ pub struct App {
     /// acts within; empty is every project.
     scope: Vec<String>,
     mode: Mode,
+    /// The cursor, in chars, in the line being typed: a prompt's, the
+    /// filter's or a command's. Past the end means at the end.
+    caret: usize,
     status: Option<(String, Tone)>,
     /// Runs and jobs the footer names, oldest first; Enter opens the first.
     notices: Vec<api::Transition>,
@@ -236,6 +246,7 @@ impl App {
             extent: (0, 20),
             scope: Vec::new(),
             mode: Mode::Normal,
+            caret: 0,
             status: None,
             notices: Vec::new(),
             marks: Vec::new(),
@@ -505,6 +516,7 @@ impl App {
     ) {
         match input {
             Ok(input) => {
+                self.caret = usize::MAX;
                 self.mode = Mode::Prompt {
                     act,
                     label,
@@ -539,6 +551,9 @@ impl App {
 
     /// Applies one key, named as `KeyboardEvent.key` names it.
     pub fn key(&mut self, key: &str) -> Option<Request> {
+        if matches!(self.mode, Mode::Command { .. }) {
+            return self.line_key(key);
+        }
         match &mut self.mode {
             Mode::Help => {
                 self.mode = Mode::Normal;
@@ -612,9 +627,6 @@ impl App {
                         self.mode = Mode::Normal;
                         self.say("Cancelled.", Tone::Muted);
                     }
-                    "Backspace" => {
-                        input.pop();
-                    }
                     "Enter" => {
                         let Mode::Prompt {
                             act, input, pick, ..
@@ -625,8 +637,9 @@ impl App {
                         let (_, pane) = self.pick();
                         return self.ask_done(act, &pick, &pane, &input);
                     }
-                    k if k.chars().count() == 1 => input.push_str(k),
-                    _ => {}
+                    k => {
+                        edit(input, &mut self.caret, k);
+                    }
                 }
                 return None;
             }
@@ -718,12 +731,6 @@ impl App {
                         }
                         self.mode = Mode::Normal;
                     }
-                    "Backspace" => {
-                        if let Some(f) = &mut self.filter[t] {
-                            f.pop();
-                        }
-                        self.refilter(t);
-                    }
                     "ArrowDown" | "ArrowUp" => {
                         let len = self.panes().get(self.pane[t]).map_or(0, |p| p.items.len());
                         if let Some(state) = self.selected[t].get_mut(self.pane[t])
@@ -736,11 +743,11 @@ impl App {
                             }));
                         }
                     }
-                    k if k.chars().count() == 1 => {
-                        self.filter[t].get_or_insert_default().push_str(k);
-                        self.refilter(t);
+                    k => {
+                        if edit(self.filter[t].get_or_insert_default(), &mut self.caret, k) {
+                            self.refilter(t);
+                        }
                     }
-                    _ => {}
                 }
                 return None;
             }
@@ -770,7 +777,7 @@ impl App {
                 }
                 return None;
             }
-            Mode::Normal => {}
+            Mode::Normal | Mode::Command { .. } => {}
         }
         if !self.notices.is_empty() {
             if key != "Enter" {
@@ -787,14 +794,115 @@ impl App {
                 };
             }
         }
+        // Left and Right move between lists, as `h` and `l` do; in a line
+        // being typed they move the cursor.
+        let key = match key {
+            "ArrowLeft" => "h",
+            "ArrowRight" => "l",
+            k => k,
+        };
         let binding = keys::lookup(key, self.tab, &self.pick().0)?;
+        self.command(binding, None)
+    }
+
+    /// A key on a `:` line. Tab completes the command's name: to what every
+    /// match shares, then through each match; BackTab goes back.
+    fn line_key(&mut self, key: &str) -> Option<Request> {
+        let pick = self.pick().0;
+        let tab = self.tab;
+        let Mode::Command { input, names, at } = &mut self.mode else {
+            unreachable!("on a command line");
+        };
+        match key {
+            "Escape" => self.mode = Mode::Normal,
+            // As in vim: deleting past the colon leaves the line.
+            "Backspace" if input.is_empty() => self.mode = Mode::Normal,
+            "Tab" | "BackTab" if !names.is_empty() => {
+                let n = names.len();
+                let i = match (*at, key) {
+                    (None, "Tab") => 0,
+                    (None, _) => n - 1,
+                    (Some(i), "Tab") => (i + 1) % n,
+                    (Some(i), _) => (i + n - 1) % n,
+                };
+                *at = Some(i);
+                *input = names[i].clone();
+                self.caret = usize::MAX;
+            }
+            // Names only: an argument is a project, a tag or free text.
+            "Tab" | "BackTab" if input.contains(char::is_whitespace) => {}
+            "Tab" | "BackTab" => {
+                let found = keys::complete(input, tab, &pick);
+                match found.as_slice() {
+                    [] => {
+                        let text = format!("No command begins `{input}` here.");
+                        self.say(text, Tone::Warn);
+                    }
+                    [only] => *input = only.clone(),
+                    many => {
+                        let shared = common_prefix(many);
+                        if shared.len() > input.len() {
+                            *input = shared;
+                        } else {
+                            *at = Some(0);
+                            *input = many[0].clone();
+                        }
+                        *names = found;
+                    }
+                }
+                self.caret = usize::MAX;
+            }
+            "Enter" => {
+                let Mode::Command { input, .. } = std::mem::replace(&mut self.mode, Mode::Normal)
+                else {
+                    unreachable!("on a command line");
+                };
+                if input.trim().is_empty() {
+                    return None;
+                }
+                return match keys::resolve(&input, tab, &pick) {
+                    Ok((b, arg)) => {
+                        let arg = arg.to_string();
+                        self.command(b, Some(&arg))
+                    }
+                    Err(e) => {
+                        self.say(e, Tone::Warn);
+                        None
+                    }
+                };
+            }
+            k => {
+                if edit(input, &mut self.caret, k) {
+                    names.clear();
+                    *at = None;
+                }
+            }
+        }
+        None
+    }
+
+    /// Does what `binding` names. `line` is the argument typed after its
+    /// name on a `:` line, or `None` from a key.
+    fn command(&mut self, binding: &'static keys::Binding, line: Option<&str>) -> Option<Request> {
         let t = index(self.tab);
+        let arg = line.unwrap_or("");
+        let takes = matches!(
+            binding.command,
+            Command::Filter | Command::Scope | Command::Jump | Command::Act(_)
+        );
+        if !arg.is_empty() && !takes {
+            let text = format!("`{}` takes no argument.", binding.command.name());
+            self.say(text, Tone::Warn);
+            return None;
+        }
+        // The usage log names how a command was reached.
+        let via = |key: &'static str| if line.is_some() { ":" } else { key };
         match binding.command {
             Command::Tab(tab) => {
                 self.tab = tab;
                 self.status = None;
                 self.marks.clear();
-                self.note(usage::Event::new("tui", "tab").tab(tab).name("key"));
+                self.note(usage::Event::new("tui", "tab").tab(tab).name(via("key")));
                 return Some(Request::Load(self.query()));
             }
             Command::Down
@@ -822,13 +930,22 @@ impl App {
                 }
             }
             Command::Filter => {
-                self.note(usage::Event::new("tui", "find").name("/"));
+                self.note(usage::Event::new("tui", "find").name(via("/")));
                 self.status = None;
+                if !arg.is_empty() {
+                    self.filter[t] = Some(arg.to_string());
+                    self.refilter(t);
+                    return None;
+                }
                 self.filter[t].get_or_insert_default();
+                self.caret = usize::MAX;
                 self.mode = Mode::Filter;
             }
             Command::Jump => {
-                self.note(usage::Event::new("tui", "find").name("O"));
+                self.note(usage::Event::new("tui", "find").name(via("O")));
+                if !arg.is_empty() {
+                    return Some(self.open_project(arg.to_string(), ":"));
+                }
                 return Some(Request::Choose {
                     what: Choosing::Project,
                     pick: Pick::Nothing,
@@ -836,7 +953,15 @@ impl App {
                 });
             }
             Command::Scope => {
-                self.note(usage::Event::new("tui", "find").name("#"));
+                self.note(usage::Event::new("tui", "find").name(via("#")));
+                if !arg.is_empty() {
+                    self.scope = match arg {
+                        NO_SCOPE => Vec::new(),
+                        tag => vec![tag.to_string()],
+                    };
+                    self.marks.clear();
+                    return Some(Request::Load(self.query()));
+                }
                 return Some(Request::Choose {
                     what: Choosing::Scope,
                     pick: Pick::Nothing,
@@ -914,6 +1039,15 @@ impl App {
             }
             Command::Help => self.mode = Mode::Help,
             Command::Quit => return Some(Request::Quit),
+            Command::Line => {
+                self.status = None;
+                self.caret = 0;
+                self.mode = Mode::Command {
+                    input: String::new(),
+                    names: Vec::new(),
+                    at: None,
+                };
+            }
             Command::Mark => {
                 let pick = self.pick().0;
                 if !self.markable(&pick) {
@@ -969,10 +1103,59 @@ impl App {
                     pick = screen::marked(&self.marks);
                 }
                 self.advance = None;
-                return self.begin(act, binding.ask, pick, pane);
+                return match arg {
+                    "" => self.begin(act, binding.ask, pick, pane),
+                    typed => self.typed(act, binding.ask, pick, &pane, typed),
+                };
             }
         }
         None
+    }
+
+    /// An act given its input on the `:` line, in place of the prompt or
+    /// list its key opens. A danger act is still confirmed.
+    fn typed(
+        &mut self,
+        act: Act,
+        ask: Ask,
+        pick: Pick,
+        pane: &[Item],
+        input: &str,
+    ) -> Option<Request> {
+        if !matches!(ask, Ask::Text(_) | Ask::Choose(_)) {
+            let text = format!("`{}` takes no argument.", Command::Act(act).name());
+            self.say(text, Tone::Warn);
+            return None;
+        }
+        self.acting(act);
+        if act.weight() != "danger" {
+            return self.ask_done(act, &pick, pane, input);
+        }
+        match screen::action_scoped(act, &pick, pane, input, &self.project, &self.scope) {
+            Ok(action) => {
+                self.mode = Mode::Confirm {
+                    action,
+                    question: screen::question(act, &pick),
+                };
+            }
+            Err(e) => self.say(e, Tone::Bad),
+        }
+        None
+    }
+
+    /// Starts the usage event an act writes once it has run.
+    fn acting(&mut self, act: Act) {
+        let title = self
+            .panes()
+            .get(self.pane[index(self.tab)])
+            .map(|p| p.title.clone());
+        let mut ev = usage::Event::new("tui", "act")
+            .tab(self.tab)
+            .name(&act.name());
+        if let Some(t) = title {
+            ev = ev.pane(&t);
+        }
+        self.acting = Some(ev);
     }
 
     /// The project `E` opens: the selected row's, else the one in view.
@@ -1052,20 +1235,11 @@ impl App {
 
     /// Starts an act on `pick`: asks what the binding asks, or does it.
     fn begin(&mut self, act: Act, ask: Ask, pick: Pick, pane: Vec<Item>) -> Option<Request> {
-        let title = self
-            .panes()
-            .get(self.pane[index(self.tab)])
-            .map(|p| p.title.clone());
-        let mut ev = usage::Event::new("tui", "act")
-            .tab(self.tab)
-            .name(&act.name());
-        if let Some(t) = title {
-            ev = ev.pane(&t);
-        }
-        self.acting = Some(ev);
+        self.acting(act);
         match ask {
             Ask::Text(label) if api::drafts(act) => Some(Request::Prompt { act, pick, label }),
             Ask::Text(label) => {
+                self.caret = usize::MAX;
                 self.mode = Mode::Prompt {
                     act,
                     label,
@@ -1132,7 +1306,7 @@ impl App {
     }
 
     pub fn render(&mut self, frame: &mut Frame) {
-        let foot = fold(self.footer(), frame.area().width);
+        let foot = self.foot(frame.area().width);
         let [title, header, body, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
@@ -1176,7 +1350,6 @@ impl App {
                 }
             }
             Mode::Confirm { question, .. } => self.render_confirm(frame, &question),
-            Mode::Prompt { label, input, .. } => self.render_prompt(frame, label, &input),
             Mode::Choose {
                 label,
                 choices,
@@ -1192,8 +1365,8 @@ impl App {
                 at,
                 ..
             } => self.render_check(frame, body, label, &items, &on, at),
-            // The filter shows in each pane's title as it is typed.
-            Mode::Normal | Mode::Filter => {}
+            // Text, a filter and a command line are typed in the footer.
+            Mode::Normal | Mode::Prompt { .. } | Mode::Filter | Mode::Command { .. } => {}
         }
     }
 
@@ -1252,23 +1425,66 @@ impl App {
         Line::from(spans)
     }
 
+    /// The footer's lines. Typed text goes on the bottom line, as in vim:
+    /// `/` and the filter; `>` and an act's text under its label; or `:` and
+    /// a command with the names Tab offers above it, as vim's wildmenu.
+    fn foot(&self, width: u16) -> Vec<Line<'static>> {
+        let p = self.palette;
+        let caret = self.caret;
+        let typed = |lead: &str, text: &str, hint: &str| {
+            // Past the width, the part around the cursor shows.
+            let chars: Vec<char> = text.chars().collect();
+            let at = caret.min(chars.len());
+            let room = (width as usize).saturating_sub(lead.chars().count()).max(1);
+            let skip = (at + 1).saturating_sub(room);
+            let shown = &chars[skip..chars.len().min(skip + room)];
+            let mut spans = vec![Span::styled(
+                lead.to_string(),
+                p.accent().add_modifier(Modifier::BOLD),
+            )];
+            spans.extend(caret_spans(shown, Some(at - skip)));
+            spans.push(Span::styled(format!("   {hint}"), p.muted()));
+            Line::from(spans)
+        };
+        let (input, names, at) = match &self.mode {
+            Mode::Command { input, names, at } => (input, names, at),
+            Mode::Filter => {
+                let text = self.filter[index(self.tab)].as_deref().unwrap_or("");
+                return vec![typed("/", text, "Up/Down move, Enter keeps, Esc clears")];
+            }
+            Mode::Prompt { label, input, .. } => {
+                let mut lines = fold(
+                    Line::from(Span::styled(
+                        format!(" {label}"),
+                        p.accent().add_modifier(Modifier::BOLD),
+                    )),
+                    width,
+                );
+                lines.extend(wrapped(p, input, caret, width));
+                return lines;
+            }
+            _ => return fold(self.footer(), width),
+        };
+        let mut lines = Vec::new();
+        if !names.is_empty() {
+            let mut spans = vec![Span::raw(" ")];
+            for (i, n) in names.iter().enumerate() {
+                let style = match Some(i) == *at {
+                    true => p.accent().add_modifier(Modifier::REVERSED),
+                    false => Style::new(),
+                };
+                spans.push(Span::styled(n.clone(), style));
+                spans.push(Span::raw("  "));
+            }
+            lines.extend(fold(Line::from(spans), width));
+        }
+        lines.push(typed(":", input, "Tab completes, Enter runs, Esc cancels"));
+        lines
+    }
+
     fn footer(&self) -> Line<'static> {
         let p = self.palette;
         match &self.mode {
-            Mode::Prompt { .. } => {
-                return hints(p, &[("Enter", "submit"), ("Esc", "cancel")]);
-            }
-            Mode::Filter => {
-                return hints(
-                    p,
-                    &[
-                        ("type", "filter"),
-                        ("Up/Down", "move"),
-                        ("Enter", "keep"),
-                        ("Esc", "clear"),
-                    ],
-                );
-            }
             Mode::Confirm { .. } => return hints(p, &[("y", "yes"), ("any key", "no")]),
             Mode::Choose {
                 filter: Some(_), ..
@@ -1326,7 +1542,7 @@ impl App {
                 );
             }
             Mode::Help => return hints(p, &[("any key", "close")]),
-            Mode::Normal => {}
+            Mode::Normal | Mode::Prompt { .. } | Mode::Filter | Mode::Command { .. } => {}
         }
         if let Some((text, tone)) = &self.status {
             return Line::from(Span::styled(format!(" {text}"), p.tone(*tone)));
@@ -1909,25 +2125,6 @@ impl App {
             area,
         );
     }
-
-    fn render_prompt(&self, frame: &mut Frame, label: &str, input: &str) {
-        let p = self.palette;
-        let area = centered(frame.area(), 70.min(frame.area().width), 5);
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(vec![
-                    Span::raw(input.to_string()),
-                    Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)),
-                ]),
-                Line::raw(""),
-                Line::styled("Enter submits, Esc cancels", p.muted()),
-            ])
-            .wrap(Wrap { trim: false })
-            .block(dialog(p, &format!(" {label} "), p.accent()).padding(Padding::horizontal(1))),
-            area,
-        );
-    }
 }
 
 /// Key hints: the key bold in the accent colour, its label plain.
@@ -2099,6 +2296,104 @@ fn diff_line(p: Palette, l: &str) -> Line<'static> {
 
 /// A terminal key as `KeyboardEvent.key` names it, the names the key table
 /// uses.
+/// Edits `text` for `key` at `caret`, a place in chars: moves it, deletes
+/// before or after it, or types there. False for a key that does neither.
+fn edit(text: &mut String, caret: &mut usize, key: &str) -> bool {
+    let n = text.chars().count();
+    *caret = (*caret).min(n);
+    let byte = |s: &str, i: usize| s.char_indices().nth(i).map_or(s.len(), |(b, _)| b);
+    match key {
+        "ArrowLeft" => *caret = caret.saturating_sub(1),
+        "ArrowRight" => *caret = (*caret + 1).min(n),
+        "Home" => *caret = 0,
+        "End" => *caret = n,
+        "Backspace" if *caret > 0 => {
+            text.remove(byte(text, *caret - 1));
+            *caret -= 1;
+        }
+        "Delete" if *caret < n => {
+            text.remove(byte(text, *caret));
+        }
+        "Backspace" | "Delete" => {}
+        k if k.chars().count() == 1 => {
+            text.insert_str(byte(text, *caret), k);
+            *caret += 1;
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// The most rows a prompt's text grows to; past them, its end shows.
+const PROMPT_ROWS: usize = 8;
+
+/// A prompt's text after `> `, wrapped to `width` so the lines grow upward
+/// as it is typed, the cursor at its end and the hint after it when it fits.
+fn wrapped(p: Palette, input: &str, caret: usize, width: u16) -> Vec<Line<'static>> {
+    const HINT: &str = "   Enter submits, Esc cancels";
+    let room = (width as usize).saturating_sub(2).max(1);
+    let chars: Vec<char> = input.chars().collect();
+    let at = caret.min(chars.len());
+    let mut rows: Vec<&[char]> = chars.chunks(room).collect();
+    // A full last row puts the cursor at the end on a row of its own.
+    if rows.last().is_none_or(|r| r.len() == room) {
+        rows.push(&[]);
+    }
+    let (here, col) = (at / room, at % room);
+    let last = rows.len() - 1;
+    // The last rows, or from the cursor's row when it is above them.
+    let skip = rows.len().saturating_sub(PROMPT_ROWS).min(here);
+    rows.into_iter()
+        .enumerate()
+        .skip(skip)
+        .take(PROMPT_ROWS)
+        .map(|(i, row)| {
+            let lead = match i {
+                0 => Span::styled("> ", p.accent().add_modifier(Modifier::BOLD)),
+                _ => Span::raw("  "),
+            };
+            let mut spans = vec![lead];
+            spans.extend(caret_spans(row, (i == here).then_some(col)));
+            if i == last && row.len() + 1 + HINT.len() <= room {
+                spans.push(Span::styled(HINT, p.muted()));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// `row` with the cursor drawn reversed at `col`: on the char there, or on a
+/// blank past the end.
+fn caret_spans(row: &[char], col: Option<usize>) -> Vec<Span<'static>> {
+    let text = |c: &[char]| c.iter().collect::<String>();
+    let reversed = Style::new().add_modifier(Modifier::REVERSED);
+    let Some(col) = col else {
+        return vec![Span::raw(text(row))];
+    };
+    let col = col.min(row.len());
+    let under = row.get(col).map_or(" ".to_string(), char::to_string);
+    vec![
+        Span::raw(text(&row[..col])),
+        Span::styled(under, reversed),
+        Span::raw(text(row.get(col + 1..).unwrap_or(&[]))),
+    ]
+}
+
+/// The longest start every name shares.
+fn common_prefix(names: &[String]) -> String {
+    let first = names.first().map_or("", String::as_str);
+    let mut end = first.len();
+    for n in names.iter().skip(1) {
+        end = first
+            .bytes()
+            .zip(n.bytes())
+            .take(end)
+            .take_while(|(a, b)| a == b)
+            .count();
+    }
+    first[..end].to_string()
+}
+
 pub fn key_name(code: KeyCode) -> Option<String> {
     Some(match code {
         KeyCode::Char(c) => c.to_string(),
@@ -2109,8 +2404,9 @@ pub fn key_name(code: KeyCode) -> Option<String> {
         KeyCode::Backspace => "Backspace".into(),
         KeyCode::Up => "ArrowUp".into(),
         KeyCode::Down => "ArrowDown".into(),
-        KeyCode::Left => "h".into(),
-        KeyCode::Right => "l".into(),
+        KeyCode::Left => "ArrowLeft".into(),
+        KeyCode::Right => "ArrowRight".into(),
+        KeyCode::Delete => "Delete".into(),
         KeyCode::Home => "Home".into(),
         KeyCode::End => "End".into(),
         KeyCode::PageUp => "PageUp".into(),
@@ -3002,7 +3298,12 @@ mod tests {
             text: "old".into(),
         }])));
         app.key("e");
-        assert!(screen_text(&mut app).contains("old"));
+        let text = screen_text(&mut app);
+        let bottom: Vec<&str> = text.lines().rev().take(2).collect();
+        assert!(
+            bottom[0].starts_with("> old") && bottom[1].contains("note"),
+            "the text on the bottom line, its label above: {text}"
+        );
         app.key("Backspace");
         app.key("!");
         assert_eq!(
@@ -3013,7 +3314,31 @@ mod tests {
             }))
         );
         app.key("n");
-        app.key("x");
+        for _ in 0..130 {
+            app.key("y");
+        }
+        app.key("z");
+        let text = screen_text(&mut app);
+        let bottom: Vec<&str> = text.lines().rev().take(3).collect();
+        assert!(
+            bottom[2].starts_with(" note")
+                && bottom[1].starts_with("> yyy")
+                && bottom[0].starts_with("  yyy")
+                && bottom[0].contains("yz ")
+                && bottom[0].contains("Enter submits"),
+            "long text grows upward, its label above: {text}"
+        );
+        // Past `PROMPT_ROWS`, the first rows give way to the end.
+        for _ in 0..1000 {
+            app.key("y");
+        }
+        let text = screen_text(&mut app);
+        let rows = text
+            .lines()
+            .rev()
+            .take_while(|l| l.starts_with("  y"))
+            .count();
+        assert_eq!(rows, PROMPT_ROWS, "{text}");
         assert_eq!(app.key("Escape"), None);
         assert_eq!(app.status.as_ref().unwrap().0, "Cancelled.");
         app.key("x");
@@ -3158,6 +3483,11 @@ mod tests {
                     on: vec![true, false],
                     at: 1,
                 },
+                Mode::Command {
+                    input: "edit".into(),
+                    names: vec!["edit".into(), "edit-note".into()],
+                    at: Some(1),
+                },
             ];
             for mode in modes {
                 app.mode = mode.clone();
@@ -3167,6 +3497,152 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{w}x{h} {mode:?}: {e}"));
             }
         }
+    }
+
+    fn typed(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.key(&c.to_string());
+        }
+    }
+
+    #[test]
+    fn a_line_edits_at_its_cursor() {
+        let mut text = "héllo".to_string();
+        let mut at = usize::MAX;
+        let keys = |text: &mut String, at: &mut usize, ks: &[&str]| {
+            for k in ks {
+                assert!(edit(text, at, k), "{k}");
+            }
+        };
+        keys(&mut text, &mut at, &["ArrowLeft", "ArrowLeft", "X"]);
+        assert_eq!((text.as_str(), at), ("hélXlo", 4));
+        keys(&mut text, &mut at, &["Home", "Delete", "End", "Backspace"]);
+        assert_eq!((text.as_str(), at), ("élXl", 4));
+        keys(&mut text, &mut at, &["Home", "Backspace", "ArrowLeft"]);
+        assert_eq!((text.as_str(), at), ("élXl", 0), "nothing before the start");
+        assert!(!edit(&mut text, &mut at, "Tab"));
+        // A long prompt shows the cursor's rows: the first, from the start.
+        let rows = wrapped(Palette::from_env(), &"y".repeat(1000), 0, 20);
+        assert_eq!(rows.len(), PROMPT_ROWS);
+        assert_eq!(rows[0].spans[0].content, "> ");
+    }
+
+    /// Left and Right move the cursor in a prompt, the filter and a command,
+    /// where they once typed `h` and `l`; elsewhere they move between lists.
+    #[test]
+    fn arrows_move_the_cursor_in_a_line_and_the_list_elsewhere() {
+        let mut app = App::new();
+        app.loaded(Ok(next_view()));
+        let t = index(app.tab);
+        let n = app.panes().len();
+        assert!(n > 1, "a tab with several lists");
+        app.key("ArrowRight");
+        assert_eq!(app.pane[t], 1, "Right is the next list");
+        app.key("ArrowLeft");
+        assert_eq!(app.pane[t], 0);
+
+        app.key("n");
+        typed(&mut app, "ac");
+        app.key("ArrowLeft");
+        app.key("b");
+        let last = screen_text(&mut app).lines().last().unwrap().to_string();
+        assert!(last.starts_with("> abc"), "{last}");
+        assert_eq!(
+            app.key("Enter"),
+            Some(Request::Act(Action::AddNote { text: "abc".into() }))
+        );
+
+        app.key("/");
+        typed(&mut app, "xz");
+        app.key("ArrowLeft");
+        app.key("y");
+        assert_eq!(app.filter[t].as_deref(), Some("xyz"));
+        app.key("Escape");
+
+        app.key(":");
+        typed(&mut app, "hstory");
+        app.key("Home");
+        app.key("ArrowRight");
+        app.key("i");
+        app.key("End");
+        assert_eq!(
+            app.key("Enter"),
+            Some(Request::Load(Query::History {
+                by: By::ALL[app.by].1,
+                of: app.selection(),
+            })),
+            "`hstory` mended to `history` mid-line"
+        );
+    }
+
+    /// `:` reads a command by name: Tab completes it to what the matches
+    /// share, then cycles them; an argument stands in for the prompt.
+    #[test]
+    fn a_command_line_completes_and_runs() {
+        let mut app = App::new();
+        app.loaded(Ok(View::Notes(vec![Note {
+            id: 3,
+            created_at: 0,
+            updated_at: 0,
+            text: "old".into(),
+        }])));
+        let line = |app: &App| match &app.mode {
+            Mode::Command { input, .. } => Some(input.clone()),
+            _ => None,
+        };
+        app.key(":");
+        typed(&mut app, "e");
+        app.key("Tab");
+        assert_eq!(
+            line(&app).as_deref(),
+            Some("edit"),
+            "what the matches share"
+        );
+        app.key("Tab");
+        app.key("Tab");
+        assert_eq!(line(&app).as_deref(), Some("edit-note"));
+        assert!(screen_text(&mut app).contains(":edit-note"));
+        app.key("BackTab");
+        assert_eq!(line(&app).as_deref(), Some("edit"));
+        app.key("Escape");
+        assert_eq!(app.mode, Mode::Normal);
+
+        app.key(":");
+        typed(&mut app, "ad");
+        app.key("Tab");
+        typed(&mut app, " hello there");
+        assert_eq!(
+            app.key("Enter"),
+            Some(Request::Act(Action::AddNote {
+                text: "hello there".into()
+            })),
+            "the argument is the prompt's text"
+        );
+
+        app.key(":");
+        typed(&mut app, "remove-note");
+        app.key("Enter");
+        assert!(
+            matches!(app.mode, Mode::Confirm { .. }),
+            "a confirmed act still asks"
+        );
+        app.key("n");
+
+        app.key(":");
+        typed(&mut app, "inbox now");
+        app.key("Enter");
+        assert_eq!(app.status.as_ref().unwrap().0, "`inbox` takes no argument.");
+        app.key(":");
+        typed(&mut app, "zz");
+        app.key("Enter");
+        assert_eq!(app.status.as_ref().unwrap().0, "No command `zz` here.");
+
+        app.key(":");
+        app.key("Backspace");
+        assert_eq!(app.mode, Mode::Normal, "backspace past the colon leaves");
+        app.key(":");
+        app.key("q");
+        assert_eq!(app.key("Enter"), Some(Request::Quit));
     }
 
     /// `z` asks for the list of names; the choice and its toggled flags
@@ -3456,7 +3932,12 @@ mod tests {
         // `task 12` holds `t12`; no other row has it within one cell, though
         // `a:2` has the letters in order across `T1` and `task 2`.
         assert_eq!(shown, ["a:12"]);
-        assert!(screen_text(&mut app).contains("1 of 12 /t12"));
+        let text = screen_text(&mut app);
+        assert!(text.contains("1 of 12 /t12"));
+        assert!(
+            text.lines().last().unwrap().starts_with("/t12"),
+            "typed on the bottom line, as in vim: {text}"
+        );
         app.key("Enter");
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(

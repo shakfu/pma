@@ -31,6 +31,12 @@ herdr-check: ## run a dispatch through a real herdr server against a fresh fixtu
 web-check: ## drive pma web in headless Chromium against a fresh fixture
 	@sh scripts/web-check.sh
 
+.PHONY: box-live
+box-live: ## run pma-box against Docker and the network: engine, relay over TLS, whole runs
+	@cargo test -p pma-box --test container_live -- --ignored --test-threads 1
+	@cargo test -p pma-box --test live_tls -- --ignored
+	@cargo test -p pma-box --test live_run -- --ignored --test-threads 1
+
 .PHONY: check
 check: ## format check, clippy with warnings as errors, and test
 	@cargo fmt --check

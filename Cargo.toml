@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pma-core", "crates/pma-tui", "crates/pma-web", "crates/pma"]
+members = ["crates/pma-box", "crates/pma-core", "crates/pma-tui", "crates/pma-web", "crates/pma"]
 resolver = "3"
 
 [workspace.package]

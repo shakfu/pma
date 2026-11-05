@@ -194,6 +194,8 @@ fn worker(name: &str, t: &Table) -> Result<Worker> {
             "command"
                 | "args"
                 | "interactive_args"
+                | "relay"
+                | "relay_args"
                 | "allow"
                 | "parse"
                 | "reports_cost"
@@ -229,6 +231,15 @@ fn worker(name: &str, t: &Table) -> Result<Worker> {
         interactive_args: match t.get("interactive_args") {
             None => Vec::new(),
             Some(v) => strings(v, &at("interactive_args"))?,
+        },
+        relay: t
+            .get("relay")
+            .and_then(Item::as_str)
+            .filter(|r| !r.is_empty())
+            .map(String::from),
+        relay_args: match t.get("relay_args") {
+            None => Vec::new(),
+            Some(v) => strings(v, &at("relay_args"))?,
         },
         allow: t
             .get("allow")
@@ -540,6 +551,12 @@ pub fn set_agent(doc: &mut DocumentMut, w: &Worker) {
     if !w.interactive_args.is_empty() {
         t["interactive_args"] =
             Item::Value(Value::Array(array(w.interactive_args.iter().cloned())));
+    }
+    if let Some(relay) = &w.relay {
+        t["relay"] = Item::Value(relay.as_str().into());
+    }
+    if !w.relay_args.is_empty() {
+        t["relay_args"] = Item::Value(Value::Array(array(w.relay_args.iter().cloned())));
     }
     if let Some(allow) = &w.allow {
         t["allow"] = Item::Value(allow.as_str().into());

@@ -203,6 +203,13 @@ pub struct Worker {
     /// Arguments for a session a person drives, with the same placeholders.
     /// Empty means the worker cannot run interactively.
     pub interactive_args: Vec<String>,
+    /// The `minosb -agent` adapter that speaks this worker's stream, so a
+    /// person's message in its minos room reaches it between turns. `None`
+    /// means the room only reaches it through `minosa`, if it calls that.
+    pub relay: Option<String>,
+    /// Arguments when `minosb` holds the worker's pipes: the task arrives on
+    /// stdin, so there is no `{prompt}`. Used only with `relay`.
+    pub relay_args: Vec<String>,
     /// A flag and a rule template separated by a space, such as
     /// `--allowedTools Bash({cmd})`. The flag is emitted once, the rule once
     /// per subcommand of the verify command. `None` means the worker has no
@@ -236,6 +243,8 @@ pub fn blank(name: &str) -> Worker {
         command: String::new(),
         args: Vec::new(),
         interactive_args: Vec::new(),
+        relay: None,
+        relay_args: Vec::new(),
         allow: None,
         parse: Parser::TextTail,
         reports_cost: false,
@@ -262,6 +271,11 @@ pub fn set_field(w: &mut Worker, field: &str, value: String) -> Result<(), Strin
         "interactive-args" => {
             w.interactive_args = serde_json::from_str(&value)
                 .map_err(|e| format!("interactive-args must be a JSON array of strings: {e}"))?;
+        }
+        "relay" => w.relay = (!value.is_empty()).then_some(value),
+        "relay-args" => {
+            w.relay_args = serde_json::from_str(&value)
+                .map_err(|e| format!("relay-args must be a JSON array of strings: {e}"))?;
         }
         "allow" => w.allow = (!value.is_empty()).then_some(value),
         "parse" => {
@@ -296,12 +310,20 @@ pub fn set_field(w: &mut Worker, field: &str, value: String) -> Result<(), Strin
     Ok(())
 }
 
-pub const FIELDS: [(&str, &str); 10] = [
+pub const FIELDS: [(&str, &str); 12] = [
     ("command", "the program to run"),
     ("args", "a JSON array of arguments"),
     (
         "interactive-args",
         "a JSON array of arguments for a session a person drives, or [] for none",
+    ),
+    (
+        "relay",
+        "the minosb adapter for its stream, such as claude, or empty for none",
+    ),
+    (
+        "relay-args",
+        "a JSON array of arguments under minosb, which writes the task to stdin",
     ),
     ("allow", "an allowlist flag and rule, or empty for none"),
     (
@@ -369,6 +391,27 @@ impl Worker {
         Some(w.build(prompt, dir, model, 0.0, extra, std::time::Duration::ZERO))
     }
 
+    /// The command `minosb` runs, from `relay_args`; `None` without a relay.
+    /// `minosb` writes the task, so a `{prompt}` reads as empty.
+    pub fn build_relay(
+        &self,
+        dir: &std::path::Path,
+        model: Option<&str>,
+        budget: f64,
+        extra: &[String],
+        timeout: std::time::Duration,
+        link: &crate::minos::Link,
+    ) -> Option<Command> {
+        if self.relay.is_none() || self.relay_args.is_empty() {
+            return None;
+        }
+        let w = Worker {
+            args: self.relay_args.clone(),
+            ..self.clone()
+        };
+        Some(w.build_linked("", dir, model, budget, extra, timeout, Some(link)))
+    }
+
     /// The command to run in `dir`. An argument whose placeholder has no
     /// value is dropped, and with it the argument before it when that one is
     /// a flag, so `--model {model}` disappears whole when no model is chosen.
@@ -381,7 +424,34 @@ impl Worker {
         extra: &[String],
         timeout: std::time::Duration,
     ) -> Command {
+        self.build_linked(prompt, dir, model, budget, extra, timeout, None)
+    }
+
+    /// Whether its arguments name the run's minos room or socket. Such a
+    /// template starts `minosb` itself, so `pma` passes the values and does
+    /// not wrap it.
+    pub fn links_itself(&self) -> bool {
+        self.args
+            .iter()
+            .any(|a| a.contains("{room}") || a.contains("{socket}"))
+    }
+
+    /// The same, with the run's minos room, broker socket and events file for
+    /// `{room}`, `{socket}` and `{events}`. With none they read as unset.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_linked(
+        &self,
+        prompt: &str,
+        dir: &std::path::Path,
+        model: Option<&str>,
+        budget: f64,
+        extra: &[String],
+        timeout: std::time::Duration,
+        link: Option<&crate::minos::Link>,
+    ) -> Command {
         let dir_text = dir.to_string_lossy().into_owned();
+        let socket = link.map(|l| l.socket.to_string_lossy().into_owned());
+        let events = link.map(|l| l.events.to_string_lossy().into_owned());
         let budget = budget.to_string();
         let timeout = format!("{}s", timeout.as_secs());
         let mut args: Vec<String> = Vec::new();
@@ -398,6 +468,9 @@ impl Worker {
                 ("budget", Some(budget.as_str())),
                 ("timeout", Some(timeout.as_str())),
                 ("model", model),
+                ("room", link.map(|l| l.room.as_str())),
+                ("socket", socket.as_deref()),
+                ("events", events.as_deref()),
             ];
             match fill(arg, &values) {
                 Some(filled) => args.push(filled),
@@ -477,6 +550,27 @@ impl Worker {
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
+            relay: Some("claude".into()),
+            // The headless form with the task on stdin, as `minosb -task`
+            // writes it, so later turns can follow it there.
+            relay_args: [
+                "-p",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--permission-mode",
+                "auto",
+                "--model",
+                "{model}",
+                "--max-budget-usd",
+                "{budget}",
+                "{extra}",
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
             allow: Some("--allowedTools Bash({cmd})".into()),
             parse: Parser::ClaudeJson,
             reports_cost: true,
@@ -510,6 +604,8 @@ impl Worker {
             .map(|s| (*s).to_string())
             .collect(),
             interactive_args: Vec::new(),
+            relay: None,
+            relay_args: Vec::new(),
             // `--auto` approves every permission that is not explicitly
             // denied, so there is no per-command allowlist to emit.
             allow: None,
@@ -576,6 +672,8 @@ impl Worker {
             .map(|s| (*s).to_string())
             .collect(),
             interactive_args: Vec::new(),
+            relay: None,
+            relay_args: Vec::new(),
             allow: None,
             parse: Parser::ClaudeJson,
             reports_cost: true,
@@ -600,6 +698,8 @@ impl Worker {
             .map(|s| (*s).to_string())
             .collect(),
             interactive_args: Vec::new(),
+            relay: None,
+            relay_args: Vec::new(),
             allow: None,
             parse: Parser::TextTail,
             reports_cost: false,
@@ -622,6 +722,8 @@ impl Worker {
                 .map(|s| (*s).to_string())
                 .collect(),
             interactive_args: Vec::new(),
+            relay: None,
+            relay_args: Vec::new(),
             allow: None,
             parse: Parser::TextTail,
             reports_cost: false,

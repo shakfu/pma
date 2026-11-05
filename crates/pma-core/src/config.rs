@@ -64,6 +64,8 @@ pub struct Config {
     pub workspace: Workspace,
     /// What agents run in. One setting because integrations exclude each other.
     pub integration: Integration,
+    /// A minos room per run, beside any `integration`: `pma integrate minos`.
+    pub minos: Minos,
     pub projects: BTreeMap<String, ProjectSettings>,
 }
 
@@ -89,6 +91,76 @@ impl Integration {
         match s {
             "none" => Some(Integration::None),
             "herdr" => Some(Integration::Herdr),
+            _ => None,
+        }
+    }
+}
+
+/// A minos room for each run, where a person reads and corrects the agent.
+/// Passwords come from the environment alone, so `settings.toml` holds none:
+/// `MINOS_PASSWORD` for `user`, `MINOS_ADMIN_PASSWORD` for `admin`.
+/// See docs/dev/pma-minos-integration.md.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Minos {
+    pub enabled: bool,
+    pub server: String,
+    /// An unset password is the account's name, as in minosd's development
+    /// accounts. Off, an unset password means no room.
+    pub dev_passwords: bool,
+    /// The account a run speaks as.
+    pub user: String,
+    /// An administrator, who founds rooms: `minosb` holds only `user`.
+    pub admin: String,
+    pub rooms: Rooms,
+    /// Seconds a relayed agent waits between turns for a correction before
+    /// its input closes and the run ends.
+    pub linger: i64,
+    /// Accounts whose `/interrupt` in the room stops a turn.
+    pub interrupters: Vec<String>,
+    /// Accounts or `@groups` invited to each room.
+    pub invite: Vec<String>,
+}
+
+impl Default for Minos {
+    fn default() -> Self {
+        // minosd's own defaults: its address, its agent account and its
+        // administrator.
+        Minos {
+            enabled: false,
+            server: "http://127.0.0.1:8000".into(),
+            dev_passwords: true,
+            user: "worker".into(),
+            admin: "demo".into(),
+            rooms: Rooms::Task,
+            linger: 120,
+            interrupters: Vec::new(),
+            invite: Vec::new(),
+        }
+    }
+}
+
+/// Which runs share a room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rooms {
+    /// One room per task: a rework reads what the last run was told. minos
+    /// seats one run per room, so a second run of the task gets none.
+    Task,
+    /// One room per run. minos cannot delete a room, so they accumulate.
+    Run,
+}
+
+impl Rooms {
+    pub fn name(self) -> &'static str {
+        match self {
+            Rooms::Task => "task",
+            Rooms::Run => "run",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Rooms> {
+        match s {
+            "task" => Some(Rooms::Task),
+            "run" => Some(Rooms::Run),
             _ => None,
         }
     }
@@ -183,6 +255,7 @@ impl Default for Config {
             notify: None,
             workspace: Workspace::Clone,
             integration: Integration::None,
+            minos: Minos::default(),
             projects: BTreeMap::new(),
         }
     }
@@ -203,6 +276,7 @@ enum Slot<'a> {
     Attribution(&'a mut Attribution),
     Workspace(&'a mut Workspace),
     Integration(&'a mut Integration),
+    Rooms(&'a mut Rooms),
     /// Empty text is `None`.
     OptText(&'a mut Option<String>),
     /// Text that may not be empty.
@@ -320,6 +394,20 @@ impl Config {
             ]
             .map(String::from),
         );
+        keys.extend(
+            [
+                "enabled",
+                "server",
+                "dev_passwords",
+                "user",
+                "admin",
+                "rooms",
+                "linger",
+                "interrupters",
+                "invite",
+            ]
+            .map(|k| format!("minos.{k}")),
+        );
         keys
     }
 
@@ -353,6 +441,7 @@ impl Config {
             | Slot::Attribution(_)
             | Slot::Workspace(_)
             | Slot::Integration(_)
+            | Slot::Rooms(_)
             | Slot::OptText(_)
             | Slot::Text(_) => "text",
         })
@@ -373,6 +462,7 @@ impl Config {
             },
             Slot::Workspace(w) => w.name().into(),
             Slot::Integration(i) => i.name().into(),
+            Slot::Rooms(r) => r.name().into(),
             Slot::OptText(v) => v.clone().unwrap_or_default(),
             Slot::Text(v) => v.clone(),
             Slot::Switch(v) => if *v { "on" } else { "off" }.into(),
@@ -456,6 +546,9 @@ impl Config {
             Slot::Integration(i) => {
                 *i = Integration::parse(value).ok_or("expected none or herdr")?;
             }
+            Slot::Rooms(r) => {
+                *r = Rooms::parse(value).ok_or("expected task or run")?;
+            }
             Slot::OptText(v) => *v = (!value.is_empty()).then(|| value.to_string()),
             Slot::Text(v) => {
                 if value.is_empty() {
@@ -520,6 +613,23 @@ impl Config {
             Some(("activity", "ignore")) => Slot::List(&mut self.activity_ignore),
             Some(("deps", "days")) => Slot::Count(&mut self.deps_days, 0, i64::MAX),
             Some(("scan", "every")) => Slot::Count(&mut self.scan_every, 0, i64::MAX),
+            Some(("minos", field)) => {
+                let m = &mut self.minos;
+                match field {
+                    "enabled" => Slot::Switch(&mut m.enabled),
+                    "server" => Slot::Text(&mut m.server),
+                    "dev_passwords" => Slot::Switch(&mut m.dev_passwords),
+                    "user" => Slot::Text(&mut m.user),
+                    "admin" => Slot::Text(&mut m.admin),
+                    "rooms" => Slot::Rooms(&mut m.rooms),
+                    // Not 0, which `minosb` reads as never: the run would end
+                    // only at the timeout.
+                    "linger" => Slot::Count(&mut m.linger, 1, 3600),
+                    "interrupters" => Slot::List(&mut m.interrupters),
+                    "invite" => Slot::List(&mut m.invite),
+                    _ => return None,
+                }
+            }
             Some(("activity", rest)) => {
                 let t = rest.strip_prefix("horizon.")?;
                 Slot::Count(&mut self.activity_horizon[tier(t)?], 1, i64::MAX)
@@ -560,7 +670,7 @@ mod tests {
     #[test]
     fn every_key_reads_and_round_trips() {
         let keys = Config::keys();
-        assert_eq!(keys.len(), 39);
+        assert_eq!(keys.len(), 48);
         let defaults = Config::default();
         let mut copy = Config::default();
         for key in &keys {

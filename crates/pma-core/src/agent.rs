@@ -45,6 +45,12 @@ pub fn restrict(cmd: &mut Command, dir: &Path) -> std::io::Result<()> {
         "KITTY_LISTEN_ON",
         "WEZTERM_UNIX_SOCKET",
         "NVIM",
+        // `pma` holds the minos passwords for `minosb` and `minos room
+        // ensure`; an agent speaks only through its run's socket.
+        "MINOS_PASSWORD",
+        "MINOS_ADMIN_PASSWORD",
+        "MINOS_USER",
+        "MINOS_SOCKET",
     ] {
         cmd.env_remove(var);
     }
@@ -310,6 +316,54 @@ pub fn parse_claude(output: &str) -> Report {
     }
 }
 
+/// Reads a run whose `claude` took turns under `minosb`: a person's message
+/// starts another turn, and each ends with a `result`. Unlike `parse_claude`:
+///
+/// - the summary is every turn's reply, in order, as the last reply may answer
+///   only the last correction;
+/// - a last turn a person interrupted (`error_during_execution`) is not a
+///   failure, so verify decides whether the work is done;
+/// - the cost is the largest total seen, as each `total_cost_usd` is the
+///   session's so far.
+pub fn parse_relayed(output: &str) -> Report {
+    let results: Vec<serde_json::Value> = output
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .filter(|v| v["type"] == "result")
+        .collect();
+    let Some(last) = results.last() else {
+        return parse_claude(output);
+    };
+    let replies: Vec<&str> = results
+        .iter()
+        .filter_map(|v| v["result"].as_str())
+        .filter(|r| !r.trim().is_empty())
+        .collect();
+    let subtype = last["subtype"].as_str();
+    let ok = match subtype {
+        Some("error_during_execution") => true,
+        _ => !last["is_error"].as_bool().unwrap_or(true) && subtype == Some("success"),
+    };
+    Report {
+        ok,
+        summary: match replies.as_slice() {
+            [] => subtype.unwrap_or_default().to_string(),
+            [one] => (*one).to_string(),
+            many => many
+                .iter()
+                .enumerate()
+                .map(|(i, r)| format!("Turn {}: {r}", i + 1))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        },
+        cost_usd: results
+            .iter()
+            .filter_map(|v| v["total_cost_usd"].as_f64())
+            .reduce(f64::max),
+        denied: denials(output, last),
+    }
+}
+
 /// A log's text, with invalid UTF-8 replaced: one stray byte from an agent
 /// must not cost the result line. `None` when the file cannot be read.
 pub fn read_log(path: &Path) -> Option<String> {
@@ -439,6 +493,49 @@ mod tests {
         let junk = parse_claude("Error: not logged in\n");
         assert!(!junk.ok);
         assert_eq!(junk.summary, "Error: not logged in");
+    }
+
+    /// A corrected run reports every turn, an interrupted last turn leaves the
+    /// verdict to verify, and the cost is the session's whole total.
+    #[test]
+    fn a_relayed_run_reads_every_turn() {
+        let turn = |subtype: &str, error: bool, result: &str, cost: f64| {
+            serde_json::json!({"type": "result", "subtype": subtype, "is_error": error,
+                               "result": result, "total_cost_usd": cost})
+            .to_string()
+        };
+        let log = [
+            turn("success", false, "Fixed the parser.", 0.2),
+            r#"{"type":"assistant"}"#.into(),
+            turn("success", false, "Renamed it too.", 0.3),
+        ]
+        .join("\n");
+        let r = parse_relayed(&log);
+        assert!(r.ok);
+        assert_eq!(
+            r.summary,
+            "Turn 1: Fixed the parser.\n\nTurn 2: Renamed it too."
+        );
+        assert_eq!(r.cost_usd, Some(0.3));
+
+        // Stopped by a person: as `parse_claude` reads it, a failure.
+        let stopped = [
+            turn("success", false, "Done.", 0.4),
+            turn("error_during_execution", true, "", 0.4),
+        ]
+        .join("\n");
+        assert!(!parse_claude(&stopped).ok);
+        let r = parse_relayed(&stopped);
+        assert!(r.ok);
+        assert_eq!((r.summary.as_str(), r.cost_usd), ("Done.", Some(0.4)));
+
+        // A one-turn run reads as `parse_claude` reads it.
+        let one = turn("success", false, "Fixed it.", 0.1);
+        assert_eq!(parse_relayed(&one), parse_claude(&one));
+        let over = turn("error_max_budget_usd", true, "", 1.2);
+        assert!(!parse_relayed(&over).ok);
+        assert_eq!(parse_relayed(&over).summary, "error_max_budget_usd");
+        assert!(!parse_relayed("not logged in").ok);
     }
 
     #[test]
@@ -595,8 +692,11 @@ mod tests {
         cmd.args([
             "-c",
             "echo \"${GH_TOKEN-unset} ${GH_ENTERPRISE_TOKEN-unset} ${GIT_ASKPASS-unset} \
-             ${HERDR_ENV-unset} ${HERDR_SOCKET_PATH-unset} ${HERDR_PANE_ID-unset} $GIT_TERMINAL_PROMPT\"",
+             ${HERDR_ENV-unset} ${HERDR_SOCKET_PATH-unset} ${HERDR_PANE_ID-unset} $GIT_TERMINAL_PROMPT \
+             ${MINOS_PASSWORD-unset} ${MINOS_ADMIN_PASSWORD-unset}\"",
         ])
+        .env("MINOS_PASSWORD", "worker")
+        .env("MINOS_ADMIN_PASSWORD", "demo")
         .env("GH_TOKEN", "secret")
         .env("GH_ENTERPRISE_TOKEN", "secret")
         .env("GIT_ASKPASS", "/bin/echo")
@@ -608,7 +708,7 @@ mod tests {
         let out = cmd.output().unwrap();
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
-            "unset unset unset unset /nonexistent/pma-agents-cannot-reach-herdr.sock unset 0\n"
+            "unset unset unset unset /nonexistent/pma-agents-cannot-reach-herdr.sock unset 0 unset unset\n"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

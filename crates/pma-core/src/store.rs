@@ -24,7 +24,7 @@ use crate::worker::{Parser, Worker};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const VERSION: i64 = 49;
+const VERSION: i64 = 50;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -467,6 +467,14 @@ WHERE state = 'ready' AND branch = '' AND workflow_instance IS NOT NULL;
 
 /// Version 47. What herdr last said of the agent in a run's pane.
 const HERDR_AGENT_STATE: &str = "ALTER TABLE runs ADD COLUMN agent_state TEXT;";
+
+/// Version 50. The minos room a run's last attempt spoke in, and how a worker
+/// runs when `minosb` holds its pipes.
+const MINOS_ROOMS: &str = "
+ALTER TABLE runs ADD COLUMN room TEXT;
+ALTER TABLE agents ADD COLUMN relay TEXT;
+ALTER TABLE agents ADD COLUMN relay_args TEXT NOT NULL DEFAULT '[]';
+";
 
 /// Version 49. How a worker starts a session a person drives, as a JSON array.
 const INTERACTIVE_ARGS: &str =
@@ -1134,6 +1142,7 @@ impl Store {
                     HERDR_AGENT_STATE,
                     PROJECT_STAMPS,
                     INTERACTIVE_ARGS,
+                    MINOS_ROOMS,
                 ];
                 let tx = conn.unchecked_transaction()?;
                 for step in &steps[version as usize..] {
@@ -1233,6 +1242,23 @@ impl Store {
                     store.change_settings(|doc| crate::settings::set_agent(doc, &w))?;
                     eprintln!(
                         "pma: wrote agents.{}.interactive_args to {}",
+                        w.name,
+                        store.settings.display()
+                    );
+                }
+            }
+        }
+        // As for `interactive_args`: a `claude` worker without a relay form
+        // gets the template's, in the file.
+        if version < 50 {
+            let template = crate::worker::Worker::claude();
+            for mut w in store.agents()? {
+                if w.command == template.command && w.relay.is_none() && w.relay_args.is_empty() {
+                    w.relay = template.relay.clone();
+                    w.relay_args = template.relay_args.clone();
+                    store.change_settings(|doc| crate::settings::set_agent(doc, &w))?;
+                    eprintln!(
+                        "pma: wrote agents.{}.relay to {}",
                         w.name,
                         store.settings.display()
                     );
@@ -2399,6 +2425,57 @@ impl Store {
         Ok(())
     }
 
+    /// What routing decided for a run inserted before its base check.
+    pub fn route_queued(&self, run: &Run) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET agent = ?2, model = ?3, preset = ?4, extra_args = ?5, scope = ?6,
+                tier = ?7, verify_base_ok = ?8, verify_base_seconds = ?9, complexity = ?10,
+                features = ?11, estimator = ?12, route_revision = ?13, route = ?14,
+                approval = ?15, prompt = ?16
+             WHERE id = ?1",
+            params![
+                run.id,
+                run.agent,
+                run.model,
+                run.preset,
+                serde_json::to_string(&run.extra_args).unwrap_or_else(|_| "[]".into()),
+                run.scope.join(","),
+                run.tier,
+                run.verify_base_ok,
+                run.verify_base_seconds,
+                run.complexity,
+                run.features.map(Features::to_json),
+                run.estimator,
+                run.route_revision,
+                run.route,
+                run.approval.map(Approval::name),
+                run.prompt,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Removes a run that routing refused before it started, with its items.
+    /// Only a queued one: anything later has a record to keep.
+    pub fn delete_queued(&self, id: i64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM run_items WHERE run = ?1 AND EXISTS
+                 (SELECT 1 FROM runs WHERE id = ?1 AND state = 'queued')",
+            [id],
+        )?;
+        tx.execute("DELETE FROM runs WHERE id = ?1 AND state = 'queued'", [id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `None` when the last attempt ran without a room.
+    pub fn set_room(&self, id: i64, room: Option<&str>) -> Result<()> {
+        self.conn
+            .execute("UPDATE runs SET room = ?2 WHERE id = ?1", params![id, room])?;
+        Ok(())
+    }
+
     pub fn set_agent_state(&self, id: i64, state: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE runs SET agent_state = ?2 WHERE id = ?1",
@@ -2448,7 +2525,7 @@ impl Store {
                     approved_tree, approved_head, approved_by,
                     workflow_instance, node, unit, lap, preset, extra_args, git_snapshot,
                     reviewed_tree, infra, workspace, start, denied,
-                    review_measured, pane, interactive, agent_state
+                    review_measured, pane, interactive, agent_state, room
              FROM runs ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -2542,6 +2619,7 @@ impl Store {
                 pane: r.get(62)?,
                 interactive: r.get(63)?,
                 agent_state: r.get(64)?,
+                room: r.get(65)?,
                 items: Vec::new(),
             })
         })?;
@@ -3072,7 +3150,7 @@ impl Store {
     pub fn agents(&self) -> Result<Vec<Worker>> {
         let mut stmt = self.conn.prepare(
             "SELECT name, command, args, allow, parse, reports_cost, enforces_budget,
-                    sandbox, resumes, env, interactive_args
+                    sandbox, resumes, env, interactive_args, relay, relay_args
              FROM agents ORDER BY name",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -3084,6 +3162,8 @@ impl Store {
                 args: serde_json::from_str(&args).unwrap_or_default(),
                 interactive_args: serde_json::from_str(&r.get::<_, String>(10)?)
                     .unwrap_or_default(),
+                relay: r.get::<_, Option<String>>(11)?.filter(|a| !a.is_empty()),
+                relay_args: serde_json::from_str(&r.get::<_, String>(12)?).unwrap_or_default(),
                 allow: r.get::<_, Option<String>>(3)?.filter(|a| !a.is_empty()),
                 parse: Parser::parse(&parse).unwrap_or(Parser::TextTail),
                 reports_cost: r.get(5)?,
@@ -3618,6 +3698,8 @@ pub struct Run {
     pub interactive: bool,
     /// What herdr last said of the agent in `pane`: `blocked` needs a person.
     pub agent_state: Option<String>,
+    /// The minos room the last attempt spoke in.
+    pub room: Option<String>,
     /// A bundle's items, in prompt order; empty for any other run.
     pub items: Vec<RunItem>,
 }
@@ -3725,6 +3807,7 @@ impl Run {
             denied: Vec::new(),
             review_measured: None,
             pane: None,
+            room: None,
             interactive: false,
             agent_state: None,
             items: Vec::new(),
@@ -3877,8 +3960,8 @@ fn seed_agent(conn: &Connection, w: &Worker) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO agents
             (name, command, args, allow, parse, reports_cost, enforces_budget, sandbox,
-             resumes, env, interactive_args)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             resumes, env, interactive_args, relay, relay_args)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             w.name,
             w.command,
@@ -3891,6 +3974,8 @@ fn seed_agent(conn: &Connection, w: &Worker) -> Result<()> {
             w.resumes,
             serde_json::to_string(&w.env).unwrap_or_else(|_| "{}".into()),
             serde_json::to_string(&w.interactive_args).unwrap_or_else(|_| "[]".into()),
+            w.relay,
+            serde_json::to_string(&w.relay_args).unwrap_or_else(|_| "[]".into()),
         ],
     )?;
     Ok(())
@@ -4359,7 +4444,10 @@ mod tests {
                 store
                     .conn
                     .execute_batch(
-                        "ALTER TABLE runs DROP COLUMN denied;
+                        "ALTER TABLE runs DROP COLUMN room;
+                         ALTER TABLE agents DROP COLUMN relay;
+                         ALTER TABLE agents DROP COLUMN relay_args;
+                         ALTER TABLE runs DROP COLUMN denied;
                          ALTER TABLE runs DROP COLUMN review_started;
                          ALTER TABLE runs DROP COLUMN review_measured;
                          ALTER TABLE runs DROP COLUMN agent_state;
@@ -4433,6 +4521,9 @@ mod tests {
     /// Undoes versions 40 to 43, for a test that rewinds the schema past
     /// them.
     const BEFORE_SCAN_FAULTS: &str = "
+        ALTER TABLE runs DROP COLUMN room;
+        ALTER TABLE agents DROP COLUMN relay;
+        ALTER TABLE agents DROP COLUMN relay_args;
         ALTER TABLE agents DROP COLUMN interactive_args;
         ALTER TABLE runs DROP COLUMN agent_state;
         ALTER TABLE runs DROP COLUMN denied;
@@ -4938,6 +5029,7 @@ mod tests {
             denied: Vec::new(),
             review_measured: None,
             pane: None,
+            room: None,
             interactive: false,
             agent_state: None,
             items: vec![
@@ -5244,7 +5336,12 @@ mod tests {
             std::fs::write(&file, format!("{}{}", &text[..line], &text[end..])).unwrap();
             store
                 .conn
-                .execute_batch("ALTER TABLE agents DROP COLUMN interactive_args;")
+                .execute_batch(
+                    "ALTER TABLE agents DROP COLUMN interactive_args;
+                     ALTER TABLE runs DROP COLUMN room;
+                     ALTER TABLE agents DROP COLUMN relay;
+                     ALTER TABLE agents DROP COLUMN relay_args;",
+                )
                 .unwrap();
             store.conn.pragma_update(None, "user_version", 48).unwrap();
         }
@@ -5261,6 +5358,47 @@ mod tests {
             Worker::claude().interactive_args,
             "{text}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Version 50 gives each `claude` worker its relay form in the file, and a
+    /// run its room. A worker of another command gets no relay.
+    #[test]
+    fn claude_gets_its_relay_and_a_run_its_room() {
+        let dir = scratch("relay");
+        let path = dir.join("p.db");
+        let file = dir.join(crate::settings::FILE);
+        {
+            let store = Store::open(&path).unwrap();
+            let text = std::fs::read_to_string(&file).unwrap();
+            let kept: Vec<&str> = text.lines().filter(|l| !l.starts_with("relay")).collect();
+            std::fs::write(&file, kept.join("\n") + "\n").unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "ALTER TABLE runs DROP COLUMN room;
+                     ALTER TABLE agents DROP COLUMN relay;
+                     ALTER TABLE agents DROP COLUMN relay_args;",
+                )
+                .unwrap();
+            store.conn.pragma_update(None, "user_version", 49).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let claude = store.agent("claude").unwrap();
+        assert_eq!(claude.relay.as_deref(), Some("claude"));
+        assert_eq!(claude.relay_args, Worker::claude().relay_args);
+        assert_eq!(store.agent("opencode").unwrap().relay, None);
+        let (_, settings) = crate::settings::read(&file).unwrap();
+        let in_file = settings.agents.iter().find(|w| w.name == "claude").unwrap();
+        assert_eq!(in_file.relay_args, Worker::claude().relay_args);
+
+        let mut run = Run::blank();
+        store.insert_run(&mut run).unwrap();
+        assert_eq!(store.run(run.id).unwrap().room, None);
+        store.set_room(run.id, Some("r9")).unwrap();
+        assert_eq!(store.run(run.id).unwrap().room.as_deref(), Some("r9"));
+        store.set_room(run.id, None).unwrap();
+        assert_eq!(store.run(run.id).unwrap().room, None);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -516,6 +516,9 @@ pub fn run_fields(run: &Run) -> Vec<Vec<String>> {
         let state = run.agent_state.as_deref().unwrap_or("-");
         rows.push(vec!["herdr".into(), format!("{pane}, {state}")]);
     }
+    if let Some(room) = &run.room {
+        rows.push(vec!["minos".into(), format!("room {room}")]);
+    }
     if let Some(s) = run.review_time() {
         rows.push(vec!["reviewed".into(), duration(Some(s))]);
     }

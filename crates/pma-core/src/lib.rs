@@ -21,6 +21,7 @@ pub mod herdr;
 pub mod history;
 pub mod jobs;
 pub mod keys;
+pub mod minos;
 pub mod next;
 pub mod pass;
 pub mod progress;

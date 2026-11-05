@@ -2026,6 +2026,308 @@ fn with_no_herdr_server_a_run_goes_on_without_a_pane() {
     );
 }
 
+/// The run is in the store, queued, while its base check runs, and the
+/// dispatch says what it waits on: an uncached suite can take the timeout.
+#[test]
+fn a_run_shows_as_queued_while_its_base_is_checked() {
+    let s = Scratch::new("basewait");
+    let (env, _, _) = dispatch_env(
+        &s,
+        &[(
+            "claude",
+            "#!/bin/sh\necho hi > hello.txt\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\",\"total_cost_usd\":0.1}'\n",
+        )],
+    );
+    let seen = env.bin.join("seen");
+    let verify = format!(
+        "sqlite3 \"$PMA_HOME/projects.db\" \"select id || ' ' || state from runs\" >> '{}'; test -f hello.txt",
+        seen.display()
+    );
+    env.ok(&["config", "projects.alpha.verify", &verify]);
+    let (out, err, success) = env.run(&["dispatch", "alpha:5"]);
+    assert!(success, "{out}{err}");
+    assert!(
+        err.contains("#1 alpha: checking the base first: `sqlite3")
+            && err.contains("up to 30 minutes")
+            && err.contains("verify_base_alongside on"),
+        "{err}"
+    );
+    let seen = fs::read_to_string(&seen).unwrap();
+    let mut checks = seen.lines();
+    assert_eq!(checks.next(), Some("1 queued"), "the base check: {seen}");
+    assert_eq!(
+        checks.next(),
+        Some("1 running"),
+        "the run's own check: {seen}"
+    );
+    // Routing filled in what the base check decided.
+    let detail = env.ok(&["review", "1"]);
+    assert!(detail.contains("claude"), "{detail}");
+
+    // Cached the second time: no wait, no message.
+    env.ok(&["review", "1", "--reject"]);
+    let (out, err, success) = env.run(&["dispatch", "alpha:5", "--retry"]);
+    assert!(success, "{out}{err}");
+    assert!(!err.contains("checking the base first"), "{err}");
+}
+
+/// `minos room ensure` as the administrator: it prints the room id.
+const FAKE_MINOS: &str = r#"#!/bin/sh
+echo "user=$MINOS_USER pass=$MINOS_PASSWORD $*" >> "$(dirname "$0")/minos.calls"
+echo room1
+"#;
+
+/// Enters the room at once. With a run command it writes the task to the
+/// command's stdin and hides the password, as `minosb` does; without one it
+/// serves until stopped.
+const FAKE_MINOSB: &str = r#"#!/bin/sh
+dir="$(dirname "$0")"
+echo "pass=${MINOS_PASSWORD-unset} $*" >> "$dir/minosb.calls"
+events= task=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -events) events="$2"; shift 2 ;;
+    -task) task="$2"; shift 2 ;;
+    --) shift; break ;;
+    *) shift ;;
+  esac
+done
+echo '{"event":"ready","room":"room1"}' >> "$events"
+if [ $# -eq 0 ]; then
+  trap 'exit 0' TERM
+  while :; do sleep 0.1; done
+fi
+unset MINOS_PASSWORD MINOS_USER
+printf '%s\n' "$task" | "$@"
+"#;
+
+const FAKE_MINOSA: &str = "#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/minosa.calls\"\n";
+
+/// Two turns, as when a person corrected the agent after its first reply.
+const RELAYED_CLAUDE: &str = r#"#!/bin/sh
+read -r task
+echo "args=$* pass=${MINOS_PASSWORD-unset} admin=${MINOS_ADMIN_PASSWORD-unset} task=$task" > "$(dirname "$0")/agent.seen"
+echo hi > hello.txt
+echo '{"type":"result","subtype":"success","is_error":false,"result":"Added it.","total_cost_usd":0.1}'
+echo '{"type":"result","subtype":"success","is_error":false,"result":"Renamed it.","total_cost_usd":0.25}'
+"#;
+
+/// `env.command` with the minos passwords pma reads from its environment.
+fn with_minos(env: &Env, args: &[&str]) -> (String, String, bool) {
+    let out = env
+        .command(args)
+        .env("MINOS_PASSWORD", "worker")
+        .env("MINOS_ADMIN_PASSWORD", "demo")
+        .output()
+        .unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.success(),
+    )
+}
+
+/// Under `pma integrate minos` a `claude` run gets a room, founded by the
+/// administrator, and runs under `minosb`, which alone holds the password.
+/// Every turn reaches the review, and the cost is the session's total.
+#[test]
+fn a_minos_run_is_relayed_through_its_room() {
+    let s = Scratch::new("minosrelay");
+    let (env, _, _) = dispatch_env(
+        &s,
+        &[
+            ("claude", RELAYED_CLAUDE),
+            ("minos", FAKE_MINOS),
+            ("minosb", FAKE_MINOSB),
+            ("minosa", FAKE_MINOSA),
+        ],
+    );
+    // Closed, so the check reports it rather than finding a real server.
+    env.ok(&["config", "minos.server", "http://127.0.0.1:9"]);
+    let (out, _, _) = with_minos(&env, &["integrate", "minos"]);
+    assert!(
+        out.contains("integration = none") && out.contains("minos = on"),
+        "{out}"
+    );
+    let (out, err, success) = with_minos(&env, &["dispatch", "alpha:5"]);
+    assert!(success, "{out}{err}");
+
+    let called = |name: &str| fs::read_to_string(env.bin.join(name)).unwrap_or_default();
+    let ensure = called("minos.calls");
+    assert!(
+        ensure.contains("user=demo pass=demo room ensure -server http://127.0.0.1:9")
+            && ensure.contains("-project alpha -task")
+            && ensure.trim_end().ends_with("-invite worker"),
+        "{ensure}"
+    );
+    let broker = called("minosb.calls");
+    assert!(broker.contains("pass=worker -server"), "{broker}");
+    assert!(
+        broker.contains("-room room1") && broker.contains("-agent claude -task"),
+        "{broker}"
+    );
+    assert!(
+        broker.contains("-- claude -p --input-format stream-json"),
+        "{broker}"
+    );
+    let seen = called("agent.seen");
+    assert!(
+        seen.contains("args=-p --input-format stream-json"),
+        "the relay form: {seen}"
+    );
+    assert!(
+        seen.contains("pass=unset admin=unset"),
+        "the agent holds neither password: {seen}"
+    );
+    assert!(
+        !seen.trim_end().ends_with("task="),
+        "the task arrives on stdin: {seen}"
+    );
+
+    let detail = env.ok(&["review", "1"]);
+    assert!(
+        detail.contains("minos") && detail.contains("room room1"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("Turn 1: Added it.") && detail.contains("Turn 2: Renamed it."),
+        "{detail}"
+    );
+    assert!(detail.contains("$0.25"), "{detail}");
+}
+
+/// A broker that cannot enter its room ran no agent. The run goes on without
+/// the room, as it would with no server, and records none.
+#[test]
+fn a_run_minos_cannot_seat_goes_on_without_a_room() {
+    const REFUSING_MINOSB: &str =
+        "#!/bin/sh\necho 'minosb: the room admits one agent run' >&2\nexit 1\n";
+    let s = Scratch::new("minosrefused");
+    let (env, _, _) = dispatch_env(
+        &s,
+        &[
+            ("claude", RELAYED_CLAUDE),
+            ("minos", FAKE_MINOS),
+            ("minosb", REFUSING_MINOSB),
+        ],
+    );
+    env.ok(&["config", "minos.enabled", "on"]);
+    let (out, err, success) = with_minos(&env, &["dispatch", "alpha:5"]);
+    assert!(success, "{out}{err}");
+    assert!(
+        err.contains("did not enter room room1") && err.contains("admits one agent run"),
+        "{err}"
+    );
+    assert!(err.contains("running without it"), "{err}");
+    assert!(env.ok(&["review"]).contains("#1  ready"));
+    assert!(!env.ok(&["review", "1"]).contains("room room1"));
+
+    // No password set: minosd's development accounts, named as passwords.
+    let s = Scratch::new("minosnopass");
+    let (env, _, _) = dispatch_env(
+        &s,
+        &[
+            ("claude", RELAYED_CLAUDE),
+            ("minos", FAKE_MINOS),
+            ("minosb", FAKE_MINOSB),
+        ],
+    );
+    env.ok(&["config", "minos.enabled", "on"]);
+    let out = env.ok(&["integrate"]);
+    assert!(
+        out.contains("MINOS_PASSWORD is not set; using `worker`"),
+        "{out}"
+    );
+    assert!(
+        out.contains("MINOS_ADMIN_PASSWORD is not set; using `demo`"),
+        "{out}"
+    );
+    let (out, err, success) = env.run(&["dispatch", "alpha:5"]);
+    assert!(success, "{out}{err}");
+    let ensure = fs::read_to_string(env.bin.join("minos.calls")).unwrap();
+    assert!(ensure.starts_with("user=demo pass=demo "), "{ensure}");
+    let broker = fs::read_to_string(env.bin.join("minosb.calls")).unwrap();
+    assert!(broker.starts_with("pass=worker "), "{broker}");
+    assert!(env.ok(&["review", "1"]).contains("room room1"));
+
+    // With the fallback off, an unset password means no room and no call to
+    // found one.
+    let s = Scratch::new("minosstrict");
+    let (env, _, _) = dispatch_env(&s, &[("claude", RELAYED_CLAUDE), ("minos", FAKE_MINOS)]);
+    env.ok(&["config", "minos.enabled", "on"]);
+    env.ok(&["config", "minos.dev_passwords", "off"]);
+    let out = env.ok(&["integrate"]);
+    assert!(
+        out.contains("minos: MINOS_PASSWORD is not set") && !out.contains("using `worker`"),
+        "{out}"
+    );
+    let (out, err, success) = env.run(&["dispatch", "alpha:5"]);
+    assert!(success, "{out}{err}");
+    assert!(
+        err.contains("no minos room: MINOS_PASSWORD is not set"),
+        "{err}"
+    );
+    assert!(!env.bin.join("minos.calls").exists());
+    assert!(!env.ok(&["review", "1"]).contains("room"));
+}
+
+/// An agent with no relay runs beside a broker that serves only the socket.
+/// It is told how to read the room, `pma` posts its start and end there, and
+/// `minos.rooms = run` gives the run a room of its own.
+#[test]
+fn an_agent_without_a_relay_reaches_its_room_through_minosa() {
+    const OMP: &str = r#"#!/bin/sh
+for last; do :; done
+dir="$(dirname "$0")"
+echo "socket=${MINOS_SOCKET-unset} pass=${MINOS_PASSWORD-unset}" > "$dir/omp.seen"
+printf '%s\n' "$last" >> "$dir/omp.seen"
+echo hi > hello.txt
+echo "added the greeting"
+"#;
+    let s = Scratch::new("minossidecar");
+    let (env, _, _) = dispatch_env(
+        &s,
+        &[
+            ("omp", OMP),
+            ("minos", FAKE_MINOS),
+            ("minosb", FAKE_MINOSB),
+            ("minosa", FAKE_MINOSA),
+        ],
+    );
+    env.ok(&["config", "agent", "omp"]);
+    env.ok(&["config", "minos.enabled", "on"]);
+    env.ok(&["config", "minos.rooms", "run"]);
+    let (out, err, success) = with_minos(&env, &["dispatch", "alpha:5"]);
+    assert!(success, "{out}{err}");
+
+    let called = |name: &str| fs::read_to_string(env.bin.join(name)).unwrap_or_default();
+    let ensure = called("minos.calls");
+    assert!(
+        ensure.contains("-task add greeting#1 -invite worker"),
+        "a room per run: {ensure}"
+    );
+    let broker = called("minosb.calls");
+    assert!(
+        !broker.contains(" -- ") && !broker.contains("-task"),
+        "a broker with no run command: {broker}"
+    );
+    let seen = called("omp.seen");
+    assert!(seen.contains(".sock pass=unset"), "{seen}");
+    assert!(
+        seen.contains("minosa messages"),
+        "the agent is told: {seen}"
+    );
+    let posts = called("minosa.calls");
+    let posts: Vec<&str> = posts.lines().collect();
+    assert_eq!(posts.len(), 2, "{posts:?}");
+    assert!(posts[0].starts_with("say -socket ") && posts[0].contains("-- Run #1 started"));
+    assert!(
+        posts[1].contains("-- Run #1 ended: added the greeting"),
+        "{posts:?}"
+    );
+    assert!(env.ok(&["review", "1"]).contains("room room1"));
+}
+
 /// An agent refused an action carries on and reports success, so its run looks
 /// finished. `--push` leaves it, and the review names what was refused.
 #[test]
@@ -3405,6 +3707,9 @@ fn a_policy_is_a_draft_until_activated_and_replays_exactly() {
         !success && err.contains("matches no route in policy revision 2"),
         "{err}"
     );
+    // Inserted before its base check, the refused run leaves no row.
+    let (_, err, success) = env.run(&["review", "4"]);
+    assert!(!success, "a refused dispatch left run #4: {err}");
 
     // An unreadable document never becomes a revision.
     let bad = s.0.join("bad.json");

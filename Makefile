@@ -27,6 +27,10 @@ test: ## run every test
 herdr-check: ## run a dispatch through a real herdr server against a fresh fixture
 	@sh scripts/herdr-check.sh
 
+.PHONY: minos-check
+minos-check: ## run a dispatch through a real minos server, built from MINOS_SRC
+	@sh scripts/minos-check.sh
+
 .PHONY: web-check
 web-check: ## drive pma web in headless Chromium against a fresh fixture
 	@sh scripts/web-check.sh

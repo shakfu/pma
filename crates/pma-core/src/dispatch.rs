@@ -977,81 +977,8 @@ fn queue(
         ..Run::default()
     })?;
     let verify = verify_command(cfg, &pick.project, worktree);
-    // The worktree is a clean checkout of the base, so this is the base
-    // tree; a clone run's is its working tree, keyed by `start`. One verify
-    // at the head alone cannot tell a regression from a repository that was
-    // already failing.
-    // Not for an interactive run: a person judges it, and is waiting at the pane.
-    let (verify_base_ok, verify_base_seconds) = match &verify {
-        Some(v) if !pick.interactive => {
-            let at = start.as_deref().unwrap_or(&base);
-            let sandbox = cfg.project(&pick.project).sandbox;
-            match (
-                cfg.verify_base_alongside,
-                store.verify_base(&pick.project, at, v, cfg.timeout, sandbox)?,
-            ) {
-                // `attempt` measures it.
-                (true, None) => (None, None),
-                _ => base_verify(store, home, cfg, &pick.project, at, v, worktree)?,
-            }
-        }
-        _ => (None, None),
-    };
-    let mut features = Features::of(&pick.text, &details);
-    features.repo_files = tracked_files(worktree);
-    // Unmeasured yet when it runs beside the agent; the last time stands in.
-    features.verify_seconds = match verify_base_seconds {
-        Some(seconds) => Some(seconds),
-        None => store.last_base_seconds(&pick.project)?,
-    }
-    .filter(|_| verify.is_some());
-    (features.prior_decided, features.prior_accepted) = store.decided_runs(&pick.project)?;
-    let complexity = complexity::estimate(class, &features);
-
-    // A policy applies only once someone activates it; in shadow it is
-    // computed and recorded but the settings still decide.
-    // An untiered project is ranked at `default_tier`, so it is routed there.
-    let tier = cfg.tier_or_default(pick.tier);
-    let subject = Subject {
-        class,
-        complexity,
-        tier,
-        // A task dispatched on its own names no node, which is what a route
-        // stating no node condition serves; a workflow unit names its node.
-        node: pick.workflow.as_ref().map(|u| u.node.as_str()),
-        lap: pick.workflow.as_ref().map_or(0, |u| u.lap),
-    };
-    let active = store.active_route()?;
-    let mut routed = (None, None, None, None, class.scope());
-    if let Some(rev) = &active
-        && rev.shadow
-    {
-        // Recorded for `pma route replay`; it refuses, scopes and approves
-        // nothing.
-        let policy = rev.policy()?;
-        routed.0 = Some(rev.revision);
-        routed.1 = policy.route(&subject).map(|r| r.name.clone());
-    } else if let Some(rev) = &active {
-        let policy = rev.policy()?;
-        let Some(route) = policy.route(&subject) else {
-            return refuse(format!(
-                "`{}` matches no route in policy revision {}; add one or widen the last",
-                pick.text, rev.revision
-            ));
-        };
-        let scope = route.scope.clone().unwrap_or_else(|| class.scope());
-        routed = (
-            Some(rev.revision),
-            Some(route.name.clone()),
-            Some(route.approval),
-            Some((route.agent.clone(), route.model.clone())),
-            scope,
-        );
-    }
-    let (route_revision, route_name, approval, applied, scope) = routed;
-    let chosen = choose_worker(store, cfg, over, applied)?;
-    let (agent, model) = (chosen.agent.clone(), chosen.model.clone());
-
+    // Inserted before the base check, which can take the whole timeout, so the
+    // run shows as queued meanwhile. Routing fills in the rest.
     let mut run = Run {
         id: 0,
         project: pick.project.clone(),
@@ -1059,7 +986,8 @@ fn queue(
         text: pick.text.clone(),
         gh: pick.gh,
         quadrant: pick.quadrant.clone(),
-        agent,
+        // Placeholders until routing, below, which needs the base check.
+        agent: cfg.agent.clone(),
         repo: repo.clone(),
         branch: branch.to_string(),
         worktree: worktree.to_path_buf(),
@@ -1083,22 +1011,22 @@ fn queue(
         published_at: None,
         review_seconds: None,
         class: Some(class),
-        scope,
-        tier,
+        scope: class.scope(),
+        tier: cfg.tier_or_default(pick.tier),
         description: (!details.trim().is_empty()).then(|| details.clone()),
         agent_budget: Some(cfg.agent_budget),
         timeout_minutes: Some(cfg.timeout),
-        verify_base_ok,
-        verify_base_seconds,
+        verify_base_ok: None,
+        verify_base_seconds: None,
         changed_paths: None,
         scope_error: None,
-        model,
-        complexity: Some(complexity),
-        features: Some(features),
-        estimator: Some(complexity::ESTIMATOR.into()),
-        route_revision,
-        route: route_name,
-        approval,
+        model: None,
+        complexity: None,
+        features: None,
+        estimator: None,
+        route_revision: None,
+        route: None,
+        approval: None,
         approved_tree: None,
         approved_head: None,
         approved_by: None,
@@ -1107,23 +1035,139 @@ fn queue(
         node: pick.workflow.as_ref().map(|u| u.node.clone()),
         unit: pick.workflow.as_ref().map(|u| u.unit.clone()),
         lap: pick.workflow.as_ref().map_or(0, |u| u.lap),
-        preset: chosen.preset.clone(),
-        extra_args: chosen.args.clone(),
+        preset: None,
+        extra_args: Vec::new(),
         git_snapshot: Some(git_snapshot),
         reviewed_tree: None,
         infra: false,
         workspace: pick.workspace,
-        start,
+        start: start.clone(),
         denied: Vec::new(),
         review_measured: None,
         pane: None,
+        room: None,
         interactive: pick.interactive,
         agent_state: None,
         items: pick.items.clone(),
     };
-    run.prompt = prompt(&run, &details, verify.as_deref());
     store.insert_run(&mut run)?;
-    Ok(Prepared::Queued(Box::new(run), Vec::new()))
+    let routed = (|| -> Result<Option<String>> {
+        let (verify_base_ok, verify_base_seconds) = match &verify {
+            Some(v) if !pick.interactive => {
+                let at = run.start.as_deref().unwrap_or(&run.base).to_string();
+                let at = at.as_str();
+                let sandbox = cfg.project(&pick.project).sandbox;
+                match (
+                    cfg.verify_base_alongside,
+                    store.verify_base(&pick.project, at, v, cfg.timeout, sandbox)?,
+                ) {
+                    // `attempt` measures it.
+                    (true, None) => (None, None),
+                    (false, None) => {
+                        // The agent waits on this, and an uncached suite can take
+                        // the whole timeout: say so, as nothing else shows it.
+                        eprintln!(
+                            "#{} {}: checking the base first: `{v}`, up to {} minutes; log {}. \
+                             `pma config verify_base_alongside on` starts the agent beside it.",
+                            run.id,
+                            pick.project,
+                            cfg.timeout,
+                            base_log(home, &pick.project, at).display()
+                        );
+                        base_verify(store, home, cfg, &pick.project, at, v, worktree)?
+                    }
+                    _ => base_verify(store, home, cfg, &pick.project, at, v, worktree)?,
+                }
+            }
+            _ => (None, None),
+        };
+        let mut features = Features::of(&pick.text, &details);
+        features.repo_files = tracked_files(worktree);
+        // Unmeasured yet when it runs beside the agent; the last time stands in.
+        features.verify_seconds = match verify_base_seconds {
+            Some(seconds) => Some(seconds),
+            None => store.last_base_seconds(&pick.project)?,
+        }
+        .filter(|_| verify.is_some());
+        (features.prior_decided, features.prior_accepted) = store.decided_runs(&pick.project)?;
+        let complexity = complexity::estimate(class, &features);
+
+        // A policy applies only once someone activates it; in shadow it is
+        // computed and recorded but the settings still decide.
+        // An untiered project is ranked at `default_tier`, so it is routed there.
+        let tier = cfg.tier_or_default(pick.tier);
+        let subject = Subject {
+            class,
+            complexity,
+            tier,
+            // A task dispatched on its own names no node, which is what a route
+            // stating no node condition serves; a workflow unit names its node.
+            node: pick.workflow.as_ref().map(|u| u.node.as_str()),
+            lap: pick.workflow.as_ref().map_or(0, |u| u.lap),
+        };
+        let active = store.active_route()?;
+        let mut routed = (None, None, None, None, class.scope());
+        if let Some(rev) = &active
+            && rev.shadow
+        {
+            // Recorded for `pma route replay`; it refuses, scopes and approves
+            // nothing.
+            let policy = rev.policy()?;
+            routed.0 = Some(rev.revision);
+            routed.1 = policy.route(&subject).map(|r| r.name.clone());
+        } else if let Some(rev) = &active {
+            let policy = rev.policy()?;
+            let Some(route) = policy.route(&subject) else {
+                return Ok(Some(format!(
+                    "`{}` matches no route in policy revision {}; add one or widen the last",
+                    pick.text, rev.revision
+                )));
+            };
+            let scope = route.scope.clone().unwrap_or_else(|| class.scope());
+            routed = (
+                Some(rev.revision),
+                Some(route.name.clone()),
+                Some(route.approval),
+                Some((route.agent.clone(), route.model.clone())),
+                scope,
+            );
+        }
+        let (route_revision, route_name, approval, applied, scope) = routed;
+        let chosen = choose_worker(store, cfg, over, applied)?;
+        run.agent = chosen.agent.clone();
+        run.model = chosen.model.clone();
+        run.preset = chosen.preset.clone();
+        run.extra_args = chosen.args.clone();
+        run.scope = scope;
+        run.tier = tier;
+        run.verify_base_ok = verify_base_ok;
+        run.verify_base_seconds = verify_base_seconds;
+        run.complexity = Some(complexity);
+        run.features = Some(features);
+        run.estimator = Some(complexity::ESTIMATOR.into());
+        run.route_revision = route_revision;
+        run.route = route_name;
+        run.approval = approval;
+        run.prompt = prompt(&run, &details, verify.as_deref());
+        Ok(None)
+    })();
+    match routed {
+        Ok(None) => {
+            store.route_queued(&run)?;
+            Ok(Prepared::Queued(Box::new(run), Vec::new()))
+        }
+        // Never started, so it leaves no record, as before it had a row.
+        Ok(Some(why)) => {
+            store.delete_queued(run.id)?;
+            refuse(why)
+        }
+        Err(e) => {
+            if let Err(d) = store.delete_queued(run.id) {
+                eprintln!("warning: #{}: {d}", run.id);
+            }
+            Err(e)
+        }
+    }
 }
 
 pub fn path_arg(path: &Path) -> Result<&str> {
@@ -1700,6 +1744,39 @@ fn attempt_once(
         None => run.prompt.clone(),
     };
     a.verify = run.verify.clone();
+    let inner = timeout.saturating_sub(INNER_GRACE);
+    // Not for a run a person drives: they are at its terminal already.
+    let link = match cfg.minos.enabled && !run.interactive {
+        true => crate::minos::open(&cfg.minos, home, run, n)
+            .inspect_err(|e| eprintln!("warning: #{}: no minos room: {e}", run.id))
+            .ok(),
+        false => None,
+    };
+    // How the room reaches the agent: its template starts the broker, the
+    // broker holds a relay's pipes, or a broker beside it serves the socket.
+    let own = link.as_ref().filter(|_| worker.links_itself());
+    let relay = link.as_ref().filter(|_| own.is_none()).and_then(|l| {
+        let cmd = worker.build_relay(
+            &run.worktree,
+            run.model.as_deref(),
+            cfg.agent_budget,
+            &run.extra_args,
+            inner,
+            l,
+        )?;
+        Some((l, cmd))
+    });
+    let mut side = None;
+    if let Some(l) = link.as_ref().filter(|_| own.is_none() && relay.is_none()) {
+        match crate::minos::serve(&cfg.minos, l, &logs.join(format!("minosb-{n}.log"))) {
+            Ok(broker) => {
+                broker.say(&format!("Run #{} started: {}", run.id, run.text));
+                a.prompt.push_str(crate::minos::SIDECAR_NOTE);
+                side = Some((broker, l));
+            }
+            Err(e) => eprintln!("warning: #{}: no minos room: {e}", run.id),
+        }
+    }
     let built = match run.interactive {
         true => worker.build_interactive(
             &a.prompt,
@@ -1707,54 +1784,105 @@ fn attempt_once(
             run.model.as_deref(),
             &run.extra_args,
         ),
-        false => Some(worker.build(
+        false => Some(worker.build_linked(
             &a.prompt,
             &run.worktree,
             run.model.as_deref(),
             cfg.agent_budget,
             &run.extra_args,
-            timeout.saturating_sub(INNER_GRACE),
+            inner,
+            own,
         )),
     };
-    let Some(mut cmd) = built else {
+    let Some(cmd) = built else {
         fail(run, &mut a, no_interactive(&worker.name));
         return a;
     };
-    worker.allow_verify(&mut cmd, run.verify.as_deref());
-    cmd.current_dir(&run.worktree);
-    if let Err(e) = agent::restrict(&mut cmd, &agent_env) {
-        fail(run, &mut a, format!("{}: {e}", agent_env.display()));
-        return a;
+    let mut cmd = match confine_agent(worker, run, &agent_env, cmd) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            fail(run, &mut a, e);
+            return a;
+        }
+    };
+    if let Some((_, l)) = &side {
+        cmd.env("MINOS_SOCKET", &l.socket);
+    }
+    let wrapped = relay.and_then(|(l, relay_cmd)| {
+        let adapter = worker.relay.as_deref().unwrap_or_default();
+        confine_agent(worker, run, &agent_env, relay_cmd)
+            .and_then(|c| crate::minos::wrap(&cfg.minos, l, adapter, &a.prompt, &c))
+            .inspect_err(|e| eprintln!("warning: #{}: no minos room: {e}", run.id))
+            .ok()
+            .map(|w| (l, w))
+    });
+    let mut room = own
+        .or(wrapped.as_ref().map(|(l, _)| *l))
+        .or(side.as_ref().map(|(_, l)| *l))
+        .map(|l| l.room.clone());
+    let id = run.id;
+    let set_room = |room: Option<&str>| {
+        if let Err(e) = Store::open_default().and_then(|s| s.set_room(id, room)) {
+            eprintln!("warning: #{id}: {e}");
+        }
+    };
+    if cfg.minos.enabled {
+        set_room(room.as_deref());
     }
     a.started_at = crate::dates::now();
     run.error = None;
     let log = logs.join(format!("agent-{n}.log"));
     let title = format!("#{} {}", run.id, run.text);
-    let id = run.id;
-    let hosted = crate::herdr::host(
-        cfg,
-        crate::herdr::Host {
-            project: &run.project,
-            title: &title,
-            interactive: run.interactive,
-            close_after: false,
-        },
-        cmd,
-        &log,
-        timeout,
-        // On a worker thread, with no store. At once rather than at the end,
-        // so a running agent's pane can be opened.
-        |pane| {
-            if let Err(e) = Store::open_default().and_then(|s| s.set_pane(id, pane)) {
-                eprintln!("warning: #{id}: {e}");
+    let (project, interactive) = (run.project.clone(), run.interactive);
+    let host = |cmd: Command| {
+        crate::herdr::host(
+            cfg,
+            crate::herdr::Host {
+                project: &project,
+                title: &title,
+                interactive,
+                close_after: false,
+            },
+            cmd,
+            &log,
+            timeout,
+            // On a worker thread, with no store. At once rather than at the end,
+            // so a running agent's pane can be opened.
+            |pane| {
+                if let Err(e) = Store::open_default().and_then(|s| s.set_pane(id, pane)) {
+                    eprintln!("warning: #{id}: {e}");
+                }
+            },
+            move |state| {
+                if let Err(e) = Store::open_default().and_then(|s| s.set_agent_state(id, state)) {
+                    eprintln!("warning: #{id}: {e}");
+                }
+            },
+        )
+    };
+    // A broker that never entered its room ran no agent: the run goes on
+    // without the room rather than failing for it.
+    let mut relayed = false;
+    let hosted = match wrapped {
+        Some((l, w)) => {
+            let hosted = host(w);
+            if crate::minos::ready(&l.events) {
+                relayed = true;
+                hosted
+            } else {
+                let why = agent::read_log(&log).map_or_else(String::new, |t| agent::tail(&t, 1));
+                eprintln!(
+                    "warning: #{id}: minosb did not enter room {}: {why}; running without it",
+                    l.room
+                );
+                room = None;
+                set_room(None);
+                host(cmd)
             }
-        },
-        move |state| {
-            if let Err(e) = Store::open_default().and_then(|s| s.set_agent_state(id, state)) {
-                eprintln!("warning: #{id}: {e}");
-            }
-        },
-    );
+        }
+        None => host(cmd),
+    };
+    run.room = room;
     let finished = match hosted {
         Ok(f) => f,
         Err(e) => {
@@ -1762,6 +1890,7 @@ fn attempt_once(
             return a;
         }
     };
+    let output = || agent::read_log(&log).unwrap_or_default();
     // A person drove it in a terminal, so there is no event stream to read.
     let report = match run.interactive {
         true => agent::Report {
@@ -1770,11 +1899,17 @@ fn attempt_once(
             cost_usd: None,
             denied: Vec::new(),
         },
-        false => worker.parse.report(
-            &agent::read_log(&log).unwrap_or_default(),
-            finished.success == Some(true),
-        ),
+        // A person's correction starts another turn of the same session.
+        false if relayed => agent::parse_relayed(&output()),
+        false => worker
+            .parse
+            .report(&output(), finished.success == Some(true)),
     };
+    if let Some((broker, _)) = &side {
+        let first = report.summary.lines().next().unwrap_or_default();
+        broker.say(&format!("Run #{id} ended: {first}"));
+    }
+    drop(side);
     a.seconds = Some(finished.seconds);
     run.seconds = Some(run.seconds.unwrap_or(0) + finished.seconds);
     // An agent that reports no cost leaves both null. Zero would read as free.
@@ -1853,6 +1988,20 @@ fn attempt_once(
     run.enter(RunState::Ready);
     a.outcome = Some(RunState::Ready.name().into());
     a
+}
+
+/// `cmd` as an agent may run: the verify allowlist, the run's directory, and
+/// no push credential.
+fn confine_agent(
+    worker: &Worker,
+    run: &Run,
+    agent_env: &Path,
+    mut cmd: Command,
+) -> std::result::Result<Command, String> {
+    worker.allow_verify(&mut cmd, run.verify.as_deref());
+    cmd.current_dir(&run.worktree);
+    agent::restrict(&mut cmd, agent_env).map_err(|e| format!("{}: {e}", agent_env.display()))?;
+    Ok(cmd)
 }
 
 /// Why a worker cannot start a session a person drives.
@@ -1936,6 +2085,11 @@ fn base_verify(
     Ok((ok, Some(seconds)))
 }
 
+fn base_log(home: &Path, project: &str, base: &str) -> PathBuf {
+    home.join("verify-base")
+        .join(format!("{project}-{}.log", &base[..base.len().min(12)]))
+}
+
 /// Runs `command` in `worktree`, a checkout of `base`, under the agent's
 /// environment, and records the result in the base cache. Returns the result,
 /// the seconds it took and the log.
@@ -1949,9 +2103,10 @@ fn measure_base(
     worktree: &Path,
 ) -> Result<(Option<bool>, i64, PathBuf)> {
     let agent_env = home.join("agent-env");
-    let logs = home.join("verify-base");
-    std::fs::create_dir_all(&logs).map_err(|e| format!("{}: {e}", logs.display()))?;
-    let log = logs.join(format!("{project}-{}.log", &base[..base.len().min(12)]));
+    let log = base_log(home, project, base);
+    if let Some(logs) = log.parent() {
+        std::fs::create_dir_all(logs).map_err(|e| format!("{}: {e}", logs.display()))?;
+    }
     let timeout = Duration::from_secs(cfg.timeout as u64 * 60);
     let sandbox = cfg.project(project).sandbox;
     let (ok, seconds) = match verify_once(command, worktree, sandbox, &agent_env, &log, timeout) {
@@ -2746,6 +2901,7 @@ mod tests {
             denied: Vec::new(),
             review_measured: None,
             pane: None,
+            room: None,
             interactive: false,
             agent_state: None,
             items: Vec::new(),

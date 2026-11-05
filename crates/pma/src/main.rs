@@ -557,14 +557,18 @@ enum Command {
         #[arg(required = true)]
         ids: Vec<i64>,
     },
-    /// What agents run in: a `herdr` pane, or `none`
+    /// Where agents run, `herdr` or `none`, and a `minos` room
     ///
-    /// Bare, it says which is on. One at a time. Under `herdr`, each run gets a
-    /// tab in a `pma: <project>` workspace; with no server, a run goes on
-    /// without a pane and warns.
+    /// Bare, it says what is on. Under `herdr`, each run gets a tab in a
+    /// `pma: <project>` workspace. Under `minos`, each run gets a room where a
+    /// person reads it and corrects it between turns; it combines with
+    /// `herdr`. With no server, a run goes on without a pane or room and warns.
     Integrate {
-        /// `herdr` or `none`.
+        /// `herdr`, `minos` or `none`.
         name: Option<String>,
+        /// Turn `herdr` or `minos` off.
+        #[arg(long, requires = "name")]
+        off: bool,
     },
     /// Renders a headless agent's output, in the pane it runs in.
     #[command(hide = true)]
@@ -1206,7 +1210,7 @@ fn main() -> ExitCode {
             run_publish_approving(&ids, all_approved, publish::Target::Push, None, approve)
         }
         Command::Close { ids } => run_close(&ids),
-        Command::Integrate { name } => run_integrate(name.as_deref()),
+        Command::Integrate { name, off } => run_integrate(name.as_deref(), off),
         Command::PaneView => run_pane_view(),
         Command::PaneStop {
             owner,
@@ -4132,6 +4136,14 @@ fn agent_command(action: Option<AgentAction>) -> Result<()> {
                     serde_json::to_string(&w.interactive_args).unwrap_or_default(),
                 ],
                 vec![
+                    "relay".into(),
+                    w.relay.clone().unwrap_or_else(|| "none".into()),
+                ],
+                vec![
+                    "relay-args".into(),
+                    serde_json::to_string(&w.relay_args).unwrap_or_default(),
+                ],
+                vec![
                     "allow".into(),
                     w.allow.clone().unwrap_or_else(|| "none".into()),
                 ],
@@ -4242,20 +4254,33 @@ fn run_close(ids: &[i64]) -> Result<()> {
     Ok(())
 }
 
-/// Sets or shows `integration`, and says whether a server answers.
-fn run_integrate(name: Option<&str>) -> Result<()> {
+/// Sets or shows `integration` and `minos.enabled`, and says whether each
+/// server answers.
+fn run_integrate(name: Option<&str>, off: bool) -> Result<()> {
     let store = Store::open_default()?;
-    if let Some(name) = name {
-        if config::Integration::parse(name).is_none() {
-            return Err(format!("unknown integration `{name}`; expected herdr or none").into());
-        }
+    let set = |key: &str, value: &str| {
         api::act(
             &store,
             Action::SetConfig {
-                key: "integration".into(),
-                value: name.into(),
+                key: key.into(),
+                value: value.into(),
             },
-        )?;
+        )
+        .map(|_| ())
+    };
+    match (name, off) {
+        (None, _) => {}
+        (Some("minos"), off) => set("minos.enabled", if off { "off" } else { "on" })?,
+        (Some("herdr"), true) => set("integration", "none")?,
+        (Some("none"), true) => return Err("`none` has nothing to turn off".into()),
+        (Some(name), false) if config::Integration::parse(name).is_some() => {
+            set("integration", name)?
+        }
+        (Some(name), _) => {
+            return Err(
+                format!("unknown integration `{name}`; expected herdr, minos or none").into(),
+            );
+        }
     }
     let cfg = api::config(&store)?;
     println!("integration = {}", cfg.integration.name());
@@ -4263,6 +4288,27 @@ fn run_integrate(name: Option<&str>) -> Result<()> {
         match pma_core::herdr::check() {
             Ok(()) => println!("herdr answers; each run opens a tab in `pma: <project>`"),
             Err(e) => println!("herdr: {e}; runs go on without a pane until it answers"),
+        }
+    }
+    let m = &cfg.minos;
+    println!("minos = {}", if m.enabled { "on" } else { "off" });
+    if m.enabled {
+        for note in pma_core::minos::dev_passwords(m) {
+            println!("minos: {note}");
+        }
+        match pma_core::minos::check(m).as_slice() {
+            [] => println!(
+                "minos answers at {}; each run speaks as `{}` in a room per {}",
+                m.server,
+                m.user,
+                m.rooms.name()
+            ),
+            problems => {
+                for p in problems {
+                    println!("minos: {p}");
+                }
+                println!("runs go on without a room until these are fixed");
+            }
         }
     }
     Ok(())

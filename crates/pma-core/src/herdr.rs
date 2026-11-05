@@ -301,6 +301,30 @@ fn quote(word: &str) -> String {
 /// The script a pane runs. `view` renders a headless agent's event stream;
 /// the log keeps it raw, for `pma watch` and the report. An interactive agent
 /// needs the terminal, so it has neither.
+/// Variables a script may not hold, as it stays on disk: `minosb`'s password.
+/// They go to a file of their own that the script reads and removes.
+const SECRETS: [&str; 1] = [crate::minos::PASSWORD];
+
+/// The `export` lines for the secrets `cmd` sets.
+fn secrets(cmd: &Command) -> String {
+    cmd.get_envs()
+        .filter(|(k, _)| SECRETS.iter().any(|s| *k == *s))
+        .filter_map(|(k, v)| {
+            v.map(|v| {
+                format!(
+                    "export {}={}\n",
+                    k.to_string_lossy(),
+                    quote(&v.to_string_lossy())
+                )
+            })
+        })
+        .collect()
+}
+
+fn secrets_file(status: &Path) -> PathBuf {
+    status.with_extension("env")
+}
+
 fn script(cmd: &Command, log: &Path, status: &Path, view: Option<&Path>) -> String {
     let path = |p: &Path| quote(&p.to_string_lossy());
     let mut out = String::from("#!/bin/sh\n");
@@ -321,9 +345,14 @@ fn script(cmd: &Command, log: &Path, status: &Path, view: Option<&Path>) -> Stri
     for (key, value) in cmd.get_envs() {
         let key = key.to_string_lossy();
         match value {
+            Some(_) if SECRETS.contains(&key.as_ref()) => {}
             Some(v) => out.push_str(&format!("export {key}={}\n", quote(&v.to_string_lossy()))),
             None => out.push_str(&format!("unset {key}\n")),
         }
+    }
+    if !secrets(cmd).is_empty() {
+        let file = path(&secrets_file(status));
+        out.push_str(&format!(". {file}; rm -f {file}\n"));
     }
     if let Some(dir) = cmd.get_current_dir() {
         out.push_str(&format!("cd {} || exit 1\n", path(dir)));
@@ -437,6 +466,17 @@ fn run_in(
     std::fs::File::create(log)?;
     let exe = std::env::current_exe()?;
     let text = script(cmd, log, &status, headless.then_some(exe.as_path()));
+    let secret = secrets_file(&status);
+    let _ = std::fs::remove_file(&secret);
+    let held = secrets(cmd);
+    if !held.is_empty() {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&secret)?
+            .write_all(held.as_bytes())?;
+    }
     // It can hold a worker's environment.
     {
         std::fs::OpenOptions::new()
@@ -487,6 +527,8 @@ fn run_in(
         }
         std::thread::sleep(Duration::from_millis(200));
     };
+    // Read and removed by the script, unless the pane closed before it ran.
+    let _ = std::fs::remove_file(&secret);
     stop.store(true, Ordering::Relaxed);
     let _ = follower.join();
     if headless && success.is_some() {
@@ -624,11 +666,29 @@ mod tests {
             out.contains("| tee '/l/a.log' | '/bin/pma' pane-view"),
             "{out}"
         );
+        assert!(!out.contains(". "), "no secret, no file: {out}");
         let by_hand = script(&cmd, Path::new("/l/a.log"), Path::new("/l/a.status"), None);
         assert!(
             !by_hand.contains("tee") && !by_hand.contains("</dev/null"),
             "{by_hand}"
         );
+    }
+
+    /// A script stays on disk, so the broker's password is read from a file
+    /// of its own, which the script removes before the agent starts.
+    #[test]
+    fn a_password_never_lands_in_the_script() {
+        let mut cmd = Command::new("minosb");
+        cmd.args(["-room", "r1"])
+            .env(crate::minos::PASSWORD, "s3cret")
+            .env("GH_CONFIG_DIR", "/g");
+        let status = Path::new("/l/a.status");
+        let out = script(&cmd, Path::new("/l/a.log"), status, None);
+        assert!(!out.contains("s3cret"), "{out}");
+        assert!(out.contains(". '/l/a.env'; rm -f '/l/a.env'\n"), "{out}");
+        let before = out.find(". '/l/a.env'").unwrap();
+        assert!(before < out.find("'minosb'").unwrap(), "{out}");
+        assert_eq!(secrets(&cmd), "export MINOS_PASSWORD='s3cret'\n");
     }
 
     #[test]

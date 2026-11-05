@@ -8,7 +8,15 @@ Upgrading from 0.10:
 
 - The database moves from schema 48 to 49 on first open. `pma` adds `interactive_args` to each `claude` worker in `settings.toml` that lacks it, and says so.
 
+- The database moves from schema 49 to 50 on first open. `pma` adds `relay` and `relay_args` to each `claude` worker in `settings.toml` that lacks them, and says so.
+
 ### Added
+
+- **minos rooms.** `pma integrate minos` gives each run a room in a [minos](https://github.com/shakfu/minos) server, where a person reads the agent and corrects it between turns; `pma review` names the room. A setting of its own (`minos.*`) over a third `integration` value, so it combines with herdr: corrections during a run in the room, takeover after it with `T`. Passwords come from `MINOS_PASSWORD` and `MINOS_ADMIN_PASSWORD` alone, so `settings.toml` holds none, and no agent receives either. An unset one is the account name, which is minosd's development fixture, until `minos.dev_passwords` is off; against another server it fails to log in and the run goes without a room. Under herdr the password goes to a 0600 file the pane script reads and deletes, since the script stays on disk.
+
+  A worker's new `relay` and `relay_args` say how it runs when `minosb` holds its pipes; `claude` ships with them. A worker without a relay runs beside a broker that serves only the socket, and its prompt tells it to poll `minosa messages`: `minosb` has a `claude` adapter only. A template that names `{room}` or `{socket}` starts its own broker, and `{events}` names the events file. `minos.rooms = task` (default) shares a task's room across its runs; `run` gives each its own. A broker that does not enter its room (no server, a seat already taken, a bad password) ran no agent, so the run is retried without the room rather than failed.
+
+  A relayed run reports every turn's reply, and a last turn a person interrupted is left to verify instead of failing the run. `make minos-check` runs a dispatch against a real `minosd` built from `MINOS_SRC`, with a correction posted mid-run. Design: `docs/dev/pma-minos-integration.md`.
 
 - **Usage log.** The TUI and web append which tabs, panes and details are opened and which acts run, with no project name or typed text, to `<state>/usage/YYYY-MM.jsonl`. `pma usage [--since 30]` counts them and lists the panes nothing reached. On by default; `pma config usage_log off` stops it. A file rather than a table in the store: every open front end reloads on any commit to the store, so each event would reload the others. Design: `docs/dev/usage-log.md`.
 
@@ -25,6 +33,8 @@ Upgrading from 0.10:
 - A `json:` parser takes the error field's message as the summary when the reply field is empty, as it is in a failed run of minima, hax or myra.
 
 ### Changed
+
+- A dispatch's run is in the store, `queued`, while its base check runs, and the dispatch says what it waits on: the command, the timeout, the log, and `verify_base_alongside on` to start the agent beside it. An uncached suite can take the whole timeout, and with no row and no output nothing showed why the agent had not started. Routing, which needs the base result, fills in the agent, model and route after; a task it refuses leaves no row. The existing `queued` state over a new `preparing` one: everything already treats `queued` as a run under way.
 
 - **Six tabs, not eight.** `1` inbox, `2` projects, `3` activity, `4` history, `5` setup, `6` matrix. History holds the run report and the scan panes that were on the projects tab; setup holds the settings tab's panes, agents first, and the library's. The inbox loses its `Tasks` list, which held 3 of 1,335 tasks, and shows notes when there are any. Rationale and usage figures: `docs/dev/views.md`, `docs/dev/views-refactor.md`.
 

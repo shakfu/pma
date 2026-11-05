@@ -71,114 +71,20 @@ pub fn prepare(
     };
     let refuse = |why: String| Ok(Prepared::Refused(format!("{project}: {why}")));
 
-    let key = pick.key.clone();
-    let (details, tags) = match key.as_str() {
-        "ci" => {
-            let Some(scan::Ci::Failing(workflows)) = store.project(&pick.project)?.map(|p| p.ci)
-            else {
-                return refuse("CI was not failing at the last scan".into());
-            };
-            // CI failed on the default branch, whatever a local clone has
-            // checked out.
-            let branch = match pick.local || in_clone {
-                true => scan::default_branch(repo).ok_or(scan::DEFAULT_BRANCH_UNKNOWN)?,
-                false => default_branch.clone(),
-            };
-            match failed_ci_logs(repo, &branch, &workflows)? {
-                Ok(logs) => (logs, Vec::new()),
-                Err(why) => return refuse(why),
-            }
-        }
-        "deps" => {
-            let detail = store
-                .project(&pick.project)?
-                .map(|p| p.deps_detail)
-                .unwrap_or_default();
-            let mut prompt = format!(
-                "Outdated dependencies at the last `pma scan --deps`:\n\n```\n{detail}\n```\n\n\
-                 Update them within the project's version constraints first. Change a \
-                 constraint only where the tests still pass, and list any dependency you \
-                 left behind, with the reason.\n"
-            );
-            if let Some(log) = failed_refresh(store, home, &pick.project)? {
-                prompt.push_str(&format!(
-                    "\n`pma deps refresh` took every update the constraints allow, and the \
-                     project's check then failed. Find the update that broke it. Fix the code, \
-                     or hold that package back with a constraint and say why. The check's \
-                     output:\n\n```\n{log}\n```\n"
-                ));
-            }
-            (prompt, Vec::new())
-        }
-        BUNDLE => {
-            let from = start.as_deref().unwrap_or(&base);
-            let file = git(repo, &["show", &format!("{from}:TODO.md")]).ok();
-            let mut kept = Vec::new();
-            for item in &pick.items {
-                let why = match on_origin(file.as_deref(), &item.key, &item.text) {
-                    OnOrigin::Open(description, tags) => {
-                        if Class::of(&item.key, &tags).dispatchable() {
-                            kept.push((item.clone(), description));
-                            continue;
-                        }
-                        "is tagged #manual and is not dispatched".to_string()
-                    }
-                    OnOrigin::Done => format!("is already done on origin/{default_branch}"),
-                    OnOrigin::Absent => format!(
-                        "is not in TODO.md on origin/{default_branch}; commit and push it first"
-                    ),
-                };
-                dropped.push(format!("{project}: `{}` {why}; left out", item.text));
-            }
-            if kept.is_empty() {
-                return refuse(format!(
-                    "no item of the bundle can be dispatched: {}",
-                    dropped.join("; ")
-                ));
-            }
-            if let [(item, description)] = &kept[..] {
-                pick.key = item.key.clone();
-                pick.text = item.text.clone();
-                pick.gh = item.gh;
-                pick.items.clear();
-                (description.clone(), Vec::new())
-            } else {
-                let mut details = String::new();
-                for (n, (item, description)) in kept.iter().enumerate() {
-                    details.push_str(&format!("{}. {}\n", n + 1, item.text));
-                    for line in description.lines() {
-                        details.push_str(&format!("   {line}\n"));
-                    }
-                    details.push('\n');
-                }
-                pick.items = kept.into_iter().map(|(item, _)| item).collect();
-                pick.text = bundle_text(&pick.items);
-                (details, Vec::new())
-            }
-        }
-        key if without_item(key) && !is_signal(key) => {
-            (pick.details.clone().unwrap_or_default(), Vec::new())
-        }
-        _ => {
-            // The tree the agent starts from: the working tree for a clone run.
-            let from = start.as_deref().unwrap_or(&base);
-            let file = git(repo, &["show", &format!("{from}:TODO.md")]).ok();
-            match on_origin(file.as_deref(), &pick.key, &pick.text) {
-                OnOrigin::Open(description, tags) => (description, tags),
-                OnOrigin::Done => {
-                    return refuse(format!(
-                        "`{}` is already done on origin/{default_branch}; pull the clone, then `pma scan`",
-                        pick.text
-                    ));
-                }
-                OnOrigin::Absent => {
-                    return refuse(format!(
-                        "`{}` is not in TODO.md on origin/{default_branch}; commit and push it first",
-                        pick.text
-                    ));
-                }
-            }
-        }
+    // The tree the agent starts from: the working tree for a clone run.
+    let from = start.as_deref().unwrap_or(&base);
+    let read = task_details(
+        store,
+        home,
+        &mut pick,
+        from,
+        &default_branch,
+        in_clone,
+        &mut dropped,
+    )?;
+    let (details, tags) = match read {
+        Ok(read) => read,
+        Err(why) => return refuse(why),
     };
 
     // Before the worktree, so a task the user marked leaves nothing behind.
@@ -213,25 +119,7 @@ pub fn prepare(
     }
 
     let parent = home.join("worktrees").join(&pick.project);
-    let stem = slug(&pick.text);
-    let (slug, worktree) = (1..)
-        .map(|n| match n {
-            1 => stem.clone(),
-            n => format!("{stem}-{n}"),
-        })
-        .map(|s| (s.clone(), parent.join(&s)))
-        .find(|(s, path)| {
-            // A remote branch is left by an earlier pull request; pushing
-            // over it would be rejected.
-            !path.exists()
-                && [
-                    format!("refs/heads/pma/{s}"),
-                    format!("refs/remotes/origin/pma/{s}"),
-                ]
-                .iter()
-                .all(|r| git(repo, &["rev-parse", "--verify", "--quiet", r]).is_err())
-        })
-        .expect("an unused slug exists");
+    let (slug, worktree) = free_slug(repo, &parent, &pick.text);
     let branch = format!("pma/{slug}");
     std::fs::create_dir_all(&parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     git(
@@ -266,6 +154,248 @@ pub fn prepare(
         let _ = remove_worktree(repo, &worktree, &branch);
     }
     noting(prepared, dropped)
+}
+
+/// What the agent is told about the task, and the item's TODO.md tags, read
+/// at `from`, the commit the agent starts at. The inner error refuses the
+/// task. A bundle loses the items `from` no longer holds open, each noted in
+/// `dropped`, and one left with a single item becomes that item.
+fn task_details(
+    store: &Store,
+    home: &Path,
+    pick: &mut Pick,
+    from: &str,
+    default_branch: &str,
+    in_clone: bool,
+    dropped: &mut Vec<String>,
+) -> Result<std::result::Result<(String, Vec<String>), String>> {
+    let repo = &pick.repo;
+    let key = pick.key.clone();
+    Ok(Ok(match key.as_str() {
+        "ci" => {
+            let Some(scan::Ci::Failing(workflows)) = store.project(&pick.project)?.map(|p| p.ci)
+            else {
+                return Ok(Err("CI was not failing at the last scan".into()));
+            };
+            // CI failed on the default branch, whatever a local clone has
+            // checked out.
+            let branch = match pick.local || in_clone {
+                true => scan::default_branch(repo).ok_or(scan::DEFAULT_BRANCH_UNKNOWN)?,
+                false => default_branch.to_string(),
+            };
+            match failed_ci_logs(repo, &branch, &workflows)? {
+                Ok(logs) => (logs, Vec::new()),
+                Err(why) => return Ok(Err(why)),
+            }
+        }
+        "deps" => {
+            let detail = store
+                .project(&pick.project)?
+                .map(|p| p.deps_detail)
+                .unwrap_or_default();
+            let mut prompt = format!(
+                "Outdated dependencies at the last `pma scan --deps`:\n\n```\n{detail}\n```\n\n\
+                 Update them within the project's version constraints first. Change a \
+                 constraint only where the tests still pass, and list any dependency you \
+                 left behind, with the reason.\n"
+            );
+            if let Some(log) = failed_refresh(store, home, &pick.project)? {
+                prompt.push_str(&format!(
+                    "\n`pma deps refresh` took every update the constraints allow, and the \
+                     project's check then failed. Find the update that broke it. Fix the code, \
+                     or hold that package back with a constraint and say why. The check's \
+                     output:\n\n```\n{log}\n```\n"
+                ));
+            }
+            (prompt, Vec::new())
+        }
+        BUNDLE => return Ok(bundle_details(pick, from, default_branch, dropped)),
+        key if without_item(key) && !is_signal(key) => {
+            (pick.details.clone().unwrap_or_default(), Vec::new())
+        }
+        _ => {
+            let file = git(repo, &["show", &format!("{from}:TODO.md")]).ok();
+            match on_origin(file.as_deref(), &pick.key, &pick.text) {
+                OnOrigin::Open(description, tags) => (description, tags),
+                OnOrigin::Done => {
+                    return Ok(Err(format!(
+                        "`{}` is already done on origin/{default_branch}; pull the clone, then `pma scan`",
+                        pick.text
+                    )));
+                }
+                OnOrigin::Absent => {
+                    return Ok(Err(format!(
+                        "`{}` is not in TODO.md on origin/{default_branch}; commit and push it first",
+                        pick.text
+                    )));
+                }
+            }
+        }
+    }))
+}
+
+/// `task_details` for a bundle: its items still open at `from`, numbered,
+/// each with its description. `Err` when none is left.
+fn bundle_details(
+    pick: &mut Pick,
+    from: &str,
+    default_branch: &str,
+    dropped: &mut Vec<String>,
+) -> std::result::Result<(String, Vec<String>), String> {
+    let file = git(&pick.repo, &["show", &format!("{from}:TODO.md")]).ok();
+    let mut kept = Vec::new();
+    for item in &pick.items {
+        let why = match on_origin(file.as_deref(), &item.key, &item.text) {
+            OnOrigin::Open(description, tags) => {
+                if Class::of(&item.key, &tags).dispatchable() {
+                    kept.push((item.clone(), description));
+                    continue;
+                }
+                "is tagged #manual and is not dispatched".to_string()
+            }
+            OnOrigin::Done => format!("is already done on origin/{default_branch}"),
+            OnOrigin::Absent => {
+                format!("is not in TODO.md on origin/{default_branch}; commit and push it first")
+            }
+        };
+        dropped.push(format!("{}: `{}` {why}; left out", pick.project, item.text));
+    }
+    if kept.is_empty() {
+        return Err(format!(
+            "no item of the bundle can be dispatched: {}",
+            dropped.join("; ")
+        ));
+    }
+    if let [(item, description)] = &kept[..] {
+        pick.key = item.key.clone();
+        pick.text = item.text.clone();
+        pick.gh = item.gh;
+        pick.items.clear();
+        return Ok((description.clone(), Vec::new()));
+    }
+    let mut details = String::new();
+    for (n, (item, description)) in kept.iter().enumerate() {
+        details.push_str(&format!("{}. {}\n", n + 1, item.text));
+        for line in description.lines() {
+            details.push_str(&format!("   {line}\n"));
+        }
+        details.push('\n');
+    }
+    pick.items = kept.into_iter().map(|(item, _)| item).collect();
+    pick.text = bundle_text(&pick.items);
+    Ok((details, Vec::new()))
+}
+
+/// The first slug of `text`, `-2` and on, with neither a directory under
+/// `parent` nor a `pma/` branch, local or on origin. A remote branch is left
+/// by an earlier pull request; pushing over it would be rejected.
+fn free_slug(repo: &Path, parent: &Path, text: &str) -> (String, PathBuf) {
+    let stem = slug(text);
+    (1..)
+        .map(|n| match n {
+            1 => stem.clone(),
+            n => format!("{stem}-{n}"),
+        })
+        .map(|s| (s.clone(), parent.join(&s)))
+        .find(|(s, path)| {
+            !path.exists()
+                && [
+                    format!("refs/heads/pma/{s}"),
+                    format!("refs/remotes/origin/pma/{s}"),
+                ]
+                .iter()
+                .all(|r| git(repo, &["rev-parse", "--verify", "--quiet", r]).is_err())
+        })
+        .expect("an unused slug exists")
+}
+
+/// The base check of a run just inserted, as its result and seconds: cached,
+/// measured now, or neither when it runs beside the agent or there is no
+/// check.
+fn base_check(
+    store: &Store,
+    home: &Path,
+    cfg: &Config,
+    run: &Run,
+) -> Result<(Option<bool>, Option<i64>)> {
+    let Some(v) = run.verify.as_deref().filter(|_| !run.interactive) else {
+        return Ok((None, None));
+    };
+    let project = &run.project;
+    let at = run.start.as_deref().unwrap_or(&run.base);
+    let sandbox = cfg.project(project).sandbox;
+    match (
+        cfg.verify_base_alongside,
+        store.verify_base(project, at, v, cfg.timeout, sandbox)?,
+    ) {
+        // `attempt` measures it.
+        (true, None) => Ok((None, None)),
+        (false, None) => {
+            // The agent waits on this, and an uncached suite can take
+            // the whole timeout: say so, as nothing else shows it.
+            eprintln!(
+                "#{} {}: checking the base first: `{v}`, up to {} minutes; log {}. \
+                 `pma config verify_base_alongside on` starts the agent beside it.",
+                run.id,
+                project,
+                cfg.timeout,
+                base_log(home, project, at).display()
+            );
+            base_verify(store, home, cfg, project, at, v, &run.worktree)
+        }
+        _ => base_verify(store, home, cfg, project, at, v, &run.worktree),
+    }
+}
+
+/// What the active policy revision decided for a run.
+struct Routed {
+    revision: Option<i64>,
+    name: Option<String>,
+    approval: Option<crate::route::Approval>,
+    /// The route's agent and model, when the policy is applied.
+    applied: Option<(Option<String>, Option<String>)>,
+    scope: Vec<String>,
+}
+
+/// Routes `subject` under the active policy revision. The inner error refuses
+/// the task `text`: an applied policy has no route for it.
+fn route_of(
+    store: &Store,
+    class: Class,
+    subject: &Subject,
+    text: &str,
+) -> Result<std::result::Result<Routed, String>> {
+    let mut routed = Routed {
+        revision: None,
+        name: None,
+        approval: None,
+        applied: None,
+        scope: class.scope(),
+    };
+    let Some(rev) = store.active_route()? else {
+        return Ok(Ok(routed));
+    };
+    let policy = rev.policy()?;
+    routed.revision = Some(rev.revision);
+    if rev.shadow {
+        // Recorded for `pma route replay`; it refuses, scopes and approves
+        // nothing.
+        routed.name = policy.route(subject).map(|r| r.name.clone());
+        return Ok(Ok(routed));
+    }
+    let Some(route) = policy.route(subject) else {
+        return Ok(Err(format!(
+            "`{text}` matches no route in policy revision {}; add one or widen the last",
+            rev.revision
+        )));
+    };
+    routed.name = Some(route.name.clone());
+    routed.approval = Some(route.approval);
+    routed.applied = Some((route.agent.clone(), route.model.clone()));
+    if let Some(scope) = &route.scope {
+        routed.scope = scope.clone();
+    }
+    Ok(Ok(routed))
 }
 
 /// A queued run with the bundle items `prepare` left out.
@@ -403,35 +533,7 @@ fn queue(
     };
     store.insert_run(&mut run)?;
     let routed = (|| -> Result<Option<String>> {
-        let (verify_base_ok, verify_base_seconds) = match &verify {
-            Some(v) if !pick.interactive => {
-                let at = run.start.as_deref().unwrap_or(&run.base).to_string();
-                let at = at.as_str();
-                let sandbox = cfg.project(&pick.project).sandbox;
-                match (
-                    cfg.verify_base_alongside,
-                    store.verify_base(&pick.project, at, v, cfg.timeout, sandbox)?,
-                ) {
-                    // `attempt` measures it.
-                    (true, None) => (None, None),
-                    (false, None) => {
-                        // The agent waits on this, and an uncached suite can take
-                        // the whole timeout: say so, as nothing else shows it.
-                        eprintln!(
-                            "#{} {}: checking the base first: `{v}`, up to {} minutes; log {}. \
-                             `pma config verify_base_alongside on` starts the agent beside it.",
-                            run.id,
-                            pick.project,
-                            cfg.timeout,
-                            base_log(home, &pick.project, at).display()
-                        );
-                        base_verify(store, home, cfg, &pick.project, at, v, worktree)?
-                    }
-                    _ => base_verify(store, home, cfg, &pick.project, at, v, worktree)?,
-                }
-            }
-            _ => (None, None),
-        };
+        let (verify_base_ok, verify_base_seconds) = base_check(store, home, cfg, &run)?;
         let mut features = Features::of(&pick.text, &details);
         features.repo_files = tracked_files(worktree);
         // Unmeasured yet when it runs beside the agent; the last time stands in.
@@ -456,49 +558,25 @@ fn queue(
             node: pick.workflow.as_ref().map(|u| u.node.as_str()),
             lap: pick.workflow.as_ref().map_or(0, |u| u.lap),
         };
-        let active = store.active_route()?;
-        let mut routed = (None, None, None, None, class.scope());
-        if let Some(rev) = &active
-            && rev.shadow
-        {
-            // Recorded for `pma route replay`; it refuses, scopes and approves
-            // nothing.
-            let policy = rev.policy()?;
-            routed.0 = Some(rev.revision);
-            routed.1 = policy.route(&subject).map(|r| r.name.clone());
-        } else if let Some(rev) = &active {
-            let policy = rev.policy()?;
-            let Some(route) = policy.route(&subject) else {
-                return Ok(Some(format!(
-                    "`{}` matches no route in policy revision {}; add one or widen the last",
-                    pick.text, rev.revision
-                )));
-            };
-            let scope = route.scope.clone().unwrap_or_else(|| class.scope());
-            routed = (
-                Some(rev.revision),
-                Some(route.name.clone()),
-                Some(route.approval),
-                Some((route.agent.clone(), route.model.clone())),
-                scope,
-            );
-        }
-        let (route_revision, route_name, approval, applied, scope) = routed;
-        let chosen = choose_worker(store, cfg, over, applied)?;
+        let routed = match route_of(store, class, &subject, &pick.text)? {
+            Ok(routed) => routed,
+            Err(why) => return Ok(Some(why)),
+        };
+        let chosen = choose_worker(store, cfg, over, routed.applied)?;
         run.agent = chosen.agent.clone();
         run.model = chosen.model.clone();
         run.preset = chosen.preset.clone();
         run.extra_args = chosen.args.clone();
-        run.scope = scope;
+        run.scope = routed.scope;
         run.tier = tier;
         run.verify_base_ok = verify_base_ok;
         run.verify_base_seconds = verify_base_seconds;
         run.complexity = Some(complexity);
         run.features = Some(features);
         run.estimator = Some(complexity::ESTIMATOR.into());
-        run.route_revision = route_revision;
-        run.route = route_name;
-        run.approval = approval;
+        run.route_revision = routed.revision;
+        run.route = routed.name;
+        run.approval = routed.approval;
         run.prompt = prompt(&run, &details, verify.as_deref());
         Ok(None)
     })();

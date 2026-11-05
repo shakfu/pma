@@ -432,8 +432,10 @@ mod tests {
         std::fs::create_dir_all(&short).unwrap();
         let near = socket_path(&short, 3, 1).unwrap();
         assert_eq!(near, short.join("minos").join("3-1.sock"));
-        let deep = base.join("d".repeat(60));
-        let other = base.join("e".repeat(60));
+        // Longer than the limit by itself, so the path falls back wherever
+        // the temporary directory is.
+        let deep = base.join("d".repeat(SOCKET_MAX));
+        let other = base.join("e".repeat(SOCKET_MAX));
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::create_dir_all(&other).unwrap();
         let far = socket_path(&deep, 3, 1).unwrap();

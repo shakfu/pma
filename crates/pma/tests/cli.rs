@@ -8226,3 +8226,18 @@ fn a_ci_task_carries_the_failed_log_and_is_refused_once_it_passes() {
         "{prompt}"
     );
 }
+
+/// A worker that cannot be hosted fails its run with the reason: here an
+/// interactive run, which only herdr can host.
+#[test]
+fn an_interactive_run_without_herdr_fails_and_says_why() {
+    let s = Scratch::new("interactive-no-herdr");
+    let (env, _, _) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
+    let out = env.ok(&["dispatch", "alpha:5", "--interactive"]);
+    assert!(out.contains("0 ready, 1 failed"), "{out}");
+    let detail = env.ok(&["review", "1"]);
+    assert!(
+        detail.contains("error       claude: an interactive run needs `pma integrate herdr`"),
+        "{detail}"
+    );
+}

@@ -1,4 +1,5 @@
 use super::*;
+use crate::minos::{Link, Sidecar};
 
 /// How much sooner a worker that bounds itself is told to stop. A worker given
 /// the same deadline as this process is killed by it first, and one that runs a
@@ -285,24 +286,66 @@ fn attempt_once(
         error: None,
         outcome: None,
     };
-    let Some(worker) = workers.iter().find(|w| w.name == run.agent) else {
-        fail(
-            run,
-            &mut a,
-            format!("unknown agent `{}`; see `pma agent`", run.agent),
-        );
-        return a;
-    };
-    let logs = home.join("runs").join(run.id.to_string());
-    let agent_env = home.join("agent-env");
-    if let Err(e) = std::fs::create_dir_all(&logs) {
-        fail(run, &mut a, format!("{}: {e}", logs.display()));
-        return a;
+    if let Err(e) = attempt_steps(home, cfg, workers, run, &mut a, feedback) {
+        fail(run, &mut a, e);
     }
+    a
+}
+
+/// What the steps of one attempt share.
+struct Session<'a> {
+    cfg: &'a Config,
+    worker: &'a Worker,
+    /// The run's log directory.
+    logs: PathBuf,
+    agent_env: PathBuf,
+    /// The attempt's number, which names its logs.
+    n: usize,
+    timeout: Duration,
+}
+
+impl Session<'_> {
+    fn log(&self, kind: &str) -> PathBuf {
+        self.logs.join(format!("{kind}-{}.log", self.n))
+    }
+}
+
+/// How the agent starts: its command, and how it reaches its room, if any.
+struct Launch<'l> {
+    cmd: Command,
+    /// The agent under a broker that holds its pipes.
+    wrapped: Option<(&'l Link, Command)>,
+    /// A broker beside the agent that serves the room's socket.
+    side: Option<(Sidecar, &'l Link)>,
+    room: Option<String>,
+}
+
+/// The steps of `attempt_once`. An error fails the run and the attempt.
+fn attempt_steps(
+    home: &Path,
+    cfg: &Config,
+    workers: &[Worker],
+    run: &mut Run,
+    a: &mut Attempt,
+    feedback: Option<&str>,
+) -> std::result::Result<(), String> {
+    let worker = workers
+        .iter()
+        .find(|w| w.name == run.agent)
+        .ok_or_else(|| format!("unknown agent `{}`; see `pma agent`", run.agent))?;
+    let logs = home.join("runs").join(run.id.to_string());
+    std::fs::create_dir_all(&logs).map_err(|e| format!("{}: {e}", logs.display()))?;
     let n = (1..)
         .find(|n| !logs.join(format!("agent-{n}.log")).exists())
         .unwrap_or(1);
-    let timeout = Duration::from_secs(cfg.timeout as u64 * 60);
+    let s = Session {
+        cfg,
+        worker,
+        logs,
+        agent_env: home.join("agent-env"),
+        n,
+        timeout: Duration::from_secs(cfg.timeout as u64 * 60),
+    };
 
     a.prompt = match feedback {
         Some(f) => format!(
@@ -312,7 +355,6 @@ fn attempt_once(
         None => run.prompt.clone(),
     };
     a.verify = run.verify.clone();
-    let inner = timeout.saturating_sub(INNER_GRACE);
     // Not for a run a person drives: they are at its terminal already.
     let link = match cfg.minos.enabled && !run.interactive {
         true => crate::minos::open(&cfg.minos, home, run, n)
@@ -320,10 +362,24 @@ fn attempt_once(
             .ok(),
         false => None,
     };
-    // How the room reaches the agent: its template starts the broker, the
-    // broker holds a relay's pipes, or a broker beside it serves the socket.
-    let own = link.as_ref().filter(|_| worker.links_itself());
-    let relay = link.as_ref().filter(|_| own.is_none()).and_then(|l| {
+    let launch = launch(&s, run, a, link.as_ref())?;
+    let failure = host_agent(&s, run, a, launch)?;
+    finish(&s, run, a, failure)
+}
+
+/// Builds the agent's confined command and connects it to the room. The
+/// worker's template starts the broker, the broker holds a relay's pipes, or
+/// a broker beside the agent serves the socket.
+fn launch<'l>(
+    s: &Session,
+    run: &Run,
+    a: &mut Attempt,
+    link: Option<&'l Link>,
+) -> std::result::Result<Launch<'l>, String> {
+    let (cfg, worker) = (s.cfg, s.worker);
+    let inner = s.timeout.saturating_sub(INNER_GRACE);
+    let own = link.filter(|_| worker.links_itself());
+    let relay = link.filter(|_| own.is_none()).and_then(|l| {
         let cmd = worker.build_relay(
             &run.worktree,
             run.model.as_deref(),
@@ -335,8 +391,8 @@ fn attempt_once(
         Some((l, cmd))
     });
     let mut side = None;
-    if let Some(l) = link.as_ref().filter(|_| own.is_none() && relay.is_none()) {
-        match crate::minos::serve(&cfg.minos, l, &logs.join(format!("minosb-{n}.log"))) {
+    if let Some(l) = link.filter(|_| own.is_none() && relay.is_none()) {
+        match crate::minos::serve(&cfg.minos, l, &s.log("minosb")) {
             Ok(broker) => {
                 broker.say(&format!("Run #{} started: {}", run.id, run.text));
                 a.prompt.push_str(crate::minos::SIDECAR_NOTE);
@@ -362,33 +418,47 @@ fn attempt_once(
             own,
         )),
     };
-    let Some(cmd) = built else {
-        fail(run, &mut a, no_interactive(&worker.name));
-        return a;
-    };
-    let mut cmd = match confine_agent(worker, run, &agent_env, cmd) {
-        Ok(cmd) => cmd,
-        Err(e) => {
-            fail(run, &mut a, e);
-            return a;
-        }
-    };
+    let cmd = built.ok_or_else(|| no_interactive(&worker.name))?;
+    let mut cmd = confine_agent(worker, run, &s.agent_env, cmd)?;
     if let Some((_, l)) = &side {
         cmd.env("MINOS_SOCKET", &l.socket);
     }
     let wrapped = relay.and_then(|(l, relay_cmd)| {
         let adapter = worker.relay.as_deref().unwrap_or_default();
-        confine_agent(worker, run, &agent_env, relay_cmd)
+        confine_agent(worker, run, &s.agent_env, relay_cmd)
             .and_then(|c| crate::minos::wrap(&cfg.minos, l, adapter, &a.prompt, &c))
             .inspect_err(|e| eprintln!("warning: #{}: no minos room: {e}", run.id))
             .ok()
             .map(|w| (l, w))
     });
-    let mut room = own
+    let room = own
         .or(wrapped.as_ref().map(|(l, _)| *l))
         .or(side.as_ref().map(|(_, l)| *l))
         .map(|l| l.room.clone());
-    let id = run.id;
+    Ok(Launch {
+        cmd,
+        wrapped,
+        side,
+        room,
+    })
+}
+
+/// Runs the agent to its end and records its report on the run and the
+/// attempt. Returns why the agent failed the run, if it did, for `finish` to
+/// apply once the tree is read.
+fn host_agent(
+    s: &Session,
+    run: &mut Run,
+    a: &mut Attempt,
+    launch: Launch,
+) -> std::result::Result<Option<String>, String> {
+    let Launch {
+        cmd,
+        wrapped,
+        side,
+        mut room,
+    } = launch;
+    let (cfg, worker, id) = (s.cfg, s.worker, run.id);
     let set_room = |room: Option<&str>| {
         if let Err(e) = Store::open_default().and_then(|s| s.set_room(id, room)) {
             eprintln!("warning: #{id}: {e}");
@@ -399,7 +469,7 @@ fn attempt_once(
     }
     a.started_at = crate::dates::now();
     run.error = None;
-    let log = logs.join(format!("agent-{n}.log"));
+    let log = s.log("agent");
     let title = format!("#{} {}", run.id, run.text);
     let (project, interactive) = (run.project.clone(), run.interactive);
     let host = |cmd: Command| {
@@ -413,7 +483,7 @@ fn attempt_once(
             },
             cmd,
             &log,
-            timeout,
+            s.timeout,
             // On a worker thread, with no store. At once rather than at the end,
             // so a running agent's pane can be opened.
             |pane| {
@@ -451,13 +521,7 @@ fn attempt_once(
         None => host(cmd),
     };
     run.room = room;
-    let finished = match hosted {
-        Ok(f) => f,
-        Err(e) => {
-            fail(run, &mut a, format!("{}: {e}", worker.command));
-            return a;
-        }
-    };
+    let finished = hosted.map_err(|e| format!("{}: {e}", worker.command))?;
     let output = || agent::read_log(&log).unwrap_or_default();
     // A person drove it in a terminal, so there is no event stream to read.
     let report = match run.interactive {
@@ -488,21 +552,35 @@ fn attempt_once(
     a.summary = Some(report.summary.clone());
     run.summary = Some(report.summary);
     run.denied = report.denied;
+    Ok(agent_failure(
+        finished.success,
+        report.ok,
+        cfg.timeout,
+        &log,
+    ))
+}
+
+/// Reads what the agent left in the tree, then verifies it. `failure`, from
+/// `host_agent`, fails the run after the tree is read, so a failed run still
+/// records its commits, diffstat and changed paths.
+fn finish(
+    s: &Session,
+    run: &mut Run,
+    a: &mut Attempt,
+    failure: Option<String>,
+) -> std::result::Result<(), String> {
     // A regular file only: a symlink could copy any file pma can read into
     // the review.
     let drafted = run.worktree.join(CHANGELOG_DRAFT);
     if std::fs::symlink_metadata(&drafted).is_ok_and(|m| m.is_file())
-        && std::fs::copy(&drafted, logs.join("changelog.md")).is_ok()
+        && std::fs::copy(&drafted, s.logs.join("changelog.md")).is_ok()
     {
         let _ = std::fs::remove_file(&drafted);
         let _ = std::fs::remove_dir(run.worktree.join(".pma"));
     }
     // Before any git call in the tree: what follows would run under a config
     // or hooks the agent wrote.
-    if let Err(e) = unchanged_git(run) {
-        fail(run, &mut a, e.to_string());
-        return a;
-    }
+    unchanged_git(run).map_err(|e| e.to_string())?;
     run.commits = wt_git(
         run,
         &["rev-list", "--count", &format!("{}..HEAD", run.base)],
@@ -522,17 +600,15 @@ fn attempt_once(
             run.scope_error = Some(e.to_string());
         }
     }
-
-    if let Some(f) = agent_failure(finished.success, report.ok, cfg.timeout, &log) {
-        fail(run, &mut a, f);
-        return a;
+    if let Some(f) = failure {
+        return Err(f);
     }
 
     run.verify_ok = None;
     if let Some(v) = &run.verify {
-        let vlog = logs.join(format!("verify-{n}.log"));
-        let sandbox = cfg.project(&run.project).sandbox;
-        match verify_once(v, &run.worktree, sandbox, &agent_env, &vlog, timeout) {
+        let sandbox = s.cfg.project(&run.project).sandbox;
+        let vlog = s.log("verify");
+        match verify_once(v, &run.worktree, sandbox, &s.agent_env, &vlog, s.timeout) {
             Ok((ok, seconds)) => {
                 a.seconds = Some(a.seconds.unwrap_or(0) + seconds);
                 run.seconds = Some(run.seconds.unwrap_or(0) + seconds);
@@ -550,7 +626,7 @@ fn attempt_once(
     run.reviewed_tree = tree(run).ok();
     run.enter(RunState::Ready);
     a.outcome = Some(RunState::Ready.name().into());
-    a
+    Ok(())
 }
 
 /// Why an agent that exited fails its run: `success` is `None` when it was

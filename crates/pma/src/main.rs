@@ -2866,7 +2866,11 @@ fn run_picks(
                 Err(e) => println!("#{} {}: left in `pma review`: {e}", run.id, run.project),
             }
         }
-        let spent = finished.iter().filter_map(|r| r.cost_usd).sum::<f64>();
+        // From 0.0: `Sum` for f64 starts at -0.0, which prints as `$-0.00`.
+        let spent = finished
+            .iter()
+            .filter_map(|r| r.cost_usd)
+            .fold(0.0, |s, c| s + c);
         println!(
             "{applied} applied unstaged, {} not, ${spent:.2} spent; `git diff` in each clone",
             finished.len() - applied

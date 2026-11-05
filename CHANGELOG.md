@@ -50,6 +50,8 @@ Upgrading from 0.10:
 
 ### Fixed
 
+- `pma dispatch --local` printed `$-0.00 spent` when no run reported a cost, and an empty workflow plan cost `-0.00`: Rust's float `Sum` starts from `-0.0`. Both now sum from `0.0`.
+
 - In the TUI, Left and Right typed `h` and `l` into a prompt, the filter or a chooser's search: the terminal key map sent the pane keys' names for the arrows. The arrows now move a cursor in the TUI's bottom line, with Home, End, Backspace and Delete editing at it; in a list they still move between panes.
 
 - A TUI table wider than the terminal shrank whichever columns ratatui's solver picked, so its first column changed width when an age cell changed. While a job ran, that happened on every 2-second reload. The first column now keeps its width; the others share a common cap.

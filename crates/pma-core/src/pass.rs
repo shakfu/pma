@@ -192,7 +192,8 @@ impl Plan {
     }
 
     pub fn cost(&self) -> f64 {
-        self.steps.iter().map(|p| p.cost).sum()
+        // From 0.0: `Sum` for f64 starts at -0.0, which prints as `$-0.00`.
+        self.steps.iter().map(|p| p.cost).fold(0.0, |s, c| s + c)
     }
 
     /// A short hash of what the plan runs: each node, its units, its worker
@@ -2982,6 +2983,12 @@ fn summary(task: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty plan costs `0.00`, not the `-0.00` a float `Sum` gives.
+    #[test]
+    fn an_empty_plan_costs_positive_zero() {
+        assert_eq!(format!("{:.2}", Plan::default().cost()), "0.00");
+    }
 
     #[test]
     fn a_doc_stays_inside_the_repository() {

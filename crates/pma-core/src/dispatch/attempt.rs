@@ -523,12 +523,7 @@ fn attempt_once(
         }
     }
 
-    let failure = match finished.success {
-        None => Some(format!("timed out after {} minutes", cfg.timeout)),
-        Some(_) if !report.ok => Some(format!("agent failed; log: {}", log.display())),
-        _ => None,
-    };
-    if let Some(f) = failure {
+    if let Some(f) = agent_failure(finished.success, report.ok, cfg.timeout, &log) {
         fail(run, &mut a, f);
         return a;
     }
@@ -556,6 +551,21 @@ fn attempt_once(
     run.enter(RunState::Ready);
     a.outcome = Some(RunState::Ready.name().into());
     a
+}
+
+/// Why an agent that exited fails its run: `success` is `None` when it was
+/// killed at the timeout, and `report_ok` is the worker's own verdict.
+fn agent_failure(
+    success: Option<bool>,
+    report_ok: bool,
+    minutes: i64,
+    log: &Path,
+) -> Option<String> {
+    match success {
+        None => Some(format!("timed out after {minutes} minutes")),
+        Some(_) if !report_ok => Some(format!("agent failed; log: {}", log.display())),
+        _ => None,
+    }
 }
 
 /// `cmd` as an agent may run: the verify allowlist, the run's directory, and
@@ -605,4 +615,30 @@ pub(super) fn fail(run: &mut Run, a: &mut Attempt, error: String) {
     run.error = Some(error.clone());
     a.error = Some(error);
     a.outcome = Some(RunState::Failed.name().into());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A timeout reads as one whatever the worker reported; otherwise the
+    /// worker's verdict decides, and its exit status alone does not.
+    #[test]
+    fn an_agent_fails_at_the_timeout_or_by_its_own_report() {
+        let log = Path::new("/runs/1/agent-1.log");
+        let fails = |success, ok| agent_failure(success, ok, 30, log);
+        assert_eq!(
+            fails(None, true).as_deref(),
+            Some("timed out after 30 minutes")
+        );
+        assert_eq!(
+            fails(None, false).as_deref(),
+            Some("timed out after 30 minutes")
+        );
+        let failed = Some("agent failed; log: /runs/1/agent-1.log");
+        assert_eq!(fails(Some(true), false).as_deref(), failed);
+        assert_eq!(fails(Some(false), false).as_deref(), failed);
+        assert_eq!(fails(Some(true), true), None);
+        assert_eq!(fails(Some(false), true), None, "the report decides");
+    }
 }

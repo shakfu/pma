@@ -3040,7 +3040,6 @@ fn the_scope_check_reads_the_whole_change_not_the_agents_report() {
     assert!(env.ok(&["review"]).contains("2 to read"), "{detail}");
 }
 
-/// A second worker runs through the same dispatch, review and push path as
 /// A worker that reports no cost is charged its whole budget, so the batch
 /// budget still stops it.
 #[test]
@@ -3066,6 +3065,7 @@ fn unknown_cost_counts_against_the_batch_budget() {
     );
 }
 
+/// A second worker runs through the same dispatch, review and push path as
 /// `claude`, with no code that knows its name.
 #[test]
 fn a_worker_without_json_output_or_an_allowlist_runs_the_same_path() {
@@ -8120,6 +8120,109 @@ fn a_refresh_the_check_refuses_reaches_the_next_agent() {
     assert!(
         prompt.contains("`pma deps refresh` took every update")
             && prompt.contains("ruff-2-broke-the-tests"),
+        "{prompt}"
+    );
+}
+
+/// A worker whose command is not installed fails its run, and the review
+/// names the missing command.
+#[test]
+fn a_missing_worker_command_fails_the_run_and_says_why() {
+    let s = Scratch::new("missing-worker");
+    let (env, _, _) = dispatch_env(&s, &[]);
+    env.ok(&["agent", "set", "ghost", "command", "pma-no-such-worker"]);
+    env.ok(&["agent", "set", "ghost", "args", r#"["{prompt}"]"#]);
+    let out = env.ok(&["dispatch", "-a", "ghost", "alpha:5"]);
+    assert!(out.contains("0 ready, 1 failed"), "{out}");
+    let detail = env.ok(&["review", "1"]);
+    assert!(
+        detail.contains("error       agent failed; log: "),
+        "{detail}"
+    );
+    // dash says `not found`, bash `command not found`.
+    let summary = detail.split("summary:").nth(1).unwrap_or_default();
+    assert!(
+        summary.contains("pma-no-such-worker") && summary.contains("not found"),
+        "{detail}"
+    );
+}
+
+/// A stand-in for `gh` with one active workflow, `test`, whose latest run on
+/// `main` failed. Once the file named in place of `PASSING` exists, its latest
+/// run passed.
+const CI_GH: &str = r#"#!/bin/sh
+case "$1 $2" in
+  "workflow list") echo '[{"id":11,"name":"test","state":"active"}]' ;;
+  "run list")
+    case "$*" in
+      *--jq*) printf 'test\tcompleted\tfailure\thttps://github.com/me/alpha/actions/runs/99\n' ;;
+      *) if [ -e 'PASSING' ]; then
+           echo '[{"databaseId":100,"status":"completed","conclusion":"success"}]'
+         else
+           echo '[{"databaseId":99,"status":"completed","conclusion":"failure"}]'
+         fi ;;
+    esac ;;
+  "run view") echo "assertion failed: greeting missing" ;;
+  *) echo "fake gh: unexpected $*" >&2; exit 1 ;;
+esac
+"#;
+
+/// A `ci` task carries each failing workflow's failed-job log, and is refused
+/// once that workflow passes again.
+#[test]
+fn a_ci_task_carries_the_failed_log_and_is_refused_once_it_passes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let s = Scratch::new("ci-dispatch");
+    let prompt_log = s.0.join("prompt.txt");
+    let passing = s.0.join("passing");
+    let catcher = format!(
+        "#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n",
+        prompt_log.display()
+    );
+    let gh = CI_GH.replace("PASSING", passing.to_str().unwrap());
+    let (env, _, alpha) = dispatch_env(&s, &[("gh", &gh), ("catcher", &catcher)]);
+    fs::set_permissions(env.bin.join("catcher"), fs::Permissions::from_mode(0o755)).unwrap();
+    env.ok(&["agent", "set", "catcher", "command", "catcher"]);
+    env.ok(&["agent", "set", "catcher", "args", r#"["{prompt}"]"#]);
+
+    let ci = ["dispatch", "alpha:ci", "--local", "-a", "catcher"];
+    // The offline scan in `dispatch_env` read no CI.
+    let (_, err, ok) = env.run(&ci);
+    assert!(
+        !ok && err.contains("CI was not failing at the last scan"),
+        "{err}"
+    );
+
+    git(
+        &alpha,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/me/alpha.git",
+        ],
+        None,
+    );
+    env.ok(&["scan"]);
+
+    fs::write(&passing, "").unwrap();
+    let (_, err, ok) = env.run(&ci);
+    assert!(
+        !ok && err.contains("`test` no longer fails on main; run `pma scan`"),
+        "{err}"
+    );
+    assert!(!prompt_log.exists(), "no agent ran");
+    fs::remove_file(&passing).unwrap();
+
+    let out = env.ok(&ci);
+    // The catcher reports no cost: nothing to sum is $0.00, not $-0.00.
+    assert!(out.contains(", $0.00 spent;"), "{out}");
+    let prompt = fs::read_to_string(&prompt_log).unwrap();
+    assert!(prompt.contains("Task: fix CI: test"), "{prompt}");
+    assert!(
+        prompt.contains("Workflow `test`, run 99, last 200 lines")
+            && prompt.contains("assertion failed: greeting missing"),
         "{prompt}"
     );
 }

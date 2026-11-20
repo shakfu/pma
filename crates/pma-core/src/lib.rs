@@ -14,6 +14,7 @@ pub mod ci_verdict;
 pub mod class;
 pub mod complexity;
 pub mod config;
+pub mod context;
 pub mod dates;
 pub mod deps;
 pub mod dispatch;

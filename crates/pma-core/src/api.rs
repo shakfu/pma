@@ -80,6 +80,13 @@ pub enum Query {
     JobLog {
         id: i64,
     },
+    /// `pma help <words>`: a command's own help, as the CLI prints it in
+    /// `project`'s directory, under what `%` names.
+    Help {
+        words: Vec<String>,
+        project: Option<String>,
+        selected: Option<String>,
+    },
     Notes,
     Workflows,
     Campaigns,
@@ -230,6 +237,10 @@ pub enum View {
         text: Option<String>,
         /// Stopped at a plan, which an approval runs.
         awaiting: bool,
+    },
+    Help {
+        command: String,
+        text: String,
     },
     Notes(Vec<Note>),
     Workflows {
@@ -573,7 +584,7 @@ pub enum Action {
         add: bool,
     },
     /// Removes finished items and `Done` sections from the project's
-    /// TODO.md, as `pma prune --apply` does.
+    /// TODO.md, as `pma prune -y` does.
     Prune {
         project: String,
     },
@@ -587,9 +598,15 @@ pub enum Action {
         project: String,
     },
     /// Rewrites the mechanical errors in the project's TODO.md, as
-    /// `pma lint --fix --apply` does.
+    /// `pma lint --fix -y` does.
     FixTodo {
         project: String,
+    },
+    /// Queued: `pma <args>`, typed on a `:` line. With `project`, it runs in
+    /// the project's directory, which is its context.
+    Cli {
+        args: Vec<String>,
+        project: Option<String>,
     },
 }
 
@@ -1462,6 +1479,24 @@ pub fn query(store: &Store, q: Query) -> Result<View> {
                 awaiting: job.state == "awaiting-approval",
             }
         }
+        Query::Help {
+            words,
+            project,
+            selected,
+        } => {
+            let cwd = match &project {
+                Some(p) => store.project(p)?.map(|r| r.path).unwrap_or(outside()?),
+                None => outside()?,
+            };
+            let mut text = cli_help(&words, &cwd)?;
+            if let Some(row) = selected {
+                text = format!("Selected: {row}, as %.\n{text}");
+            }
+            View::Help {
+                command: words.join(" "),
+                text,
+            }
+        }
         Query::Notes => View::Notes(store.notes()?),
         Query::Workflows => View::Workflows {
             revisions: store.workflow_revisions()?,
@@ -2176,7 +2211,7 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
                 "refresh".into(),
                 row.path.to_string_lossy().into_owned(),
             ];
-            let id = jobs::queue(store, &args, &std::env::current_dir()?, Some(&project))?;
+            let id = jobs::queue(store, &args, &outside()?, Some(&project))?;
             Outcome::said(format!("job {id} queued: pma {}", args.join(" ")))
         }
         Action::Scan {
@@ -2219,14 +2254,35 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
             }
             out
         }
+        Action::Cli { args, project } => {
+            let cwd = match &project {
+                Some(p) => {
+                    store
+                        .project(p)?
+                        .ok_or_else(|| format!("unknown project `{p}`"))?
+                        .path
+                }
+                None => outside()?,
+            };
+            let id = jobs::queue(store, &args, &cwd, project.as_deref())?;
+            Outcome::said(format!("job {id} queued: pma {}", args.join(" ")))
+        }
         queued => {
             let args = command_line(&queued).expect("every other action is queued");
             let project = project_of(&queued).or(run_project(store, &queued)?);
             let wait = wait_note(store, &queued, project.as_deref())?;
-            let id = jobs::queue(store, &args, &std::env::current_dir()?, project.as_deref())?;
+            let id = jobs::queue(store, &args, &outside()?, project.as_deref())?;
             Outcome::said(format!("job {id} queued{wait}: pma {}", args.join(" ")))
         }
     })
+}
+
+/// Where a front end's job runs: in no project, so a command that names
+/// none means every project, wherever the front end was started.
+fn outside() -> Result<std::path::PathBuf> {
+    let dir = crate::store::state_home()?;
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 /// The one project the runs a queued action names are in, when they are in one.
@@ -2390,6 +2446,72 @@ fn project_of(a: &Action) -> Option<String> {
     }
 }
 
+/// What a front end asks before it queues `action`. For a `pma` command
+/// with `-d`, its plan follows: `pma <args> -d` in the job's context.
+pub fn confirm_question(store: &Store, action: &Action) -> Result<String> {
+    let Action::Cli { args, project } = action else {
+        return Err("only a `pma` command has a plan".into());
+    };
+    let line = args.join(" ");
+    let mut question = format!("queue `pma {line}` as a job?");
+    if !args
+        .first()
+        .is_some_and(|w| crate::keys::CLI_PLANS.contains(&w.as_str()))
+    {
+        return Ok(question);
+    }
+    let cwd = match project {
+        Some(p) => store.project(p)?.map(|r| r.path).unwrap_or(outside()?),
+        None => outside()?,
+    };
+    // `-y` conflicts with `-d`, and `-d` may be typed already.
+    let plan: Vec<&String> = args
+        .iter()
+        .filter(|a| !["-y", "--yes", "-d", "--dry-run"].contains(&a.as_str()))
+        .collect();
+    let out = std::process::Command::new(std::env::current_exe()?)
+        .args(plan)
+        .arg("-d")
+        .current_dir(cwd)
+        .env_remove(crate::context::VAR)
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    let plan = String::from_utf8_lossy(&out.stdout);
+    if out.status.success() && !plan.trim().is_empty() {
+        question.push_str("\n\n");
+        question.push_str(plan.trim_end());
+    }
+    Ok(question)
+}
+
+/// `pma help <words>`, as this binary prints it. A front end runs inside
+/// `pma`, so the help is clap's own.
+fn cli_help(words: &[String], cwd: &std::path::Path) -> Result<String> {
+    let known = words.first().is_some_and(|w| {
+        crate::keys::CLI.contains(&w.as_str()) || crate::keys::CLI_TERMINAL.contains(&w.as_str())
+    });
+    let plain = words
+        .iter()
+        .all(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_lowercase() || c == '-'));
+    if !known || !plain {
+        return Err(format!("no pma command `{}`", words.join(" ")).into());
+    }
+    let out = std::process::Command::new(std::env::current_exe()?)
+        .arg("help")
+        .args(words)
+        .current_dir(cwd)
+        .env_remove(crate::context::VAR)
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr)
+            .trim()
+            .to_string()
+            .into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// The CLI command a queued action runs; `None` for one that runs in place.
 pub fn command_line(a: &Action) -> Option<Vec<String>> {
     let mut v: Vec<String> = Vec::new();
@@ -2416,6 +2538,7 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
         }
     };
     match a {
+        Action::Cli { args, .. } => v.extend(args.iter().cloned()),
         Action::Scan { of, offline, deps } => {
             push("scan");
             v.extend(of.projects.iter().cloned());
@@ -2537,7 +2660,8 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
             push("sync");
             v.extend(of.projects.iter().cloned());
             tags(&mut v, &of.tags);
-            flag(&mut v, *apply, "--apply");
+            // A job is approved; without `apply`, only the plan.
+            flag(&mut v, !*apply, "--dry-run");
         }
         Action::Verify { of } => {
             push("verify");

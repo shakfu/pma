@@ -90,7 +90,7 @@ pma run test-gaps alpha
 pma run doc-drift alpha
 pma run todo-audit alpha            # open items the code already does
 pma run fix-ci alpha                # verified edit lands unstaged in the clone
-pma run deps-upgrade --tag rust --dry-run   # bulk: plan first, then --yes
+pma run deps-upgrade --tag rust -d   # bulk: the plan alone; without -d it asks
 pma run review alpha -w claude:sonnet       # override the model
 ```
 
@@ -145,9 +145,9 @@ pma workflow run review-fix alpha --local --unattended --detach
 | `#urgent` | urgent regardless of date |
 | `due:YYYY-MM-DD` | urgent within 7 days |
 | `gh:N` | linked issue |
-| `^k3f9q` | stable id; `pma lint --ids --apply` adds them |
+| `^k3f9q` | stable id; `pma lint --ids` adds them |
 
-`pma lint ~/projects/*/` checks; `--fix --apply` repairs; `pma prune --apply` removes ticked items.
+`pma lint ~/projects/*/` checks; `--fix` repairs; `pma prune` removes ticked items.
 
 ## TUI and web keys
 
@@ -169,7 +169,21 @@ pma workflow run review-fix alpha --local --unattended --detach
 
 All typing happens on the bottom line, as in vim: `:` a command, `/` the list filter, `>` the text an act asks for.
 
-Type a command by name after `:`; `Tab` completes it, then cycles the matches. An argument takes the place of the prompt: `:add-note buy milk`, `:project audio`, `:scope rust`, `:filter ci`, `:run review --push`. A unique prefix runs (`:hist`); `:q` quits. Only commands that apply to the selected row are offered. `Up`/`Down` recall earlier lines that begin with what is typed. The bottom line takes `C-a`, `C-e`, `C-w`, `C-u`, `C-k`, and word motion with Alt or Ctrl plus an arrow.
+Type a command by name after `:`; `Tab` completes it, then cycles the matches. An argument takes the place of the prompt: `:add-note buy milk`, `:project audio`, `:scope rust`, `:filter ci`. A unique prefix runs (`:hist`); `:q` quits. Only commands that apply to the selected row are offered.
+
+Any `pma` command runs from `:` as a job, after a confirm that shows its plan: `:stale`, `:project tier 2 audio`. `!` opens the same prompt. On a project's page the project may be left out (`:project tier 2`), and `%` is the selected row (`:push %`). A name both have, such as `prune`, `run` or `commit`, is the view's act when bare and the CLI's with arguments. `:help` lists what acts on the page; `:help prune` is the command's help there. `tui`, `web` and `watch` need a terminal and are refused. `Up`/`Down` recall earlier lines that begin with what is typed. The bottom line takes `C-a`, `C-e`, `C-w`, `C-u`, `C-k`, and word motion with Alt or Ctrl plus an arrow.
+
+## Context and confirmation
+
+| Typed | Means |
+|-|-|
+| no project, inside a project directory | that project; `$PMA_PROJECT` names one too |
+| `.`, `:12` | the context project; its line 12 |
+| `-A` | every project, whatever the context |
+| `-y` | go ahead without asking |
+| `-d` | show the plan, change nothing |
+
+`push`, `pr`, `merge`, `sync`, `close`, `review --reject`, the `rm` commands and a bulk `run` ask first. Without a terminal they refuse; a script passes `-y`. `prune` asks only to remove text git could not restore.
 
 ## Where things are
 

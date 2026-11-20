@@ -40,6 +40,11 @@ const NO_SCOPE: &str = "*";
 pub enum Request {
     Load(Query),
     Act(Action),
+    /// The question before a `pma` command is queued, with its plan
+    /// (`api::confirm_question`).
+    Confirm {
+        action: Action,
+    },
     /// A list to choose from: what `api::choices` gives for an act, the
     /// projects, to open one, or the tags, to scope the views to one.
     Choose {
@@ -533,6 +538,11 @@ impl App {
         }
     }
 
+    /// Asks `question` before `action`.
+    pub fn confirming(&mut self, action: Action, question: String) {
+        self.mode = Mode::Confirm { action, question };
+    }
+
     /// An action finished; what it said, or its error, shows in the footer.
     pub fn acted(&mut self, outcome: std::result::Result<Outcome, String>) {
         self.mode = Mode::Normal;
@@ -928,7 +938,7 @@ impl App {
         let arg = line.unwrap_or("");
         let takes = matches!(
             binding.command,
-            Command::Filter | Command::Scope | Command::Jump | Command::Act(_)
+            Command::Filter | Command::Scope | Command::Jump | Command::Help | Command::Act(_)
         );
         if !arg.is_empty() && !takes {
             let text = format!("`{}` takes no argument.", binding.command.name());
@@ -1077,6 +1087,22 @@ impl App {
                 self.finished = (self.finished + 1) % api::FINISHED.len();
                 return Some(Request::Load(self.query()));
             }
+            // A bad name would replace the tab with its error: refused here.
+            Command::Help if !arg.is_empty() => {
+                let words: Vec<String> = arg.split_whitespace().map(String::from).collect();
+                if !keys::CLI.contains(&words[0].as_str())
+                    && !keys::CLI_TERMINAL.contains(&words[0].as_str())
+                {
+                    self.say(format!("No pma command `{}`.", words[0]), Tone::Warn);
+                    return None;
+                }
+                let pick = self.pick().0;
+                return Some(Request::Load(Query::Help {
+                    words,
+                    project: (self.tab == Tab::Project).then(|| self.project.clone()),
+                    selected: screen::selection(&pick),
+                }));
+            }
             Command::Help => self.mode = Mode::Help,
             Command::Quit => return Some(Request::Quit),
             Command::Line => {
@@ -1169,10 +1195,17 @@ impl App {
             return None;
         }
         self.acting(act);
-        if act.weight() != "danger" {
+        if act.weight() != "danger" || act == Act::Cli {
             return self.ask_done(act, &pick, pane, input);
         }
-        match screen::action_scoped(act, &pick, pane, input, &self.project, &self.scope) {
+        match screen::action_scoped(
+            act,
+            &pick,
+            pane,
+            input,
+            screen::in_view(act, self.tab, &self.project),
+            &self.scope,
+        ) {
             Ok(action) => {
                 self.mode = Mode::Confirm {
                     action,
@@ -1298,7 +1331,14 @@ impl App {
                 Some(Request::Check { act, pick, label })
             }
             Ask::Confirm => {
-                match screen::action_scoped(act, &pick, &pane, "", &self.project, &self.scope) {
+                match screen::action_scoped(
+                    act,
+                    &pick,
+                    &pane,
+                    "",
+                    screen::in_view(act, self.tab, &self.project),
+                    &self.scope,
+                ) {
                     Ok(action) => {
                         self.mode = Mode::Confirm {
                             action,
@@ -1317,7 +1357,16 @@ impl App {
     }
 
     fn ask_done(&mut self, act: Act, pick: &Pick, pane: &[Item], input: &str) -> Option<Request> {
-        match screen::action_scoped(act, pick, pane, input, &self.project, &self.scope) {
+        match screen::action_scoped(
+            act,
+            pick,
+            pane,
+            input,
+            screen::in_view(act, self.tab, &self.project),
+            &self.scope,
+        ) {
+            // Typed is not confirmed: the plan is shown first.
+            Ok(a @ Action::Cli { .. }) => Some(Request::Confirm { action: a }),
             Ok(a) => {
                 if matches!(a, Action::Run { .. }) {
                     self.marks.clear();
@@ -1925,6 +1974,26 @@ impl App {
         let mut third = group("Anywhere", &|b| {
             matches!(b.command, Command::Act(_)) && b.tabs.is_empty()
         });
+        // The `pma` commands that act on this page, with what they act on.
+        let project = match self.tab {
+            Tab::Project => self.project.as_str(),
+            _ => "",
+        };
+        let title = match project {
+            "" => "Commands here".to_string(),
+            p => format!("Commands here ({p})"),
+        };
+        let mut here = vec![Line::styled(title, p.accent().add_modifier(Modifier::BOLD))];
+        for (typed, on, _) in keys::commands_here(project, &self.pick().0) {
+            here.push(Line::from(vec![
+                Span::styled(
+                    format!("{typed:>16}  "),
+                    Style::new().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(on),
+            ]));
+        }
+        third.append(&mut here);
         // A third column where one list would run off the bottom and there is
         // the width for it.
         let wide = right.len() + third.len() + 2 > area.height as usize && area.width >= 108;
@@ -2018,26 +2087,44 @@ impl App {
         );
     }
 
+    /// The question's first line, then any plan under it.
     fn render_confirm(&self, frame: &mut Frame, question: &str) {
         let p = self.palette;
-        let width = (question.chars().count() as u16 + 8).clamp(40, 80);
-        let area = centered(frame.area(), width.min(frame.area().width), 5);
+        let mut lines = question.lines();
+        let head = lines.next().unwrap_or_default();
+        let plan: Vec<&str> = lines.collect();
+        let widest = question
+            .lines()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0);
+        let width = (widest as u16 + 8).clamp(40, 100);
+        let height = (plan.len() as u16 + 5).min(frame.area().height);
+        let area = centered(frame.area(), width.min(frame.area().width), height);
         frame.render_widget(Clear, area);
+        let mut text = vec![Line::styled(
+            head.to_string(),
+            Style::new().add_modifier(Modifier::BOLD),
+        )];
+        text.extend(plan.iter().map(|l| Line::raw(l.to_string())));
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::styled(
-                    question.to_string(),
-                    Style::new().add_modifier(Modifier::BOLD),
-                ),
-                Line::raw(""),
-                Line::from(vec![
-                    Span::styled("y", p.tone(Tone::Warn).add_modifier(Modifier::BOLD)),
-                    Span::raw(" yes    "),
-                    Span::styled("any other key", Style::new().add_modifier(Modifier::BOLD)),
-                    Span::raw(" no"),
-                ]),
-            ])
-            .wrap(Wrap { trim: true })
+            Paragraph::new(
+                text.into_iter()
+                    .chain([
+                        Line::raw(""),
+                        Line::from(vec![
+                            Span::styled("y", p.tone(Tone::Warn).add_modifier(Modifier::BOLD)),
+                            Span::raw(" yes    "),
+                            Span::styled(
+                                "any other key",
+                                Style::new().add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(" no"),
+                        ]),
+                    ])
+                    .collect::<Vec<_>>(),
+            )
+            .wrap(Wrap { trim: false })
             .block(dialog(p, " Confirm ", p.tone(Tone::Warn)).padding(Padding::horizontal(1))),
             area,
         );
@@ -2651,6 +2738,10 @@ fn execute(store: &Store, app: &mut App, request: Request) {
             let input = api::initial_input(store, act, &pick).map_err(|e| e.to_string());
             app.prompted(act, pick, label, input);
         }
+        Request::Confirm { action } => match api::confirm_question(store, &action) {
+            Ok(question) => app.confirming(action, question),
+            Err(e) => app.acted(Err(e.to_string())),
+        },
         Request::Check { act, pick, label } => {
             let items = api::checklist(store, act, &pick).map_err(|e| e.to_string());
             if let Some(next) = app.checking(act, pick, label, items) {
@@ -3748,6 +3839,79 @@ mod tests {
                 of: app.selection(),
             })),
             "`hstory` mended to `history` mid-line"
+        );
+    }
+
+    /// A `pma` command on the `:` line is confirmed, then queued; `help`
+    /// with a name loads that command's help, and refuses a name it lacks.
+    #[test]
+    fn a_command_line_runs_a_pma_command() {
+        let mut app = App::new();
+        app.loaded(Ok(next_view()));
+        let enter = |app: &mut App, line: &str| {
+            app.key(":");
+            typed(app, line);
+            app.key("Enter")
+        };
+        let cli = Action::Cli {
+            args: vec!["prune".into(), "argdec".into()],
+            project: None,
+        };
+        assert_eq!(
+            enter(&mut app, "prune argdec"),
+            Some(Request::Confirm {
+                action: cli.clone()
+            }),
+            "the plan is asked for; the inbox is every project"
+        );
+        app.confirming(
+            cli.clone(),
+            "queue `pma prune argdec` as a job?\n\nargdec/TODO.md:5: remove `done`".into(),
+        );
+        let shown = screen_text(&mut app);
+        assert!(
+            shown.contains("queue `pma prune argdec`") && shown.contains("remove `done`"),
+            "{shown}"
+        );
+        assert_eq!(app.key("y"), Some(Request::Act(cli)));
+        app.mode = Mode::Normal;
+        // From `!`, the same.
+        app.key("!");
+        typed(&mut app, "status");
+        assert!(matches!(app.key("Enter"), Some(Request::Confirm { .. })));
+        app.mode = Mode::Normal;
+        assert_eq!(
+            enter(&mut app, "help prune"),
+            Some(Request::Load(Query::Help {
+                words: vec!["prune".into()],
+                project: None,
+                selected: Some("a:5".into()),
+            })),
+            "the selected task is named, as `%`"
+        );
+        app.key("?");
+        assert!(
+            screen_text(&mut app).contains("Commands here"),
+            "the inbox's"
+        );
+        app.mode = Mode::Normal;
+        app.tab = Tab::Project;
+        app.project = "argdec".into();
+        app.key("?");
+        let sheet = screen_text(&mut app);
+        assert!(
+            sheet.contains("Commands here (argdec)") && sheet.contains("argdec's TODO.md"),
+            "{sheet}"
+        );
+        app.mode = Mode::Normal;
+        app.tab = Tab::Inbox;
+        assert_eq!(enter(&mut app, "help nope"), None);
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("No pma command `nope`")
         );
     }
 

@@ -45,7 +45,7 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 - A root `TODO.md` per repository is the only task file. Nothing to keep in step, and no lock-in: remove `pma` and the files still read.
 
-- `pma lint` checks the format; `pma lint --fix --apply` rewrites the mechanical errors. `pma prune` removes what is finished.
+- `pma lint` checks the format; `pma lint --fix` rewrites the mechanical errors. `pma prune` removes what is finished.
 
 - `pma sync` mirrors `Critical` items to GitHub Issues and ticks items whose issue was closed.
 
@@ -195,7 +195,7 @@ The rules, which `pma lint` checks:
 
 - A finished item is ticked where it stands. `pma prune` removes it.
 
-Two open items with the same text, or two items with the same `gh:N` or id, are errors. An item is identified by its id, else its issue number, else its text. Ids are optional and `pma` writes them: `pma lint --ids --apply` gives one to every open item, and an item a workflow adds gets one. With an id, rewording an item keeps its age and any run it has.
+Two open items with the same text, or two items with the same `gh:N` or id, are errors. An item is identified by its id, else its issue number, else its text. Ids are optional and `pma` writes them: `pma lint --ids` gives one to every open item, and an item a workflow adds gets one. With an id, rewording an item keeps its age and any run it has.
 
 ## Commands
 
@@ -204,15 +204,15 @@ Projects and tasks:
 ```sh
 pma lint                        # ./TODO.md; a directory means its TODO.md
 pma lint ~/projects/*/          # every project
-pma prune ~/projects/*/         # what would be removed; --apply to do it
+pma prune ~/projects/*/         # remove finished items; -d to preview
 pma root add ~/projects/        # also `pma root` and `pma root rm`
 pma project                     # every project: tier, tags, last scanned
 pma project tier 1 alpha beta   # or `none`; untiered projects rank at default_tier, 5
 pma project export tiers.csv    # every project's tier and tags, to edit
-pma project import tiers.csv --apply   # read them back
+pma project import tiers.csv   # read them back, after a confirm
 pma project tag add rust myproject     # private groups; --tag <t> elsewhere
 pma project forget gone         # a deleted project's record; `x` on the projects tab
-pma project clone --tag work    # check out absent projects again; --apply to do it
+pma project clone --tag work    # check out absent projects again
 pma scan                        # TODO.md, git state, CI via gh
 pma scan --offline myproject    # one project, without GitHub
 pma scan --deps                 # also measure how far each cargo, uv and go lock can move
@@ -349,8 +349,8 @@ A pass runs every node a rule decides, then stops and prints a plan for the agen
 GitHub Issues:
 
 ```sh
-pma sync                        # what would change
-pma sync --apply myproject      # carry it out
+pma sync -d                     # what would change
+pma sync myproject              # carry it out, after a confirm
 ```
 
 Each `## Critical` item gets an issue labelled `pma:critical`, and `gh:N` is written into its line. An item whose issue is closed is ticked. Edits to `TODO.md` are left uncommitted, for you to read first.

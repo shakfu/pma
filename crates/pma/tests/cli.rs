@@ -93,7 +93,12 @@ fn prune_lists_then_removes_finished_items() {
     let bad = s.project("bad", "## High\n\n- [x] kept\n");
     let todo = a.join("TODO.md");
 
-    let out = pma(&["prune".as_ref(), a.as_os_str(), bad.as_os_str()]);
+    let out = pma(&[
+        "prune".as_ref(),
+        "-d".as_ref(),
+        a.as_os_str(),
+        bad.as_os_str(),
+    ]);
     assert!(out.status.success());
     assert_eq!(
         stdout(&out),
@@ -103,14 +108,26 @@ fn prune_lists_then_removes_finished_items() {
              {0}:5: remove `finished`\n\
              {0}:8: kept `parent`: line 9 under it is open\n\
              {1}: skipped: lint errors; see `pma lint`\n\
-             2 removals; run `pma prune --apply` to make them\n",
+             2 removals; dry run, nothing changed\n",
             todo.display(),
             bad.join("TODO.md").display()
         )
     );
     assert_eq!(fs::read_to_string(&todo).unwrap(), text);
 
-    let out = pma(&["prune".as_ref(), "--apply".as_ref(), a.as_os_str()]);
+    // Not in git, so git could not restore it: it asks, and with no
+    // terminal to ask on it refuses.
+    let out = pma(&["prune".as_ref(), a.as_os_str()]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("removes text not in git's HEAD"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("-y goes ahead"));
+    assert_eq!(fs::read_to_string(&todo).unwrap(), text);
+
+    let out = pma(&["prune".as_ref(), "-y".as_ref(), a.as_os_str()]);
     assert!(out.status.success());
     assert!(
         stdout(&out).ends_with("2 removals made; TODO.md edits are uncommitted\n"),
@@ -134,14 +151,44 @@ fn prune_lists_then_removes_finished_items() {
     );
 }
 
+/// What git can restore needs no question: a ticked item is its committed
+/// unticked self. A line written since the commit is asked about.
+#[test]
+fn prune_asks_only_to_remove_uncommitted_text() {
+    let s = Scratch::new("prune-git");
+    let a = s.project("a", "# TODO\n\n## High\n\n- [ ] finished\n- [ ] open\n");
+    git(&a, &["init", "-q", "-b", "main"], None);
+    git(&a, &["add", "."], None);
+    git(&a, &["commit", "-qm", "init"], None);
+    let todo = a.join("TODO.md");
+    fs::write(
+        &todo,
+        "# TODO\n\n## High\n\n- [x] finished\n  since the commit\n- [ ] open\n",
+    )
+    .unwrap();
+    let out = pma(&["prune".as_ref(), a.as_os_str()]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an uncommitted line is asked about"
+    );
+    fs::write(&todo, "# TODO\n\n## High\n\n- [x] finished\n- [ ] open\n").unwrap();
+    let out = pma(&["prune".as_ref(), a.as_os_str()]);
+    assert!(out.status.success(), "{}", stdout(&out));
+    assert_eq!(
+        fs::read_to_string(&todo).unwrap(),
+        "# TODO\n\n## High\n\n- [ ] open\n"
+    );
+}
+
 #[test]
 fn prune_apply_exits_one_for_a_file_it_skips() {
     let s = Scratch::new("prune-skip");
     let bad = s.project("bad", "## High\n\n- [x] kept\n");
-    let out = pma(&["prune".as_ref(), "--apply".as_ref(), bad.as_os_str()]);
+    let out = pma(&["prune".as_ref(), "-y".as_ref(), bad.as_os_str()]);
     assert_eq!(out.status.code(), Some(1));
     // A dry run changes nothing, so a skip is no failure.
-    let out = pma(&["prune".as_ref(), bad.as_os_str()]);
+    let out = pma(&["prune".as_ref(), "-d".as_ref(), bad.as_os_str()]);
     assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
 }
 
@@ -766,9 +813,9 @@ fn a_clone_run_edits_the_clone_and_waits_for_review() {
     assert!(!success && err.contains("holds run #1"), "{err}");
 
     env.ok(&["review", "1", "--approve"]);
-    let (out, err, success) = env.run(&["pr", "1"]);
+    let (out, err, success) = env.run(&["pr", "1", "-y"]);
     assert!(!success && out.contains("--worktree"), "{out}{err}");
-    let out = env.ok(&["push", "1"]);
+    let out = env.ok(&["push", "1", "-y"]);
     assert!(
         out.contains("staged in") && out.contains("committed") && out.contains("pushed"),
         "{out}"
@@ -795,7 +842,7 @@ fn a_clone_run_edits_the_clone_and_waits_for_review() {
         fs::read_to_string(alpha.join("second.txt")).unwrap(),
         "two\n"
     );
-    let out = env.ok(&["review", "2", "--reject"]);
+    let out = env.ok(&["review", "2", "--reject", "-y"]);
     assert!(
         out.starts_with("Run #2 rejected; reverted 1 file in "),
         "{out}"
@@ -954,19 +1001,19 @@ fn dispatch_review_rework_and_push() {
 
     // A rejected run leaves no worktree or branch.
     env.ok(&["dispatch", "alpha:8"]);
-    env.ok(&["review", "3", "--reject"]);
+    env.ok(&["review", "3", "--reject", "-y"]);
     assert!(!env.home.join("state/worktrees/alpha/third-task").exists());
     assert_eq!(git_out(&alpha, &["branch", "--list", "pma/third-task"]), "");
 
     // `git apply --index` refuses a file with unstaged edits, and the run
     // stays approved.
-    let (out, _, success) = env.run(&["push", "1"]);
+    let (out, _, success) = env.run(&["push", "1", "-y"]);
     assert!(
         !success && out.contains("TODO.md: does not match index"),
         "{out}"
     );
     git(&alpha, &["checkout", "-q", "--", "TODO.md"], None);
-    let (out, _, success) = env.run(&["push", "1", "2"]);
+    let (out, _, success) = env.run(&["push", "1", "2", "-y"]);
     assert!(!success, "{out}");
     assert!(out.contains("#1 alpha: staged in "), "{out}");
     assert!(out.contains("; committed "), "{out}");
@@ -992,7 +1039,7 @@ fn dispatch_review_rework_and_push() {
         git_out(&alpha, &["branch", "--list", "pma/add-greeting"]),
         ""
     );
-    let (_, err, success) = env.run(&["push", "1"]);
+    let (_, err, success) = env.run(&["push", "1", "-y"]);
     assert!(
         !success
             && err.contains(
@@ -1055,14 +1102,14 @@ fn dispatch_review_rework_and_push() {
     // The budget refusal never reached the agent, so `--retry` reset nothing,
     // and neither it nor its rejection uses an attempt.
     env.ok(&["config", "batch_budget", "5.0"]);
-    env.ok(&["review", "4", "--reject"]);
+    env.ok(&["review", "4", "--reject", "-y"]);
     let (_, err, success) = env.run(&["dispatch", "alpha:8"]);
     assert!(!success && err.contains("2 attempts on"), "{err}");
     // A retry that starts resets the count: the two runs after it each use one.
     env.ok(&["dispatch", "alpha:8", "--retry"]);
-    env.ok(&["review", "5", "--reject"]);
+    env.ok(&["review", "5", "--reject", "-y"]);
     env.ok(&["dispatch", "alpha:8"]);
-    env.ok(&["review", "6", "--reject"]);
+    env.ok(&["review", "6", "--reject", "-y"]);
     let (_, err, success) = env.run(&["dispatch", "alpha:8"]);
     assert!(!success && err.contains("2 attempts on"), "{err}");
 }
@@ -1076,7 +1123,7 @@ fn an_infrastructure_rejection_uses_no_attempt_and_is_in_no_share() {
 
     // `third task` fails its check, which uses one of its two attempts.
     env.ok(&["dispatch", "alpha:8"]);
-    env.ok(&["review", "1", "--reject", "--infra"]);
+    env.ok(&["review", "1", "--reject", "--infra", "-y"]);
     let report = env.ok(&["report"]);
     assert!(report.starts_with("nothing decided yet"), "{report}");
     assert!(
@@ -1086,7 +1133,7 @@ fn an_infrastructure_rejection_uses_no_attempt_and_is_in_no_share() {
 
     // Both attempts are still there: the check and a plain rejection.
     env.ok(&["dispatch", "alpha:8"]);
-    env.ok(&["review", "2", "--reject"]);
+    env.ok(&["review", "2", "--reject", "-y"]);
     let (_, err, success) = env.run(&["dispatch", "alpha:8"]);
     assert!(!success && err.contains("2 attempts"), "{err}");
     assert!(
@@ -1142,14 +1189,14 @@ fn a_pull_request_merges_or_has_its_conflicts_fixed() {
 
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
-    env.ok(&["pr", "1"]);
+    env.ok(&["pr", "1", "-y"]);
     let tip = git_out(&origin, &["rev-parse", "pma/add-greeting"]);
     conflict_on_origin(&s, &origin);
 
     // A conflict refuses the merge and names the fix.
     fs::write(&pr_state, "CONFLICTING\n").unwrap();
     pr_json("CONFLICTING", &tip, "");
-    let (_, err, success) = env.run(&["merge", "1"]);
+    let (_, err, success) = env.run(&["merge", "1", "-y"]);
     assert!(
         !success && err.contains("has conflicts") && err.contains("--fix"),
         "{err}"
@@ -1163,7 +1210,7 @@ fn a_pull_request_merges_or_has_its_conflicts_fixed() {
 
     // Publishing moves the same branch to one commit on the new base.
     env.ok(&["review", "1", "--approve"]);
-    env.ok(&["pr", "1"]);
+    env.ok(&["pr", "1", "-y"]);
     let log = git_out(&origin, &["log", "--format=%s", "main..pma/add-greeting"]);
     assert_eq!(log.lines().count(), 1, "{log}");
     assert_ne!(git_out(&origin, &["rev-parse", "pma/add-greeting"]), tip);
@@ -1177,7 +1224,7 @@ fn a_pull_request_merges_or_has_its_conflicts_fixed() {
     fs::write(&pr_state, "MERGEABLE\n").unwrap();
     let head = git_out(&origin, &["rev-parse", "pma/add-greeting"]);
     let refused = |want: &str| {
-        let (_, err, success) = env.run(&["merge", "1"]);
+        let (_, err, success) = env.run(&["merge", "1", "-y"]);
         assert!(!success && err.contains(want), "{err}");
         assert!(!env.home.join("pr-merge-args").exists());
     };
@@ -1204,7 +1251,10 @@ fn a_pull_request_merges_or_has_its_conflicts_fixed() {
 
     // No checks at all is no failure. GitHub is held to the same head.
     pr_json("MERGEABLE", &head, "");
-    assert!(env.ok(&["merge", "1"]).contains("pull request merged"));
+    assert!(
+        env.ok(&["merge", "1", "-y"])
+            .contains("pull request merged")
+    );
     let args = fs::read_to_string(env.home.join("pr-merge-args")).unwrap();
     assert!(args.contains("--squash"), "{args}");
     assert!(
@@ -1212,7 +1262,7 @@ fn a_pull_request_merges_or_has_its_conflicts_fixed() {
         "{args}"
     );
     assert!(env.ok(&["review", "1"]).starts_with("#1 merged"));
-    let (_, err, success) = env.run(&["merge", "1"]);
+    let (_, err, success) = env.run(&["merge", "1", "-y"]);
     assert!(!success && err.contains("no open pull request"), "{err}");
 }
 
@@ -1225,7 +1275,7 @@ fn a_conflict_fix_stays_with_its_pull_request() {
     let pr_state = env.home.join("pr-state");
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
-    env.ok(&["pr", "1"]);
+    env.ok(&["pr", "1", "-y"]);
     let tip = git_out(&origin, &["rev-parse", "pma/add-greeting"]);
     conflict_on_origin(&s, &origin);
     let main = git_out(&origin, &["rev-parse", "main"]);
@@ -1247,7 +1297,7 @@ fn a_conflict_fix_stays_with_its_pull_request() {
     assert_eq!(git_out(&alpha, &["diff", "--cached"]), "");
 
     // Rejecting drops the fix alone: the task is held and no attempt charged.
-    let out = env.ok(&["review", "1", "--reject"]);
+    let out = env.ok(&["review", "1", "--reject", "-y"]);
     assert!(
         out.contains("its pull request stays open: https://"),
         "{out}"
@@ -1261,7 +1311,7 @@ fn a_conflict_fix_stays_with_its_pull_request() {
     // It stays settled from GitHub, and can be fixed again.
     env.ok(&["merge", "1", "--fix"]);
     assert!(env.ok(&["review", "1"]).starts_with("#1 ready"));
-    env.ok(&["review", "1", "--reject"]);
+    env.ok(&["review", "1", "--reject", "-y"]);
     fs::write(&pr_state, "CLOSED\n").unwrap();
     env.ok(&["review"]);
     assert!(env.ok(&["review", "1"]).starts_with("#1 closed"));
@@ -1274,7 +1324,7 @@ fn a_conflict_fix_does_not_push_over_a_newer_commit() {
     let (env, origin, _alpha) = dispatch_env(&s, &[("claude", FAKE_CLAUDE), ("gh", FAKE_GH_PR)]);
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
-    env.ok(&["pr", "1"]);
+    env.ok(&["pr", "1", "-y"]);
     conflict_on_origin(&s, &origin);
     fs::write(env.home.join("pr-state"), "CONFLICTING\n").unwrap();
     env.ok(&["merge", "1", "--fix"]);
@@ -1299,7 +1349,7 @@ fn a_conflict_fix_does_not_push_over_a_newer_commit() {
     let human = git_out(&origin, &["rev-parse", "pma/add-greeting"]);
 
     env.ok(&["review", "1", "--approve"]);
-    let (_, _, success) = env.run(&["pr", "1"]);
+    let (_, _, success) = env.run(&["pr", "1", "-y"]);
     assert!(!success);
     assert_eq!(git_out(&origin, &["rev-parse", "pma/add-greeting"]), human);
 }
@@ -1319,7 +1369,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","t
     let (env, origin, _alpha) = dispatch_env(&s, &[("claude", IDLE_ON_FIX), ("gh", FAKE_GH_PR)]);
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
-    env.ok(&["pr", "1"]);
+    env.ok(&["pr", "1", "-y"]);
     conflict_on_origin(&s, &origin);
     fs::write(env.home.join("pr-state"), "CONFLICTING\n").unwrap();
     env.ok(&["merge", "1", "--fix"]);
@@ -1336,7 +1386,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","t
     assert!(out.starts_with("#1 failed"), "{out}");
     let (_, err, success) = env.run(&["review", "2"]);
     assert!(!success, "no second run: {err}");
-    env.ok(&["review", "1", "--reject"]);
+    env.ok(&["review", "1", "--reject", "-y"]);
     assert!(env.ok(&["review", "1"]).starts_with("#1 pr-open"));
 }
 
@@ -1348,7 +1398,7 @@ fn a_pull_request_holds_its_task_until_merged_or_closed() {
 
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
-    let out = env.ok(&["pr", "1"]);
+    let out = env.ok(&["pr", "1", "-y"]);
     assert_eq!(out, "#1 alpha: https://github.com/me/alpha/pull/1\n");
     // The body names the run and says what verify made of it.
     let args = fs::read_to_string(env.home.join("pr-create-args")).unwrap();
@@ -1369,10 +1419,10 @@ fn a_pull_request_holds_its_task_until_merged_or_closed() {
     assert!(env.ok(&["review"]).contains("#1  pr-open  alpha"));
     let out = env.ok(&["dispatch", "--auto", "-n", "1"]);
     assert!(out.contains("#2 alpha: second task"), "{out}");
-    env.ok(&["review", "2", "--reject"]);
+    env.ok(&["review", "2", "--reject", "-y"]);
     let (_, err, success) = env.run(&["dispatch", "alpha:5"]);
     assert!(!success && err.contains("already has a run"), "{err}");
-    let (_, err, success) = env.run(&["review", "1", "--reject"]);
+    let (_, err, success) = env.run(&["review", "1", "--reject", "-y"]);
     assert!(
         !success && err.contains("open pull request; merge or close it"),
         "{err}"
@@ -1395,7 +1445,7 @@ fn a_pull_request_holds_its_task_until_merged_or_closed() {
     assert!(env.ok(&["review", "3"]).contains("pma/add-greeting-2 in"));
 
     env.ok(&["review", "3", "--approve"]);
-    env.ok(&["pr", "3"]);
+    env.ok(&["pr", "3", "-y"]);
     // An open pull request someone has reviewed says so, as GitHub does.
     fs::write(&pr_state, "OPEN\tCHANGES_REQUESTED\t2\t1\n").unwrap();
     let out = env.ok(&["review"]);
@@ -1510,7 +1560,7 @@ fn a_bundle_is_one_run_and_its_approver_says_what_it_closes() {
         "{detail}"
     );
 
-    env.ok(&["push", "1"]);
+    env.ok(&["push", "1", "-y"]);
     let todo = git_out(&origin, &["show", "main:TODO.md"]);
     assert!(
         todo.contains("- [x] add greeting")
@@ -1547,7 +1597,7 @@ fn a_reject_never_takes_out_later_work() {
     assert!(detail.contains("hello.txt"), "{detail}");
     assert!(!detail.contains("uncommitted.txt"), "{detail}");
 
-    let (_, err, success) = env.run(&["review", "1", "--reject"]);
+    let (_, err, success) = env.run(&["review", "1", "--reject", "-y"]);
     assert!(!success && err.contains("has moved past"), "{err}");
     let kept = || {
         ["hello.txt", "later.txt", "uncommitted.txt"]
@@ -1557,7 +1607,7 @@ fn a_reject_never_takes_out_later_work() {
     assert!(kept());
     assert!(env.ok(&["review"]).contains("#1  ready"));
 
-    let out = env.ok(&["close", "1"]);
+    let out = env.ok(&["close", "1", "-y"]);
     assert!(out.contains("left as they are"), "{out}");
     assert!(kept());
     assert!(!env.ok(&["review"]).contains("#1"));
@@ -1565,7 +1615,7 @@ fn a_reject_never_takes_out_later_work() {
     // Neither accepted nor refused: no decided run to count.
     let report = env.ok(&["report"]);
     assert!(!report.contains("0% of 1"), "{report}");
-    let (_, err, success) = env.run(&["close", "1"]);
+    let (_, err, success) = env.run(&["close", "1", "-y"]);
     assert!(!success && err.contains("cannot be rejected"), "{err}");
     // The clone is free again.
     assert!(env.run(&["dispatch", "alpha:7"]).2);
@@ -1581,7 +1631,7 @@ fn a_reject_takes_out_only_the_runs_change() {
     env.ok(&["dispatch", "alpha:5"]);
     fs::write(alpha.join("mine.txt"), "mine\n").unwrap();
     fs::write(alpha.join("hello.txt"), "edited since\n").unwrap();
-    let (_, err, success) = env.run(&["review", "1", "--reject"]);
+    let (_, err, success) = env.run(&["review", "1", "--reject", "-y"]);
     assert!(
         !success && err.contains("no longer reverts cleanly"),
         "{err}"
@@ -1589,7 +1639,7 @@ fn a_reject_takes_out_only_the_runs_change() {
     assert!(alpha.join("mine.txt").exists());
 
     fs::write(alpha.join("hello.txt"), "hi\n").unwrap();
-    env.ok(&["review", "1", "--reject"]);
+    env.ok(&["review", "1", "--reject", "-y"]);
     assert!(!alpha.join("hello.txt").exists());
     assert_eq!(
         fs::read_to_string(alpha.join("mine.txt")).unwrap(),
@@ -1605,10 +1655,10 @@ fn a_run_with_no_record_is_not_reverted() {
     env.ok(&["config", "workspace", "clone"]);
     env.ok(&["dispatch", "alpha:5"]);
     fs::remove_file(env.home.join("state/runs/1/ready.patch")).unwrap();
-    let (_, err, success) = env.run(&["review", "1", "--reject"]);
+    let (_, err, success) = env.run(&["review", "1", "--reject", "-y"]);
     assert!(!success && err.contains("no record"), "{err}");
     assert!(alpha.join("hello.txt").exists());
-    env.ok(&["close", "1"]);
+    env.ok(&["close", "1", "-y"]);
     assert!(alpha.join("hello.txt").exists());
 }
 
@@ -1832,7 +1882,7 @@ exit 0
     );
     let detail = env.ok(&["review", "1"]);
     assert!(detail.contains("$0.42"), "{detail}");
-    let (out, err, success) = herdr.pma(&env, &["push", "1"]);
+    let (out, err, success) = herdr.pma(&env, &["push", "1", "-y"]);
     assert!(success, "{out}{err}");
     assert_eq!(
         git_out(&origin, &["log", "-1", "--format=%s", "main"]),
@@ -1868,7 +1918,7 @@ fn a_worker_runs_interactively_from_its_own_args() {
         format!("{out}{err}").contains("agent `codex` has no `interactive_args`"),
         "{out}{err}"
     );
-    env.ok(&["review", "1", "--reject"]);
+    env.ok(&["review", "1", "--reject", "-y"]);
 
     env.ok(&[
         "agent",
@@ -1939,7 +1989,7 @@ fn a_dispatch_waits_for_its_clone() {
     let jobs = env.ok(&["job"]);
     assert!(jobs.contains("queued"), "still waiting: {jobs}");
 
-    env.ok(&["review", "1", "--reject"]);
+    env.ok(&["review", "1", "--reject", "-y"]);
     let started = std::time::Instant::now();
     while !env.ok(&["job"]).contains("done") && started.elapsed().as_secs() < 30 {
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2072,7 +2122,7 @@ fn with_no_herdr_server_a_run_goes_on_without_a_pane() {
     assert!(err.contains("without a pane"), "{err}");
     assert!(env.ok(&["review"]).contains("#1  ready"));
 
-    env.ok(&["review", "1", "--reject"]);
+    env.ok(&["review", "1", "--reject", "-y"]);
     let (out, err, _) = none(&["dispatch", "alpha:7", "--interactive"]);
     assert!(
         format!("{out}{err}").contains("an interactive run needs herdr"),
@@ -2119,7 +2169,7 @@ fn a_run_shows_as_queued_while_its_base_is_checked() {
     assert!(detail.contains("claude"), "{detail}");
 
     // Cached the second time: no wait, no message.
-    env.ok(&["review", "1", "--reject"]);
+    env.ok(&["review", "1", "--reject", "-y"]);
     let (out, err, success) = env.run(&["dispatch", "alpha:5", "--retry"]);
     assert!(success, "{out}{err}");
     assert!(!err.contains("checking the base first"), "{err}");
@@ -2425,9 +2475,9 @@ fn push_approve_approves_a_ready_run_first() {
     let (env, origin, _) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
     env.ok(&["config", "workspace", "clone"]);
     env.ok(&["dispatch", "alpha:5"]);
-    let (_, err, success) = env.run(&["push", "1"]);
+    let (_, err, success) = env.run(&["push", "1", "-y"]);
     assert!(!success && err.contains("run #1 is ready"), "{err}");
-    env.ok(&["push", "1", "--approve"]);
+    env.ok(&["push", "1", "--approve", "-y"]);
     assert_eq!(git_out(&origin, &["show", "main:hello.txt"]), "hi\n");
 }
 
@@ -2438,13 +2488,13 @@ fn push_approve_on_a_bundle_needs_its_items() {
     let s = Scratch::new("pushbundle");
     let (env, origin, _) = dispatch_env(&s, &[("claude", BUNDLE_CLAUDE)]);
     env.ok(&["dispatch", "alpha:5", "alpha:high", "alpha:12"]);
-    let (_, err, success) = env.run(&["push", "1", "--approve"]);
+    let (_, err, success) = env.run(&["push", "1", "--approve", "-y"]);
     assert!(
         !success && err.contains("run #1 is a bundle; approve it first"),
         "{err}"
     );
     assert!(env.ok(&["review"]).contains("#1  ready"));
-    env.ok(&["push", "1", "--approve", "--drop", "3"]);
+    env.ok(&["push", "1", "--approve", "--drop", "3", "-y"]);
     let todo = git_out(&origin, &["show", "main:TODO.md"]);
     assert!(
         todo.contains("- [x] add greeting") && todo.contains("- [ ] third task"),
@@ -2460,7 +2510,7 @@ fn a_bundle_stops_at_its_attempt_limit() {
     let (env, _, _) = dispatch_env(&s, &[("claude", FAKE_CLAUDE)]);
     // The check fails, which uses one attempt; the rejection uses the other.
     env.ok(&["dispatch", "alpha:7", "alpha:8"]);
-    env.ok(&["review", "1", "--reject"]);
+    env.ok(&["review", "1", "--reject", "-y"]);
     let (_, err, success) = env.run(&["dispatch", "alpha:7", "alpha:8"]);
     assert!(
         !success && err.contains("2 attempts on the bundle `second task; third task`"),
@@ -2479,7 +2529,7 @@ fn a_bundle_runs_in_the_clone() {
     env.ok(&["config", "workspace", "clone"]);
     let (_, err, _) = env.run(&["dispatch", "alpha:5", "alpha:7", "--separate"]);
     assert!(err.contains("its clone holds run #1"), "{err}");
-    env.ok(&["review", "1", "--reject"]);
+    env.ok(&["review", "1", "--reject", "-y"]);
 
     let (out, err, success) = env.run(&["dispatch", "alpha:5", "alpha:7"]);
     assert!(success && !err.contains("holds run"), "{out}{err}");
@@ -2541,7 +2591,7 @@ fn a_prompt_is_a_run_over_the_project() {
     assert!(out.contains("#2 alpha: add greeting"), "{out}");
 
     env.ok(&["review", "2", "--approve"]);
-    env.ok(&["push", "2"]);
+    env.ok(&["push", "2", "-y"]);
     assert_eq!(git_out(&origin, &["show", "main:hello.txt"]), "hi\n");
     assert!(
         git_out(&origin, &["show", "main:TODO.md"]).contains("- [ ] add greeting"),
@@ -2563,7 +2613,7 @@ fn a_closed_pull_request_uses_an_attempt() {
     for id in ["1", "2"] {
         env.ok(&["dispatch", "alpha:5"]);
         env.ok(&["review", id, "--approve"]);
-        env.ok(&["pr", id]);
+        env.ok(&["pr", id, "-y"]);
         env.ok(&["review"]);
     }
     let (_, err, success) = env.run(&["dispatch", "alpha:5"]);
@@ -2589,7 +2639,7 @@ fn publishing_refuses_a_todo_md_the_agent_made_a_symlink() {
     let (env, _origin, _alpha) = dispatch_env(&s, &[("claude", &agent), ("gh", FAKE_GH_PR)]);
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
-    let (out, err, _) = env.run(&["pr", "1"]);
+    let (out, err, _) = env.run(&["pr", "1", "-y"]);
     assert!(
         format!("{out}{err}").contains("TODO.md: is a symlink"),
         "{out}{err}"
@@ -2611,7 +2661,7 @@ fn publishing_resumes_after_a_partial_failure() {
         &["worktree", "lock", worktree.to_str().unwrap()],
         None,
     );
-    let out = env.ok(&["push", "1"]);
+    let out = env.ok(&["push", "1", "-y"]);
     assert!(
         out.contains("; warning: worktree not removed: ") && out.contains("; pushed "),
         "{out}"
@@ -2633,7 +2683,7 @@ fn publishing_resumes_after_a_partial_failure() {
         &["worktree", "unlock", worktree.to_str().unwrap()],
         None,
     );
-    let out = env.ok(&["push", "1"]);
+    let out = env.ok(&["push", "1", "-y"]);
     assert!(out.starts_with("#1 alpha: pushed "), "{out}");
     assert!(!worktree.exists());
     assert_eq!(
@@ -2646,7 +2696,7 @@ fn publishing_resumes_after_a_partial_failure() {
     env.ok(&["dispatch", "alpha:7"]);
     env.ok(&["review", "2", "--approve"]);
     fs::write(env.home.join("pr-create-fails"), "").unwrap();
-    let (out, _, success) = env.run(&["pr", "2"]);
+    let (out, _, success) = env.run(&["pr", "2", "-y"]);
     assert!(!success && out.contains("gh pr create: HTTP 502"), "{out}");
     assert!(env.ok(&["review"]).contains("#2  approved"));
     fs::remove_file(env.home.join("pr-create-fails")).unwrap();
@@ -2656,13 +2706,16 @@ fn publishing_resumes_after_a_partial_failure() {
     )
     .unwrap();
     // Run 1 is pushed, so only run 2 is approved.
-    let (_, err, success) = env.run(&["pr", "2", "--all-approved"]);
+    let (_, err, success) = env.run(&["pr", "2", "--all-approved", "-y"]);
     assert!(!success && err.contains("cannot be used with"), "{err}");
     assert_eq!(
-        env.ok(&["pr", "--all-approved"]),
+        env.ok(&["pr", "--all-approved", "-y"]),
         "#2 alpha: https://github.com/me/alpha/pull/9\n"
     );
-    assert_eq!(env.ok(&["push", "--all-approved"]), "no approved runs\n");
+    assert_eq!(
+        env.ok(&["push", "--all-approved", "-y"]),
+        "no approved runs\n"
+    );
 }
 
 /// A stage refused after it ticked the item leaves the worktree as it was
@@ -2678,21 +2731,21 @@ fn a_retried_publish_publishes_only_what_was_approved() {
     // Something the user staged would go into the run's commit.
     fs::write(alpha.join("mine.txt"), "mine\n").unwrap();
     git(&alpha, &["add", "mine.txt"], None);
-    let (out, _, success) = env.run(&["push", "1"]);
+    let (out, _, success) = env.run(&["push", "1", "-y"]);
     assert!(!success && out.contains("holds staged changes"), "{out}");
     assert!(env.ok(&["review"]).contains("#1  approved"));
     git(&alpha, &["rm", "-q", "--cached", "mine.txt"], None);
 
     let worktree = env.home.join("state/worktrees/alpha/add-greeting");
     fs::write(worktree.join("extra.txt"), "extra\n").unwrap();
-    let (out, _, success) = env.run(&["push", "1"]);
+    let (out, _, success) = env.run(&["push", "1", "-y"]);
     assert!(
         !success && out.contains("the worktree changed after it was approved"),
         "{out}"
     );
     fs::remove_file(worktree.join("extra.txt")).unwrap();
 
-    assert!(env.ok(&["push", "1"]).contains("; pushed "));
+    assert!(env.ok(&["push", "1", "-y"]).contains("; pushed "));
     assert_eq!(git_out(&origin, &["show", "main:hello.txt"]), "hi\n");
     assert_eq!(
         git_out(&origin, &["ls-tree", "--name-only", "main"]),
@@ -2714,13 +2767,13 @@ fn a_retried_publish_publishes_only_what_was_approved() {
     env.ok(&["dispatch", "alpha:7"]);
     env.ok(&["review", "2", "--approve"]);
     fs::write(env.home.join("pr-create-fails"), "").unwrap();
-    let (out, _, success) = env.run(&["pr", "2"]);
+    let (out, _, success) = env.run(&["pr", "2", "-y"]);
     assert!(!success && out.contains("gh pr create: HTTP 502"), "{out}");
     let pushed = git_out(&origin, &["rev-parse", "pma/second-task"]);
     fs::remove_file(env.home.join("pr-create-fails")).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1100));
     assert_eq!(
-        env.ok(&["pr", "2"]),
+        env.ok(&["pr", "2", "-y"]),
         "#2 alpha: https://github.com/me/alpha/pull/1\n"
     );
     assert_eq!(
@@ -2787,10 +2840,10 @@ fn stage_commit_and_push_follow_git() {
     fs::write(alpha.join("mine.txt"), "mine\n").unwrap();
     git(&alpha, &["add", "mine.txt"], None);
     git(&alpha, &["commit", "-qm", "mine"], None);
-    let (out, _, success) = env.run(&["push", "1"]);
+    let (out, _, success) = env.run(&["push", "1", "-y"]);
     assert!(!success && out.contains("is not run #1's commit"), "{out}");
     git(&alpha, &["reset", "-q", "--hard", "HEAD^"], None);
-    let out = env.ok(&["push", "1"]);
+    let out = env.ok(&["push", "1", "-y"]);
     assert!(out.starts_with("#1 alpha: pushed "), "{out}");
     assert_eq!(
         git_out(&origin, &["log", "--format=%s", "main"]),
@@ -2885,7 +2938,7 @@ fn a_verified_tree_committed_by_hand_settles_the_run() {
 
     // Closed before the commit: the close recorded no decision.
     env.ok(&["dispatch", "alpha:7"]);
-    env.ok(&["close", "2"]);
+    env.ok(&["close", "2", "-y"]);
     by_hand("fix two");
     env.ok(&["review"]);
     let detail = env.ok(&["review", "2"]);
@@ -2959,7 +3012,7 @@ fn the_agents_own_commits_are_not_published() {
     let (env, origin, _) = dispatch_env(&s, &[("claude", COMMITTING_CLAUDE), ("gh", FAKE_GH_PR)]);
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
-    assert!(env.ok(&["push", "1"]).contains("; pushed "));
+    assert!(env.ok(&["push", "1", "-y"]).contains("; pushed "));
     assert_eq!(
         git_out(&origin, &["log", "--format=%s", "main"]),
         "add greeting\ninit\n"
@@ -2974,7 +3027,7 @@ fn the_agents_own_commits_are_not_published() {
 
     env.ok(&["dispatch", "alpha:7"]);
     env.ok(&["review", "2", "--approve"]);
-    env.ok(&["pr", "2"]);
+    env.ok(&["pr", "2", "-y"]);
     assert_eq!(
         git_out(&origin, &["log", "--format=%s", "main..pma/second-task"]),
         "second task\n"
@@ -3002,7 +3055,7 @@ fn an_approval_requires_the_tree_last_shown() {
     // Shown, it is approved and published.
     assert!(env.ok(&["review", "1"]).contains("late.txt"));
     env.ok(&["review", "1", "--approve"]);
-    assert!(env.ok(&["push", "1"]).contains("; pushed "));
+    assert!(env.ok(&["push", "1", "-y"]).contains("; pushed "));
     assert_eq!(git_out(&origin, &["show", "main:late.txt"]), "late\n");
 
     // Shown, then written to: refused again.
@@ -3031,7 +3084,7 @@ fn a_run_with_no_changes_is_not_published() {
     env.ok(&["config", "projects.alpha.verify", "none"]);
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
-    let (out, _, success) = env.run(&["push", "1"]);
+    let (out, _, success) = env.run(&["push", "1", "-y"]);
     assert!(
         !success && out.contains("nothing to stage: run #1 changed nothing; `pma close 1`"),
         "{out}"
@@ -3203,7 +3256,7 @@ fn a_worker_without_json_output_or_an_allowlist_runs_the_same_path() {
     );
 
     env.ok(&["review", "1", "--approve"]);
-    assert!(env.ok(&["push", "1"]).contains("; pushed "), "pushed");
+    assert!(env.ok(&["push", "1", "-y"]).contains("; pushed "), "pushed");
     assert_eq!(git_out(&origin, &["show", "main:hello.txt"]), "hi\n");
     // No cost to sum, and `--by agent` names the worker that did the work.
     let report = env.ok(&["report", "--by", "agent"]);
@@ -3211,7 +3264,7 @@ fn a_worker_without_json_output_or_an_allowlist_runs_the_same_path() {
     assert!(report.contains("$0.00+1?"), "{report}");
 
     // A run whose worker was removed says so rather than running nothing.
-    env.ok(&["agent", "rm", "plain"]);
+    env.ok(&["agent", "rm", "plain", "-y"]);
     env.ok(&["dispatch", "alpha:7"]);
     let detail = env.ok(&["review", "2"]);
     assert!(detail.contains("unknown agent `plain`"), "{detail}");
@@ -3336,7 +3389,7 @@ fn a_campaign_applies_one_definition_across_repositories() {
 
     // Once it is rejected, a restart dispatches that member and no other.
     fs::write(env.home.join("fixed"), "").unwrap();
-    env.ok(&["review", "2", "--reject"]);
+    env.ok(&["review", "2", "--reject", "-y"]);
     let out = env.ok(&["campaign", "run", "workflows"]);
     assert!(out.contains("1 ready, 0 failed"), "{out}");
     assert_eq!(out.matches(": add a workflow").count(), 1, "{out}");
@@ -3365,7 +3418,7 @@ fn an_approval_is_evidence_about_a_tree_not_a_state() {
     env.ok(&["review", "1", "--approve"]);
     let worktree = env.home.join("state/worktrees/alpha/add-greeting");
     fs::write(worktree.join("sneaked.txt"), "later\n").unwrap();
-    let (out, err, success) = env.run(&["push", "1"]);
+    let (out, err, success) = env.run(&["push", "1", "-y"]);
     assert!(!success, "{out}{err}");
     assert!(
         out.contains("the worktree changed after it was approved"),
@@ -3376,7 +3429,7 @@ fn an_approval_is_evidence_about_a_tree_not_a_state() {
     // Reviewing it again approves the tree that is actually there.
     fs::remove_file(worktree.join("sneaked.txt")).unwrap();
     env.ok(&["review", "1", "--approve"]);
-    assert!(env.ok(&["push", "1"]).contains("; pushed "), "pushed");
+    assert!(env.ok(&["push", "1", "-y"]).contains("; pushed "), "pushed");
 
     // A rework withdraws an approval: the approver read another tree.
     env.ok(&["dispatch", "alpha:7"]);
@@ -3398,7 +3451,7 @@ fn an_approval_is_evidence_about_a_tree_not_a_state() {
     fs::write(other.join("Makefile"), "test:\n\ttest -f never.txt\n").unwrap();
     git(&other, &["commit", "-qam", "stricter test"], None);
     git(&other, &["push", "-q"], None);
-    let (out, err, success) = env.run(&["push", "2"]);
+    let (out, err, success) = env.run(&["push", "2", "-y"]);
     assert!(!success, "{out}{err}");
     assert!(
         out.contains("origin's main moved since the run's base"),
@@ -3446,7 +3499,7 @@ fn a_batch_approval_refuses_a_list_with_anything_to_read_in_it() {
     .unwrap();
     env.ok(&["route", "propose", doc.to_str().unwrap()]);
     env.ok(&["route", "activate", "1"]);
-    env.ok(&["review", "1", "--reject"]);
+    env.ok(&["review", "1", "--reject", "-y"]);
     env.ok(&["dispatch", "alpha:5", "--retry"]);
     let (_, err, success) = env.run(&["review", "4", "--approve"]);
     assert!(!success && err.contains("which is `propose`"), "{err}");
@@ -3647,18 +3700,18 @@ fn a_missing_checkout_is_cloned_from_its_recorded_slug() {
     fs::rename(root.join("beta"), s.0.join("beta-moved")).unwrap();
     env.ok(&["scan", "--offline"]);
 
-    let out = env.ok(&["project", "clone", "--tag", "work"]);
+    let out = env.ok(&["project", "clone", "--tag", "work", "-d"]);
     assert!(out.contains("alpha: already checked out"), "{out}");
     assert!(
         out.contains(&format!(
-            "beta: would clone me/beta into {}",
+            "beta: clone me/beta into {}",
             root.join("beta").display()
         )),
         "{out}"
     );
     assert!(!root.join("beta").exists(), "a dry run clones nothing");
 
-    let out = env.ok(&["project", "clone", "--tag", "work", "--apply"]);
+    let out = env.ok(&["project", "clone", "--tag", "work", "-y"]);
     assert!(out.contains("beta: cloned me/beta"), "{out}");
     assert!(root.join("beta/TODO.md").exists());
     git(
@@ -3681,7 +3734,7 @@ fn a_missing_checkout_is_cloned_from_its_recorded_slug() {
     fs::rename(root.join("beta"), s.0.join("beta-again")).unwrap();
     env.ok(&["scan", "--offline"]);
     fs::create_dir(root.join("beta")).unwrap();
-    let out = env.ok(&["project", "clone", "beta", "--apply"]);
+    let out = env.ok(&["project", "clone", "beta", "-y"]);
     assert!(out.contains("already exists; not cloned"), "{out}");
 }
 
@@ -3739,7 +3792,7 @@ fn a_policy_is_a_draft_until_activated_and_replays_exactly() {
     let detail = env.ok(&["review", "1"]);
     assert!(detail.contains("ran as unset"), "{detail}");
     assert!(!detail.contains("revision 1"), "{detail}");
-    env.ok(&["review", "1", "--reject"]);
+    env.ok(&["review", "1", "--reject", "-y"]);
 
     // Shadow records the route without applying it.
     env.ok(&["route", "activate", "1", "--shadow", "--by", "me"]);
@@ -3750,7 +3803,7 @@ fn a_policy_is_a_draft_until_activated_and_replays_exactly() {
         "{detail}"
     );
     assert!(detail.contains("ran as unset"), "shadow applies nothing");
-    env.ok(&["review", "2", "--reject"]);
+    env.ok(&["review", "2", "--reject", "-y"]);
 
     // Activated, the same task takes the route's model.
     env.ok(&["route", "activate", "1", "--by", "me"]);
@@ -3799,7 +3852,7 @@ fn a_policy_is_a_draft_until_activated_and_replays_exactly() {
     .unwrap();
     env.ok(&["route", "propose", narrow.to_str().unwrap()]);
     env.ok(&["route", "activate", "2"]);
-    env.ok(&["review", "3", "--reject"]);
+    env.ok(&["review", "3", "--reject", "-y"]);
     let (_, err, success) = env.run(&["dispatch", "alpha:5", "--retry"]);
     assert!(
         !success && err.contains("matches no route in policy revision 2"),
@@ -3872,8 +3925,8 @@ fn a_second_session_leaves_running_runs_alone() {
     );
     for args in [
         &["dispatch", "alpha:6"][..],
-        &["push", "1"],
-        &["review", "1", "--reject"],
+        &["push", "1", "-y"],
+        &["review", "1", "--reject", "-y"],
     ] {
         let (_, err, success) = env.run(args);
         assert!(
@@ -3890,7 +3943,7 @@ fn a_second_session_leaves_running_runs_alone() {
         "{stdout}"
     );
     assert!(env.ok(&["review"]).contains("#1  ready"));
-    env.ok(&["review", "1", "--reject"]);
+    env.ok(&["review", "1", "--reject", "-y"]);
 }
 
 /// A stand-in for `gh` backed by `issues.json`; mutating calls are logged.
@@ -3981,7 +4034,7 @@ fn sync_plans_then_applies_and_settles() {
     sync(&["scan", "--offline"]);
 
     let original = fs::read_to_string(alpha.join("TODO.md")).unwrap();
-    let (out, err) = sync(&["sync"]);
+    let (out, err) = sync(&["sync", "-d"]);
     assert_eq!(
         out,
         "alpha:5: open an issue for `segfault on empty input`\n\
@@ -3989,7 +4042,7 @@ fn sync_plans_then_applies_and_settles() {
          alpha:11: mark done, #1 is closed\n\
          alpha: untriaged #3 by alice: please add X\n\
          beta: skipped: TODO.md has lint errors; see `pma lint`\n\
-         3 changes; run `pma sync --apply` to make them\n",
+         3 changes; dry run, nothing changed\n",
         "{err}"
     );
     assert_eq!(fs::read_to_string(alpha.join("TODO.md")).unwrap(), original);
@@ -3998,7 +4051,7 @@ fn sync_plans_then_applies_and_settles() {
         "a dry run changes nothing"
     );
 
-    let (out, err) = sync(&["sync", "--apply", "alpha"]);
+    let (out, err) = sync(&["sync", "-y", "alpha"]);
     assert!(
         out.ends_with(
             "3 changes made\nTODO.md changed, uncommitted, in: alpha; commit, then `pma scan`\n"
@@ -4017,7 +4070,7 @@ fn sync_plans_then_applies_and_settles() {
         "# TODO\n\n## Critical\n\n- [ ] segfault on empty input gh:4\n  when stdin is empty\n- [ ] renamed crash gh:2\n\n## High\n\n- [x] fixed elsewhere gh:1\n"
     );
 
-    let (out, _) = sync(&["sync", "alpha"]);
+    let (out, _) = sync(&["sync", "alpha", "-y"]);
     assert_eq!(out, "alpha: untriaged #3 by alice: please add X\nin sync\n");
 }
 
@@ -4337,7 +4390,7 @@ fn a_preset_names_a_worker_a_model_and_its_configuration() {
 
     // Forgetting the default clears the setting rather than leaving a name
     // nothing resolves.
-    env.ok(&["preset", "rm", "cheap"]);
+    env.ok(&["preset", "rm", "cheap", "-y"]);
     let listed = env.ok(&["preset"]);
     assert!(!listed.contains("* cheap"), "the default is gone: {listed}");
     let settings = env.ok(&["config"]);
@@ -4878,12 +4931,15 @@ fn tiers_and_tags_go_out_to_a_file_and_come_back() {
 
     // Edited by hand: a retier, a tag added, a tag dropped, a row deleted.
     fs::write(&csv, "name,tier,tags\nalpha,1\nbeta,none,python,cli\n").unwrap();
-    let out = ok(&home, &["project", "import", csv.to_str().unwrap()]);
+    let out = ok(&home, &["project", "import", csv.to_str().unwrap(), "-d"]);
     assert!(out.contains("alpha: tier 2 -> 1"), "{out}");
     assert!(out.contains("alpha: tags rust -> none"), "{out}");
     assert!(out.contains("beta: tier 2 -> none"), "{out}");
     assert!(out.contains("beta: tags none -> python,cli"), "{out}");
-    assert!(out.contains("4 changes; --apply to make them"), "{out}");
+    assert!(
+        out.contains("4 changes") && out.contains("dry run; nothing changed"),
+        "{out}"
+    );
     assert!(
         out.contains("1 projects the file leaves out keep what they have"),
         "{out}"
@@ -4891,20 +4947,14 @@ fn tiers_and_tags_go_out_to_a_file_and_come_back() {
     // A dry run changed nothing.
     assert!(ok(&home, &["project"]).contains("alpha  tier 2  rust"));
 
-    let out = ok(
-        &home,
-        &["project", "import", csv.to_str().unwrap(), "--apply"],
-    );
+    let out = ok(&home, &["project", "import", csv.to_str().unwrap(), "-y"]);
     assert!(out.contains("4 changes applied"), "{out}");
     let listed = ok(&home, &["project"]);
     assert!(listed.contains("alpha  tier 1"), "{listed}");
     assert!(listed.contains("beta   untiered  cli,python"), "{listed}");
     assert!(listed.contains("gamma  tier 2"), "{listed}");
     // Applied once, it is a no-op.
-    let out = ok(
-        &home,
-        &["project", "import", csv.to_str().unwrap(), "--apply"],
-    );
+    let out = ok(&home, &["project", "import", csv.to_str().unwrap(), "-y"]);
     assert!(out.contains("nothing to change"), "{out}");
 
     // JSON is the same round trip, and the extension is what picks it.
@@ -4916,10 +4966,7 @@ fn tiers_and_tags_go_out_to_a_file_and_come_back() {
         "{text}"
     );
     fs::write(&json, text.replace(r#""tier":1"#, r#""tier":5"#)).unwrap();
-    ok(
-        &home,
-        &["project", "import", json.to_str().unwrap(), "--apply"],
-    );
+    ok(&home, &["project", "import", json.to_str().unwrap(), "-y"]);
     assert!(ok(&home, &["project"]).contains("alpha  tier 5"));
 
     let (_, err, success) = pma_in(
@@ -4930,10 +4977,7 @@ fn tiers_and_tags_go_out_to_a_file_and_come_back() {
 
     // A file naming something that is not a project is refused whole.
     fs::write(&csv, "name,tier,tags\nalpha,3\ndelta,1\n").unwrap();
-    let (_, err, success) = pma_in(
-        &home,
-        &["project", "import", csv.to_str().unwrap(), "--apply"],
-    );
+    let (_, err, success) = pma_in(&home, &["project", "import", csv.to_str().unwrap(), "-y"]);
     assert!(!success && err.contains("not projects: delta"), "{err}");
     assert!(
         ok(&home, &["project"]).contains("alpha  tier 5"),
@@ -6156,7 +6200,7 @@ fn settings_are_edited_from_the_web() {
 }
 
 /// `lint --fix` lists the mechanical rewrites and leaves the file; with
-/// `--apply` it writes them, and what it cannot fix is still reported.
+/// `-y` it writes them, and what it cannot fix is still reported.
 #[test]
 fn lint_fix_rewrites_what_a_machine_can() {
     let s = Scratch::new("lintfix");
@@ -6171,11 +6215,11 @@ fn lint_fix_rewrites_what_a_machine_can() {
     let before = "# Todo\n\n##High\n\n- plain item\n* [ ] star item due:never\n";
     fs::write(&file, before).unwrap();
     let dir_s = dir.to_str().unwrap();
-    let out = env.ok(&["lint", "--fix", dir_s]);
+    let out = env.ok(&["lint", "--fix", "-d", dir_s]);
     assert!(
         out.contains(":1: `# Todo` -> `# TODO`")
             && out.contains(":5: `- plain item` -> `- [ ] plain item`")
-            && out.contains("4 rewrites; run `pma lint --fix --apply`"),
+            && out.contains("4 rewrites; dry run, nothing changed"),
         "{out}"
     );
     assert_eq!(
@@ -6183,7 +6227,7 @@ fn lint_fix_rewrites_what_a_machine_can() {
         before,
         "listed, not written"
     );
-    let out = env.ok(&["lint", "--fix", "--apply", dir_s]);
+    let out = env.ok(&["lint", "--fix", "-y", dir_s]);
     assert!(out.contains("4 lines rewritten"), "{out}");
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
@@ -6194,8 +6238,11 @@ fn lint_fix_rewrites_what_a_machine_can() {
         !success && out.contains("is not a date"),
         "the date is yours: {out}"
     );
-    let (_, err, success) = env.run(&["lint", "--apply", dir_s]);
-    assert!(!success && err.contains("--apply needs"), "{err}");
+    let (_, err, success) = env.run(&["lint", "-y", dir_s]);
+    assert!(
+        !success && err.contains("-y and -d need --ids or --fix"),
+        "{err}"
+    );
 }
 
 /// Every act the key table binds is one the web server takes by name: asked
@@ -7063,7 +7110,7 @@ fn a_replaced_git_dir_is_refused_before_pma_runs_git_in_it() {
         format!("{out}{err}").contains("is not the file `git worktree add` wrote"),
         "{out}{err}"
     );
-    env.ok(&["review", "1", "--reject"]);
+    env.ok(&["review", "1", "--reject", "-y"]);
     assert!(!env.home.join("state/worktrees/alpha/add-greeting").exists());
     assert_eq!(git_out(&alpha, &["branch", "--list", "pma/*"]), "");
     assert!(!s.0.join("pwned").exists(), "the monitor ran");
@@ -7089,7 +7136,7 @@ fn a_hook_added_during_a_run_stops_its_push() {
     let hooked = s.0.join("hooked");
     env.ok(&["dispatch", "alpha:5"]);
     env.ok(&["review", "1", "--approve"]);
-    assert!(env.ok(&["push", "1"]).contains("; pushed "));
+    assert!(env.ok(&["push", "1", "-y"]).contains("; pushed "));
     assert!(s.0.join("own.log").exists(), "the user's hook did not run");
 
     env.ok(&["dispatch", "alpha:7"]);
@@ -7098,7 +7145,7 @@ fn a_hook_added_during_a_run_stops_its_push() {
     let hook = alpha.join(".git/hooks/pre-push");
     fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", hooked.display())).unwrap();
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
-    let (out, _, success) = env.run(&["push", "2"]);
+    let (out, _, success) = env.run(&["push", "2", "-y"]);
     assert!(!success, "{out}");
     assert!(
         out.contains("hooks or git settings changed since run #2 was dispatched")
@@ -7113,7 +7160,7 @@ fn a_hook_added_during_a_run_stops_its_push() {
 
     // Restoring the hooks is enough.
     fs::remove_file(&hook).unwrap();
-    assert!(env.ok(&["push", "2"]).contains("; pushed "));
+    assert!(env.ok(&["push", "2", "-y"]).contains("; pushed "));
 }
 
 /// An agent that writes a clean filter and a filesystem monitor into the
@@ -7164,7 +7211,7 @@ fn a_git_setting_added_by_the_agent_fails_the_run_before_pma_runs_git() {
     assert!(!ok && err.contains("and they are still in"), "{err}");
     let (_, err, _) = env.run(&["verify", "alpha"]);
     assert!(err.contains("and they are still in"), "{err}");
-    let (_, err, ok) = env.run(&["review", "1", "--reject"]);
+    let (_, err, ok) = env.run(&["review", "1", "--reject", "-y"]);
     assert!(!ok && err.contains("Restore them first"), "{err}");
     // `git status` would run the monitor, so the clone is not read.
     let (_, err, ok) = env.run(&["scan", "--offline"]);
@@ -7180,7 +7227,7 @@ fn a_git_setting_added_by_the_agent_fails_the_run_before_pma_runs_git() {
     fs::remove_file(alpha.join(".git/hooks/pre-commit")).unwrap();
     let (_, err, _) = env.run(&["verify", "alpha"]);
     assert!(!err.contains("still in"), "{err}");
-    env.ok(&["review", "1", "--reject"]);
+    env.ok(&["review", "1", "--reject", "-y"]);
     assert!(!marker.exists(), "the filter ran");
     assert_eq!(git_out(&alpha, &["branch", "--list", "pma/*"]), "");
 }
@@ -7255,7 +7302,7 @@ fn an_agent_does_not_outlive_a_killed_session() {
     assert!(!alive(), "agent {pid} outlived its session");
     // The next session fails the interrupted run, and rejecting it is safe.
     assert!(env.ok(&["review"]).contains("#1  failed"));
-    env.ok(&["review", "1", "--reject"]);
+    env.ok(&["review", "1", "--reject", "-y"]);
 }
 
 /// `pma verify` runs the check where a dispatch would: at origin's head, in a
@@ -7411,10 +7458,11 @@ fn pma_run_reviews_a_path_with_the_bundled_library() {
     );
     env.ok(&["config", "workflow_budget", "63"]);
 
-    let out = env.ok(&["run", "review", "--all"]);
+    // A bulk run shows its plan, then asks; with no terminal it refuses.
+    let (out, err, success) = env.run(&["run", "review", "--all"]);
     assert!(out.contains("revision 1: the bundled workflows"), "{out}");
-    assert!(out.contains("rerun with `--yes`"), "{out}");
-    assert!(!log.exists(), "a bulk run without --yes ran an agent");
+    assert!(!success && err.contains("-y goes ahead"), "{err}");
+    assert!(!log.exists(), "a bulk run without -y ran an agent");
 
     let out = env.ok(&["run", "review", alpha.to_str().unwrap()]);
     assert!(out.contains("REVIEW.md"), "the prose is pointed to: {out}");
@@ -7676,7 +7724,7 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","t
     assert!(out.contains("waiting at merged"), "still waiting: {out}");
     assert!(!env.ok(&["workflow"]).contains("finished"));
 
-    env.ok(&["review", "1", "--reject"]);
+    env.ok(&["review", "1", "--reject", "-y"]);
     let out = env.ok(&["workflow", "run", "greet", "--instance", "1"]);
     assert!(out.contains("nothing left to run"), "{out}");
     assert!(
@@ -7855,7 +7903,7 @@ fn an_id_keeps_an_items_age_and_its_run_across_a_reword() {
     let alpha_dir = alpha.to_str().unwrap();
 
     // Listed, then written, then there is nothing left to write.
-    let out = env.ok(&["lint", "--ids", alpha_dir]);
+    let out = env.ok(&["lint", "--ids", "-d", alpha_dir]);
     assert!(
         out.contains(":5: ^") && out.contains("4 items without an id"),
         "{out}"
@@ -7865,10 +7913,10 @@ fn an_id_keeps_an_items_age_and_its_run_across_a_reword() {
 
     // A run on line 5 before its id exists moves to the id when it is written.
     env.ok(&["dispatch", "alpha:5"]);
-    let out = env.ok(&["lint", "--ids", "--apply", alpha_dir]);
+    let out = env.ok(&["lint", "--ids", alpha_dir]);
     assert!(out.contains("4 ids written"), "{out}");
     assert!(
-        env.ok(&["lint", "--ids", alpha_dir])
+        env.ok(&["lint", "--ids", "-d", alpha_dir])
             .contains("every open item has an id")
     );
     let written = fs::read_to_string(alpha.join("TODO.md")).unwrap();
@@ -7912,10 +7960,7 @@ fn an_id_keeps_the_age_git_gave_an_item() {
     git(&alpha, &["commit", "-qm", "init"], Some(now() - 100 * DAY));
     ok(&home, &["root", "add", root.to_str().unwrap()]);
     ok(&home, &["project", "tier", "1", "alpha"]);
-    ok(
-        &home,
-        &["lint", "--ids", "--apply", alpha.to_str().unwrap()],
-    );
+    ok(&home, &["lint", "--ids", alpha.to_str().unwrap()]);
     ok(&home, &["scan", "--offline"]);
     assert!(ok(&home, &["stale"]).contains("open 100d  old thing"));
 
@@ -8122,7 +8167,7 @@ fn a_git_setting_added_by_a_read_node_fails_its_run() {
     // The user may say the change is theirs, which lifts the hold.
     let (_, err, _) = env.run(&["verify", "alpha"]);
     assert!(err.contains("and they are still in"), "{err}");
-    env.ok(&["review", "1", "--reject", "--keep-git-changes"]);
+    env.ok(&["review", "1", "--reject", "--keep-git-changes", "-y"]);
     let (_, err, _) = env.run(&["verify", "alpha"]);
     assert!(!err.contains("still in"), "{err}");
 }
@@ -8208,7 +8253,7 @@ fn a_refresh_the_check_refuses_reaches_the_next_agent() {
     let review = env.ok(&["review", "1"]);
     assert!(review.contains("+ruff 2"), "the lock moved: {review}");
     assert!(review.contains("base passed, head FAILED"), "{review}");
-    env.ok(&["review", "1", "--reject"]);
+    env.ok(&["review", "1", "--reject", "-y"]);
 
     env.ok(&["agent", "set", "catcher", "command", "catcher"]);
     env.ok(&["agent", "set", "catcher", "args", r#"["{prompt}"]"#]);
@@ -8416,7 +8461,7 @@ fn a_pushed_ci_fix_is_judged_by_ci_on_its_commit() {
     let out = env.ok(&["dispatch", "alpha:ci", "-a", "fixer"]);
     assert!(out.contains("1 ready"), "{out}");
     env.ok(&["review", "1", "--approve"]);
-    env.ok(&["push", "1"]);
+    env.ok(&["push", "1", "-y"]);
     let landed = git_out(&origin, &["rev-parse", "main"]);
     let detail = env.ok(&["review", "1"]);
     assert!(
@@ -8552,4 +8597,312 @@ fn an_interactive_run_without_herdr_fails_and_says_why() {
         detail.contains("error       claude: an interactive run needs `pma integrate herdr`"),
         "{detail}"
     );
+}
+
+/// `pma agent | head -0`: a reader that closed its end ends pma with status
+/// 141, as SIGPIPE ends a shell tool, and not with a panic.
+#[test]
+fn a_closed_stdout_ends_quietly() {
+    use std::os::unix::process::ExitStatusExt;
+    let s = Scratch::new("pipe");
+    let env = Env {
+        home: s.0.join("home"),
+        bin: s.0.join("bin"),
+        push_log: s.0.join("push.log"),
+    };
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let out = env
+        .command(&["agent"])
+        .stdout(writer)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(141),
+        "{:?} {err}",
+        out.status.signal()
+    );
+    assert!(err.is_empty(), "{err}");
+}
+
+/// A `pma` command typed on the web's `:` line: help shows as the CLI prints
+/// it, and the command runs as a job. `prune` takes a project's name.
+#[test]
+fn the_command_line_runs_any_pma_command() {
+    let s = Scratch::new("cliline");
+    let env = Env {
+        home: s.0.join("home"),
+        bin: s.0.join("bin"),
+        push_log: s.0.join("push.log"),
+    };
+    let root = s.0.join("root");
+    let alpha = root.join("alpha");
+    fs::create_dir_all(&alpha).unwrap();
+    git(&alpha, &["init", "-q", "-b", "main"], None);
+    let todo = "# TODO\n\n## High\n\n- [x] finished\n- [ ] open\n";
+    fs::write(alpha.join("TODO.md"), todo).unwrap();
+    git(&alpha, &["add", "."], None);
+    git(&alpha, &["commit", "-qm", "init"], None);
+    env.ok(&["root", "add", root.to_str().unwrap()]);
+    env.ok(&["scan", "--offline"]);
+
+    // By name, from a directory that is not the project's.
+    let listed = env.ok(&["prune", "alpha", "-d"]);
+    assert!(listed.contains("remove `finished`"), "{listed}");
+
+    let (child, port, cookie) = start_web(&env);
+    let (status, help) = web(
+        port,
+        &cookie,
+        "/api/open",
+        Some(serde_json::json!({ "help": "prune" })),
+    );
+    assert_eq!(status, 200, "{help}");
+    let text = help["body"]["detail"]["sections"].to_string();
+    assert!(
+        text.contains("Remove finished items") && text.contains("--dry-run"),
+        "{help}"
+    );
+    // On the project's page, help is the command's there, and lists what
+    // acts on it.
+    let (_, here) = web(
+        port,
+        &cookie,
+        "/api/open",
+        Some(serde_json::json!({ "help": "prune", "project": "alpha" })),
+    );
+    assert!(
+        here.to_string().contains("Here: alpha's TODO.md (cwd)"),
+        "{here}"
+    );
+    let (status, rows) = web(
+        port,
+        &cookie,
+        "/api/here",
+        Some(serde_json::json!({ "project": "alpha", "pick": { "kind": "nothing" } })),
+    );
+    assert_eq!(status, 200, "{rows}");
+    assert!(
+        rows["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["typed"] == ":prune" && r["on"] == "alpha's TODO.md"),
+        "{rows}"
+    );
+    // The page's `:` line is read by the server, as the TUI reads it.
+    let (_, keys) = web(port, &cookie, "/api/keys", None);
+    let resolve = |line: &str, tab: &str| {
+        let (status, got) = web(
+            port,
+            &cookie,
+            "/api/resolve",
+            Some(serde_json::json!({ "line": line, "tab": tab, "pick": { "kind": "nothing" } })),
+        );
+        assert_eq!(status, 200, "{got}");
+        match got["binding"].as_u64() {
+            Some(i) => Ok((
+                keys["bindings"][i as usize]["name"].clone(),
+                got["arg"].clone(),
+            )),
+            None => Err(got["error"].as_str().unwrap().to_string()),
+        }
+    };
+    assert_eq!(
+        resolve(" prune -d ", "project"),
+        Ok(("cli".into(), "prune -d".into()))
+    );
+    assert_eq!(resolve("q", "inbox"), Ok(("quit".into(), "".into())));
+    assert_eq!(
+        resolve("nope", "inbox"),
+        Err("No command `nope` here.".into())
+    );
+    assert!(resolve("web", "inbox").unwrap_err().contains("terminal"));
+    let (status, bad) = web(
+        port,
+        &cookie,
+        "/api/open",
+        Some(serde_json::json!({ "help": "nope" })),
+    );
+    assert_eq!(status, 400, "{bad}");
+
+    // On the project's page the name may be left out; the question holds
+    // the command's plan. On the inbox it is every project's.
+    let page = |input: &str, tab: &str| {
+        serde_json::json!({
+            "tab": tab,
+            "act": "Cli",
+            "pick": { "kind": "nothing" },
+            "project": "alpha",
+            "input": input,
+        })
+    };
+    let (status, asked) = web(port, &cookie, "/api/ask", Some(page("prune", "project")));
+    assert_eq!(status, 200, "{asked}");
+    let question = asked["question"].as_str().unwrap();
+    assert!(
+        question.starts_with("queue `pma prune` as a job?")
+            && question.contains("remove `finished`"),
+        "{question}"
+    );
+    assert_eq!(
+        fs::read_to_string(alpha.join("TODO.md")).unwrap(),
+        todo,
+        "a plan changes nothing"
+    );
+    let (_, asked) = web(port, &cookie, "/api/ask", Some(page("prune -y", "project")));
+    assert!(
+        asked["question"]
+            .as_str()
+            .unwrap()
+            .contains("remove `finished`"),
+        "{asked}"
+    );
+    assert_eq!(
+        fs::read_to_string(alpha.join("TODO.md")).unwrap(),
+        todo,
+        "`-y` is not in the plan"
+    );
+    let (_, asked) = web(port, &cookie, "/api/ask", Some(page("prune", "inbox")));
+    assert!(
+        !asked["question"].as_str().unwrap().contains("remove"),
+        "{asked}"
+    );
+
+    let (status, acted) = web(port, &cookie, "/api/act", Some(page("prune", "project")));
+    assert_eq!(status, 200, "{acted}");
+    assert!(
+        acted["said"][0].as_str().unwrap().contains("pma prune"),
+        "{acted}"
+    );
+    wait_for_job(&env, 20, |jobs| jobs.contains("done"));
+    assert_eq!(
+        fs::read_to_string(alpha.join("TODO.md")).unwrap(),
+        "# TODO\n\n## High\n\n- [ ] open\n"
+    );
+    drop(child);
+}
+
+/// Inside a project, a command that names none acts on it: the cwd, or
+/// `$PMA_PROJECT`, is the context. `-A` and `--tag` override it.
+#[test]
+fn a_command_acts_on_the_project_it_is_run_in() {
+    let s = Scratch::new("context");
+    let env = Env {
+        home: s.0.join("home"),
+        bin: s.0.join("bin"),
+        push_log: s.0.join("push.log"),
+    };
+    let root = s.0.join("root");
+    for name in ["alpha", "beta"] {
+        let dir = root.join(name).join("src");
+        fs::create_dir_all(&dir).unwrap();
+        let todo = format!("# TODO\n\n## High\n\n- [x] {name} done\n- [ ] {name} open\n");
+        fs::write(root.join(name).join("TODO.md"), todo).unwrap();
+        git(&root.join(name), &["init", "-q", "-b", "main"], None);
+    }
+    env.ok(&["root", "add", root.to_str().unwrap()]);
+    env.ok(&["scan", "--offline"]);
+    let inside = root.join("alpha").join("src");
+    let run = |dir: &std::path::Path, vars: &[(&str, &str)], args: &[&str]| {
+        let mut cmd = env.command(args);
+        cmd.current_dir(dir);
+        for (k, v) in vars {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        (
+            stdout(&out),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.success(),
+        )
+    };
+
+    let (out, err, ok) = run(&inside, &[], &["status"]);
+    assert!(
+        ok && out.contains("alpha") && !out.contains("beta"),
+        "{out}{err}"
+    );
+    let (out, _, _) = run(&inside, &[], &["status", "-A"]);
+    assert!(out.contains("alpha") && out.contains("beta"), "{out}");
+    let (out, _, _) = run(&inside, &[], &["status", "beta"]);
+    assert!(
+        out.contains("beta") && !out.contains("alpha"),
+        "a name beats the context: {out}"
+    );
+    let (out, _, _) = run(&s.0, &[("PMA_PROJECT", "beta")], &["status"]);
+    assert!(out.contains("beta") && !out.contains("alpha"), "{out}");
+    let (_, err, ok) = run(&s.0, &[("PMA_PROJECT", "nope")], &["status"]);
+    assert!(
+        !ok && err.contains("PMA_PROJECT names no project `nope`"),
+        "{err}"
+    );
+
+    // A project argument may be left out, or written `.`.
+    let (_, err, ok) = run(&inside, &[], &["project", "tier", "2"]);
+    assert!(ok, "{err}");
+    assert!(env.ok(&["project"]).contains("alpha  tier 2"));
+    let (out, err, ok) = run(&inside, &[], &["project", "show", "."]);
+    assert!(ok && out.contains("alpha"), "{out}{err}");
+    let (_, err, ok) = run(&s.0, &[], &["project", "tier", "2"]);
+    assert!(!ok && err.contains("name a project"), "{err}");
+    let (_, err, ok) = run(&s.0, &[], &["project", "show", "."]);
+    assert!(!ok && err.contains("needs a project"), "{err}");
+
+    // Help says what a command acts on here.
+    let (out, _, _) = run(&inside, &[], &["help", "prune"]);
+    assert!(
+        out.starts_with("Here: alpha's TODO.md (cwd) when no path is named."),
+        "{out}"
+    );
+    let (out, _, _) = run(&inside, &[], &["status", "--help"]);
+    assert!(
+        out.starts_with("Here: acts on alpha (cwd); -A for every project."),
+        "{out}"
+    );
+    let (out, _, _) = run(&inside, &[], &["--help"]);
+    assert!(out.starts_with("Context: alpha (cwd)"), "{out}");
+    let (out, _, _) = run(&s.0, &[], &["help"]);
+    assert!(out.starts_with("Context: none (every project)."), "{out}");
+
+    let (out, err, ok) = run(&inside, &[], &["task", ":6"]);
+    assert!(
+        ok && out.contains("alpha open"),
+        "`:6` is alpha:6: {out}{err}"
+    );
+
+    // `prune` reads the project's TODO.md from a subdirectory.
+    let (out, err, ok) = run(&inside, &[], &["prune", "-d"]);
+    assert!(ok && out.contains("remove `alpha done`"), "{out}{err}");
+}
+
+/// What cannot be undone is asked about: with no terminal it is refused,
+/// `-d` previews it and `-y` does it.
+#[test]
+fn an_irreversible_command_asks_first() {
+    let s = Scratch::new("confirm");
+    let env = Env {
+        home: s.0.join("home"),
+        bin: s.0.join("bin"),
+        push_log: s.0.join("push.log"),
+    };
+    let root = s.0.join("root");
+    fs::create_dir_all(&root).unwrap();
+    let dir = root.to_str().unwrap();
+    env.ok(&["root", "add", dir]);
+    let (_, err, ok) = env.run(&["root", "rm", dir]);
+    assert!(
+        !ok && err.contains("no terminal to ask on; -y goes ahead, -d previews"),
+        "{err}"
+    );
+    let out = env.ok(&["root", "rm", dir, "-d"]);
+    assert!(out.contains("dry run; nothing changed"), "{out}");
+    assert!(env.ok(&["root"]).contains("root"), "still a root");
+    env.ok(&["root", "rm", dir, "-y"]);
+    assert!(!env.ok(&["root"]).contains(dir), "removed");
+    let (_, err, ok) = env.run(&["root", "rm", dir, "-y", "-d"]);
+    assert!(!ok && err.contains("cannot be used with"), "{err}");
 }

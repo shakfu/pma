@@ -744,6 +744,37 @@ pub struct Pruned {
 /// section whole. Blank lines before a section that ends the file go too.
 /// A finished item with an open nested checkbox is kept. Other lines are
 /// unchanged.
+/// The lines of `was` that `now` lacks, as many times as it lacks them.
+pub fn removed_lines(was: &str, now: &str) -> Vec<String> {
+    let mut left: HashMap<&str, usize> = HashMap::new();
+    for l in now.lines() {
+        *left.entry(l).or_default() += 1;
+    }
+    was.lines()
+        .filter(|l| {
+            let n = left.entry(l).or_default();
+            let gone = *n == 0;
+            *n = n.saturating_sub(1);
+            gone
+        })
+        .map(String::from)
+        .collect()
+}
+
+/// `line` with a ticked checkbox unticked, so a ticked item reads as the one
+/// it was before.
+pub fn unticked(line: &str) -> String {
+    let indent = line.len() - line.trim_start().len();
+    let (lead, rest) = line.split_at(indent);
+    match rest
+        .strip_prefix("- [x] ")
+        .or_else(|| rest.strip_prefix("- [X] "))
+    {
+        Some(text) => format!("{lead}- [ ] {text}"),
+        None => line.to_string(),
+    }
+}
+
 pub fn prune(text: &str) -> Pruned {
     let parsed = parse(text);
     let lines: Vec<&str> = text.split_inclusive('\n').collect();

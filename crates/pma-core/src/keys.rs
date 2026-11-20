@@ -168,10 +168,12 @@ pub enum Act {
     /// Dispatches a typed prompt over the project in view: work that is no
     /// TODO.md item.
     Prompt,
+    /// Queues a typed `pma` command line as a job: what no key does.
+    Cli,
 }
 
 impl Act {
-    pub const ALL: [Act; 54] = [
+    pub const ALL: [Act; 55] = [
         Act::ApproveRun,
         Act::ApproveRuns,
         Act::RejectRun,
@@ -226,6 +228,7 @@ impl Act {
         Act::Prompt,
         Act::ForgetRun,
         Act::ForgetProject,
+        Act::Cli,
     ];
 
     /// Whether the act settles a run a reviewer has open, so the next one to
@@ -270,6 +273,7 @@ impl Act {
                 | Act::Configure
                 | Act::Prune
                 | Act::Prompt
+                | Act::Cli
         )
     }
 
@@ -296,7 +300,8 @@ impl Act {
             | Act::RemovePreset
             | Act::RemoveCampaign
             | Act::ForgetProject
-            | Act::Prune => "danger",
+            | Act::Prune
+            | Act::Cli => "danger",
             _ => "default",
         }
     }
@@ -364,6 +369,7 @@ impl Act {
             Action::SetTier { .. } | Action::Tag { .. } => &[Act::Configure],
             Action::Prune { .. } | Action::FixTodo { .. } => &[Act::Prune],
             Action::RefreshDeps { .. } => &[Act::ScanProject],
+            Action::Cli { .. } => &[Act::Cli],
         }
     }
 }
@@ -536,7 +542,7 @@ const PANES: &[Tab] = &[
 const RUNS: &[Tab] = &[Tab::Inbox, Tab::Project];
 const JOBS: &[Tab] = &[Tab::Inbox, Tab::Activity, Tab::Project];
 
-pub const BINDINGS: &[Binding] = &[
+pub static BINDINGS: &[Binding] = &[
     bind("1", Command::Tab(Tab::Inbox), "inbox"),
     bind("2", Command::Tab(Tab::Projects), "projects"),
     bind("3", Command::Tab(Tab::Activity), "activity"),
@@ -613,6 +619,13 @@ pub const BINDINGS: &[Binding] = &[
     on("c", &[], Act::Scan, Ask::Nothing, "scan"),
     on("i", &[], Act::Sync, Ask::Confirm, "sync issues"),
     on("n", &[], Act::AddNote, Ask::Text("note"), "add note"),
+    on(
+        "!",
+        &[],
+        Act::Cli,
+        Ask::Text("pma command"),
+        "run pma command",
+    ),
     on(
         "r",
         &[Tab::Project],
@@ -925,6 +938,288 @@ pub fn shown(key: &str) -> &str {
 /// Names vim users type that a prefix alone would not settle.
 const ALIASES: [(&str, Command); 2] = [("q", Command::Quit), ("h", Command::Help)];
 
+/// What a `pma` command acts on without a project named: the kinds of
+/// `docs/dev/cli-context.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Every project, narrowed by the context.
+    Portfolio,
+    /// The targets named, else the context project.
+    Targets,
+    /// One project: the context's, or an error.
+    One,
+    /// A TODO.md: the context project's, else `./TODO.md`.
+    Files,
+    /// Run ids.
+    Runs,
+    /// No project.
+    None,
+}
+
+/// `pma`'s commands that a `:` line queues as a job, with clap's one-line
+/// help and their scope. The pma crate's tests hold this and
+/// `CLI_TERMINAL` to clap's list.
+pub const CLI_TABLE: &[(&str, &str, Scope)] = &[
+    (
+        "next",
+        "Tasks for agents, and what waits on you. The default",
+        Scope::Portfolio,
+    ),
+    (
+        "run",
+        "Run a review, a CI fix or an upgrade over projects, by name",
+        Scope::Targets,
+    ),
+    (
+        "scan",
+        "Read TODO.md, git state and CI into the database",
+        Scope::Portfolio,
+    ),
+    (
+        "matrix",
+        "Every tiered project's tasks, ranked, in one view",
+        Scope::Portfolio,
+    ),
+    (
+        "dispatch",
+        "Run an agent on tasks, each in its own worktree",
+        Scope::Targets,
+    ),
+    (
+        "review",
+        "Runs awaiting a decision; show one, or act on it",
+        Scope::Runs,
+    ),
+    (
+        "close",
+        "End a run and leave your files as they are",
+        Scope::Runs,
+    ),
+    (
+        "stage",
+        "Write each run named into its clone's index, for review",
+        Scope::Runs,
+    ),
+    (
+        "commit",
+        "Commit each run named in its clone, staging it first",
+        Scope::Runs,
+    ),
+    (
+        "push",
+        "Push each run named to the default branch, committing first",
+        Scope::Runs,
+    ),
+    (
+        "pr",
+        "Open a pull request for each approved run named",
+        Scope::Runs,
+    ),
+    (
+        "merge",
+        "Merge a run's open pull request, or fix its conflicts",
+        Scope::Runs,
+    ),
+    (
+        "task",
+        "One task in full, as Enter opens it in the TUI and web",
+        Scope::One,
+    ),
+    (
+        "lint",
+        "Check TODO.md files against the format",
+        Scope::Files,
+    ),
+    (
+        "prune",
+        "Remove finished items and `Done` sections",
+        Scope::Files,
+    ),
+    ("stale", "Open items by age, oldest first", Scope::Portfolio),
+    (
+        "sync",
+        "Mirror `Critical` items to GitHub Issues",
+        Scope::Portfolio,
+    ),
+    (
+        "note",
+        "Portfolio notes, which belong to no one project",
+        Scope::None,
+    ),
+    ("deps", "Dependency locks", Scope::One),
+    (
+        "shell",
+        "A shell in a project's clone, for a fix by hand",
+        Scope::One,
+    ),
+    (
+        "status",
+        "Projects worst first, by what needs attention",
+        Scope::Portfolio,
+    ),
+    (
+        "history",
+        "Past scans, or what one scan changed",
+        Scope::None,
+    ),
+    (
+        "report",
+        "What dispatching produced: outcomes, cost, time",
+        Scope::None,
+    ),
+    (
+        "usage",
+        "Which tabs, panes and acts the TUI and web were used for",
+        Scope::None,
+    ),
+    (
+        "root",
+        "Directories whose git repos are projects",
+        Scope::None,
+    ),
+    (
+        "project",
+        "A project's record: its tier, its tags, or its removal",
+        Scope::One,
+    ),
+    (
+        "config",
+        "List a setting, show one, or set one, in `settings.toml`",
+        Scope::None,
+    ),
+    (
+        "verify",
+        "Run each project's check where a dispatch would",
+        Scope::Targets,
+    ),
+    (
+        "integrate",
+        "Where agents run, `herdr` or `none`, and a `minos` room",
+        Scope::None,
+    ),
+    ("agent", "The workers `pma dispatch` can run", Scope::None),
+    (
+        "preset",
+        "A named worker, model and configuration",
+        Scope::None,
+    ),
+    (
+        "route",
+        "Which worker and how much autonomy, per kind of task",
+        Scope::None,
+    ),
+    ("campaign", "One task across many repositories", Scope::None),
+    (
+        "workflow",
+        "A graph of agents over a project",
+        Scope::Targets,
+    ),
+    (
+        "job",
+        "Commands queued with `--detach`, newest first",
+        Scope::None,
+    ),
+];
+
+/// The names in `CLI_TABLE`.
+pub const CLI: &[&str] = &{
+    let mut out = [""; CLI_TABLE.len()];
+    let mut i = 0;
+    while i < CLI_TABLE.len() {
+        out[i] = CLI_TABLE[i].0;
+        i += 1;
+    }
+    out
+};
+
+/// `command`'s scope; `None` for one not in `CLI_TABLE`.
+pub fn scope_of(command: &str) -> Option<Scope> {
+    CLI_TABLE.iter().find(|c| c.0 == command).map(|c| c.2)
+}
+
+/// The `pma` commands that act on something on this page, for `:help`:
+/// each as typed, what it acts on, and its one-liner. `project` is the
+/// project page's, empty elsewhere; `%` stands for the selected row.
+pub fn commands_here(project: &str, pick: &Pick) -> Vec<(String, String, &'static str)> {
+    let p = (!project.is_empty()).then_some(project);
+    let row = screen::selection(pick);
+    let run = matches!(pick, Pick::Run { .. });
+    let task = matches!(
+        pick,
+        Pick::Task { .. }
+            | Pick::Project {
+                target: Some(_),
+                ..
+            }
+    );
+    CLI_TABLE
+        .iter()
+        .filter_map(|&(name, about, scope)| {
+            let (typed, on) = match (scope, p) {
+                (Scope::Portfolio, Some(p)) => {
+                    (name.to_string(), format!("{p}; -A for every project"))
+                }
+                (Scope::Portfolio, None) => (name.to_string(), "every project".into()),
+                (Scope::Targets, _) if task => (format!("{name} %"), row.clone()?),
+                (Scope::Targets, Some(p)) => {
+                    (name.to_string(), format!("{p}, unless a target is named"))
+                }
+                (Scope::One, Some(p)) => (name.to_string(), p.to_string()),
+                (Scope::Files, Some(p)) => (name.to_string(), format!("{p}'s TODO.md")),
+                (Scope::Runs, _) if run => (format!("{name} %"), format!("run #{}", row.clone()?)),
+                _ => return None,
+            };
+            Some((format!(":{typed}"), on, about))
+        })
+        .collect()
+}
+
+/// What `command` acts on with no project named, given the context
+/// `(project, how it was found)`: the line its help starts with.
+pub fn here(command: &str, ctx: Option<(&str, &str)>) -> Option<String> {
+    Some(match (scope_of(command)?, ctx) {
+        (Scope::Portfolio, Some((p, how))) => {
+            format!("Here: acts on {p} ({how}); -A for every project.")
+        }
+        (Scope::Portfolio, None) => "Here: no project context; acts on every project.".into(),
+        (Scope::Targets, Some((p, how))) => {
+            format!("Here: acts on {p} ({how}) when no target is named; `:12` is {p}:12.")
+        }
+        (Scope::Targets, None) => "Here: no project context; name a target.".into(),
+        (Scope::One, Some((p, how))) => {
+            format!("Here: acts on {p} ({how}) when no project is named.")
+        }
+        (Scope::One, None) => "Here: no project context; name a project.".into(),
+        (Scope::Files, Some((p, how))) => {
+            format!("Here: {p}'s TODO.md ({how}) when no path is named.")
+        }
+        (Scope::Files, None) => "Here: no project context; ./TODO.md.".into(),
+        (Scope::Runs | Scope::None, _) => return None,
+    })
+}
+
+/// Commands with `-d`, whose plan a front end shows before it queues one.
+/// `-d` on a subcommand without it is a parse error, which changes nothing.
+pub const CLI_PLANS: &[&str] = &[
+    "push", "pr", "merge", "close", "sync", "prune", "lint", "run", "review", "root", "agent",
+    "preset", "campaign", "project",
+];
+
+/// Commands that hold a terminal of their own, which a job has none of.
+pub const CLI_TERMINAL: &[&str] = &["tui", "web", "watch"];
+
+/// `pma project`'s subcommands: `:project tier 2 x` runs the CLI, where
+/// `:project x` opens a project.
+pub const PROJECT_SUBCOMMANDS: &[&str] =
+    &["show", "tier", "export", "import", "tag", "forget", "clone"];
+
+fn cli_binding() -> &'static Binding {
+    BINDINGS
+        .iter()
+        .find(|b| b.command == Command::Act(Act::Cli))
+        .expect("`Act::Cli` has a key")
+}
+
 /// The commands `:` offers on `tab` for a row about `pick`, one binding
 /// each, in table order. An act on a row that does not fit it is left out.
 pub fn commands(tab: Tab, pick: &Pick) -> Vec<(String, &'static Binding)> {
@@ -945,15 +1240,22 @@ pub fn commands(tab: Tab, pick: &Pick) -> Vec<(String, &'static Binding)> {
 
 /// The names in `commands` that begin with `word`, for Tab to complete.
 pub fn complete(word: &str, tab: Tab, pick: &Pick) -> Vec<String> {
-    commands(tab, pick)
-        .into_iter()
-        .map(|(n, _)| n)
-        .filter(|n| n.starts_with(word))
-        .collect()
+    let mut names: Vec<String> = commands(tab, pick).into_iter().map(|(n, _)| n).collect();
+    for c in CLI {
+        if !names.iter().any(|n| n == c) {
+            names.push(c.to_string());
+        }
+    }
+    names.retain(|n| n.starts_with(word));
+    names
 }
 
 /// The binding a typed line names, and the argument after the name. A name
-/// matches exactly, as an alias, or as the prefix of one command alone.
+/// matches exactly, as an alias, or as the prefix of one command alone. A
+/// `pma` command's name resolves to `Act::Cli` with the whole line as its
+/// argument: when nothing here has that name, or when arguments follow it,
+/// as the front end's command of that name acts on the selection instead.
+/// `help` with an argument is help on that `pma` command.
 pub fn resolve<'a>(
     line: &'a str,
     tab: Tab,
@@ -961,6 +1263,17 @@ pub fn resolve<'a>(
 ) -> Result<(&'static Binding, &'a str), String> {
     let line = line.trim();
     let (word, arg) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    let arg = arg.trim();
+    if CLI_TERMINAL.contains(&word) {
+        return Err(format!(
+            "`{word}` needs a terminal of its own: run `pma {word}`."
+        ));
+    }
+    let jump = word == "project"
+        && !PROJECT_SUBCOMMANDS.contains(&arg.split_whitespace().next().unwrap_or(""));
+    if CLI.contains(&word) && !arg.is_empty() && !jump {
+        return Ok((cli_binding(), line));
+    }
     let offered = commands(tab, pick);
     let alias = ALIASES
         .iter()
@@ -968,19 +1281,25 @@ pub fn resolve<'a>(
         .map(|(_, c)| c.name());
     let exact = alias.as_deref().unwrap_or(word);
     if let Some((_, b)) = offered.iter().find(|(n, _)| n == exact) {
-        return Ok((b, arg.trim()));
+        return Ok((b, arg));
     }
     // A full name is never read as the prefix of another: `approve-run`
     // off a run must not become `approve-runs`.
     if BINDINGS.iter().any(|b| b.command.name() == exact) {
-        return Err(format!("`{word}` does not apply here."));
+        return Err(match CLI.contains(&word) {
+            true => format!("`{word}` does not apply here; `:{word} <args>` runs `pma {word}`."),
+            false => format!("`{word}` does not apply here."),
+        });
+    }
+    if CLI.contains(&word) {
+        return Ok((cli_binding(), line));
     }
     let prefixed: Vec<&(String, &Binding)> = offered
         .iter()
         .filter(|(n, _)| n.starts_with(word))
         .collect();
     match prefixed.as_slice() {
-        [(_, b)] => Ok((b, arg.trim())),
+        [(_, b)] => Ok((b, arg)),
         [] if word.is_empty() => Err("Type a command; Tab completes.".into()),
         [] => Err(format!("No command `{word}` here.")),
         many => Err(format!(
@@ -1121,6 +1440,90 @@ mod tests {
         }
         assert_eq!(Command::Act(Act::ApproveRun).name(), "approve-run");
         assert_eq!(Command::Act(Act::Pr).name(), "pr");
+    }
+
+    /// A `pma` command's name runs the CLI when arguments follow it or
+    /// nothing here has that name; bare, the front end's command keeps it.
+    #[test]
+    fn a_line_names_a_pma_command() {
+        let got = |line: &str, tab: Tab| {
+            resolve(line, tab, &Pick::Nothing).map(|(b, arg)| (b.command, arg.to_string()))
+        };
+        let cli = |line: &str| Ok((Command::Act(Act::Cli), line.to_string()));
+        assert_eq!(got(" prune  argdec ", Tab::Inbox), cli("prune  argdec"));
+        assert_eq!(got("prune argdec -y", Tab::Project), cli("prune argdec -y"));
+        assert_eq!(
+            got("prune", Tab::Project),
+            Ok((Command::Act(Act::Prune), String::new())),
+            "bare, the open project's"
+        );
+        assert_eq!(
+            got("prune", Tab::Inbox),
+            Err("`prune` does not apply here; `:prune <args>` runs `pma prune`.".into())
+        );
+        assert_eq!(got("status", Tab::Inbox), cli("status"));
+        assert_eq!(got("stale --tag x", Tab::Inbox), cli("stale --tag x"));
+        assert_eq!(
+            got("history", Tab::Inbox),
+            Ok((Command::Tab(Tab::History), String::new()))
+        );
+        assert_eq!(
+            got("project argdec", Tab::Inbox),
+            Ok((Command::Jump, "argdec".into())),
+            "a project's name opens it"
+        );
+        assert_eq!(
+            got("project tier 2 argdec", Tab::Inbox),
+            cli("project tier 2 argdec")
+        );
+        assert_eq!(
+            got("help prune", Tab::Inbox),
+            Ok((Command::Help, "prune".into()))
+        );
+        assert!(
+            got("tui", Tab::Inbox)
+                .unwrap_err()
+                .contains("terminal of its own")
+        );
+        assert!(complete("sta", Tab::Inbox, &Pick::Nothing).contains(&"status".to_string()));
+    }
+
+    /// `:help` names what each command acts on here: the project page's
+    /// project, the selected row as `%`, else every project.
+    #[test]
+    fn help_lists_what_each_command_acts_on_here() {
+        let find = |rows: &[(String, String, &str)], typed: &str| {
+            rows.iter().find(|r| r.0 == typed).map(|r| r.1.clone())
+        };
+        let page = commands_here("argdec", &Pick::Nothing);
+        assert_eq!(find(&page, ":prune").as_deref(), Some("argdec's TODO.md"));
+        assert_eq!(
+            find(&page, ":status").as_deref(),
+            Some("argdec; -A for every project")
+        );
+        assert_eq!(find(&page, ":shell").as_deref(), Some("argdec"));
+        assert_eq!(find(&page, ":push %"), None, "no run selected");
+        assert_eq!(find(&page, ":config"), None, "no project");
+        let inbox = commands_here("", &Pick::Nothing);
+        assert_eq!(find(&inbox, ":status").as_deref(), Some("every project"));
+        assert_eq!(find(&inbox, ":prune"), None, "no TODO.md here");
+        let run = Pick::Run {
+            id: 51,
+            clean: true,
+            fixing: false,
+            empty: false,
+            state: "ready".into(),
+            project: "argdec".into(),
+        };
+        assert_eq!(
+            find(&commands_here("", &run), ":push %").as_deref(),
+            Some("run #51")
+        );
+        assert_eq!(
+            here("prune", Some(("argdec", "cwd"))).as_deref(),
+            Some("Here: argdec's TODO.md (cwd) when no path is named.")
+        );
+        assert_eq!(here("config", None), None);
     }
 
     #[test]

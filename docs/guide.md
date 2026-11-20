@@ -24,7 +24,7 @@ Untiered projects rank at tier 5. Tier the 5-15 projects you actually maintain. 
 ```sh
 pma project tier 1 core-lib
 pma project tier 2 cli site
-pma project export tiers.csv    # bulk edit, then: pma project import tiers.csv --apply
+pma project export tiers.csv    # bulk edit, then: pma project import tiers.csv
 ```
 
 Tag projects by kind (`rust`, `work`, `py`). Tags drive `--tag`, the TUI's `#` scope and `O` jump.
@@ -57,7 +57,7 @@ The item text and its indented lines are the whole prompt. The agent sees nothin
 - Name the test that should pass, if one exists.
 - Tag `#agent` on items you trust to an unattended pick. `--auto` takes only those, plus `ci` and `deps`.
 - Tag `#manual` on items that need you: design calls, credentials, releases.
-- Run `pma lint --ids --apply` once. Ids keep a task's age and runs when you reword it.
+- Run `pma lint --ids` once. Ids keep a task's age and runs when you reword it.
 
 ```markdown
 ## High
@@ -191,7 +191,7 @@ On the projects tab, `d` or `I` on a project row dispatches the task in its `nex
 
 ### Portfolio sweeps
 
-`pma run` runs one named job across many projects. Bulk selections stop at a plan until `--yes`.
+`pma run` runs one named job across many projects. A bulk selection shows its plan and asks; `-y` skips the question, `-d` stops at the plan.
 
 ```sh
 pma run fix-ci --all --dry-run

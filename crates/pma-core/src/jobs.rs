@@ -34,7 +34,12 @@ pub fn enqueue(store: &Store, targets: &[String]) -> Result<()> {
         .filter(|a| a != "--detach")
         .collect();
     let project = crate::api::one_project(targets);
-    let id = queue(store, &args, &std::env::current_dir()?, project.as_deref())?;
+    // The job runs where the context is, so it reads the same one.
+    let cwd = match crate::context::detect(store)? {
+        Some(c) if c.source == crate::context::VAR => c.path,
+        _ => std::env::current_dir()?,
+    };
+    let id = queue(store, &args, &cwd, project.as_deref())?;
     println!("job {id} queued; `pma job` lists jobs and `pma job log {id}` shows its output");
     Ok(())
 }
@@ -79,7 +84,9 @@ fn spawn_runner() -> Result<()> {
         .append(true)
         .open(&path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
+    // A job's context is its cwd; the runner's own would reach every job.
     Command::new(std::env::current_exe()?)
+        .env_remove(crate::context::VAR)
         .arg("runner")
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
@@ -105,7 +112,12 @@ fn needs(job: &Job) -> Needs {
     let command = job.args.first().map_or("", String::as_str);
     match (command, &job.project) {
         // A person in a shell: it holds no lock, so other work goes on.
-        ("scan" | "shell", _) => Needs::Nothing,
+        // Reads, queued from a `:` line, need no lock either.
+        (
+            "scan" | "shell" | "next" | "status" | "stale" | "report" | "usage" | "history"
+            | "matrix" | "task" | "job" | "help",
+            _,
+        ) => Needs::Nothing,
         (
             "dispatch" | "review" | "push" | "pr" | "stage" | "commit" | "merge" | "verify"
             | "deps",

@@ -503,6 +503,21 @@ async function openDetail(pick, asked) {
   draw();
 }
 
+// `pma help <words>` in the detail, as the CLI prints it.
+async function openHelp(words) {
+  note({ ev: "open", name: "help" });
+  try {
+    const project = S.tab === "project" ? S.project : "";
+    const screen = await api("/api/open", { help: words, project, pick: currentPick() });
+    const d = screen.body.detail;
+    S.detail = { screen, pick: d.pick, acts: d.acts };
+    $("content").scrollTop = 0;
+  } catch (e) {
+    toast(e.message, "bad");
+  }
+  draw();
+}
+
 function button(b, extraClass) {
   const weight = b.command.weight && b.command.weight !== "default" ? b.command.weight : "";
   return el("button", {
@@ -947,7 +962,22 @@ async function act(b, typed = "") {
   const pick = marked ? markedPick() : currentPick();
   let input = typed;
   try {
-    if (typed) {
+    if (name === "Cli") {
+      // Typed or from `!`, a `pma` command is confirmed with its plan.
+      if (!input) input = await askLine(`${label(b.label)}: ${label(b.ask.label)}`, "");
+      if (!input) return;
+      const asked = await api("/api/ask", { tab: S.tab, act: name, pick, input, project: S.project, tag: S.scope });
+      const [head, ...plan] = asked.question.split("\n");
+      const text = plan.join("\n").trim();
+      const yes = await dialog({
+        title: label(head),
+        text: text ? el("pre", { class: "log" }, text) : undefined,
+        ok: label(b.label),
+        okClass: "danger",
+        cancel: true,
+      });
+      if (!yes) return;
+    } else if (typed) {
       // A danger act is still confirmed.
       if (b.command.weight === "danger") {
         const asked = await api("/api/ask", { tab: S.tab, act: name, pick, project: S.project, tag: S.scope });
@@ -1008,7 +1038,7 @@ async function act(b, typed = "") {
 // log. `arg`: what followed the command's name on a `:` line.
 async function run(b, via = "key", arg = "") {
   if (!b) return;
-  if (arg && !["Filter", "Scope", "Jump", "act"].includes(b.command.kind)) {
+  if (arg && !["Filter", "Scope", "Jump", "Help", "act"].includes(b.command.kind)) {
     toast(`\`${b.name}\` takes no argument.`, "warn");
     return;
   }
@@ -1116,9 +1146,22 @@ async function run(b, via = "key", arg = "") {
     case "Finished":
       S.finished = (S.finished + 1) % S.keys.finished.length;
       return load();
-    case "Help":
-      await dialog({ title: "Keyboard shortcuts", text: shortcuts(), ok: "Close" });
+    case "Help": {
+      if (arg) return openHelp(arg);
+      const project = S.tab === "project" ? S.project : "";
+      let here = { rows: [] };
+      try { here = await api("/api/here", { project, pick: currentPick() }); } catch (e) { toast(e.message, "warn"); }
+      const node = el("div", {}, shortcuts());
+      if (here.rows.length) {
+        const grid = el("div", { class: "shortcuts" });
+        for (const r of here.rows) {
+          grid.append(el("div", { title: r.about }, el("span", {}, r.on), el("span", {}, el("kbd", {}, r.typed))));
+        }
+        node.append(el("h3", {}, project ? `Commands here (${project})` : "Commands here"), grid);
+      }
+      await dialog({ title: "Keyboard shortcuts", text: node, ok: "Close" });
       break;
+    }
     case "Quit": toast("Close the browser tab to leave. pma web runs until Ctrl-C in its terminal.", "accent"); break;
     case "Open": {
       const pick = currentPick();
@@ -1155,8 +1198,6 @@ function onKey(e) {
 
 // ---------------------------------------------------------------- command line
 
-// Names vim users type that a prefix alone would not settle.
-const ALIASES = { q: "quit", h: "help" };
 // `lead`: `:` for a command, `/` for the tab's filter, `>` for an act's
 // text. `answer` settles the text's promise: the line, or null.
 // `recall`: the history entry Up put in the line, and the text typed before.
@@ -1177,22 +1218,12 @@ function commands() {
   return out;
 }
 
-// The binding a typed line names, and its argument. As
-// pma_core::keys::resolve: exact name or alias, else a unique prefix; a full
-// name is never read as the prefix of another.
-function resolveLine(line) {
-  const text = line.trim();
-  const at = text.search(/\s/);
-  const word = at < 0 ? text : text.slice(0, at);
-  const arg = at < 0 ? "" : text.slice(at).trim();
-  const offered = commands();
-  const exact = ALIASES[word] || word;
-  if (offered.has(exact)) return { b: offered.get(exact), arg };
-  if (S.keys.bindings.some((b) => b.name === exact)) throw new Error(`\`${word}\` does not apply here.`);
-  const many = [...offered.keys()].filter((n) => n.startsWith(word));
-  if (many.length === 1) return { b: offered.get(many[0]), arg };
-  if (!many.length) throw new Error(`No command \`${word}\` here.`);
-  throw new Error(`\`${word}\` could be ${many.join(", ")}.`);
+// The binding a typed line names here, and its argument:
+// pma_core::keys::resolve, asked of the server.
+async function resolveLine(line) {
+  const got = await api("/api/resolve", { line, tab: S.tab, pick: currentPick() });
+  if (got.error) throw new Error(got.error);
+  return { b: S.keys.bindings[got.binding], arg: got.arg };
 }
 
 function drawNames() {
@@ -1284,7 +1315,9 @@ function completeLine(back) {
     C.at = C.at < 0 ? (back ? n - 1 : 0) : (C.at + (back ? n - 1 : 1)) % n;
     input.value = C.names[C.at];
   } else if (!/\s/.test(input.value)) {
-    const found = [...commands().keys()].filter((k) => k.startsWith(input.value));
+    const names = [...commands().keys()];
+    for (const c of S.keys.cli) if (!names.includes(c)) names.push(c);
+    const found = names.filter((k) => k.startsWith(input.value));
     if (!found.length) toast(`No command begins \`${input.value}\` here.`, "warn");
     else if (found.length === 1) input.value = found[0];
     else {
@@ -1331,7 +1364,7 @@ function recallLine(up) {
   input.setSelectionRange(input.value.length, input.value.length);
 }
 
-function lineKey(e) {
+async function lineKey(e) {
   // Readline's keys, on every platform, as the TUI's: start and end of line,
   // and kills with no kill ring. Words move natively with Alt or Ctrl and
   // the arrows.
@@ -1372,7 +1405,7 @@ function lineKey(e) {
     HISTORY.push(line);
     if (HISTORY.length > 50) HISTORY.shift();
     let got;
-    try { got = resolveLine(line); } catch (err) { toast(err.message, "warn"); return; }
+    try { got = await resolveLine(line); } catch (err) { toast(err.message, "warn"); return; }
     run(got.b, ":", got.arg);
   }
 }

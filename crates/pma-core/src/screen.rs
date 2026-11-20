@@ -1810,6 +1810,18 @@ pub fn screen(view: View) -> Screen {
                 )],
             },
         ),
+        View::Help { command, text } => detail(
+            None,
+            None,
+            Detail {
+                title: format!("pma {command}"),
+                pick: Pick::Nothing,
+                badge: None,
+                notice: None,
+                fields: Vec::new(),
+                sections: vec![("Help".into(), Section::Log, text)],
+            },
+        ),
         View::Notes(notes) => panes(Tab::Inbox, None, vec![notes_pane(notes)]),
         View::Workflows {
             revisions,
@@ -2358,6 +2370,9 @@ pub fn initial_input(act: Act, pick: &Pick) -> String {
 
 /// The question a confirmation asks.
 pub fn question(act: Act, pick: &Pick) -> String {
+    if act == Act::Cli {
+        return "queue this pma command as a job?".into();
+    }
     let what = match pick {
         Pick::Task { target, .. } => target.clone(),
         Pick::Tasks { targets, .. } => {
@@ -2443,6 +2458,44 @@ pub fn action_in(
     project: &str,
 ) -> Result<Action, String> {
     action_scoped(act, pick, pane, input, project, &[])
+}
+
+/// What `%` names for `pick`: a run's or job's id, a task's target, a
+/// project's name.
+pub fn selection(pick: &Pick) -> Option<String> {
+    Some(match pick {
+        Pick::Run { id, .. } | Pick::Job { id, .. } | Pick::Note { id, .. } => id.to_string(),
+        Pick::Task { target, .. } => target.clone(),
+        Pick::Project {
+            target: Some(target),
+            ..
+        } => target.clone(),
+        Pick::Project { project, .. } | Pick::Manual { project } => project.clone(),
+        Pick::Campaign { name } => name.clone(),
+        _ => return None,
+    })
+}
+
+/// `%` in a `pma` command line as the selected row.
+fn with_selection(args: Vec<String>, pick: &Pick) -> Result<Vec<String>, String> {
+    if !args.iter().any(|a| a == "%") {
+        return Ok(args);
+    }
+    let row = selection(pick).ok_or("`%` is the selected row; select one first")?;
+    Ok(args
+        .into_iter()
+        .map(|a| if a == "%" { row.clone() } else { a })
+        .collect())
+}
+
+/// The project in view that `act` may fall back to. A `pma` command takes
+/// it only on the project's page: a front end remembers the last project
+/// opened, and `:status` on the inbox means every project.
+pub fn in_view(act: Act, tab: Tab, project: &str) -> &str {
+    match act == Act::Cli && tab != Tab::Project {
+        true => "",
+        false => project,
+    }
 }
 
 /// `action_in`, within a scope: the tags the front end's views are narrowed
@@ -2649,6 +2702,24 @@ pub fn action_scoped(
                             .into(),
                     );
                 }
+            }
+        }
+        (Act::Cli, _) => {
+            let mut args = shlex::split(input).ok_or("unbalanced quotes")?;
+            // The line is queued already; a second queue says nothing more.
+            args.retain(|a| a != "--detach");
+            match args.first().map(String::as_str) {
+                None => return Err("type a pma command, as `prune argdec`".into()),
+                Some(w) if crate::keys::CLI_TERMINAL.contains(&w) => {
+                    return Err(format!("`{w}` needs a terminal of its own: run `pma {w}`"));
+                }
+                Some(w) if !crate::keys::CLI.contains(&w) && w != "help" => {
+                    return Err(format!("no pma command `{w}`"));
+                }
+                Some(_) => Action::Cli {
+                    args: with_selection(args, pick)?,
+                    project: (!project.is_empty()).then(|| project.to_string()),
+                },
             }
         }
         (Act::Prune, pick) => {
@@ -3976,6 +4047,49 @@ mod tests {
                 value: "fast".into()
             })
         );
+        assert_eq!(
+            action(Act::Cli, &none, &[], r#"note add "two words" --detach"#),
+            Ok(Action::Cli {
+                args: vec!["note".into(), "add".into(), "two words".into()],
+                project: None,
+            })
+        );
+        let run = Pick::Run {
+            id: 51,
+            clean: true,
+            fixing: false,
+            empty: false,
+            state: "ready".into(),
+            project: "argdec".into(),
+        };
+        assert_eq!(
+            action_in(Act::Cli, &run, &[], "push % -y", "argdec"),
+            Ok(Action::Cli {
+                args: vec!["push".into(), "51".into(), "-y".into()],
+                project: Some("argdec".into()),
+            }),
+            "`%` is the selected run; the page's project is the context"
+        );
+        assert!(
+            action(Act::Cli, &none, &[], "push %")
+                .unwrap_err()
+                .contains("select one")
+        );
+        assert_eq!(in_view(Act::Cli, Tab::Inbox, "argdec"), "");
+        assert_eq!(in_view(Act::Cli, Tab::Project, "argdec"), "argdec");
+        assert_eq!(in_view(Act::Prune, Tab::Inbox, "argdec"), "argdec");
+        assert!(
+            action(Act::Cli, &none, &[], "web")
+                .unwrap_err()
+                .contains("terminal")
+        );
+        assert!(
+            action(Act::Cli, &none, &[], "nope")
+                .unwrap_err()
+                .contains("no pma command")
+        );
+        assert!(action(Act::Cli, &none, &[], "note add \"x").is_err());
+        assert!(action(Act::Cli, &none, &[], "").is_err());
         assert_eq!(
             action_in(Act::ScanProject, &none, &[], "refresh-deps", "argdec"),
             Ok(Action::RefreshDeps {

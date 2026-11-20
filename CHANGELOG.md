@@ -16,7 +16,19 @@ Upgrading from 0.10:
 
 - The database moves from schema 52 to 53 on first open. It adds `runs.pr_head`. A `claude` worker whose `interactive_args` are the form pma shipped gains `--session-id {session}` in `settings.toml`, and `pma` says so.
 
+- `--apply` is gone. `prune`, `lint --fix`, `lint --ids`, `sync` and `project import`, `forget` and `clone` act; `-d` previews. Commands that cannot be undone ask first, and with no terminal they refuse: a script passes `-y`. `run`'s `--yes` and `--dry-run` are `-y` and `-d`.
+
+- Inside a project directory, a command that names no project acts on that one. Bare `pma` there shows that project; `-A` shows every project.
+
 ### Added
+
+- **Project context.** A command that names no project takes the one `$PMA_PROJECT` names, else the one whose directory holds the cwd. `.` is that project and `:12` its line 12: `pma dispatch :12`, `pma project tier 2`. `--tag` and `-A` override it. `--all` already meant three different things, so the flag is `-A/--all-projects`. Help starts with what the command acts on here: `Here: acts on argdec (cwd); -A for every project.` Design: `docs/dev/cli-context.md`.
+
+- **Confirmation.** `push`, `pr`, `merge`, `sync`, `close`, `review --reject`, the `rm` commands, `project forget`, `clone` and `import`, and a bulk `run` print what they will do and ask `[y/N]`. `-y` skips the question; `-d` (`--dry-run`) prints the plan and stops. `-n` was taken: it is `--count` on `stale` and `dispatch`. `prune` and `lint --fix` ask only to remove a line that `HEAD` lacks, since git restores the rest; a ticked item counts as its committed unticked line. A job is approved, since whoever queued it confirmed. `PMA_JOB` is removed from an agent's environment, so an agent's own `pma` is not taken as approved.
+
+- **Any `pma` command from `:`.** The `:` line in the TUI and web runs any `pma` command as a job, and `!` opens it directly. The confirm shows the command's `-d` plan. On a project's page the job runs in the project's directory, so `:prune` and `:status -d` need no name; elsewhere a job runs outside every project. `%` is the selected row: `:push %`. `:help` lists the commands that act on the page; `:help <command>` is that command's help in the page's context. A name the view also has, such as `prune` or `push`, keeps the view's act when bare and runs the CLI with arguments, because bare `pma push` acts on no row. Queuing over a parser per command: about 30 commands had no front-end action, and the job queue already runs any argv. Reads (`status`, `stale`, `report` and similar) take no project lock, so they do not wait behind a dispatch.
+
+- `pma prune` and `pma lint` take a project's name where a path does not exist.
 
 - **Interactive cost.** An interactive `claude` session starts with `--session-id`, and its cost is read from that session's transcript (`totalCostUSD` of the last `cost-state` record). It was unknown for 31 of 45 runs. The record is not a documented Claude Code format; without it the cost stays unknown, never zero.
 
@@ -65,6 +77,8 @@ Upgrading from 0.10:
 - A full scan of 117 projects makes 205 to 223 `gh` calls instead of 311, and takes 24 to 26 s instead of 38 s. A repository with no active workflow gets no `run list`. A project's per-workflow reads run in parallel. A workflow read alone is cached in `ci_alone`. It is reused while the 100-run window reaches back to that read, so any newer run of it would be in the window, and for at most 24 h, which bounds a re-run of an old run. A window under 100 runs holds every run, so a workflow missing from it is not asked about. Measurements and the options not built: `docs/dev/gh-optimize.md`.
 
 ### Fixed
+
+- `pma scan | head` panicked when `head` closed the pipe. pma now exits with status 141 and prints nothing, as a shell tool ended by SIGPIPE does. It catches only a failed print to stdout: restoring the SIGPIPE default would also kill pma on a write to an agent's or job's pipe.
 
 - A fix-CI prompt whose failed-job log was empty showed an empty code block. That happens when a job is cancelled before any step runs, as on a lost runner. The prompt now lists the run's jobs and their conclusions, and tells the agent CI itself may be at fault.
 

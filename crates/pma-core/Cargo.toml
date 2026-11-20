@@ -12,4 +12,5 @@ rhai.workspace = true
 rusqlite.workspace = true
 sanduk-sandbox.workspace = true
 serde_json.workspace = true
+shlex.workspace = true
 toml_edit.workspace = true

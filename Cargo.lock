@@ -771,6 +771,7 @@ dependencies = [
  "rusqlite",
  "sanduk-sandbox",
  "serde_json",
+ "shlex",
  "toml_edit",
 ]
 

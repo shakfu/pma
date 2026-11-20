@@ -251,6 +251,18 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
                     "question": screen::question(act, &pick),
                     "input": api::initial_input(store, act, &pick)?,
                 });
+                // A `pma` command's question carries its plan.
+                if act == Act::Cli {
+                    let action = screen::action_scoped(
+                        act,
+                        &pick,
+                        &[],
+                        b["input"].as_str().unwrap_or(""),
+                        screen::in_view(act, tab, b["project"].as_str().unwrap_or("")),
+                        &[],
+                    )?;
+                    out["question"] = json!(api::confirm_question(store, &action)?);
+                }
                 let chooses = keys::BINDINGS
                     .iter()
                     .any(|b| b.command == Command::Act(act) && matches!(b.ask, Ask::Choose(_)));
@@ -285,6 +297,19 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
                 return Response::status(400);
             };
             let q = match pick_from(&b["pick"]) {
+                pick if b["help"].is_string() => api::Query::Help {
+                    words: b["help"]
+                        .as_str()
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .map(String::from)
+                        .collect(),
+                    project: b["project"]
+                        .as_str()
+                        .filter(|p| !p.is_empty())
+                        .map(String::from),
+                    selected: pick.as_ref().and_then(screen::selection),
+                },
                 Some(Pick::Run { id, .. }) => api::Query::Run { id },
                 Some(Pick::Job { id, .. }) => api::Query::JobLog { id },
                 Some(Pick::Task {
@@ -317,7 +342,7 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
                     &pick,
                     &rows(store, tab, act, &b)?,
                     &input,
-                    b["project"].as_str().unwrap_or(""),
+                    screen::in_view(act, tab, b["project"].as_str().unwrap_or("")),
                     &scope(b["tag"].as_str()).tags,
                 )?;
                 let out = api::act(store, action);
@@ -330,6 +355,38 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
                 Ok(json!({ "said": out.said, "warnings": out.warnings }))
             })
         }
+        // The binding a `:` line names here, by its index in `/api/keys`.
+        ("POST", "/api/resolve") => {
+            let Ok(b) = body() else {
+                return Response::status(400);
+            };
+            let (Some(line), Some(tab)) =
+                (b["line"].as_str(), b["tab"].as_str().and_then(tab_named))
+            else {
+                return Response::status(400);
+            };
+            let pick = pick_from(&b["pick"]).unwrap_or(Pick::Nothing);
+            match keys::resolve(line, tab, &pick) {
+                Ok((got, arg)) => {
+                    let at = keys::BINDINGS.iter().position(|b| std::ptr::eq(b, got));
+                    Response::json(200, &json!({ "binding": at, "arg": arg }))
+                }
+                Err(e) => Response::json(200, &json!({ "error": e })),
+            }
+        }
+        // The `pma` commands that act on this page, for `:help`.
+        ("POST", "/api/here") => {
+            let Ok(b) = body() else {
+                return Response::status(400);
+            };
+            let pick = pick_from(&b["pick"]).unwrap_or(Pick::Nothing);
+            let project = b["project"].as_str().unwrap_or("");
+            let rows: Vec<Value> = keys::commands_here(project, &pick)
+                .into_iter()
+                .map(|(typed, on, about)| json!({ "typed": typed, "on": on, "about": about }))
+                .collect();
+            Response::json(200, &json!({ "rows": rows }))
+        }
         ("POST", "/api/usage") => {
             let Some(ev) = body().ok().as_ref().and_then(usage_event) else {
                 return Response::status(400);
@@ -340,9 +397,11 @@ fn route(req: &Request, ctx: &Ctx) -> Response {
             })
         }
         (_, "/" | "/app.js" | "/app.css" | "/session" | "/api/keys" | "/api/screen")
-        | (_, "/api/ask" | "/api/open" | "/api/act" | "/api/tags" | "/api/usage") => {
-            Response::status(405)
-        }
+        | (
+            _,
+            "/api/ask" | "/api/open" | "/api/act" | "/api/tags" | "/api/usage" | "/api/here"
+            | "/api/resolve",
+        ) => Response::status(405),
         _ => Response::status(404),
     }
 }
@@ -521,6 +580,7 @@ fn keys_json() -> Value {
             .map(|s| s.map_or("all", |s| s.name()))
             .collect::<Vec<_>>(),
         "bindings": bindings,
+        "cli": keys::CLI,
     })
 }
 

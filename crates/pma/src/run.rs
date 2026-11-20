@@ -21,8 +21,7 @@ pub struct Request {
     pub tags: Vec<String>,
     pub worker: Option<String>,
     pub set: Vec<String>,
-    pub dry_run: bool,
-    pub yes: bool,
+    pub confirm: super::Confirm,
     /// For a worktree run: leave each edit in `pma review` rather than
     /// writing it into the clone. A clone run waits in review either way.
     pub review: bool,
@@ -110,7 +109,7 @@ pub fn run(req: Request) -> Result<()> {
             }
             let local = !req.review;
             let in_clone = !req.worktree && cfg.workspace == pma_core::config::Workspace::Clone;
-            if req.dry_run || (bulk && !req.yes) {
+            if req.confirm.dry_run || bulk {
                 let goes = match (in_clone, req.push, local) {
                     (true, true, _) => "each edit made in its clone and pushed when clean",
                     (true, false, _) => "each edit made in its clone, waiting for review",
@@ -124,10 +123,12 @@ pub fn run(req: Request) -> Result<()> {
                 for t in &targets {
                     println!("  {t}");
                 }
-                if !req.dry_run {
-                    println!("a bulk run; rerun with `--yes` to dispatch them");
+                if !req
+                    .confirm
+                    .approve(&format!("dispatch {}", targets.len()))?
+                {
+                    return Ok(());
                 }
-                return Ok(());
             }
             let over = dispatch::Overrides {
                 agent,
@@ -180,29 +181,36 @@ pub fn run(req: Request) -> Result<()> {
                 println!("no project to run `{name}` over");
                 return Ok(());
             }
-            let gated = bulk && !req.yes;
-            let before = latest_instance(&store)?;
-            workflow_command(Some(WorkflowAction::Run {
-                name: workflow_name.to_string(),
-                projects,
-                tag: None,
-                instance: None,
-                set: req.set,
-                dry_run: req.dry_run || gated,
-                approve: None,
-                unattended: !(req.dry_run || gated),
-                local: false,
-                worktree: req.worktree,
-                detach: false,
-                cap: Vec::new(),
-                agent,
-                model,
-                preset: None,
-            }))?;
-            if gated && !req.dry_run {
-                println!("\na bulk run; rerun with `--yes` to run it unattended");
-                return Ok(());
+            let go = |dry_run: bool| {
+                workflow_command(Some(WorkflowAction::Run {
+                    name: workflow_name.to_string(),
+                    projects: projects.clone(),
+                    tag: None,
+                    instance: None,
+                    set: req.set.clone(),
+                    dry_run,
+                    approve: None,
+                    unattended: !dry_run,
+                    local: false,
+                    worktree: req.worktree,
+                    detach: false,
+                    cap: Vec::new(),
+                    agent: agent.clone(),
+                    model: model.clone(),
+                    preset: None,
+                }))
+            };
+            // A bulk run shows its plan and worst case before it is asked for.
+            let asked = !req.confirm.yes && pma_core::jobs::current().is_none();
+            if req.confirm.dry_run || (bulk && asked) {
+                go(true)?;
+                println!();
+                if !req.confirm.approve("run it unattended")? {
+                    return Ok(());
+                }
             }
+            let before = latest_instance(&store)?;
+            go(false)?;
             if let Some(id) = latest_instance(&store)?.filter(|id| Some(*id) != before) {
                 print_outputs(&store, &doc, workflow_name, id)?;
                 print_documents(id)?;

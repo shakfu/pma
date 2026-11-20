@@ -56,6 +56,10 @@ pub fn restrict(cmd: &mut Command, dir: &Path) -> std::io::Result<()> {
         "MINOS_ADMIN_PASSWORD",
         "MINOS_USER",
         "MINOS_SOCKET",
+        // A job counts as approved, and the context names a project: an
+        // agent's own `pma` gets neither from the job that started it.
+        "PMA_JOB",
+        crate::context::VAR,
     ] {
         cmd.env_remove(var);
     }

@@ -3,9 +3,9 @@
 //! Design: `docs/dev/design.md`.
 
 use pma_core::{
-    api, class, config, dates, deps, dispatch, history, jobs, next, pass, progress, projects,
-    publish, rank, report, report_runs, route, scan, script, store, sync, todo, watch, worker,
-    workflow,
+    api, class, config, context, dates, deps, dispatch, history, jobs, next, pass, progress,
+    projects, publish, rank, report, report_runs, route, scan, script, store, sync, todo, watch,
+    worker, workflow,
 };
 use pma_tui::{choose, tui};
 
@@ -19,6 +19,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use api::{Action, Query, Selection, View, has_run, select, whoami};
 use config::Config;
+use context::Context;
 use store::{Result, RunState, Session, Store};
 use todo::Priority;
 
@@ -55,7 +56,7 @@ const GROUPS: [(&str, &[&str]); 6] = [
 
 /// The template that leaves the command list to `grouped_commands`.
 const HELP: &str = "\
-{about-with-newline}
+{before-help}{about-with-newline}
 {usage-heading} {usage}{after-help}
 Options:
 {options}";
@@ -100,6 +101,50 @@ struct Cli {
     /// With no command, `pma next`.
     #[command(subcommand)]
     command: Option<Command>,
+    /// Every project, ignoring the one the cwd or `$PMA_PROJECT` names.
+    #[arg(short = 'A', long, global = true)]
+    all_projects: bool,
+}
+
+/// Whether to go ahead with what cannot be undone. Design:
+/// `docs/dev/cli-context.md`.
+#[derive(clap::Args, Debug, Clone, Copy, Default)]
+struct Confirm {
+    /// Go ahead without asking.
+    #[arg(short = 'y', long)]
+    yes: bool,
+    /// Show what would happen, and change nothing.
+    #[arg(short = 'd', long, conflicts_with = "yes")]
+    dry_run: bool,
+}
+
+impl Confirm {
+    /// Asks whether to do `what`, after its plan is printed. A job is
+    /// approved: whoever queued it confirmed. With no terminal, refuses.
+    fn approve(self, what: &str) -> Result<bool> {
+        use std::io::{BufRead, IsTerminal, Write};
+        if self.dry_run {
+            println!("dry run; nothing changed");
+            return Ok(false);
+        }
+        if self.yes || jobs::current().is_some() {
+            return Ok(true);
+        }
+        if !std::io::stdin().is_terminal() {
+            return Err(
+                format!("{what}: no terminal to ask on; -y goes ahead, -d previews").into(),
+            );
+        }
+        eprint!("{what}? [y/N] ");
+        std::io::stderr().flush()?;
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        let yes = matches!(line.trim(), "y" | "Y" | "yes");
+        if !yes {
+            println!("cancelled; nothing changed");
+        }
+        Ok(yes)
+    }
 }
 
 #[derive(Subcommand)]
@@ -111,33 +156,33 @@ enum Command {
     /// TODO.md. Exits 1 when any file has errors or cannot be read; warnings
     /// alone exit 0.
     Lint {
-        /// Files or directories; defaults to the current directory.
+        /// Files, directories or project names; defaults to the current
+        /// directory.
         paths: Vec<PathBuf>,
-        /// List the open items with no id, which keeps an item's identity
-        /// when its text changes. With --apply, write one at the end of each,
-        /// as `- [ ] text ^k3f9q`.
+        /// Give each open item with no id one, which keeps an item's identity
+        /// when its text changes: `- [ ] text ^k3f9q`.
         #[arg(long)]
         ids: bool,
-        /// List the mechanical errors a rewrite settles: the title, a
-        /// section heading, a plain bullet or an odd checkbox where an item
-        /// belongs. With --apply, rewrite them. Dates, issue numbers,
+        /// Rewrite the mechanical errors: the title, a section heading, a
+        /// plain bullet or an odd checkbox where an item belongs. Dates, issue
+        /// numbers,
         /// duplicates and fences stay for you.
         #[arg(long, conflicts_with = "ids")]
         fix: bool,
-        /// With --ids or --fix, write the edits. They stay uncommitted.
-        #[arg(long)]
-        apply: bool,
+        /// With --ids or --fix. The edits stay uncommitted.
+        #[command(flatten)]
+        confirm: Confirm,
     },
     /// Remove finished items and `Done` sections.
     ///
     /// Each path is a TODO.md file or a directory containing one, whose
-    /// subdirectories are not searched. A file with lint errors is skipped. Edits stay uncommitted. Dry run unless --apply.
+    /// subdirectories are not searched. A file with lint errors is skipped. Edits stay uncommitted; it asks first only to remove text that `HEAD` lacks.
     Prune {
-        /// Files or directories; defaults to the current directory.
+        /// Files, directories or project names; defaults to the current
+        /// directory.
         paths: Vec<PathBuf>,
-        /// Remove them instead of listing them.
-        #[arg(long)]
-        apply: bool,
+        #[command(flatten)]
+        confirm: Confirm,
     },
     /// Directories whose git repos are projects.
     Root {
@@ -250,8 +295,8 @@ enum Command {
     /// Bare, it lists the names. A review runs to the end and prints what it
     /// found. `fix-ci` and `deps-upgrade` write each edit that passes verify
     /// into the clone, unstaged. A target is a project's
-    /// name or its path. `--all` and `--tag` show the plan and run it only with
-    /// `--yes`. A review asks `claude` for its strongest model unless `-w`, a
+    /// name or its path. `--all` and `--tag` show the plan and ask
+    /// before running it. A review asks `claude` for its strongest model unless `-w`, a
     /// route or a default preset names another.
     Run {
         /// What to run; omit to list the names.
@@ -271,12 +316,10 @@ enum Command {
         /// Set a workflow parameter: `--set breadth=5`. Repeatable.
         #[arg(long = "set", value_name = "NAME=VALUE")]
         set: Vec<String>,
-        /// Show what would run and its worst case; run nothing.
-        #[arg(long)]
-        dry_run: bool,
-        /// Run a bulk selection without stopping at its plan.
-        #[arg(long, conflicts_with = "dry_run")]
-        yes: bool,
+        /// `-y` runs a bulk selection without asking; `-d` shows what would
+        /// run and its worst case.
+        #[command(flatten)]
+        confirm: Confirm,
         /// With `--worktree`, or `workspace = worktree`: leave each edit of
         /// `fix-ci` and `deps-upgrade` in `pma review` instead of writing it
         /// into the clone. A run in the clone waits in `pma review` either
@@ -359,6 +402,8 @@ enum Command {
     },
     /// Runs awaiting a decision; show one, or act on it.
     Review {
+        #[command(flatten)]
+        confirm: Confirm,
         /// Run ids; omit to list runs. Several are allowed with --approve.
         ids: Vec<i64>,
         /// Mark ready runs for `pma pr` or `pma push`.
@@ -481,6 +526,8 @@ enum Command {
     /// until the pull request is merged (`merged`) or closed without merging
     /// (`closed`); `pma review` and `pma dispatch` read that from GitHub.
     Pr {
+        #[command(flatten)]
+        confirm: Confirm,
         /// Run ids, as `pma review` lists them.
         #[arg(required_unless_present = "all_approved")]
         ids: Vec<i64>,
@@ -493,6 +540,8 @@ enum Command {
     /// With `--fix`, the agent resolves the conflicts with the default branch
     /// and the run returns to review. `pma pr` then updates the pull request.
     Merge {
+        #[command(flatten)]
+        confirm: Confirm,
         /// Run id, as `pma review` lists it.
         id: i64,
         /// Resolve the pull request's conflicts instead of merging.
@@ -533,6 +582,8 @@ enum Command {
     /// only, never other local commits; git refuses it when origin has moved
     /// past the run's base. The run becomes `pushed`.
     Push {
+        #[command(flatten)]
+        confirm: Confirm,
         /// Run ids, as `pma review` lists them.
         #[arg(required_unless_present = "all_approved")]
         ids: Vec<i64>,
@@ -554,6 +605,8 @@ enum Command {
     /// rejection would refuse. The run is left out of the accepted share and
     /// uses no attempt. A worktree run's worktree is still removed.
     Close {
+        #[command(flatten)]
+        confirm: Confirm,
         /// Run ids, as `pma review` lists them.
         #[arg(required = true)]
         ids: Vec<i64>,
@@ -626,8 +679,8 @@ enum Command {
     /// terminal.
     /// When it ends the project is re-read, so an unstaged edit shows at once.
     Shell {
-        /// The project's name.
-        project: String,
+        /// The project's name; defaults to the one you are in.
+        project: Option<String>,
     },
     /// What running agents are doing, read from their logs.
     ///
@@ -652,10 +705,8 @@ enum Command {
         /// Also select every project carrying this tag; repeatable.
         #[arg(long = "tag", value_name = "TAG")]
         tags: Vec<String>,
-
-        /// Make the changes instead of listing them.
-        #[arg(long)]
-        apply: bool,
+        #[command(flatten)]
+        confirm: Confirm,
     },
 }
 
@@ -672,15 +723,18 @@ enum JobAction {
 #[derive(Subcommand)]
 enum ProjectAction {
     /// One project: its state, its open tasks and its runs.
-    Show { name: String },
+    Show {
+        /// Defaults to the project you are in.
+        name: Option<String>,
+    },
     /// Set the tier of one project or many: 1 (most important) to 5, or `none`.
     ///
     /// `pma project` lists every project's tier.
     Tier {
         /// 1 to 5, or `none`.
         tier: String,
-        /// Project directory names under a root.
-        #[arg(required = true)]
+        /// Project directory names under a root; defaults to the project you
+        /// are in.
         projects: Vec<String>,
     },
     /// Write every project's tier and tags to a file to edit in bulk.
@@ -694,14 +748,12 @@ enum ProjectAction {
     /// Read tiers and tags back from an edited `export` file.
     ///
     /// A project the file leaves out keeps the tier and tags it has; a
-    /// project it names gets exactly the tags in its row. Dry run unless
-    /// --apply.
+    /// project it names gets exactly the tags in its row.
     Import {
         /// The file to read, ending `.csv` or `.json`.
         file: PathBuf,
-        /// Make the changes instead of listing them.
-        #[arg(long)]
-        apply: bool,
+        #[command(flatten)]
+        confirm: Confirm,
     },
     /// Group projects with private tags. A project may carry several.
     ///
@@ -716,17 +768,16 @@ enum ProjectAction {
     ///
     /// Only a project that no full scan can find is forgotten, since one that
     /// is still under a root returns on the next scan. Its runs are kept:
-    /// their worktrees may still exist. Dry run unless --apply.
+    /// their worktrees may still exist.
     Forget {
         /// The project's name, as `pma status` shows it.
         project: String,
-        /// Delete it instead of reporting what would go.
-        #[arg(long)]
-        apply: bool,
+        #[command(flatten)]
+        confirm: Confirm,
     },
     /// Check out projects whose record exists but whose working tree does
     /// not, from the GitHub `owner/name` the last scan recorded, with
-    /// `gh repo clone`. Dry run unless --apply.
+    /// `gh repo clone`.
     Clone {
         /// Project names.
         projects: Vec<String>,
@@ -736,9 +787,8 @@ enum ProjectAction {
         /// The root to clone into; needed when several are registered.
         #[arg(long)]
         root: Option<PathBuf>,
-        /// Clone instead of reporting what would be cloned.
-        #[arg(long)]
-        apply: bool,
+        #[command(flatten)]
+        confirm: Confirm,
     },
 }
 
@@ -747,13 +797,13 @@ enum TagAction {
     /// Give projects a tag.
     Add {
         tag: String,
-        #[arg(required = true)]
+        /// Defaults to the project you are in.
         projects: Vec<String>,
     },
     /// Take a tag off projects.
     Rm {
         tag: String,
-        #[arg(required = true)]
+        /// Defaults to the project you are in.
         projects: Vec<String>,
     },
     /// List the projects carrying a tag.
@@ -768,8 +818,8 @@ enum DepsAction {
     /// `go mod tidy`, for each lock present. The `refresh` worker runs this in
     /// a dispatch's worktree, where the project's check decides what is kept.
     Refresh {
-        /// The project directory.
-        dir: PathBuf,
+        /// The project directory; defaults to the project you are in.
+        dir: Option<PathBuf>,
     },
 }
 
@@ -796,7 +846,11 @@ enum RootAction {
     /// itself if it is one, become projects.
     Add { dir: PathBuf },
     /// Remove a directory; the next full scan marks its projects absent.
-    Rm { dir: PathBuf },
+    Rm {
+        dir: PathBuf,
+        #[command(flatten)]
+        confirm: Confirm,
+    },
 }
 
 fn parse_quadrant(s: &str) -> std::result::Result<rank::Quadrant, String> {
@@ -833,7 +887,11 @@ enum CampaignAction {
         count: Option<usize>,
     },
     /// Remove a campaign. Its runs are untouched.
-    Rm { name: String },
+    Rm {
+        name: String,
+        #[command(flatten)]
+        confirm: Confirm,
+    },
 }
 
 #[derive(Subcommand)]
@@ -881,7 +939,11 @@ enum PresetAction {
     /// Make a preset the default, as `pma config preset` does.
     Use { name: String },
     /// Forget a preset. The worker it named is untouched.
-    Rm { name: String },
+    Rm {
+        name: String,
+        #[command(flatten)]
+        confirm: Confirm,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1004,24 +1066,51 @@ enum AgentAction {
     /// Print every field of one worker.
     Show { name: String },
     /// Remove a worker.
-    Rm { name: String },
+    Rm {
+        name: String,
+        #[command(flatten)]
+        confirm: Confirm,
+    },
+}
+
+/// `pma scan | head` exits as a shell tool does when `head` closes the pipe:
+/// status 141 and no panic. A SIGPIPE default would also kill pma on a write
+/// to an agent's or job's pipe, so only a print to stdout is caught.
+fn quiet_on_closed_stdout() {
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let said = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or("");
+        if said.starts_with("failed printing to stdout") && said.contains("Broken pipe") {
+            std::process::exit(141);
+        }
+        report(info)
+    }));
 }
 
 fn main() -> ExitCode {
+    quiet_on_closed_stdout();
     // The command list is grouped rather than alphabetical, which needs the
     // template and the list built before parsing.
-    let command = Cli::command();
+    let command = with_here(Cli::command());
     let help = grouped_commands(&command);
     let matches = command.help_template(HELP).after_help(help).get_matches();
     let cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
         Err(e) => e.exit(),
     };
-    let command = cli.command.unwrap_or(Command::Next {
+    let mut command = cli.command.unwrap_or(Command::Next {
         projects: Vec::new(),
         tags: Vec::new(),
         all: false,
     });
+    if let Err(e) = contextualize(&mut command, cli.all_projects, &mut Here::default()) {
+        eprintln!("pma: {e}");
+        return ExitCode::FAILURE;
+    }
     // What reads the task lists sees what the files say now.
     if matches!(
         command,
@@ -1044,19 +1133,19 @@ fn main() -> ExitCode {
             paths,
             ids,
             fix,
-            apply,
+            confirm,
         } => {
             return match (ids, fix) {
-                (true, _) => add_ids(&paths, apply),
-                (_, true) => fix_todos(&paths, apply),
-                _ if apply => {
-                    eprintln!("pma: --apply needs --ids or --fix");
+                (true, _) => add_ids(&paths, !confirm.dry_run),
+                (_, true) => fix_todos(&paths, confirm),
+                _ if confirm.yes || confirm.dry_run => {
+                    eprintln!("pma: -y and -d need --ids or --fix");
                     ExitCode::FAILURE
                 }
                 _ => lint(&paths),
             };
         }
-        Command::Prune { paths, apply } => return prune(&paths, apply),
+        Command::Prune { paths, confirm } => return prune(&paths, confirm),
         Command::Root { action } => root(action),
         Command::Project { action } => project_command(action),
         Command::Config { key, value, reset } => configure(key.as_deref(), value.as_deref(), reset),
@@ -1094,8 +1183,7 @@ fn main() -> ExitCode {
             tags,
             worker,
             set,
-            dry_run,
-            yes,
+            confirm,
             review,
             worktree,
             push,
@@ -1106,8 +1194,7 @@ fn main() -> ExitCode {
             tags,
             worker,
             set,
-            dry_run,
-            yes,
+            confirm,
             review,
             worktree,
             push,
@@ -1165,16 +1252,27 @@ fn main() -> ExitCode {
             minutes,
             drop,
             retry: false,
-        } => run_review(
-            &ids,
-            approve,
-            reject,
-            keep_git_changes,
-            infra,
-            rework.as_deref(),
-            minutes,
-            &drop,
-        ),
+            confirm,
+        } => {
+            let asked = match (reject, confirm.yes || confirm.dry_run) {
+                (true, _) => approve_runs("reject", &ids, false, None, confirm),
+                // A plan run must not approve or rework.
+                (false, true) => Err("-y and -d apply to --reject".into()),
+                (false, false) => Ok(true),
+            };
+            gated(asked, || {
+                run_review(
+                    &ids,
+                    approve,
+                    reject,
+                    keep_git_changes,
+                    infra,
+                    rework.as_deref(),
+                    minutes,
+                    &drop,
+                )
+            })
+        }
         Command::Task { target } => match target.rsplit_once(':') {
             Some((project, _)) => show(Query::task(project, &target)),
             None => Err("name a task as `project:line` or `project:ci`".into()),
@@ -1191,10 +1289,30 @@ fn main() -> ExitCode {
         Command::Preset { action } => preset_command(action),
         Command::Agent { action } => agent_command(action),
         Command::Report { by } => run_report(by.as_deref()),
-        Command::Pr { ids, all_approved } => {
-            run_publish(&ids, all_approved, publish::Target::Pr, None)
+        Command::Pr {
+            ids,
+            all_approved,
+            confirm,
+        } => gated(
+            approve_runs(
+                "open a pull request for",
+                &ids,
+                all_approved,
+                Some(publish::Target::Pr),
+                confirm,
+            ),
+            || run_publish(&ids, all_approved, publish::Target::Pr, None),
+        ),
+        Command::Merge { id, fix, confirm } => {
+            let asked = match (fix, confirm.yes || confirm.dry_run) {
+                (true, true) => Err("-y and -d apply to a merge, not --fix".into()),
+                (true, false) => Ok(true),
+                (false, _) => {
+                    approve_runs("merge the pull request of", &[id], false, None, confirm)
+                }
+            };
+            gated(asked, || run_merge(id, fix))
         }
-        Command::Merge { id, fix } => run_merge(id, fix),
         Command::Stage { ids, all_approved } => {
             run_publish(&ids, all_approved, publish::Target::Stage, None)
         }
@@ -1208,11 +1326,26 @@ fn main() -> ExitCode {
             all_approved,
             approve,
             drop,
-        } => {
-            let approve = approve.then_some(drop);
-            run_publish_approving(&ids, all_approved, publish::Target::Push, None, approve)
+            confirm,
+        } => gated(
+            approve_runs(
+                "push",
+                &ids,
+                all_approved,
+                // `--approve` takes a ready run, which a push alone refuses.
+                (!approve).then_some(publish::Target::Push),
+                confirm,
+            ),
+            || {
+                let approve = approve.then_some(drop);
+                run_publish_approving(&ids, all_approved, publish::Target::Push, None, approve)
+            },
+        ),
+        Command::Close { ids, confirm } => {
+            gated(approve_runs("close", &ids, false, None, confirm), || {
+                run_close(&ids)
+            })
         }
-        Command::Close { ids } => run_close(&ids),
         Command::Integrate { name, off } => run_integrate(name.as_deref(), off),
         Command::PaneView => run_pane_view(),
         Command::PaneStop {
@@ -1227,11 +1360,14 @@ fn main() -> ExitCode {
         Command::Sync {
             projects,
             tags,
-            apply,
-        } => run_sync(&projects, &tags, apply),
+            confirm,
+        } => run_sync(&projects, &tags, confirm),
         Command::Deps {
             action: DepsAction::Refresh { dir },
-        } => deps::refresh(&dir).map_err(Into::into),
+        } => match dir {
+            Some(dir) => deps::refresh(&dir).map_err(Into::into),
+            None => Err("name a project directory, or run inside a project".into()),
+        },
         Command::Note { action } => note(action),
 
         Command::Tui => run_tui(),
@@ -1240,7 +1376,7 @@ fn main() -> ExitCode {
         Command::Job { action } => run_job(action),
         Command::Runner => jobs::run(),
         Command::Watch { once } => run_watch(once),
-        Command::Shell { project } => api::shell(&project),
+        Command::Shell { project } => named(project).and_then(|p| api::shell(&p)),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -1251,18 +1387,243 @@ fn main() -> ExitCode {
     }
 }
 
+/// Help that says what each command acts on here. The store is read only
+/// when help is asked for.
+fn with_here(command: clap::Command) -> clap::Command {
+    let args: Vec<String> = std::env::args().collect();
+    let asked =
+        args.iter().any(|a| a == "-h" || a == "--help") || args.get(1).is_some_and(|a| a == "help");
+    if !asked {
+        return command;
+    }
+    let ctx = Here::default().get().ok().flatten().cloned();
+    let at = ctx.as_ref().map(|c| (c.project.as_str(), c.source));
+    let top = match at {
+        Some((p, how)) => format!("Context: {p} ({how}); -A for every project."),
+        None => "Context: none (every project).".into(),
+    };
+    let names: Vec<String> = command
+        .get_subcommands()
+        .map(|c| c.get_name().to_string())
+        .collect();
+    names.iter().fold(
+        command.before_help(top),
+        |command, name| match pma_core::keys::here(name, at) {
+            Some(line) => command.mut_subcommand(name, |c| c.before_help(line)),
+            None => command,
+        },
+    )
+}
+
+/// Runs `act` if the answer was yes.
+fn gated(asked: Result<bool>, act: impl FnOnce() -> Result<()>) -> Result<()> {
+    match asked? {
+        true => act(),
+        false => Ok(()),
+    }
+}
+
+/// Lists the runs `verb` would act on, the approved ones for `all`, and
+/// asks. A run that does not exist is left for the command to refuse.
+fn approve_runs(
+    verb: &str,
+    ids: &[i64],
+    all: bool,
+    target: Option<publish::Target>,
+    confirm: Confirm,
+) -> Result<bool> {
+    if confirm.yes || jobs::current().is_some() {
+        return Ok(true);
+    }
+    let store = Store::open_default()?;
+    let runs: Vec<store::Run> = match all {
+        true => store
+            .runs()?
+            .into_iter()
+            .filter(|r| r.state == RunState::Approved)
+            .collect(),
+        false => ids.iter().filter_map(|id| store.run(*id).ok()).collect(),
+    };
+    // A run the command will refuse is refused before anything is asked.
+    let refused = target.is_some_and(|t| {
+        runs.iter()
+            .any(|r| !t.takes(r.state) || publish::keeps_pr(r, t).is_some())
+    });
+    if runs.len() < ids.len() || runs.is_empty() || refused {
+        return Ok(!confirm.dry_run);
+    }
+    for r in &runs {
+        println!("#{} {}: {}", r.id, r.project, r.text);
+    }
+    let what = match runs.len() {
+        1 => format!("{verb} run #{}", runs[0].id),
+        n => format!("{verb} {n} runs"),
+    };
+    confirm.approve(&what)
+}
+
+/// The context, found once and only when a command asks.
+#[derive(Default)]
+struct Here(Option<Option<Context>>);
+
+impl Here {
+    fn get(&mut self) -> Result<Option<&Context>> {
+        if self.0.is_none() {
+            // No store yet is no context; a bad `$PMA_PROJECT` is an error.
+            let found = match Store::open_default() {
+                Ok(store) => context::detect(&store)?,
+                Err(_) => None,
+            };
+            self.0 = Some(found);
+        }
+        Ok(self.0.as_ref().and_then(Option::as_ref))
+    }
+}
+
+/// A project argument that defaults to the context; `None` is left for the
+/// handler to refuse.
+fn named(name: Option<String>) -> Result<String> {
+    name.ok_or_else(|| "name a project, or run inside one".into())
+}
+
+/// Fills in what the context supplies: `.` and `:12` references, and the
+/// context project where a command names none. Design:
+/// `docs/dev/cli-context.md`.
+fn contextualize(command: &mut Command, all: bool, here: &mut Here) -> Result<()> {
+    // The store is opened only for a command the context can change.
+    let uses = matches!(
+        command,
+        Command::Next { .. }
+            | Command::Matrix { .. }
+            | Command::Status { .. }
+            | Command::Stale { .. }
+            | Command::Sync { .. }
+            | Command::Scan { .. }
+            | Command::Verify { .. }
+            | Command::Dispatch { .. }
+            | Command::Run { name: Some(_), .. }
+            | Command::Workflow {
+                action: Some(WorkflowAction::Run { .. })
+            }
+            | Command::Task { .. }
+            | Command::Shell { .. }
+            | Command::Project {
+                action: Some(
+                    ProjectAction::Show { .. }
+                        | ProjectAction::Tier { .. }
+                        | ProjectAction::Tag { .. }
+                )
+            }
+            | Command::Deps { .. }
+            | Command::Lint { .. }
+            | Command::Prune { .. }
+    );
+    if !uses {
+        return Ok(());
+    }
+    let ctx = here.get()?;
+    let scope = |names: &mut Vec<String>, tagged: bool| -> Result<()> {
+        *names = context::scope(names, tagged, all, ctx)?;
+        Ok(())
+    };
+    let one = |name: &mut Option<String>| -> Result<()> {
+        *name = match name.take() {
+            Some(n) => Some(context::reference(&n, ctx)?),
+            None => ctx.map(|c| c.project.clone()),
+        };
+        Ok(())
+    };
+    // `.` is a path as well; in a project it is the project's directory.
+    let paths = |paths: &mut Vec<PathBuf>| {
+        let Some(c) = ctx else { return };
+        if paths.is_empty() {
+            paths.push(c.path.clone());
+        }
+        for p in paths.iter_mut().filter(|p| p.as_os_str() == ".") {
+            *p = c.path.clone();
+        }
+    };
+    match command {
+        Command::Next { projects, tags, .. }
+        | Command::Matrix { projects, tags, .. }
+        | Command::Status { projects, tags, .. }
+        | Command::Stale { projects, tags, .. }
+        | Command::Sync { projects, tags, .. }
+        | Command::Scan { projects, tags, .. }
+        | Command::Verify { projects, tags } => scope(projects, !tags.is_empty())?,
+        Command::Dispatch { targets, tags, .. } => scope(targets, !tags.is_empty())?,
+        Command::Run {
+            name: Some(_),
+            targets,
+            all: every,
+            tags,
+            ..
+        } => scope(targets, *every || !tags.is_empty())?,
+        Command::Workflow {
+            action:
+                Some(WorkflowAction::Run {
+                    projects,
+                    tag,
+                    instance,
+                    ..
+                }),
+        } => scope(projects, tag.is_some() || instance.is_some())?,
+        Command::Task { target } => *target = context::reference(target, ctx)?,
+        Command::Shell { project } => one(project)?,
+        Command::Project {
+            action: Some(ProjectAction::Show { name }),
+        } => one(name)?,
+        Command::Project {
+            action: Some(ProjectAction::Tier { projects, .. }),
+        }
+        | Command::Project {
+            action:
+                Some(ProjectAction::Tag {
+                    action: Some(TagAction::Add { projects, .. } | TagAction::Rm { projects, .. }),
+                }),
+        } => {
+            scope(projects, false)?;
+            if projects.is_empty() {
+                return Err("name a project, or run inside one".into());
+            }
+        }
+        Command::Deps {
+            action: DepsAction::Refresh { dir },
+        } => {
+            if dir.is_none() {
+                *dir = ctx.map(|c| c.path.clone());
+            }
+        }
+        Command::Lint { paths: p, .. } | Command::Prune { paths: p, .. } => paths(p),
+        _ => {}
+    }
+    Ok(())
+}
+
 /// The TODO.md each path names: the file itself, or the one in a directory.
 /// The flag says the path was a directory, where a missing file is skipped: a
 /// glob over a root names every repository, and not every one keeps a list.
+/// A path that does not exist and names a known project is that project's
+/// directory, so `pma prune argdec` works from anywhere, as a `:` line needs.
 fn todo_files(paths: &[PathBuf]) -> Vec<(PathBuf, bool)> {
     if paths.is_empty() {
         return vec![(PathBuf::from("./TODO.md"), false)];
     }
+    let mut store = None;
+    let mut known = |p: &Path| -> Option<PathBuf> {
+        if p.exists() || p.components().count() != 1 {
+            return None;
+        }
+        let s = store.get_or_insert_with(|| Store::open_default().ok());
+        let row = s.as_ref()?.project(p.to_str()?).ok()??;
+        Some(row.path)
+    };
     paths
         .iter()
-        .map(|p| match p.is_dir() {
-            true => (p.join("TODO.md"), true),
-            false => (p.clone(), false),
+        .map(|p| match known(p) {
+            Some(dir) => (dir.join("TODO.md"), true),
+            None if p.is_dir() => (p.join("TODO.md"), true),
+            None => (p.clone(), false),
         })
         .collect()
 }
@@ -1279,8 +1640,8 @@ fn read_todo(file: &Path, from_dir: bool) -> std::io::Result<Option<String>> {
 /// Lists each line `todo::fix` would rewrite, and with `apply` writes the
 /// files. A file lint cannot read is an error; one with nothing to fix is
 /// passed over in silence.
-fn fix_todos(paths: &[PathBuf], apply: bool) -> ExitCode {
-    let (mut count, mut failed) = (0, false);
+fn fix_todos(paths: &[PathBuf], confirm: Confirm) -> ExitCode {
+    let (mut count, mut failed, mut writes) = (0, false, Vec::new());
     for (file, from_dir) in todo_files(paths) {
         let text = match read_todo(&file, from_dir) {
             Ok(Some(text)) => text,
@@ -1299,18 +1660,16 @@ fn fix_todos(paths: &[PathBuf], apply: bool) -> ExitCode {
             println!("{}:{line}: `{was}` -> `{now}`", file.display());
         }
         count += fixed.fixes.len();
-        if apply
-            && !fixed.fixes.is_empty()
-            && let Err(err) = todo::save(&file, &fixed.text)
-        {
-            println!("{}: error: {err}", file.display());
-            failed = true;
+        if !fixed.fixes.is_empty() {
+            writes.push((file, text, fixed.text));
         }
     }
-    match (count, apply) {
-        (0, _) => println!("nothing to fix"),
-        (n, true) => println!("{n} lines rewritten; TODO.md edits are uncommitted"),
-        (n, false) => println!("{n} rewrites; run `pma lint --fix --apply` to make them"),
+    if count == 0 {
+        println!("nothing to fix");
+    } else if confirm.dry_run {
+        println!("{count} rewrites; dry run, nothing changed");
+    } else if rewrite(&writes, confirm, &mut failed) {
+        println!("{count} lines rewritten; TODO.md edits are uncommitted");
     }
     if failed {
         ExitCode::FAILURE
@@ -1428,7 +1787,7 @@ fn add_ids(paths: &[PathBuf], apply: bool) -> ExitCode {
     match (count, apply) {
         (0, _) => println!("every open item has an id"),
         (n, true) => println!("{n} ids written; TODO.md edits are uncommitted"),
-        (n, false) => println!("{n} items without an id; `pma lint --ids --apply` writes them"),
+        (n, false) => println!("{n} items without an id; dry run, nothing changed"),
     }
     match failed {
         true => ExitCode::FAILURE,
@@ -1436,8 +1795,74 @@ fn add_ids(paths: &[PathBuf], apply: bool) -> ExitCode {
     }
 }
 
-fn prune(paths: &[PathBuf], apply: bool) -> ExitCode {
-    let (mut count, mut failed) = (0, false);
+/// Writes each `(file, was, now)`. It asks first only when a
+/// rewrite removes a line the file's `HEAD` lacks, which git cannot bring
+/// back. Whether it wrote them all.
+fn rewrite(writes: &[(PathBuf, String, String)], confirm: Confirm, failed: &mut bool) -> bool {
+    let unsaved: Vec<&PathBuf> = writes
+        .iter()
+        .filter(|(file, was, now)| !committed(file, &todo::removed_lines(was, now)))
+        .map(|(file, ..)| file)
+        .collect();
+    for file in &unsaved {
+        println!("{}: removes text not in git's HEAD", file.display());
+    }
+    if !unsaved.is_empty() {
+        match confirm.approve("remove it") {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(e) => {
+                eprintln!("pma: {e}");
+                *failed = true;
+                return false;
+            }
+        }
+    }
+    let mut all = true;
+    for (file, _, now) in writes {
+        if let Err(err) = todo::save(file, now) {
+            println!("{}: error: {err}", file.display());
+            *failed = true;
+            all = false;
+        }
+    }
+    all
+}
+
+/// Whether every one of `lines` is in the file's `HEAD`, counting a ticked
+/// item as its unticked self: ticking is not text git would lose.
+fn committed(file: &Path, lines: &[String]) -> bool {
+    let dir = file
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let head = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["show", &format!("HEAD:./{name}")])
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Some(head) = head.ok().filter(|o| o.status.success()) else {
+        return lines.is_empty();
+    };
+    let mut have: std::collections::HashMap<String, usize> = Default::default();
+    for l in String::from_utf8_lossy(&head.stdout).lines() {
+        *have.entry(todo::unticked(l)).or_default() += 1;
+    }
+    lines.iter().all(|l| {
+        let n = have.entry(todo::unticked(l)).or_default();
+        let ok = *n > 0;
+        *n = n.saturating_sub(1);
+        ok
+    })
+}
+
+fn prune(paths: &[PathBuf], confirm: Confirm) -> ExitCode {
+    let (mut count, mut failed, mut writes) = (0, false, Vec::new());
     for (file, from_dir) in todo_files(paths) {
         let fail = |why: String| println!("{}: error: {why}", file.display());
         let text = match read_todo(&file, from_dir) {
@@ -1454,7 +1879,7 @@ fn prune(paths: &[PathBuf], apply: bool) -> ExitCode {
         };
         if todo::parse(&text).has_errors() {
             println!("{}: skipped: lint errors; see `pma lint`", file.display());
-            failed |= apply;
+            failed |= !confirm.dry_run;
             continue;
         }
         let pruned = todo::prune(&text);
@@ -1485,23 +1910,18 @@ fn prune(paths: &[PathBuf], apply: bool) -> ExitCode {
             );
         }
         let removals = pruned.done_sections.len() + pruned.items.len();
-        if apply
-            && removals > 0
-            && let Err(err) = todo::save(&file, &pruned.text)
-        {
-            fail(err.to_string());
-            failed = true;
-            continue;
+        if removals > 0 {
+            writes.push((file.clone(), text, pruned.text));
         }
         count += removals;
     }
 
     if count == 0 {
         println!("nothing to prune");
-    } else if apply {
+    } else if confirm.dry_run {
+        println!("{count} removals; dry run, nothing changed");
+    } else if rewrite(&writes, confirm, &mut failed) {
         println!("{count} removals made; TODO.md edits are uncommitted");
-    } else {
-        println!("{count} removals; run `pma prune --apply` to make them");
     }
     if failed {
         ExitCode::FAILURE
@@ -1529,7 +1949,10 @@ fn root(action: Option<RootAction>) -> Result<()> {
                 println!("{} is already a root", dir.display());
             }
         }
-        Some(RootAction::Rm { dir }) => {
+        Some(RootAction::Rm { dir, confirm }) => {
+            if !confirm.approve(&format!("remove root {}", dir.display()))? {
+                return Ok(());
+            }
             let canonical = dir.canonicalize().unwrap_or_else(|_| dir.clone());
             if !store.remove_root(&canonical)? && !store.remove_root(&dir)? {
                 return Err(format!("{} is not a root", dir.display()).into());
@@ -1539,7 +1962,7 @@ fn root(action: Option<RootAction>) -> Result<()> {
     Ok(())
 }
 
-fn forget(name: &str, apply: bool) -> Result<()> {
+fn forget(name: &str, confirm: Confirm) -> Result<()> {
     let store = Store::open_default()?;
     let f = api::forgettable(&store, name)?;
 
@@ -1553,8 +1976,7 @@ fn forget(name: &str, apply: bool) -> Result<()> {
     if f.runs > 0 {
         println!("{name}: {} finished runs are kept", f.runs);
     }
-    if !apply {
-        println!("run `pma project forget {name} --apply` to delete the record");
+    if !confirm.approve(&format!("forget {name}"))? {
         return Ok(());
     }
     store.forget_project(name)?;
@@ -1566,7 +1988,7 @@ fn clone_projects(
     names: &[String],
     tags: &[String],
     root: Option<&Path>,
-    apply: bool,
+    confirm: Confirm,
 ) -> Result<()> {
     let store = Store::open_default()?;
     let names = select(&store, names, tags)?;
@@ -1588,7 +2010,7 @@ fn clone_projects(
         (None, []) => return Err("no root registered; `pma root add <dir>`".into()),
         (None, _) => return Err("several roots are registered; name one with --root".into()),
     };
-    let mut planned = 0;
+    let mut planned = Vec::new();
     for name in &names {
         let row = store
             .project(name)?
@@ -1607,14 +2029,16 @@ fn clone_projects(
             println!("{name}: {} already exists; not cloned", target.display());
             continue;
         }
-        planned += 1;
-        if !apply {
-            println!("{name}: would clone {slug} into {}", target.display());
-            continue;
-        }
+        println!("{name}: clone {slug} into {}", target.display());
+        planned.push((name, slug.to_string(), target));
+    }
+    if planned.is_empty() || !confirm.approve(&format!("clone {}", planned.len()))? {
+        return Ok(());
+    }
+    for (name, slug, target) in &planned {
         let out = std::process::Command::new("gh")
             .args(["repo", "clone", slug])
-            .arg(&target)
+            .arg(target)
             .args(["--", "-q"])
             .output()
             .map_err(|e| format!("gh: {e}"))?;
@@ -1627,11 +2051,7 @@ fn clone_projects(
         }
         println!("{name}: cloned {slug} into {}", target.display());
     }
-    match (planned, apply) {
-        (0, _) => {}
-        (_, false) => println!("run again with --apply to clone"),
-        (_, true) => println!("run `pma scan` to read them"),
-    }
+    println!("run `pma scan` to read them");
     Ok(())
 }
 
@@ -1743,7 +2163,7 @@ fn export_projects(file: &Path) -> Result<()> {
     std::fs::write(file, projects::write(&entries, format)?)
         .map_err(|e| format!("{}: {e}", file.display()))?;
     println!(
-        "{} projects to {}; edit it, then `pma project import {} --apply`",
+        "{} projects to {}; edit it, then `pma project import {}`",
         entries.len(),
         file.display(),
         file.display()
@@ -1751,7 +2171,17 @@ fn export_projects(file: &Path) -> Result<()> {
     Ok(())
 }
 
-fn import_projects(file: &Path, apply: bool) -> Result<()> {
+/// Prints what `file` would change, asks, then changes it.
+fn import_projects(file: &Path, confirm: Confirm) -> Result<()> {
+    let changes = import_pass(file, false)?;
+    if changes > 0 && confirm.approve(&format!("make {changes} changes"))? {
+        import_pass(file, true)?;
+    }
+    Ok(())
+}
+
+/// The changes `file` makes: listed, or with `apply` made. How many.
+fn import_pass(file: &Path, apply: bool) -> Result<usize> {
     let store = Store::open_default()?;
     let format = projects::Format::of(file)?;
     let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
@@ -1784,13 +2214,14 @@ fn import_projects(file: &Path, apply: bool) -> Result<()> {
             .collect();
         if row.tier != entry.tier {
             changes += 1;
-            println!(
-                "{}: tier {} -> {}",
-                entry.name,
-                show_tier(row.tier),
-                show_tier(entry.tier)
-            );
-            if apply {
+            if !apply {
+                println!(
+                    "{}: tier {} -> {}",
+                    entry.name,
+                    show_tier(row.tier),
+                    show_tier(entry.tier)
+                );
+            } else {
                 store.set_tier(&entry.name, &row.path, entry.tier)?;
             }
         }
@@ -1798,13 +2229,14 @@ fn import_projects(file: &Path, apply: bool) -> Result<()> {
         let new: Vec<&String> = entry.tags.iter().filter(|t| !was.contains(t)).collect();
         if !gone.is_empty() || !new.is_empty() {
             changes += 1;
-            println!(
-                "{}: tags {} -> {}",
-                entry.name,
-                show_tags(&was),
-                show_tags(&entry.tags)
-            );
-            if apply {
+            if !apply {
+                println!(
+                    "{}: tags {} -> {}",
+                    entry.name,
+                    show_tags(&was),
+                    show_tags(&entry.tags)
+                );
+            } else {
                 for tag in gone {
                     store.remove_project_tag(&entry.name, tag)?;
                 }
@@ -1825,10 +2257,10 @@ fn import_projects(file: &Path, apply: bool) -> Result<()> {
         match (changes, apply) {
             (0, _) => format!("{} projects, nothing to change{kept}", entries.len()),
             (n, true) => format!("{n} changes applied{kept}"),
-            (n, false) => format!("{n} changes; --apply to make them{kept}"),
+            (n, false) => format!("{n} changes{kept}"),
         }
     );
-    Ok(())
+    Ok(changes)
 }
 
 fn show_tier(tier: Option<u8>) -> String {
@@ -3197,7 +3629,10 @@ fn campaign_command(action: Option<CampaignAction>) -> Result<()> {
             })?;
             println!("campaign `{name}` defined; `pma campaign run {name}` starts it");
         }
-        CampaignAction::Rm { name } => {
+        CampaignAction::Rm { name, confirm } => {
+            if !confirm.approve(&format!("remove campaign `{name}`"))? {
+                return Ok(());
+            }
             if !store.remove_campaign(&name)? {
                 return Err(format!("unknown campaign `{name}`").into());
             }
@@ -3351,18 +3786,18 @@ fn project_command(action: Option<ProjectAction>) -> Result<()> {
         return Ok(());
     };
     match action {
-        ProjectAction::Show { name } => show(Query::Project { name }),
+        ProjectAction::Show { name } => show(Query::Project { name: named(name)? }),
         ProjectAction::Tier { tier, projects } => set_tier(&tier, &projects),
         ProjectAction::Export { file } => export_projects(&file),
-        ProjectAction::Import { file, apply } => import_projects(&file, apply),
+        ProjectAction::Import { file, confirm } => import_projects(&file, confirm),
         ProjectAction::Tag { action } => tag(action),
-        ProjectAction::Forget { project, apply } => forget(&project, apply),
+        ProjectAction::Forget { project, confirm } => forget(&project, confirm),
         ProjectAction::Clone {
             projects,
             tags,
             root,
-            apply,
-        } => clone_projects(&projects, &tags, root.as_deref(), apply),
+            confirm,
+        } => clone_projects(&projects, &tags, root.as_deref(), confirm),
     }
 }
 
@@ -3439,7 +3874,10 @@ fn preset_command(action: Option<PresetAction>) -> Result<()> {
             store.set_config("preset", &name)?;
             println!("`{name}` is the default preset");
         }
-        PresetAction::Rm { name } => {
+        PresetAction::Rm { name, confirm } => {
+            if !confirm.approve(&format!("remove preset `{name}`"))? {
+                return Ok(());
+            }
             if !store.remove_preset(&name)? {
                 return Err(format!("no preset `{name}`").into());
             }
@@ -4211,7 +4649,10 @@ fn agent_command(action: Option<AgentAction>) -> Result<()> {
             ];
             print!("{}", report::table(&rows, ""));
         }
-        AgentAction::Rm { name } => {
+        AgentAction::Rm { name, confirm } => {
+            if !confirm.approve(&format!("remove agent `{name}`"))? {
+                return Ok(());
+            }
             if !store.remove_agent(&name)? {
                 return Err(format!("unknown agent `{name}`").into());
             }
@@ -4523,7 +4964,7 @@ fn run_publish_approving(
     Ok(())
 }
 
-fn run_sync(names: &[String], tags: &[String], apply: bool) -> Result<()> {
+fn run_sync(names: &[String], tags: &[String], confirm: Confirm) -> Result<()> {
     let store = Store::open_default()?;
     let names = &select(&store, names, tags)?;
     let rows = store.projects()?;
@@ -4534,6 +4975,7 @@ fn run_sync(names: &[String], tags: &[String], apply: bool) -> Result<()> {
     }
     let me = sync::login()?;
     let (mut changes, mut failed, mut edited) = (0, 0, Vec::new());
+    let mut plans = Vec::new();
     for row in rows
         .iter()
         .filter(|r| names.is_empty() || names.contains(&r.name))
@@ -4579,28 +5021,32 @@ fn run_sync(names: &[String], tags: &[String], apply: bool) -> Result<()> {
             }
         }
         let planned = actions.iter().filter(|a| a.is_change()).count();
-        if !apply || planned == 0 {
-            changes += planned;
-            continue;
-        }
-        let before = text;
-        match sync::apply(repo, &path, &actions) {
-            Ok(n) => changes += n,
-            Err(e) => {
-                println!("{}: stopped: {e}", row.name);
-                failed += 1;
-            }
-        }
-        if std::fs::read_to_string(&path).is_ok_and(|after| after != before) {
-            edited.push(row.name.clone());
+        changes += planned;
+        if planned > 0 {
+            plans.push((row.name.clone(), repo.to_string(), path, text, actions));
         }
     }
     if changes == 0 && failed == 0 {
         println!("in sync");
-    } else if apply {
-        println!("{changes} changes made");
-    } else if changes > 0 {
-        println!("{changes} changes; run `pma sync --apply` to make them");
+    } else if changes > 0 && confirm.dry_run {
+        println!("{changes} changes; dry run, nothing changed");
+    } else if changes > 0
+        && confirm.approve(&format!("make {changes} changes on GitHub and in TODO.md"))?
+    {
+        let mut made = 0;
+        for (name, repo, path, before, actions) in plans {
+            match sync::apply(&repo, &path, &actions) {
+                Ok(n) => made += n,
+                Err(e) => {
+                    println!("{name}: stopped: {e}");
+                    failed += 1;
+                }
+            }
+            if std::fs::read_to_string(&path).is_ok_and(|after| after != before) {
+                edited.push(name);
+            }
+        }
+        println!("{made} changes made");
     }
     if !edited.is_empty() {
         println!(
@@ -4916,6 +5362,7 @@ fn render(view: View) -> String {
         View::JobLog { id, text, .. } => {
             text.unwrap_or_else(|| format!("job {id} has no output yet\n"))
         }
+        View::Help { text, .. } => text,
         View::Notes(notes) => {
             let rows: Vec<Vec<String>> = notes
                 .into_iter()
@@ -5283,6 +5730,10 @@ mod tests {
                 of: of.clone(),
                 apply: true,
             },
+            Action::Cli {
+                args: vec!["prune".into(), "argdec".into(), "-d".into()],
+                project: Some("argdec".into()),
+            },
             Action::Verify { of },
         ];
         for a in &queued {
@@ -5321,6 +5772,39 @@ mod tests {
                 "`{name}` is grouped but is not a command"
             );
         }
+    }
+
+    /// A `:` line knows every command clap does: each is queued as a job, or
+    /// refused as needing a terminal. `project`'s subcommands decide whether
+    /// `:project x` opens a project.
+    #[test]
+    fn the_command_line_knows_every_command() {
+        use pma_core::keys::{CLI, CLI_TERMINAL, PROJECT_SUBCOMMANDS};
+        let command = Cli::command();
+        let mut clap: Vec<&str> = command
+            .get_subcommands()
+            .filter(|s| s.get_name() != "help" && !s.is_hide_set())
+            .map(|s| s.get_name())
+            .collect();
+        let mut ours: Vec<&str> = CLI.iter().chain(CLI_TERMINAL).copied().collect();
+        clap.sort();
+        ours.sort();
+        assert_eq!(ours, clap);
+        for (name, about, _) in pma_core::keys::CLI_TABLE {
+            let sub = command.find_subcommand(name).unwrap();
+            let theirs = sub.get_about().map(|a| a.to_string()).unwrap_or_default();
+            assert_eq!(theirs.trim_end_matches('.'), *about, "`{name}`'s one-liner");
+        }
+        let project = command.find_subcommand("project").unwrap();
+        let mut subs: Vec<&str> = project
+            .get_subcommands()
+            .map(|s| s.get_name())
+            .filter(|n| *n != "help")
+            .collect();
+        let mut ours = PROJECT_SUBCOMMANDS.to_vec();
+        subs.sort();
+        ours.sort();
+        assert_eq!(ours, subs);
     }
 
     /// Every line fits a narrow terminal, which is why the one-liners are

@@ -43,6 +43,6 @@ printf '%s\n' "$detail" | grep -q 'greeting'; check "the run reports its summary
 pane="$(sqlite3 "$PMA_HOME/projects.db" "select pane from runs where id = $id")"
 [ -n "$pane" ]; check "the run recorded its pane" $?
 herdr pane get "$pane" >/dev/null 2>&1; check "the pane stays open for review" $?
-"$pma" review "$id" --reject >/dev/null
+"$pma" review "$id" --reject -y >/dev/null
 ! herdr pane get "$pane" >/dev/null 2>&1; check "the decision closes the pane" $?
 [ "$fails" = 0 ]

@@ -51,7 +51,7 @@ printf '%s\n' "$detail" | grep -q 'greeting'; check "the run reports its summary
 pane="$(sqlite3 "$PMA_HOME/projects.db" "select pane from runs where id = $id")"
 case "$pane" in hc:t*) true ;; *) false ;; esac; check "the run recorded its terminal: $pane" $?
 live "${pane#hc:}"; check "the terminal stays open for review" $?
-"$pma" review "$id" --reject >/dev/null
+"$pma" review "$id" --reject -y >/dev/null
 sleep 1
 ! live "${pane#hc:}"; check "the decision ends the terminal" $?
 [ "$fails" = 0 ]

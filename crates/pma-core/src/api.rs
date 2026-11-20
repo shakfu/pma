@@ -1868,6 +1868,15 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
         }
         Action::TakeOver { id } => {
             let run = store.run(id)?;
+            // Seconds are added once an agent finishes, so a failed run without
+            // them never started one and left nothing to take over.
+            if run.state == RunState::Failed && run.seconds.is_none() {
+                let why = run.error.as_deref().unwrap_or("no reason recorded");
+                return Err(format!(
+                    "run #{id} failed before its agent started ({why}); dispatch it again"
+                )
+                .into());
+            }
             // The change is on disk, so any agent can read it: the run's own
             // when it has an interactive form, else the default one.
             let own = store
@@ -1878,11 +1887,7 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
                 Some(w) => (w, run.model.as_deref()),
                 None => (store.agent(&config(store)?.agent)?, None),
             };
-            let prompt = format!(
-                "An earlier agent worked on this task, and its change is uncommitted in this \
-                 directory. Read the diff, then wait for my instructions.\n\nTask: {}",
-                run.text
-            );
+            let prompt = take_over_prompt(&run.text, &run.prompt);
             let title = format!("#{id} take over");
             let cmd = worker
                 .build_interactive(&prompt, &run.worktree, model, &[], None)
@@ -2576,12 +2581,33 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
     Some(v)
 }
 
+/// What a person's agent is told on taking over a run: the task, and the
+/// earlier agent's instructions, which carry context such as a failing CI log.
+fn take_over_prompt(task: &str, earlier: &str) -> String {
+    format!(
+        "An earlier agent worked on this task in this directory. Its change, if any, \
+         is uncommitted. Read the diff, then wait for my instructions.\n\nTask: {task}\n\n\
+         For context, the earlier agent was given the instructions below. They were \
+         for it, not for you.\n\n<earlier-instructions>\n{earlier}\n</earlier-instructions>"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// A job shows in a project's view when everything it names is in that
     /// project: several of its tasks too.
+    /// A take-over carries the earlier instructions, so a fix-CI run's log
+    /// reaches the person's agent.
+    #[test]
+    fn a_take_over_carries_the_earlier_instructions() {
+        let p = take_over_prompt("fix CI: ci", "Workflow `ci`, run 9:\n\nassert failed");
+        assert!(p.contains("Task: fix CI: ci"), "{p}");
+        assert!(p.contains("Its change, if any, is uncommitted"), "{p}");
+        assert!(p.contains("<earlier-instructions>\nWorkflow `ci`, run 9:\n\nassert failed\n</earlier-instructions>"), "{p}");
+    }
+
     #[test]
     fn a_job_is_about_one_project_when_every_name_is() {
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -2719,6 +2745,33 @@ mod tests {
             }),
             ["dispatch", "a:5", "--push"]
         );
+    }
+
+    /// A run refused before its agent started has nothing to take over; the
+    /// refusal says why it failed.
+    #[test]
+    fn a_run_that_never_started_is_not_taken_over() {
+        let dir = std::env::temp_dir().join(format!("pma-take-over-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("p.db")).unwrap();
+        let mut run = Run {
+            project: "a".into(),
+            state: RunState::Failed,
+            error: Some("claude: Herdr.app is not running: start it and try again".into()),
+            ..Run::default()
+        };
+        store.insert_run(&mut run).unwrap();
+        // Recorded on failure, after the run was inserted.
+        store.update_run(&run).unwrap();
+        let err = act(&store, Action::TakeOver { id: run.id })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("failed before its agent started (claude: Herdr.app is not running"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A checkout deleted since the last full scan can be forgotten; one on

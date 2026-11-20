@@ -107,8 +107,9 @@ The split differs from the TUI's. `hc` runs terminals and has no workspaces or t
 
 | TUI | App |
 |-|-|
-| `workspace.create` / `tab.create`, then type a line | `space.new` / `tab.new --argv`, which return `{space, tab, terminal}` |
-| `focus: false` | none: a new tab is shown, so `pma` reselects the tab from `herdr-app status` |
+| `workspace.create` / `tab.create`, then type a line | `hc run` labelled `herdr.space=pma-<project>` and `herdr.tab=<new id>`; the app places it, now or when it next starts |
+| `focus: false` | none needed: a placed terminal is not brought to the front; `pane.focus` for a run in front |
+| workspace found by label | space found by its fixed id; renamed `pma: <project>` while Herdr still calls it after its folder |
 | `pane.close` | `pane.close` on the pane from `herdr-app ls`, else `hc kill` |
 | `events.subscribe` per pane | `hc events --terminal`: a snapshot, then `finished`, `removed`, `status` |
 | `notification.show` on `blocked` | none; the app alerts itself |
@@ -117,9 +118,18 @@ The split differs from the TUI's. `hc` runs terminals and has no workspaces or t
 Measured:
 
 - The app runs argv as `zsh -lic '"$@"; exec "$0" -li'`, so a shell stays after the script, as in a TUI pane, and `hc` reports no exit code for it. The status file stays.
-- With the window closed, a headless run goes to `hc run --no-parent --no-notify`. Without `--no-parent`, `hc` types a note about each run into the terminal that ran `pma`. `H` then gives it a tab with `terminal.keep`, which lands in the active space.
+- Every run starts with `hc run --no-parent --no-notify`. Without `--no-parent`, `hc` types a note about each run into the terminal that ran `pma`. `pma` passes argv in the app's wrapper, with `$SHELL` when it is a Bourne-style shell, else `/bin/sh`. With Herdr quit, only headless runs start; a person would wait at an unseen interactive one.
+- `H` on a run started before runs were labelled still uses `terminal.keep`, which lands in the active space.
 - `terminal.keep` and `pane.focus` take an address (`t1c`), not a name.
 - A pane is stored as `hc:<address>`, so `close` and `focus` pick the backend from the run, not from the current setting.
+
+Measured 2026-11-20 against herdr-app 0.1.16 and `hc` 0.1.21:
+
+- Terminals the app shows are kept. A kept terminal whose program dies sends `lost`, then `restarted` as a login shell at the same address with a new pid, and stays `live`; the event stream stays open. `follow` treats either event, or a pid that differs from the first snapshot's, as closed. Before this, such a run waited for its timeout, or forever when interactive.
+- App quit: `herdr-app do` fails at once (exit 2) and does not start the app. App running with no window: `status` answers, and `space.new` opens a window.
+- `hc run --label herdr.space=<id> --label herdr.tab=<id>` works with the app quit: the terminal is placed when the app starts, under those exact ids, without being brought to the front. Placement, including by a later `hc label`, turns keep on. The space is named after the terminal's folder.
+- Unwrapped, a placed `hc run` closes its pane on exit, and its space if that was the last tab. Given the app's wrapper (`zsh -lic '"$@"; exec "$0" -li'`), a shell stays.
+- `space.new` / `tab.new` accept `--focus false`.
 
 Untested: the shape of a `status` event, since none fired while captured; `hear` accepts `data.status` or `data.state`. Whether `hc server status` starts a core, so `pma integrate` calls it only under `herdr-app`. `scripts/herdr-app-check.sh` (`make herdr-app-check`) runs a dispatch against the open window.
 

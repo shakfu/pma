@@ -66,6 +66,10 @@ Upgrading from 0.10:
 
 ### Fixed
 
+- A fix-CI prompt whose failed-job log was empty showed an empty code block. That happens when a job is cancelled before any step runs, as on a lost runner. The prompt now lists the run's jobs and their conclusions, and tells the agent CI itself may be at fault.
+
+- Taking over a run (`T`) told the agent a change was uncommitted, even for a run refused before its agent started. Such a run is now refused with the reason it failed. Other take-overs carry the earlier agent's instructions, so a fix-CI take-over has the failing log.
+
 - A run committed by hand with the exact tree pma verified now settles as `committed`, then `pushed`, for headless runs as for interactive ones, and also when it was closed first. `pma close` had counted 7 such runs as infrastructure, out of the accept share. `pma report` now lists runs closed without a decision apart from those rejected for infrastructure.
 
 - A CI task listed the workflows failing at the last scan. Dispatch then refused the whole task when any of them passed since, even with others still failing. It now reads the project's CI first and stores it, so the task covers only workflows failing now, and the TUI and web row update at once. The agent gets the failed-job log of the run that read found, so scan and dispatch can no longer disagree. Runs are matched to workflows by id rather than name: two workflow files may share a name. A failed read keeps the last scan's CI and warns.

@@ -105,13 +105,78 @@ fn pane_of(listed: &Value, address: &str) -> Option<String> {
         .and_then(|t| t["pane"].as_str().map(String::from))
 }
 
-fn space_named(listed: &Value, name: &str) -> Option<String> {
+/// `listed`'s space with id `id`.
+fn space_of<'a>(listed: &'a Value, id: &str) -> Option<&'a Value> {
     listed["spaces"]
         .as_array()
         .into_iter()
         .flatten()
-        .find(|s| s["name"] == name)
-        .and_then(|s| s["id"].as_str().map(String::from))
+        .find(|s| s["id"] == id)
+}
+
+/// A space id for `project`, the same on every run: `pma-` and the name, with
+/// each byte outside `a-z0-9` written as `-` and two hex digits, so two
+/// projects never share one.
+fn space_id(project: &str) -> String {
+    let mut id = String::from("pma-");
+    for b in project.bytes() {
+        match b {
+            b'a'..=b'z' | b'0'..=b'9' => id.push(b as char),
+            _ => id.push_str(&format!("-{b:02x}")),
+        }
+    }
+    id
+}
+
+/// A tab id no other run has.
+fn tab_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("pma-{nanos:x}-{:x}", std::process::id())
+}
+
+/// `argv` as the app runs it: in a login shell, which stays once it ends.
+/// The words go to the shell as `"$@"`, so only Bourne-style shells are used.
+fn wrapped(argv: &[String], shell: Option<&str>) -> Vec<String> {
+    if argv.is_empty() {
+        return Vec::new();
+    }
+    let bourne = |s: &&str| {
+        let name = s.rsplit('/').next().unwrap_or(s);
+        matches!(name, "zsh" | "bash" | "ksh" | "sh")
+    };
+    let shell = shell.filter(bourne).unwrap_or("/bin/sh").to_string();
+    let mut all = vec![
+        shell.clone(),
+        "-lic".into(),
+        r#""$@"; exec "$0" -li"#.into(),
+        shell,
+    ];
+    all.extend_from_slice(argv);
+    all
+}
+
+/// Whether Herdr named the space after its folder, as it does one nobody named.
+fn unnamed(space: &Value) -> bool {
+    let folder = space["folder"].as_str().unwrap_or("");
+    let base = folder.rsplit('/').next().unwrap_or("");
+    let name = space["name"].as_str().unwrap_or("");
+    name == base || name == "~"
+}
+
+/// The window's listing once it shows `address`, polling briefly: the app
+/// places a labelled terminal a moment after it starts.
+fn placed(address: &str) -> Option<Value> {
+    for _ in 0..25 {
+        if let Ok(listed) = window(&["ls"])
+            && pane_of(&listed, address).is_some()
+        {
+            return Some(listed);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    None
 }
 
 /// How a new terminal is shown.
@@ -119,14 +184,15 @@ fn space_named(listed: &Value, name: &str) -> Option<String> {
 pub enum Show {
     /// In front: a person asked for it.
     Front,
-    /// In a tab, leaving the person's view as it was: the app shows a new tab.
+    /// In a tab, leaving the person's view as it was.
     Back,
-    /// As `Back`, or with the window closed, unseen in the core.
+    /// As `Back`, or, with the app quit, placed when it next starts.
     Anywhere,
 }
 
-/// Starts `argv` (a shell when empty) in a new tab of `project`'s space, made
-/// if need be, and returns its pane.
+/// Starts `argv` (a shell when empty) in a new tab of `project`'s space and
+/// returns its pane. `hc` starts it labelled with the space and tab, which the
+/// app places, making either if need be, now or when it next starts.
 pub fn start(
     project: &str,
     title: &str,
@@ -134,62 +200,45 @@ pub fn start(
     argv: &[String],
     show: Show,
 ) -> Result<String, String> {
+    let window_up = window(&["status"]).is_ok();
+    if !window_up && show != Show::Anywhere {
+        return Err("Herdr.app is not running: start it and try again".into());
+    }
     let title: String = title.chars().take(40).collect();
     let cwd = cwd.to_string_lossy();
-    let shown = match window(&["status"]) {
-        Ok(shown) => shown,
-        Err(_) if show == Show::Anywhere && !argv.is_empty() => {
-            // No parent: from inside a terminal, `hc` would type notes about
-            // the run into the one that started `pma`.
-            let label = format!("pma={title}");
-            let mut args = vec![
-                "run",
-                "--bg",
-                "--no-parent",
-                "--no-notify",
-                "--cwd",
-                &cwd,
-                "--label",
-                &label,
-                "--",
-            ];
-            args.extend(argv.iter().map(String::as_str));
-            let ran = hc(&args)?;
-            return ran["address"]
-                .as_str()
-                .map(|a| format!("{PREFIX}{a}"))
-                .ok_or_else(|| "hc ran it and named no terminal".to_string());
-        }
-        Err(e) => return Err(format!("Herdr.app's window is not open: {e}")),
-    };
-    let argv_json = serde_json::to_string(argv).map_err(|e| e.to_string())?;
-    let space_name = format!("pma: {project}");
-    let mut args: Vec<&str> = vec!["--name"];
-    let made = match space_named(&window(&["ls"])?, &space_name) {
-        Some(space) => {
-            args.extend([title.as_str(), "--space", &space, "--folder", &cwd]);
-            if !argv.is_empty() {
-                args.extend(["--argv", &argv_json]);
-            }
-            act("tab.new", &args)?
-        }
-        None => {
-            args.extend([space_name.as_str(), "--tab", &title, "--folder", &cwd]);
-            if !argv.is_empty() {
-                args.extend(["--argv", &argv_json]);
-            }
-            act("space.new", &args)?
-        }
-    };
-    if show != Show::Front
-        && let Some(tab) = shown["tab"].as_str()
-    {
-        let _ = act("tab.select", &["--id", tab]);
+    let space = space_id(project);
+    let tab = tab_id();
+    let labels = [
+        format!("herdr.space={space}"),
+        format!("herdr.tab={tab}"),
+        format!("pma={title}"),
+    ];
+    // No parent: from inside a terminal, `hc` would type notes about the run
+    // into the one that started `pma`.
+    let mut args = vec!["run", "--bg", "--no-parent", "--no-notify", "--cwd", &cwd];
+    for label in &labels {
+        args.extend(["--label", label]);
     }
-    made["terminal"]
+    let argv = wrapped(argv, std::env::var("SHELL").ok().as_deref());
+    if !argv.is_empty() {
+        args.push("--");
+        args.extend(argv.iter().map(String::as_str));
+    }
+    let ran = hc(&args)?;
+    let address = ran["address"]
         .as_str()
-        .map(|t| format!("{PREFIX}{t}"))
-        .ok_or_else(|| "Herdr.app made a tab and named no terminal".to_string())
+        .ok_or("hc ran it and named no terminal")?;
+    if window_up && let Some(listed) = placed(address) {
+        let _ = act("tab.rename", &["--id", &tab, "--name", &title]);
+        if space_of(&listed, &space).is_some_and(unnamed) {
+            let name = format!("pma: {project}");
+            let _ = act("space.rename", &["--id", &space, "--name", &name]);
+        }
+        if show == Show::Front {
+            act("pane.focus", &["--terminal", address])?;
+        }
+    }
+    Ok(format!("{PREFIX}{address}"))
 }
 
 /// Closes a pane and ends its terminal. It may be gone already.
@@ -204,7 +253,8 @@ pub fn close(pane: &str) {
     }
 }
 
-/// Brings a terminal to the front, giving it a tab if it ran unseen.
+/// Brings a terminal to the front, giving it a tab if it ran unseen: one
+/// started before runs were labelled with their space.
 pub fn focus(pane: &str) -> Result<(), String> {
     let address = address(pane);
     if pane_of(&window(&["ls"])?, address).is_none() {
@@ -224,7 +274,11 @@ enum Heard {
 /// The first line is a snapshot of matching terminals; after it, `event`
 /// notifications. A subscriber that fell behind gets `missed`, then a fresh
 /// snapshot, which this reads as it reads the first.
-fn hear(line: &str, address: &str) -> Heard {
+///
+/// A kept terminal whose program dies (`lost`) is `restarted` as a shell at
+/// the same address and stays live, so either event, or a snapshot with a pid
+/// other than the first one seen (`pid`), means the run's program has gone.
+fn hear(line: &str, address: &str, pid: &mut Option<u64>) -> Heard {
     let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
         return Heard::Nothing;
     };
@@ -234,7 +288,7 @@ fn hear(line: &str, address: &str) -> Heard {
     if let Some(terminals) = snapshot {
         return match terminals.iter().find(|t| t["address"] == address) {
             None => Heard::Closed,
-            Some(t) if t["state"] != "live" => Heard::Closed,
+            Some(t) if t["state"] != "live" || replaced(t, pid) => Heard::Closed,
             Some(t) => t["status"]
                 .as_str()
                 .map_or(Heard::Nothing, |s| Heard::Status(s.to_string())),
@@ -245,7 +299,7 @@ fn hear(line: &str, address: &str) -> Heard {
         return Heard::Nothing;
     }
     match p["type"].as_str() {
-        Some("finished" | "removed") => Heard::Closed,
+        Some("finished" | "removed" | "lost" | "restarted") => Heard::Closed,
         Some("status") => {
             let d = &p["data"];
             d["status"]
@@ -254,6 +308,18 @@ fn hear(line: &str, address: &str) -> Heard {
                 .map_or(Heard::Nothing, |s| Heard::Status(s.to_string()))
         }
         _ => Heard::Nothing,
+    }
+}
+
+/// Whether `t` runs another process than the first one seen, which it records.
+fn replaced(t: &Value, pid: &mut Option<u64>) -> bool {
+    let now = t["pid"].as_u64();
+    match *pid {
+        Some(first) => now.is_some_and(|n| n != first),
+        None => {
+            *pid = now;
+            false
+        }
     }
 }
 
@@ -272,8 +338,9 @@ pub fn follow(pane: &str, closed: &AtomicBool, stop: &AtomicBool, on_state: &dyn
     let address = address(pane);
     let mut failures = 0;
     let mut last = String::new();
+    let mut pid = None;
     while !stop.load(Ordering::Relaxed) {
-        match subscribe_once(address, closed, stop, on_state, &mut last) {
+        match subscribe_once(address, closed, stop, on_state, &mut last, &mut pid) {
             Ok(()) => failures = 0,
             Err(_) => failures += 1,
         }
@@ -281,7 +348,7 @@ pub fn follow(pane: &str, closed: &AtomicBool, stop: &AtomicBool, on_state: &dyn
             return;
         }
         let gone = match hc(&["get", address]) {
-            Ok(t) => t["state"] != "live",
+            Ok(t) => t["state"] != "live" || replaced(&t, &mut pid),
             Err(e) => e.contains("no terminal") || failures >= SERVER_GONE,
         };
         if gone {
@@ -298,6 +365,7 @@ fn subscribe_once(
     stop: &AtomicBool,
     on_state: &dyn Fn(&str),
     last: &mut String,
+    pid: &mut Option<u64>,
 ) -> Result<(), String> {
     let mut child = Command::new("hc")
         .args(["events", "--terminal", address])
@@ -322,7 +390,7 @@ fn subscribe_once(
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return Err("hc events ended".into()),
         };
-        match hear(&line, address) {
+        match hear(&line, address, pid) {
             Heard::Closed => {
                 closed.store(true, Ordering::Relaxed);
                 return Ok(());
@@ -345,26 +413,69 @@ mod tests {
     #[test]
     fn events_are_read_as_hc_sends_them() {
         let finished = r#"{"jsonrpc":"2.0","method":"event","params":{"data":{"exit_code":1,"finished_ms":1,"reason":"killed","signal":null},"seq":816,"terminal":"t1f","type":"finished"}}"#;
-        assert_eq!(hear(finished, "t1f"), Heard::Closed);
-        assert_eq!(hear(finished, "t1d"), Heard::Nothing, "another terminal");
+        assert_eq!(hear(finished, "t1f", &mut None), Heard::Closed);
+        assert_eq!(
+            hear(finished, "t1d", &mut None),
+            Heard::Nothing,
+            "another terminal"
+        );
         let labels = r#"{"jsonrpc":"2.0","method":"event","params":{"data":{"labels":{}},"seq":812,"terminal":"t1f","type":"labels"}}"#;
-        assert_eq!(hear(labels, "t1f"), Heard::Nothing);
+        assert_eq!(hear(labels, "t1f", &mut None), Heard::Nothing);
         let status = r#"{"jsonrpc":"2.0","method":"event","params":{"data":{"status":"blocked"},"seq":9,"terminal":"t1f","type":"status"}}"#;
-        assert_eq!(hear(status, "t1f"), Heard::Status("blocked".into()));
+        assert_eq!(
+            hear(status, "t1f", &mut None),
+            Heard::Status("blocked".into())
+        );
         let record = r#"{"jsonrpc":"2.0","method":"event","params":{"data":{"state":"working"},"seq":9,"terminal":"t1f","type":"status"}}"#;
-        assert_eq!(hear(record, "t1f"), Heard::Status("working".into()));
+        assert_eq!(
+            hear(record, "t1f", &mut None),
+            Heard::Status("working".into())
+        );
     }
 
     /// A snapshot opens each subscription, and a fresh one follows `missed`.
     #[test]
     fn a_snapshot_says_whether_the_terminal_still_runs() {
         let live = r#"{"channel":null,"seq":811,"terminals":[{"address":"t1f","state":"live","status":"working"}]}"#;
-        assert_eq!(hear(live, "t1f"), Heard::Status("working".into()));
+        assert_eq!(
+            hear(live, "t1f", &mut None),
+            Heard::Status("working".into())
+        );
         let ended =
             r#"{"seq":811,"terminals":[{"address":"t1f","state":"finished","status":null}]}"#;
-        assert_eq!(hear(ended, "t1f"), Heard::Closed);
+        assert_eq!(hear(ended, "t1f", &mut None), Heard::Closed);
         let absent = r#"{"seq":811,"terminals":[]}"#;
-        assert_eq!(hear(absent, "t1f"), Heard::Closed);
+        assert_eq!(hear(absent, "t1f", &mut None), Heard::Closed);
+    }
+
+    /// As captured from herdr-core 0.1.21 after `kill -9` of a kept terminal.
+    #[test]
+    fn a_kept_terminal_that_lost_its_program_is_closed() {
+        let lost = r#"{"jsonrpc":"2.0","method":"event","params":{"data":{"exit_code":null,"finished_ms":null,"reason":"signaled","signal":9},"seq":150,"terminal":"t2t","type":"lost"}}"#;
+        assert_eq!(hear(lost, "t2t", &mut None), Heard::Closed);
+        let restarted = r#"{"jsonrpc":"2.0","method":"event","params":{"data":{"address":"t2t","argv":["/bin/zsh","-l"],"keep":true,"pid":3605,"state":"live"},"seq":151,"terminal":"t2t","type":"restarted"}}"#;
+        assert_eq!(hear(restarted, "t2t", &mut None), Heard::Closed);
+    }
+
+    /// A loss missed while reconnecting shows only as another pid.
+    #[test]
+    fn a_new_pid_in_a_later_snapshot_is_closed() {
+        let at = |pid: u32| {
+            format!(
+                r#"{{"seq":1,"terminals":[{{"address":"t2t","state":"live","pid":{pid},"status":"working"}}]}}"#
+            )
+        };
+        let mut pid = None;
+        assert_eq!(
+            hear(&at(3467), "t2t", &mut pid),
+            Heard::Status("working".into())
+        );
+        assert_eq!(pid, Some(3467));
+        assert_eq!(
+            hear(&at(3467), "t2t", &mut pid),
+            Heard::Status("working".into())
+        );
+        assert_eq!(hear(&at(3605), "t2t", &mut pid), Heard::Closed);
     }
 
     #[test]
@@ -383,8 +494,49 @@ mod tests {
         .unwrap();
         assert_eq!(pane_of(&listed, "t6").as_deref(), Some("p3"));
         assert_eq!(pane_of(&listed, "t7"), None);
-        assert_eq!(space_named(&listed, "pma: alpha").as_deref(), Some("sp1"));
-        assert_eq!(space_named(&listed, "pma: beta"), None);
+        assert_eq!(space_of(&listed, "sp1").unwrap()["name"], "pma: alpha");
+        assert!(space_of(&listed, "sp2").is_none());
+    }
+
+    #[test]
+    fn a_space_id_is_stable_and_distinct_per_project() {
+        assert_eq!(space_id("alpha"), "pma-alpha");
+        assert_eq!(space_id("my-app"), "pma-my-2dapp");
+        assert_eq!(space_id("My_App"), "pma--4dy-5f-41pp");
+        assert_ne!(space_id("a-b"), space_id("a_b"));
+        assert_ne!(space_id("a-2d"), space_id("a--2d"));
+    }
+
+    /// As measured: the app runs argv as `zsh -lic '"$@"; exec "$0" -li' zsh ...`.
+    #[test]
+    fn argv_is_wrapped_as_the_app_wraps_it() {
+        let argv = ["sh".to_string(), "/x/run.sh".to_string()];
+        assert_eq!(
+            wrapped(&argv, Some("/bin/zsh")),
+            [
+                "/bin/zsh",
+                "-lic",
+                r#""$@"; exec "$0" -li"#,
+                "/bin/zsh",
+                "sh",
+                "/x/run.sh"
+            ]
+        );
+        assert_eq!(wrapped(&argv, Some("/opt/homebrew/bin/fish"))[0], "/bin/sh");
+        assert_eq!(wrapped(&argv, None)[0], "/bin/sh");
+        assert!(
+            wrapped(&[], Some("/bin/zsh")).is_empty(),
+            "the core's own shell"
+        );
+    }
+
+    #[test]
+    fn a_space_named_after_its_folder_is_unnamed() {
+        let space = |name: &str, folder: &str| serde_json::json!({"name": name, "folder": folder});
+        assert!(unnamed(&space("tmp", "/private/tmp")));
+        assert!(unnamed(&space("~", "/Users/sa")));
+        assert!(!unnamed(&space("pma: alpha", "/w/alpha")));
+        assert!(!unnamed(&space("mine", "/w/alpha")));
     }
 
     #[test]
@@ -407,6 +559,9 @@ mod tests {
         let pane = start("live-probe", "probe", Path::new("/tmp"), &argv, Show::Back).unwrap();
         assert!(is_app(&pane), "{pane}");
         assert_eq!(window(&["status"]).unwrap()["tab"], before, "view kept");
+        let listed = window(&["ls"]).unwrap();
+        let space = space_of(&listed, &space_id("live-probe")).expect("placed by label");
+        assert_eq!(space["name"], "pma: live-probe");
         focus(&pane).unwrap();
         assert_ne!(
             window(&["status"]).unwrap()["tab"],
@@ -432,10 +587,8 @@ mod tests {
             stop.store(true, Ordering::Relaxed);
         });
         assert!(closed.load(Ordering::Relaxed), "closing was heard");
-        let listed = window(&["ls"]).unwrap();
-        if let Some(space) = space_named(&listed, "pma: live-probe") {
-            let _ = act("space.close", &["--id", &space, "--confirmed", "true"]);
-        }
+        let space = space_id("live-probe");
+        let _ = act("space.close", &["--id", &space, "--confirmed", "true"]);
         let _ = hc(&["rm", address(&pane)]);
     }
 }

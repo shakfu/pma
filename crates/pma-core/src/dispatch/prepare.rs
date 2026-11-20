@@ -635,14 +635,38 @@ fn failed_ci_logs(repo: &Path, workflows: &[String], runs: &[(String, String)]) 
             continue;
         };
         // A startup failure has no job log; the agent still gets the run id.
-        let log = gh(&["run", "view", &id.to_string(), "-R", &slug, "--log-failed"])
+        let id = id.to_string();
+        let log = gh(&["run", "view", &id, "-R", &slug, "--log-failed"])
             .map(|log| agent::tail(&log, CI_LOG_LINES))
             .unwrap_or_else(|e| format!("(no failed-job log: {e})"));
-        logs.push_str(&format!(
-            "Workflow `{workflow}`, run {id}, last {CI_LOG_LINES} lines of `gh run view --log-failed`:\n\n```\n{log}\n```\n\n"
-        ));
+        let jobs = || {
+            let each = r#".jobs[] | "- \(.name): \(.conclusion)""#;
+            gh(&[
+                "run", "view", &id, "-R", &slug, "--json", "jobs", "--jq", each,
+            ])
+            .unwrap_or_else(|e| format!("(jobs unknown: {e})"))
+        };
+        logs.push_str(&ci_log_section(workflow, &id, &log, jobs));
     }
     Ok(logs)
+}
+
+/// One workflow's part of a fix-CI prompt. An empty failed-job log means no
+/// step failed: a job cancelled or never started, as when a runner is lost.
+/// Its jobs are listed instead, and the agent is told CI itself may be at fault.
+fn ci_log_section(workflow: &str, id: &str, log: &str, jobs: impl FnOnce() -> String) -> String {
+    if !log.trim().is_empty() {
+        return format!(
+            "Workflow `{workflow}`, run {id}, last {CI_LOG_LINES} lines of `gh run view --log-failed`:\n\n```\n{log}\n```\n\n"
+        );
+    }
+    format!(
+        "Workflow `{workflow}`, run {id}: `gh run view --log-failed` is empty, so no step \
+         failed with a log. Its jobs:\n\n{}\n\nA job that was cancelled or never ran its \
+         steps points at CI itself, not the code. Read `gh run view {id} --log` first. If \
+         nothing in the code is wrong, change nothing and say so.\n\n",
+        jobs().trim_end()
+    )
 }
 
 /// Where an agent drafts changelog entries, relative to its worktree. pma
@@ -785,6 +809,25 @@ pub fn verify_command(cfg: &Config, project: &str, worktree: &Path) -> Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// As on minima's run 44529899074, attempt 1: a macOS job was cancelled
+    /// before any step, so `--log-failed` printed nothing.
+    #[test]
+    fn an_empty_ci_log_lists_the_jobs_and_says_ci_may_be_at_fault() {
+        let jobs = || "- test (macos-15): cancelled\n- lint (macos-15): success\n".to_string();
+        let empty = ci_log_section("ci", "44529899074", "\n", jobs);
+        assert!(
+            empty.contains("`gh run view --log-failed` is empty"),
+            "{empty}"
+        );
+        assert!(
+            empty.contains("- test (macos-15): cancelled\n- lint"),
+            "{empty}"
+        );
+        assert!(empty.contains("change nothing and say so"), "{empty}");
+        let full = ci_log_section("ci", "9", "assertion failed", || unreachable!());
+        assert!(full.contains("```\nassertion failed\n```"), "{full}");
+    }
     use crate::dispatch::tests::bundle;
 
     #[test]

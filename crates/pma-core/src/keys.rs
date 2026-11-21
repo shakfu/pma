@@ -691,7 +691,7 @@ pub static BINDINGS: &[Binding] = &[
         TASKS,
         Act::DispatchInteractive,
         Ask::Nothing,
-        "dispatch to drive in herdr",
+        "dispatch to drive yourself",
     ),
     // A run.
     on(
@@ -735,7 +735,7 @@ pub static BINDINGS: &[Binding] = &[
     on("F", RUNS, Act::FixConflicts, Ask::Confirm, "fix conflicts"),
     on("H", RUNS, Act::OpenPane, Ask::Nothing, "open in herdr"),
     // Opening a pane publishes nothing and spends nothing until it is used.
-    on("T", RUNS, Act::TakeOver, Ask::Nothing, "take over in herdr"),
+    on("T", RUNS, Act::TakeOver, Ask::Nothing, "take over"),
     // A project: the selected row's, or the one in view.
     on(
         "S",
@@ -991,6 +991,11 @@ pub const CLI_TABLE: &[(&str, &str, Scope)] = &[
         Scope::Runs,
     ),
     (
+        "take-over",
+        "Open an interactive agent on a finished run's directory",
+        Scope::Runs,
+    ),
+    (
         "close",
         "End a run and leave your files as they are",
         Scope::Runs,
@@ -1094,7 +1099,7 @@ pub const CLI_TABLE: &[(&str, &str, Scope)] = &[
     ),
     (
         "integrate",
-        "Where agents run, `herdr` or `none`, and a `minos` room",
+        "Where agents run: `herdr`, `herdr-app`, `minos` or `none`",
         Scope::None,
     ),
     ("agent", "The workers `pma dispatch` can run", Scope::None),

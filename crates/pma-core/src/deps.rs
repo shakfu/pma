@@ -5,8 +5,10 @@
 //! - cargo: `cargo update --dry-run`, transitive crates included.
 //! - uv: `uv lock --upgrade --dry-run`, transitive packages included.
 //! - go: `go list -u -m all`, direct modules with any newer version.
+//! - npm, pnpm: `update` with a lock-only flag on a copy of `package.json`
+//!   and the lock, compared with the lock; transitive packages included.
 //!
-//! None of the three writes to the project. Each needs the network.
+//! None writes to the project. Each needs the network.
 
 use std::path::Path;
 use std::process::Command;
@@ -20,10 +22,12 @@ use crate::scan::DepsFacts;
 const TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Each ecosystem, the root file that says it applies, and its lock.
-pub const ECOSYSTEMS: [(&str, &str, &str); 3] = [
+pub const ECOSYSTEMS: [(&str, &str, &str); 5] = [
     ("cargo", "Cargo.lock", "Cargo.lock"),
     ("uv", "uv.lock", "uv.lock"),
     ("go", "go.mod", "go.sum"),
+    ("npm", "package-lock.json", "package-lock.json"),
+    ("pnpm", "pnpm-lock.yaml", "pnpm-lock.yaml"),
 ];
 
 /// One package the lock would move. `current` is `none` for a package the
@@ -59,7 +63,8 @@ fn measure_with(dir: &Path, run: impl Fn(&str, &Path) -> Result<String, String>)
                         parse_cargo(&output)
                     }
                     "uv" => parse_uv(&output),
-                    _ => parse_go(&output),
+                    "go" => parse_go(&output),
+                    _ => parse_moves(&output),
                 };
                 found = Some(found.unwrap_or(0) + list.len() as i64);
                 detail.extend(
@@ -86,7 +91,9 @@ fn fixes(ecosystem: &str) -> &'static [&'static [&'static str]] {
     match ecosystem {
         "cargo" => &[&["cargo", "update"]],
         "uv" => &[&["uv", "lock", "--upgrade"]],
-        _ => &[&["go", "get", "-u", "./..."], &["go", "mod", "tidy"]],
+        "go" => &[&["go", "get", "-u", "./..."], &["go", "mod", "tidy"]],
+        "npm" => &[&["npm", "update"]],
+        _ => &[&["pnpm", "update"]],
     }
 }
 
@@ -99,10 +106,8 @@ pub fn refresh(dir: &Path) -> Result<(), String> {
         .map(|(ecosystem, _, _)| *ecosystem)
         .collect();
     if present.is_empty() {
-        return Err(format!(
-            "{}: no Cargo.lock, uv.lock or go.mod",
-            dir.display()
-        ));
+        let markers: Vec<&str> = ECOSYSTEMS.iter().map(|(_, m, _)| *m).collect();
+        return Err(format!("{}: none of {}", dir.display(), markers.join(", ")));
     }
     for argv in present.into_iter().flat_map(fixes) {
         let line = argv.join(" ");
@@ -121,7 +126,7 @@ pub fn refresh(dir: &Path) -> Result<(), String> {
 
 /// The tool's output, or why it failed.
 fn run(ecosystem: &str, dir: &Path) -> Result<String, String> {
-    let mut cmd = match ecosystem {
+    let cmd = match ecosystem {
         "cargo" => {
             let mut c = Command::new("cargo");
             c.args(["update", "--dry-run"]);
@@ -132,6 +137,7 @@ fn run(ecosystem: &str, dir: &Path) -> Result<String, String> {
             c.args(["lock", "--upgrade", "--dry-run"]);
             c
         }
+        "npm" | "pnpm" => return node_moves(ecosystem, dir),
         _ => {
             let mut c = Command::new("go");
             c.args([
@@ -145,6 +151,11 @@ fn run(ecosystem: &str, dir: &Path) -> Result<String, String> {
             c
         }
     };
+    limited(cmd, dir)
+}
+
+/// `cmd`'s output in `dir`, bounded by `TIMEOUT`, or why it failed.
+fn limited(mut cmd: Command, dir: &Path) -> Result<String, String> {
     cmd.current_dir(dir)
         .env("NO_COLOR", "1")
         .env("CARGO_TERM_COLOR", "never");
@@ -163,6 +174,148 @@ fn run(ecosystem: &str, dir: &Path) -> Result<String, String> {
         Some(false) => Err(agent::tail(&output, 1)),
         Some(true) => Ok(output),
     }
+}
+
+/// What `npm update` or `pnpm update` would move, as `name current -> latest`
+/// lines. Neither has a dry run that reads the lock alone: npm's compares
+/// with `node_modules`, which a clone lacks. So each updates the lock alone
+/// in a copy of the manifest and lock, and the two locks are compared.
+fn node_moves(ecosystem: &str, dir: &Path) -> Result<String, String> {
+    let lock = match ecosystem {
+        "npm" => "package-lock.json",
+        _ => "pnpm-lock.yaml",
+    };
+    let manifest = std::fs::read_to_string(dir.join("package.json"))
+        .map_err(|e| format!("package.json: {e}"))?;
+    let workspaces = serde_json::from_str::<serde_json::Value>(&manifest)
+        .is_ok_and(|v| v.get("workspaces").is_some());
+    if workspaces || dir.join("pnpm-workspace.yaml").is_file() {
+        return Err("workspaces are not measured".into());
+    }
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let copy = std::env::temp_dir().join(format!(
+        "pma-deps-{ecosystem}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&copy).map_err(|e| format!("{}: {e}", copy.display()))?;
+    let moved = (|| -> Result<Vec<Outdated>, String> {
+        for file in ["package.json", lock, ".npmrc"] {
+            if dir.join(file).is_file() {
+                std::fs::copy(dir.join(file), copy.join(file))
+                    .map_err(|e| format!("{file}: {e}"))?;
+            }
+        }
+        let read =
+            |d: &Path| std::fs::read_to_string(d.join(lock)).map_err(|e| format!("{lock}: {e}"));
+        let before = read(&copy)?;
+        let mut cmd = Command::new(ecosystem);
+        cmd.args(match ecosystem {
+            "npm" => &[
+                "update",
+                "--package-lock-only",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+            ][..],
+            _ => &["update", "--lockfile-only", "--ignore-scripts"],
+        });
+        limited(cmd, &copy)?;
+        let after = read(&copy)?;
+        let versions = |t: &str| match ecosystem {
+            "npm" => npm_versions(t),
+            _ => Ok(pnpm_versions(t)),
+        };
+        Ok(moves(&versions(&before)?, &versions(&after)?))
+    })();
+    let _ = std::fs::remove_dir_all(&copy);
+    Ok(moved?
+        .iter()
+        .map(|o| format!("{} {} -> {}", o.name, o.current, o.latest))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Each installed package and its version in a `package-lock.json`, from its
+/// `packages` map; a linked workspace package has none.
+fn npm_versions(lock: &str) -> Result<Vec<(String, String)>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(lock).map_err(|e| format!("package-lock.json: {e}"))?;
+    let packages = v["packages"]
+        .as_object()
+        .ok_or("package-lock.json has no `packages`; npm 7 or later writes it")?;
+    Ok(packages
+        .iter()
+        .filter_map(|(path, p)| {
+            let name = path.rsplit_once("node_modules/")?.1;
+            Some((name.to_string(), p["version"].as_str()?.to_string()))
+        })
+        .collect())
+}
+
+/// Each `name@version` key of a `pnpm-lock.yaml`'s `packages` section;
+/// lockfile 6 starts keys with `/`, and either may carry a `(peer)` suffix.
+fn pnpm_versions(lock: &str) -> Vec<(String, String)> {
+    lock.lines()
+        .skip_while(|l| *l != "packages:")
+        .skip(1)
+        .take_while(|l| l.is_empty() || l.starts_with(' '))
+        .filter(|l| l.starts_with("  ") && !l.starts_with("   ") && l.ends_with(':'))
+        .filter_map(|l| {
+            let key = l.trim().trim_end_matches(':').trim_matches('\'');
+            let key = key.strip_prefix('/').unwrap_or(key);
+            let key = key.split('(').next()?;
+            let at = key.rfind('@').filter(|&i| i > 0)?;
+            Some((key[..at].to_string(), key[at + 1..].to_string()))
+        })
+        .collect()
+}
+
+/// The packages whose locked versions differ, each version list joined as
+/// uv joins one; `none` where a lock has no such package.
+fn moves(before: &[(String, String)], after: &[(String, String)]) -> Vec<Outdated> {
+    use std::collections::BTreeMap;
+    let index = |list: &[(String, String)]| {
+        let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (name, version) in list {
+            by.entry(name.clone()).or_default().push(version.clone());
+        }
+        for versions in by.values_mut() {
+            versions.sort();
+            versions.dedup();
+        }
+        by
+    };
+    let (was, now) = (index(before), index(after));
+    let joined = |v: Option<&Vec<String>>| v.map_or("none".to_string(), |v| v.join(", "));
+    let mut names: Vec<&String> = was.keys().chain(now.keys()).collect();
+    names.sort();
+    names.dedup();
+    names
+        .into_iter()
+        .filter(|n| was.get(*n) != now.get(*n))
+        .map(|n| Outdated {
+            name: n.clone(),
+            current: joined(was.get(n)),
+            latest: joined(now.get(n)),
+        })
+        .collect()
+}
+
+/// `name current -> latest` lines, as `node_moves` writes them.
+fn parse_moves(output: &str) -> Vec<Outdated> {
+    output
+        .lines()
+        .filter_map(|l| {
+            let (name, versions) = l.split_once(' ')?;
+            let (current, latest) = versions.split_once(" -> ")?;
+            Some(Outdated {
+                name: name.into(),
+                current: current.into(),
+                latest: latest.into(),
+            })
+        })
+        .collect()
 }
 
 /// `Updating clap v4.6.6 -> v4.6.7`, `Downgrading`, `Adding` and `Removing`
@@ -307,10 +460,93 @@ mod tests {
     }
 
     #[test]
+    fn npm_locks_list_each_installed_version() {
+        let lock = r#"{"name":"y","lockfileVersion":3,"packages":{
+            "":{"name":"y","dependencies":{"debug":"^2.0.0"}},
+            "node_modules/debug":{"version":"2.6.0"},
+            "node_modules/ms":{"version":"0.7.2"},
+            "node_modules/debug/node_modules/ms":{"version":"0.7.1"},
+            "node_modules/@scope/pkg":{"version":"1.0.0"},
+            "node_modules/local":{"resolved":"packages/local","link":true}}}"#;
+        let mut got = npm_versions(lock).unwrap();
+        got.sort();
+        let want: Vec<(String, String)> = [
+            ("@scope/pkg", "1.0.0"),
+            ("debug", "2.6.0"),
+            ("ms", "0.7.1"),
+            ("ms", "0.7.2"),
+        ]
+        .iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(got, want);
+        assert!(
+            npm_versions(r#"{"lockfileVersion":1,"dependencies":{}}"#)
+                .unwrap_err()
+                .contains("npm 7")
+        );
+    }
+
+    #[test]
+    fn pnpm_locks_list_their_packages_section() {
+        let v9 = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      debug:\n        specifier: ^2.0.0\n        version: 2.6.0\n\npackages:\n\n  '@sindresorhus/is@4.0.0':\n    resolution: {integrity: sha512-x}\n    engines: {node: '>=10'}\n\n  debug@2.6.0:\n    resolution: {integrity: sha512-y}\n    peerDependencies:\n      supports-color: '*'\n\n  ms@0.7.2:\n    resolution: {integrity: sha512-z}\n\nsnapshots:\n\n  debug@2.6.0:\n    dependencies:\n      ms: 0.7.2\n";
+        assert_eq!(
+            pnpm_versions(v9),
+            [
+                ("@sindresorhus/is".to_string(), "4.0.0".to_string()),
+                ("debug".into(), "2.6.0".into()),
+                ("ms".into(), "0.7.2".into()),
+            ]
+        );
+        let v6 = "lockfileVersion: '6.0'\n\npackages:\n\n  /react-dom@18.2.0(react@18.2.0):\n    resolution: {integrity: sha512-a}\n";
+        assert_eq!(
+            pnpm_versions(v6),
+            [("react-dom".to_string(), "18.2.0".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_lock_moves_where_a_package_changes_versions() {
+        let list = |l: &[(&str, &str)]| -> Vec<(String, String)> {
+            l.iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect()
+        };
+        let before = list(&[
+            ("debug", "2.6.0"),
+            ("ms", "0.7.2"),
+            ("ms", "0.7.1"),
+            ("old", "1.0.0"),
+            ("same", "1.0.0"),
+        ]);
+        let after = list(&[
+            ("debug", "2.6.9"),
+            ("ms", "2.0.0"),
+            ("new", "1.0.0"),
+            ("same", "1.0.0"),
+        ]);
+        let out = names(moves(&before, &after));
+        assert_eq!(
+            out,
+            [
+                "debug 2.6.0 2.6.9",
+                "ms 0.7.1, 0.7.2 2.0.0",
+                "new none 1.0.0",
+                "old 1.0.0 none"
+            ]
+        );
+        let written =
+            "debug 2.6.0 -> 2.6.9\nms 0.7.1, 0.7.2 -> 2.0.0\nnew none -> 1.0.0\nold 1.0.0 -> none";
+        assert_eq!(names(parse_moves(written)), out);
+    }
+
+    #[test]
     fn each_fix_is_its_measure_without_the_dry_run() {
         assert_eq!(fixes("cargo"), [["cargo", "update"]]);
         assert_eq!(fixes("uv"), [["uv", "lock", "--upgrade"]]);
         assert_eq!(fixes("go").len(), 2);
+        assert_eq!(fixes("npm"), [["npm", "update"]]);
+        assert_eq!(fixes("pnpm"), [["pnpm", "update"]]);
     }
 
     #[test]
@@ -343,9 +579,9 @@ mod tests {
             }
         );
         assert!(
-            refresh(&dir)
-                .unwrap_err()
-                .ends_with("no Cargo.lock, uv.lock or go.mod")
+            refresh(&dir).unwrap_err().ends_with(
+                "none of Cargo.lock, uv.lock, go.mod, package-lock.json, pnpm-lock.yaml"
+            )
         );
         let _ = std::fs::remove_dir_all(dir);
     }

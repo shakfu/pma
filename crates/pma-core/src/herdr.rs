@@ -605,10 +605,12 @@ pub struct Host<'a> {
     /// Whether a run that succeeds closes its tab: a workflow's many nodes
     /// have no review to close them at.
     pub close_after: bool,
+    /// Under minos, the room a broker holds the agent in, and its events.
+    pub room: Option<(&'a str, &'a Path)>,
 }
 
 /// Runs an agent: in a herdr pane or Herdr.app tab under `pma integrate`,
-/// otherwise as a child. `on_pane` hears which pane. With neither server the
+/// otherwise, minos included, as a child. `on_pane` hears which pane. With neither server the
 /// run goes on as a child and says so, so unattended work does not stop with
 /// the terminal.
 pub fn host(
@@ -641,10 +643,27 @@ pub fn host(
         Integration::None => {
             if host.interactive {
                 return Err(std::io::Error::other(
-                    "an interactive run needs `pma integrate herdr` or `herdr-app`",
+                    "an interactive run needs `pma integrate herdr`, `herdr-app` or `minos`",
                 ));
             }
             return without(cmd, String::new());
+        }
+        // A child of pma, as with none. A person drives an interactive one
+        // from its room, and ends it, so it has no timeout.
+        Integration::Minos => {
+            let limit = if host.interactive {
+                Duration::MAX
+            } else {
+                timeout
+            };
+            let (room, events) = host.room.unzip();
+            let room = room.filter(|_| front);
+            let watched = crate::minos::Watched {
+                room,
+                events,
+                person: host.interactive,
+            };
+            return crate::minos::host(&cfg.minos, watched, cmd, log, limit, on_state);
         }
         Integration::HerdrApp => {
             if let Err(e) = app::check() {

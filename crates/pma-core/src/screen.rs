@@ -2409,7 +2409,7 @@ pub fn question(act: Act, pick: &Pick) -> String {
     let verb = match act {
         Act::Dispatch => "dispatch",
         Act::DispatchPush => "dispatch, and push when clean,",
-        Act::DispatchInteractive => "dispatch, to drive in herdr,",
+        Act::DispatchInteractive => "dispatch, to drive yourself,",
         Act::TakeOver => "open an interactive agent on",
         Act::RejectRun => "reject",
         Act::ForgetRun => "close, leaving its files as they are,",

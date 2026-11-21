@@ -250,6 +250,64 @@ fn denial_line(text: &str) -> String {
     }
 }
 
+/// An ACP run, from its `-events` (minos `docs/minosb-events.md`); its stdout
+/// is JSON-RPC. As for a relayed claude run, the summary is every turn's reply
+/// and a last turn a person cancelled is not a failure. The cost is the last
+/// `usage`, a session total, and only when in USD.
+pub fn parse_acp(events: &str, exit_ok: bool) -> Report {
+    let records: Vec<serde_json::Value> = events
+        .lines()
+        .filter_map(|l| serde_json::from_str(l.trim()).ok())
+        .collect();
+    let of = |name: &str| {
+        records
+            .iter()
+            .filter(move |v| v["event"] == name)
+            .collect::<Vec<_>>()
+    };
+    let results = of("result");
+    let replies: Vec<&str> = results
+        .iter()
+        .filter_map(|v| v["text"].as_str())
+        .filter(|t| !t.trim().is_empty())
+        .collect();
+    let last = results.last();
+    let failed = last.and_then(|v| v["error"].as_str());
+    let stop = last.and_then(|v| v["stop_reason"].as_str());
+    Report {
+        ok: exit_ok && failed.is_none() && matches!(stop, Some("end_turn" | "cancelled")),
+        summary: match (replies.as_slice(), failed, stop) {
+            ([], Some(e), _) => format!("turn failed: {e}"),
+            ([], None, Some(s)) => s.to_string(),
+            ([], None, None) => "the agent gave no result".to_string(),
+            ([one], ..) => (*one).to_string(),
+            (many, ..) => many
+                .iter()
+                .enumerate()
+                .map(|(i, r)| format!("Turn {}: {r}", i + 1))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        },
+        cost_usd: of("usage")
+            .last()
+            .filter(|v| v["currency"] == "USD")
+            .and_then(|v| v["cost"].as_f64()),
+        denied: of("permission")
+            .iter()
+            .filter(|v| v["outcome"] == "denied")
+            .map(|v| {
+                let field = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+                denial_line(&format!(
+                    "{} {}: {}",
+                    field("kind"),
+                    field("tool"),
+                    field("input")
+                ))
+            })
+            .collect(),
+    }
+}
+
 /// The result's `permission_denials`, then each tool result the auto mode
 /// classifier refused that they left out. Both are read because the classifier
 /// has not been seen to fill the result's list.
@@ -431,9 +489,29 @@ pub fn tail(text: &str, lines: usize) -> String {
     all[all.len().saturating_sub(lines)..].join("\n")
 }
 
+/// Whether `program` is an executable file in a `PATH` directory.
+pub(crate) fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            std::fs::metadata(dir.join(program)).is_ok_and(|m| {
+                use std::os::unix::fs::PermissionsExt;
+                m.is_file() && m.permissions().mode() & 0o111 != 0
+            })
+        })
+    })
+}
+
 /// The first of `make test`, `cargo test`, `go test ./...`, `npm test` and
 /// pytest that the project's files support.
 pub fn detect_verify(dir: &Path) -> Option<String> {
+    detect_verify_with(dir, on_path("uv"))
+}
+
+/// Without `uv.lock`, pytest runs in a throwaway uv environment holding the
+/// project, its extras and groups, and pytest; system `python3` has none of
+/// them. Poetry 1 keeps dependencies outside `[project]`, where uv cannot
+/// read them, so a `poetry.lock` means Poetry.
+fn detect_verify_with(dir: &Path, uv: bool) -> Option<String> {
     let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
     let has_test_target = ["GNUmakefile", "makefile", "Makefile"]
         .iter()
@@ -452,11 +530,15 @@ pub fn detect_verify(dir: &Path) -> Option<String> {
         return Some("npm test".into());
     }
     if dir.join("pyproject.toml").is_file() {
-        return Some(if dir.join("uv.lock").is_file() {
-            "uv run pytest".into()
-        } else {
-            "python3 -m pytest".into()
-        });
+        return Some(
+            match () {
+                _ if dir.join("uv.lock").is_file() => "uv run pytest",
+                _ if dir.join("poetry.lock").is_file() => "poetry run pytest",
+                _ if uv => "uv run --isolated --all-extras --all-groups --with pytest pytest",
+                _ => "python3 -m pytest",
+            }
+            .into(),
+        );
     }
     None
 }
@@ -568,6 +650,47 @@ mod tests {
 
     /// A corrected run reports every turn, an interrupted last turn leaves the
     /// verdict to verify, and the cost is the session's whole total.
+    /// An ACP run is read from its events: every turn's reply, the last
+    /// session total in USD, and each denial.
+    #[test]
+    fn an_acp_run_is_read_from_its_events() {
+        let events = [
+            r#"{"event":"ready","room":"r1"}"#,
+            r#"{"event":"permission","tool":"Write a.txt","kind":"edit","input":"{\"path\":\"a.txt\"}","outcome":"denied","by":"policy"}"#,
+            r#"{"event":"permission","tool":"ls","kind":"execute","input":"{}","outcome":"allowed","by":"policy"}"#,
+            r#"{"event":"usage","cost":0.02,"currency":"USD"}"#,
+            r#"{"event":"result","text":"Added it.","stop_reason":"end_turn"}"#,
+            r#"{"event":"usage","cost":0.05,"currency":"USD"}"#,
+            r#"{"event":"result","text":"Renamed it.","stop_reason":"cancelled"}"#,
+            r#"{"event":"turn","delivering":0}"#,
+        ]
+        .join("\n");
+        let r = parse_acp(&events, true);
+        assert!(r.ok, "a cancelled last turn leaves it to verify");
+        assert_eq!(r.summary, "Turn 1: Added it.\n\nTurn 2: Renamed it.");
+        assert_eq!(r.cost_usd, Some(0.05), "cumulative: the last stands");
+        assert_eq!(r.denied, [r#"edit Write a.txt: {"path":"a.txt"}"#]);
+
+        let credits = r#"{"event":"usage","cost":3,"currency":"credits"}
+{"event":"result","text":"","stop_reason":"refusal"}"#;
+        let r = parse_acp(credits, true);
+        assert!(!r.ok);
+        assert_eq!((r.summary.as_str(), r.cost_usd), ("refusal", None));
+
+        let failed = r#"{"event":"result","text":"","error":"-32603: boom"}"#;
+        let r = parse_acp(failed, true);
+        assert!(!r.ok);
+        assert_eq!(r.summary, "turn failed: -32603: boom");
+        assert!(!parse_acp(r#"{"event":"ready"}"#, true).ok);
+        assert!(
+            !parse_acp(
+                r#"{"event":"result","text":"x","stop_reason":"end_turn"}"#,
+                false
+            )
+            .ok
+        );
+    }
+
     #[test]
     fn a_relayed_run_reads_every_turn() {
         let turn = |subtype: &str, error: bool, result: &str, cost: f64| {
@@ -628,7 +751,17 @@ mod tests {
         let dir = scratch("verify");
         assert_eq!(detect_verify(&dir), None);
         std::fs::write(dir.join("pyproject.toml"), "").unwrap();
-        assert_eq!(detect_verify(&dir).as_deref(), Some("python3 -m pytest"));
+        let python = |uv| detect_verify_with(&dir, uv);
+        assert_eq!(python(false).as_deref(), Some("python3 -m pytest"));
+        assert_eq!(
+            python(true).as_deref(),
+            Some("uv run --isolated --all-extras --all-groups --with pytest pytest"),
+            "no lock: a throwaway environment with the project's dependencies"
+        );
+        std::fs::write(dir.join("poetry.lock"), "").unwrap();
+        assert_eq!(python(true).as_deref(), Some("poetry run pytest"));
+        std::fs::write(dir.join("uv.lock"), "").unwrap();
+        assert_eq!(python(true).as_deref(), Some("uv run pytest"));
         std::fs::write(dir.join("Cargo.toml"), "").unwrap();
         assert_eq!(detect_verify(&dir).as_deref(), Some("cargo test"));
         std::fs::write(dir.join("Makefile"), "build:\n\tcc\n").unwrap();

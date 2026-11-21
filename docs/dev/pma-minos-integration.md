@@ -91,3 +91,29 @@ Decided by the user 2026-11-05.
 4. **Server down.** The run goes on without a room and warns.
 
 5. **Shape.** A setting of its own, `minos.*`, not a third `integration` value. herdr chooses where the agent process runs and `minosb` wraps its command, so the two combine. Non-`claude` workers get the room through `minosa` (issue 12).
+
+## minos as the backend, 2026-11-20
+
+Decided by the user: minos becomes where agents run, a third `integration` value that excludes herdr and herdr-app. This reverses decision 5. Running both wrapped one process in a herdr pane and a broker, and the combinations were too complicated to keep. Decision 1 changes with it: `T` now runs in the room, not in herdr. The minos side is in minos `TODO.md`, items marked `pma backend`.
+
+Built in pma, schema 54:
+
+- `integration = minos`. The migration maps `minos.enabled = on` to it when no herdr backend is chosen, and retires the key either way.
+- `I` relays through `minosb` with `-task` and `-linger 0s`, and pma gives it no timeout. A person ends it with `/end` in the room, which minos added on 2026-11-20 (uncommitted there), or by stopping pma. It needs a worker with a relay form. With no room it fails rather than running without one.
+- `T` queues the job `pma take-over <id>`, which holds no lock. It runs the run's relaying worker, else the default one, in `runs.room`, with the take-over prompt as its first frame. It starts a new session; it does not resume the earlier one.
+- `H` names the room. A shell runs on the terminal, as with no backend.
+
+Also built, on minos's `pushed` event and `minos -room ID -exit-with USER` (2026-11-20, uncommitted in minos):
+
+- A run's state comes from its `-events` while it runs. `pushed` is working. A `turn` with nothing to deliver is `blocked` when a person drives the run, which raises pma's "needs you", and `idle` otherwise, so an unattended run does not notify each turn.
+- An `I` or `T` started on a terminal opens the person's client in the room, without the run's passwords. The client returns when the broker leaves the room. pma kills it when the broker ends first or never entered, since the client then cannot see it leave.
+
+`pma integrate` runs `minos ping` as each of the run's account and the administrator. It reports a missing server (exit 3), a refused account (exit 4), and any capability pma uses that the list lacks. A minos without `ping` gets five seconds and no terminal, since it would start its client.
+
+Not used yet: the `session` event. `T` starts a new session with the earlier instructions; resuming the run's own session would need its id stored on the run.
+
+Not built, waiting on minos:
+
+- Moving a client already open into a room, for `H` from the web.
+- An agent other than claude driving `I` or `T`: adapters.
+- An end that lets `minosb` post its closing note when pma stops: pma kills the group with SIGKILL.

@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::Integration;
 use crate::minos::{Link, Sidecar};
 
 /// How much sooner a worker that bounds itself is told to stop. A worker given
@@ -357,11 +358,19 @@ fn attempt_steps(
         None => run.prompt.clone(),
     };
     a.verify = run.verify.clone();
-    // Not for a run a person drives: they are at its terminal already.
-    let link = match cfg.minos.enabled && !run.interactive {
-        true => crate::minos::open(&cfg.minos, home, run, n)
-            .inspect_err(|e| eprintln!("warning: #{}: no minos room: {e}", run.id))
-            .ok(),
+    // A person drives an interactive run from its room, so without the room
+    // there is no run; an unattended one goes on without it.
+    let link = match cfg.integration == Integration::Minos {
+        true => match crate::minos::open(&cfg.minos, home, run, n) {
+            Ok(l) => Some(l),
+            Err(e) if run.interactive => {
+                return Err(format!("an interactive run needs its minos room: {e}"));
+            }
+            Err(e) => {
+                eprintln!("warning: #{}: no minos room: {e}", run.id);
+                None
+            }
+        },
         false => None,
     };
     let launch = launch(&s, run, a, link.as_ref())?;
@@ -392,6 +401,15 @@ fn launch<'l>(
         )?;
         Some((l, cmd))
     });
+    // In a room, a person drives an agent through its relay form: one that
+    // only reads the room when it chooses cannot be driven.
+    let in_room = run.interactive && link.is_some();
+    if in_room && own.is_none() && relay.is_none() {
+        return Err(format!(
+            "an interactive run under minos needs a worker with a relay form; `{}` has none",
+            worker.name
+        ));
+    }
     let mut side = None;
     if let Some(l) = link.filter(|_| own.is_none() && relay.is_none()) {
         match crate::minos::serve(&cfg.minos, l, &s.log("minosb")) {
@@ -404,13 +422,14 @@ fn launch<'l>(
         }
     }
     let session = (run.interactive
+        && !in_room
         && worker
             .interactive_args
             .iter()
             .any(|a| a.contains("{session}")))
     .then(agent::new_session_id)
     .flatten();
-    let built = match run.interactive {
+    let built = match run.interactive && !in_room {
         true => worker.build_interactive(
             &a.prompt,
             &run.worktree,
@@ -436,7 +455,7 @@ fn launch<'l>(
     let wrapped = relay.and_then(|(l, relay_cmd)| {
         let adapter = worker.relay.as_deref().unwrap_or_default();
         confine_agent(worker, run, &s.agent_env, relay_cmd)
-            .and_then(|c| crate::minos::wrap(&cfg.minos, l, adapter, &a.prompt, &c))
+            .and_then(|c| crate::minos::wrap(&cfg.minos, l, adapter, &a.prompt, &c, in_room))
             .inspect_err(|e| eprintln!("warning: #{}: no minos room: {e}", run.id))
             .ok()
             .map(|w| (l, w))
@@ -476,7 +495,8 @@ fn host_agent(
             eprintln!("warning: #{id}: {e}");
         }
     };
-    if cfg.minos.enabled {
+    let minos = cfg.integration == Integration::Minos;
+    if minos {
         set_room(room.as_deref());
     }
     a.started_at = crate::dates::now();
@@ -484,7 +504,7 @@ fn host_agent(
     let log = s.log("agent");
     let title = format!("#{} {}", run.id, run.text);
     let (project, interactive) = (run.project.clone(), run.interactive);
-    let host = |cmd: Command| {
+    let host = |cmd: Command, room: Option<&Link>| {
         crate::herdr::host(
             cfg,
             crate::herdr::Host {
@@ -492,6 +512,7 @@ fn host_agent(
                 title: &title,
                 interactive,
                 close_after: false,
+                room: room.map(|l| (l.room.as_str(), l.events.as_path())),
             },
             cmd,
             &log,
@@ -513,12 +534,23 @@ fn host_agent(
     // A broker that never entered its room ran no agent: the run goes on
     // without the room rather than failing for it.
     let mut relayed = false;
+    let events = wrapped.as_ref().map(|(l, _)| l.events.clone());
     let hosted = match wrapped {
         Some((l, w)) => {
-            let hosted = host(w);
+            if interactive {
+                eprintln!(
+                    "#{id} is in minos room {} ({}): talk to the agent there. It ends when \
+                     the agent exits, or with Ctrl-C here or `pma job stop`.",
+                    l.room, project
+                );
+            }
+            let hosted = host(w, Some(l));
             if crate::minos::ready(&l.events) {
                 relayed = true;
                 hosted
+            } else if interactive {
+                let why = agent::read_log(&log).map_or_else(String::new, |t| agent::tail(&t, 1));
+                return Err(format!("minosb did not enter room {}: {why}", l.room));
             } else {
                 let why = agent::read_log(&log).map_or_else(String::new, |t| agent::tail(&t, 1));
                 eprintln!(
@@ -527,16 +559,31 @@ fn host_agent(
                 );
                 room = None;
                 set_room(None);
-                host(cmd)
+                host(cmd, None)
             }
         }
-        None => host(cmd),
+        None => host(cmd, None),
     };
     run.room = room;
     let finished = hosted.map_err(|e| format!("{}: {e}", worker.command))?;
     let output = || agent::read_log(&log).unwrap_or_default();
     // A person drove it in a terminal, so there is no event stream to read.
     let report = match run.interactive {
+        // A person's correction starts another turn of the same session.
+        // Its stdout is JSON-RPC; minosb reports each turn in `-events`.
+        _ if relayed && worker.relay.as_deref() == Some("acp") => agent::parse_acp(
+            &events
+                .and_then(|e| std::fs::read_to_string(e).ok())
+                .unwrap_or_default(),
+            finished.success == Some(true),
+        ),
+        _ if relayed && worker.parse == crate::worker::Parser::ClaudeJson => {
+            agent::parse_relayed(&output())
+        }
+        // A one-shot CLI under `-agent-spec`: one result record per turn.
+        _ if relayed => worker
+            .parse
+            .report_turns(&output(), finished.success == Some(true)),
         true => {
             let cost_usd = session.as_deref().and_then(agent::session_cost);
             let what = if cost_usd.is_some() {
@@ -551,8 +598,6 @@ fn host_agent(
                 denied: Vec::new(),
             }
         }
-        // A person's correction starts another turn of the same session.
-        false if relayed => agent::parse_relayed(&output()),
         false => worker
             .parse
             .report(&output(), finished.success == Some(true)),
@@ -676,6 +721,70 @@ fn confine_agent(
     cmd.current_dir(&run.worktree);
     agent::restrict(&mut cmd, agent_env).map_err(|e| format!("{}: {e}", agent_env.display()))?;
     Ok(cmd)
+}
+
+/// A take-over under minos: a session a person drives from the run's room,
+/// on the run's directory, held by this process until it ends. The run's own
+/// worker when it relays, else the default.
+pub fn take_over_in_room(store: &Store, cfg: &Config, run: &Run, prompt: &str) -> Result<String> {
+    let home = crate::store::state_home()?;
+    let workers = store.agents()?;
+    let relays = |name: &str| workers.iter().find(|w| w.name == name && w.relay.is_some());
+    let worker = relays(&run.agent)
+        .or_else(|| relays(&cfg.agent))
+        .ok_or_else(|| {
+            format!(
+                "a take-over under minos needs a worker with a relay form; `{}` and `{}` have none",
+                run.agent, cfg.agent
+            )
+        })?;
+    let model = run.model.as_deref().filter(|_| worker.name == run.agent);
+    let logs = home.join("runs").join(run.id.to_string());
+    std::fs::create_dir_all(&logs).map_err(|e| format!("{}: {e}", logs.display()))?;
+    // The broker's files are named by number; an attempt's number is taken.
+    let n = (1..)
+        .find(|n| {
+            !logs.join(format!("agent-{n}.log")).exists()
+                && !logs.join(format!("minos-{n}.events")).exists()
+        })
+        .unwrap_or(1);
+    let mut link = crate::minos::open(&cfg.minos, &home, run, n)?;
+    // The run's own room holds what it was told and what it said.
+    if let Some(room) = &run.room {
+        link.room = room.clone();
+    }
+    let timeout = Duration::from_secs(cfg.timeout as u64 * 60);
+    let cmd = worker
+        .build_relay(&run.worktree, model, cfg.agent_budget, &[], timeout, &link)
+        .ok_or_else(|| format!("agent `{}` has no `relay_args`", worker.name))?;
+    let cmd = confine_agent(worker, run, &home.join("agent-env"), cmd)?;
+    let adapter = worker.relay.as_deref().unwrap_or_default();
+    let wrapped = crate::minos::wrap(&cfg.minos, &link, adapter, prompt, &cmd, true)?;
+    let log = logs.join(format!("take-over-{n}.log"));
+    eprintln!(
+        "#{} take-over is in minos room {} ({}): talk to the agent there. It ends when the \
+         agent exits, or with Ctrl-C here or `pma job stop`.",
+        run.id, link.room, run.project
+    );
+    let front = crate::jobs::current().is_none();
+    let watched = crate::minos::Watched {
+        room: front.then_some(link.room.as_str()),
+        events: None,
+        person: true,
+    };
+    let finished = crate::minos::host(&cfg.minos, watched, wrapped, &log, Duration::MAX, |_| {})?;
+    if !crate::minos::ready(&link.events) {
+        let why = agent::read_log(&log).map_or_else(String::new, |t| agent::tail(&t, 1));
+        return Err(format!("minosb did not enter room {}: {why}", link.room).into());
+    }
+    Ok(match finished.success {
+        Some(true) => format!("Take-over of run #{} ended.", run.id),
+        _ => format!(
+            "Take-over of run #{} ended with a failure; log: {}",
+            run.id,
+            log.display()
+        ),
+    })
 }
 
 /// Why a worker cannot start a session a person drives.

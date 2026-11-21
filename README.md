@@ -92,13 +92,15 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 **Talking to a run in minos**
 
-- `pma integrate minos` gives each run a [minos](https://github.com/shakfu/minos) room, where you read the agent and correct it between turns. It works beside `herdr` or `herdr-app`: steer a run in its room, then take it over with `T`. `pma integrate minos --off` turns it off; `pma integrate` shows what is on.
+- `pma integrate minos` makes [minos](https://github.com/shakfu/minos) where agents run, in place of `herdr` or `herdr-app`. Each run gets a room where you read the agent and correct it between turns. `pma integrate minos --off` turns it off; `pma integrate` shows which backend is on.
+
+- `I` (`dispatch --interactive`) and `T` (`pma take-over <id>`) are driven from the room. The agent starts on the task, or on the take-over prompt, and waits for you between turns. It ends when the agent exits: `/end` in the room, Ctrl-C on a foreground run, or `pma job stop` on one the TUI or web queued. Such a run needs a worker with a `relay`. Started from a terminal, it opens the `minos` client in the room, which returns when the run stops; one queued from the TUI or web leaves you to enter the room, which `H` names. A run waiting on you between turns shows as blocked and raises a notice, as herdr's do.
 
 - `pma` reads two passwords from its environment and stores neither: `MINOS_PASSWORD` for the run's account (`minos.user`, default `worker`) and `MINOS_ADMIN_PASSWORD` for the administrator who founds rooms (`minos.admin`, default `demo`). An unset one is the account name, as in minosd's development accounts; `pma config minos.dev_passwords off` makes it mean no room. Agents get neither.
 
-- A worker with a `relay` runs under `minosb`, which writes the task and each correction to its stdin; `claude` ships with one. Any other worker runs beside a broker and is told to read the room with `minosa messages`.
+- A worker with a `relay` runs under `minosb`, which writes the task and each correction to its stdin; `claude` ships with one. A `relay` naming a `.json` file is a minos one-shot spec, which runs the CLI once per turn; see `docs/dev/agent-entries.md`. `relay = "acp"` runs an ACP agent (minos `docs/acp.md`), reported from the run's events. Any other worker runs beside a broker and is told to read the room with `minosa messages`.
 
-- `minos.rooms` is `task` (default), one room a task's runs share, or `run`, one room per run. minos seats one run per room, so a second run of a task in progress goes without one. With no server, a run goes on without a room and warns.
+- `minos.rooms` is `task` (default), one room a task's runs share, or `run`, one room per run. minos seats one run per room, so a second run of a task in progress goes without one. With no server, an unattended run goes on without a room and warns; `I` and `T` fail.
 
 **Running unattended**
 
@@ -148,9 +150,9 @@ What is supported:
 
 - **Forge: GitHub.** CI status, `pma pr` and `pma sync` need a GitHub remote. A repository elsewhere is still scanned, and dispatched to with `stage`, `commit` or `push`; its CI reads as unknown.
 
-- **Dependencies: Cargo, uv and Go modules.** `pma scan --deps` and the `refresh` worker read `Cargo.lock`, `uv.lock` and `go.mod`. Other projects show no deps state.
+- **Dependencies: Cargo, uv, Go modules, npm and pnpm.** `pma scan --deps` and the `refresh` worker read `Cargo.lock`, `uv.lock`, `go.mod`, `package-lock.json` and `pnpm-lock.yaml`. npm and pnpm workspaces are not measured. Other projects show no deps state.
 
-- **Test command detection:** a `test:` target in the Makefile, then `cargo test`, `go test ./...`, `npm test` when `package.json` has a `test` script, then `uv run pytest` with a `uv.lock` or `python3 -m pytest` without one. For anything else, or a Python project that needs an environment, set `pma config projects.<name>.verify "<command>"` and check it with `pma verify <name>`.
+- **Test command detection:** a `test:` target in the Makefile, then `cargo test`, `go test ./...`, `npm test` when `package.json` has a `test` script, then pytest for a `pyproject.toml`: `uv run pytest` with a `uv.lock`, `poetry run pytest` with a `poetry.lock`, else in a throwaway uv environment that holds the project, its extras and dependency groups. Without uv on `PATH` it is `python3 -m pytest`. For anything else, set `pma config projects.<name>.verify "<command>"` and check it with `pma verify <name>`.
 
 ## TODO.md format
 
@@ -215,7 +217,7 @@ pma project forget gone         # a deleted project's record; `x` on the project
 pma project clone --tag work    # check out absent projects again
 pma scan                        # TODO.md, git state, CI via gh
 pma scan --offline myproject    # one project, without GitHub
-pma scan --deps                 # also measure how far each cargo, uv and go lock can move
+pma scan --deps                 # also measure how far each lock (cargo, uv, go, npm, pnpm) can move
 pma next                        # for agents and for you; --all for every row
 pma matrix                      # the ranked 2x2; -q q1 for one quadrant
 pma status --explain            # projects worst first, with what placed each
@@ -302,7 +304,7 @@ pma dispatch b:deps -a claude            # the agent gets the check's output
 
 A project's deps are stale when a `--deps` measurement no older than `deps.days` (30) found that a lock can move within its declared constraints, and that lock has not changed for `deps.days`. An older measurement places the project in no deps state, so run `pma scan --deps` at least that often.
 
-The `refresh` worker runs `pma deps refresh`: `cargo update`, `uv lock --upgrade`, or `go get -u ./...` with `go mod tidy`. Under `>=` constraints, `uv lock --upgrade` takes new major versions; the project's check decides whether the result is kept. Reject a refused refresh before another worker takes the task. The next agent's prompt then carries the check's output. A refresh uses none of the agent's two attempts and none of `batch_budget`. The worker runs the `pma` on your `PATH`, so install the build that has `pma deps refresh`.
+The `refresh` worker runs `pma deps refresh`: `cargo update`, `uv lock --upgrade`, `go get -u ./...` with `go mod tidy`, `npm update` or `pnpm update`. `pnpm update` also raises the ranges in `package.json` to the versions it locks. Under `>=` constraints, `uv lock --upgrade` takes new major versions; the project's check decides whether the result is kept. Reject a refused refresh before another worker takes the task. The next agent's prompt then carries the check's output. A refresh uses none of the agent's two attempts and none of `batch_budget`. The worker runs the `pma` on your `PATH`, so install the build that has `pma deps refresh`.
 
 For `pma dispatch --auto` to send deps to `refresh` and everything else to your default, propose and activate a policy:
 

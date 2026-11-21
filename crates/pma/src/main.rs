@@ -30,8 +30,19 @@ const GROUPS: [(&str, &[&str]); 6] = [
     (
         "The loop",
         &[
-            "next", "run", "scan", "matrix", "dispatch", "review", "close", "stage", "commit",
-            "push", "pr", "merge",
+            "next",
+            "run",
+            "scan",
+            "matrix",
+            "dispatch",
+            "review",
+            "take-over",
+            "close",
+            "stage",
+            "commit",
+            "push",
+            "pr",
+            "merge",
         ],
     ),
     (
@@ -219,7 +230,7 @@ enum Command {
         /// Skip GitHub; CI is recorded as unknown.
         #[arg(long)]
         offline: bool,
-        /// Also measure outdated dependencies (cargo, uv, go); seconds per
+        /// Also measure outdated dependencies (cargo, uv, go, npm, pnpm); seconds per
         /// project. Without it, the last measurement is kept.
         #[arg(long, conflicts_with = "offline")]
         deps: bool,
@@ -611,19 +622,29 @@ enum Command {
         #[arg(required = true)]
         ids: Vec<i64>,
     },
-    /// Where agents run, `herdr` or `none`, and a `minos` room
+    /// Where agents run: `herdr`, `herdr-app`, `minos` or `none`
     ///
-    /// Bare, it says what is on. Under `herdr`, each run gets a tab in a
-    /// `pma: <project>` workspace. Under `minos`, each run gets a room where a
-    /// person reads it and corrects it between turns; it combines with
-    /// `herdr`. With no server, a run goes on without a pane or room and warns.
+    /// Bare, it says which is on; one at a time. Under `herdr` or `herdr-app`,
+    /// each run gets a tab in a `pma: <project>` workspace. Under `minos`, each
+    /// run gets a room where a person reads and corrects it between turns, and
+    /// `I` and `T` are driven from the room. With no server, an unattended
+    /// run goes on without a pane or room and warns.
     Integrate {
         /// `herdr` (the TUI's server), `herdr-app` (Herdr.app over
         /// herdr-core), `minos` or `none`.
         name: Option<String>,
-        /// Turn `herdr`, `herdr-app` or `minos` off.
+        /// Turn the one named off.
         #[arg(long, requires = "name")]
         off: bool,
+    },
+    /// Open an interactive agent on a finished run's directory.
+    ///
+    /// Under `herdr` or `herdr-app`, in a tab, as `T` does. Under `minos`, in
+    /// the run's room, held here until the agent exits; `T` queues this as a
+    /// job. An edit made there changes the run: read it again before approving.
+    TakeOver {
+        /// The run's id, as `pma review` lists it.
+        id: i64,
     },
     /// Renders a headless agent's output, in the pane it runs in.
     #[command(hide = true)]
@@ -814,8 +835,8 @@ enum TagAction {
 enum DepsAction {
     /// Move each lock in a directory within its declared constraints.
     ///
-    /// Runs `cargo update`, `uv lock --upgrade`, or `go get -u ./...` with
-    /// `go mod tidy`, for each lock present. The `refresh` worker runs this in
+    /// Runs `cargo update`, `uv lock --upgrade`, `go get -u ./...` with
+    /// `go mod tidy`, `npm update` or `pnpm update`, for each lock present. The `refresh` worker runs this in
     /// a dispatch's worktree, where the project's check decides what is kept.
     Refresh {
         /// The project directory; defaults to the project you are in.
@@ -1341,6 +1362,15 @@ fn main() -> ExitCode {
                 run_publish_approving(&ids, all_approved, publish::Target::Push, None, approve)
             },
         ),
+        Command::TakeOver { id } => (|| {
+            let store = Store::open_default()?;
+            let said = match api::config(&store)?.integration {
+                config::Integration::Minos => vec![api::take_over_in_room(&store, id)?],
+                _ => api::act(&store, Action::TakeOver { id })?.said,
+            };
+            said.iter().for_each(|s| println!("{s}"));
+            Ok(())
+        })(),
         Command::Close { ids, confirm } => {
             gated(approve_runs("close", &ids, false, None, confirm), || {
                 run_close(&ids)
@@ -4747,8 +4777,7 @@ fn run_close(ids: &[i64]) -> Result<()> {
     Ok(())
 }
 
-/// Sets or shows `integration` and `minos.enabled`, and says whether each
-/// server answers.
+/// Sets or shows `integration`, and says whether its server answers.
 fn run_integrate(name: Option<&str>, off: bool) -> Result<()> {
     let store = Store::open_default()?;
     let set = |key: &str, value: &str| {
@@ -4763,9 +4792,14 @@ fn run_integrate(name: Option<&str>, off: bool) -> Result<()> {
     };
     match (name, off) {
         (None, _) => {}
-        (Some("minos"), off) => set("minos.enabled", if off { "off" } else { "on" })?,
-        (Some("herdr" | "herdr-app"), true) => set("integration", "none")?,
         (Some("none"), true) => return Err("`none` has nothing to turn off".into()),
+        (Some(name), true) if config::Integration::parse(name).is_some() => {
+            let on = api::config(&store)?.integration;
+            if on.name() != name {
+                return Err(format!("`{name}` is not on; `{}` is", on.name()).into());
+            }
+            set("integration", "none")?
+        }
         (Some(name), false) if config::Integration::parse(name).is_some() => {
             set("integration", name)?
         }
@@ -4800,6 +4834,33 @@ fn run_integrate(name: Option<&str>, off: bool) -> Result<()> {
             ),
             Err(e) => println!("herdr-app: {e}; runs go on without a pane until it answers"),
         },
+        config::Integration::Minos => {
+            let m = &cfg.minos;
+            for note in pma_core::minos::dev_passwords(m) {
+                println!("minos: {note}");
+            }
+            let extra: Vec<&str> = store
+                .agents()?
+                .iter()
+                .filter_map(|w| w.relay.as_deref().and_then(pma_core::minos::relay_needs))
+                .collect();
+            match pma_core::minos::check(m, &extra).as_slice() {
+                [] => println!(
+                    "minos answers at {}; each run speaks as `{}` in a room per {}",
+                    m.server,
+                    m.user,
+                    m.rooms.name()
+                ),
+                problems => {
+                    for p in problems {
+                        println!("minos: {p}");
+                    }
+                    println!(
+                        "unattended runs go on without a room, and `I` and `T` fail, until these are fixed"
+                    );
+                }
+            }
+        }
         config::Integration::None => {}
     }
     // A hint, not a switch: a job runner keeps the environment it started in,
@@ -4809,27 +4870,6 @@ fn run_integrate(name: Option<&str>, off: bool) -> Result<()> {
     }
     if cfg.integration != config::Integration::Herdr && tui.is_ok() {
         println!("a herdr server is running: `pma integrate herdr` uses it");
-    }
-    let m = &cfg.minos;
-    println!("minos = {}", if m.enabled { "on" } else { "off" });
-    if m.enabled {
-        for note in pma_core::minos::dev_passwords(m) {
-            println!("minos: {note}");
-        }
-        match pma_core::minos::check(m).as_slice() {
-            [] => println!(
-                "minos answers at {}; each run speaks as `{}` in a room per {}",
-                m.server,
-                m.user,
-                m.rooms.name()
-            ),
-            problems => {
-                for p in problems {
-                    println!("minos: {p}");
-                }
-                println!("runs go on without a room until these are fixed");
-            }
-        }
     }
     Ok(())
 }

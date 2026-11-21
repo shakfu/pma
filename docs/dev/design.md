@@ -215,6 +215,8 @@ The deps signal measures how far each lock can move within its declared constrai
 | cargo | `Cargo.lock` | `cargo update --dry-run` | lock updates, additions and removals, transitive included |
 | uv | `uv.lock` | `uv lock --upgrade --dry-run` | lock updates, additions and removals, transitive included |
 | go | `go.mod` | `go list -u -m all`, direct modules | modules with a newer version |
+| npm | `package-lock.json` | `npm update --package-lock-only` on a copy | packages whose locked versions change, transitive included |
+| pnpm | `pnpm-lock.yaml` | `pnpm update --lockfile-only` on a copy | as npm |
 
 cargo also reports crates its constraints hold back, which `status --explain` shows and nothing ranks.
 
@@ -399,7 +401,7 @@ An agent and its verify run under a `sh` watchdog holding a pipe from `pma`. Whe
 
 4. If the branch has commits beyond its base, `pma` flags the run. The output was meant to be uncommitted.
 
-5. `pma` runs the project's `verify` command itself. The agent's report is not trusted as proof. Without `projects.<name>.verify`, the first match wins: a Makefile `test:` target, `Cargo.toml`, `go.mod`, a `package.json` with a `test` script, `pyproject.toml` (`uv run pytest` with `uv.lock`, else `python3 -m pytest`). A failed verify still leaves the run ready; the reviewer decides.
+5. `pma` runs the project's `verify` command itself. The agent's report is not trusted as proof. Without `projects.<name>.verify`, the first match wins: a Makefile `test:` target, `Cargo.toml`, `go.mod`, a `package.json` with a `test` script, `pyproject.toml` (`uv run pytest` with `uv.lock`, `poetry run pytest` with `poetry.lock`, else `uv run --isolated --all-extras --all-groups --with pytest pytest`, or `python3 -m pytest` without uv). A failed verify still leaves the run ready; the reviewer decides.
 
 6. Record: agent, diffstat, verify result, agent summary, cost where reported, duration.
 
@@ -485,7 +487,7 @@ Each stage is used before the next one is built.
 
 4. `pma sync` with Issues. Built.
 
-5. Notes commands, deps signal, TUI. Built. The deps signal covers cargo, uv and go; npm (2 repos here) is not covered.
+5. Notes commands, deps signal, TUI. Built. The deps signal covers cargo, uv, go, npm and pnpm.
 
 ## Open questions
 

@@ -142,6 +142,51 @@ impl Parser {
     }
 }
 
+impl Parser {
+    /// A run of one-shot turns under `minosb -agent-spec`: one process per
+    /// turn, each printing its own result. Each record's cost covers its turn
+    /// only, so the cost is their sum; the summary is every turn's reply.
+    pub fn report_turns(&self, output: &str, exit_ok: bool) -> Report {
+        let last = self.report(output, exit_ok);
+        let Parser::Fields { summary, cost, .. } = self else {
+            return last;
+        };
+        let records: Vec<serde_json::Value> = output
+            .lines()
+            .filter_map(|l| serde_json::from_str(l.trim()).ok())
+            .filter(serde_json::Value::is_object)
+            .collect();
+        let costs: Vec<f64> = records
+            .iter()
+            .filter_map(|v| at(v, cost))
+            .filter_map(|v| match v {
+                serde_json::Value::Number(n) => n.as_f64(),
+                serde_json::Value::String(s) => s.parse().ok(),
+                _ => None,
+            })
+            .collect();
+        let replies: Vec<String> = records
+            .iter()
+            .filter_map(|v| at(v, summary).map(text))
+            .filter(|r| !r.trim().is_empty())
+            .collect();
+        Report {
+            summary: if replies.len() > 1 {
+                replies
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| format!("Turn {}: {r}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            } else {
+                last.summary.clone()
+            },
+            cost_usd: (!costs.is_empty()).then(|| costs.iter().sum()),
+            ..last
+        }
+    }
+}
+
 /// The last JSON value in the output: the whole text where that parses, else
 /// the last line that does. A worker that streams events therefore reports from
 /// its final one.
@@ -977,6 +1022,20 @@ mod tests {
         assert_eq!(r.summary, "{\"other\":1}");
         // No JSON at all is a failure, whatever the status said.
         assert!(!p.report("command not found\n", true).ok);
+    }
+
+    /// One-shot turns: costs add up, a null cost adds nothing, and one turn
+    /// reads as a plain reply.
+    #[test]
+    fn one_shot_turns_sum_their_costs() {
+        let p = Parser::parse("json:text:cost:error").unwrap();
+        let two = "{\"text\":\"a\",\"cost\":0.1}\nlog line\n{\"text\":\"b\",\"cost\":null}\n{\"text\":\"\",\"cost\":0.2,\"error\":\"boom\"}\n";
+        let r = p.report_turns(two, true);
+        assert!((r.cost_usd.unwrap() - 0.3).abs() < 1e-9);
+        assert_eq!(r.summary, "Turn 1: a\n\nTurn 2: b");
+        assert!(!r.ok, "the last turn's error flag still decides");
+        let none = p.report_turns("{\"text\":\"a\",\"cost\":null}\n", true);
+        assert_eq!((none.summary.as_str(), none.cost_usd), ("a", None));
     }
 
     /// The `result` record myra, minima and hax print: `error` is null or a

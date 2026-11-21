@@ -904,7 +904,7 @@ impl Transition {
                     "ready" => "ready for review",
                     "staged" => "staged in its clone, commit next",
                     "committed" => "committed in its clone, push next",
-                    BLOCKED => "needs you in herdr",
+                    BLOCKED => "needs you",
                     s => s,
                 },
                 self.text
@@ -1038,11 +1038,17 @@ impl Watch {
                 "done" | "failed" | "awaiting-approval" | "stopped"
             );
             if moved && told && !self.jobs.is_empty() {
+                let mut text = format!("pma {}", j.args.join(" "));
+                if j.state == "failed"
+                    && let Some(why) = jobs::reason(j.id)
+                {
+                    text = format!("{text}: {why}");
+                }
                 out.push(Transition {
                     kind: "job",
                     id: j.id,
                     project: String::new(),
-                    text: format!("pma {}", j.args.join(" ")),
+                    text,
                     state: j.state.clone(),
                 });
             }
@@ -1895,6 +1901,16 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
         }
         Action::FocusPane { id } => {
             let run = store.run(id)?;
+            // A room is entered from the person's minos client, not raised.
+            if let (None, Some(room)) = (&run.pane, &run.room) {
+                return Ok(Outcome {
+                    said: vec![format!(
+                        "Run #{id} is in minos room {room} ({}); enter it from `minos`.",
+                        run.project
+                    )],
+                    ..Outcome::default()
+                });
+            }
             let pane = run
                 .pane
                 .ok_or_else(|| format!("run #{id} has no herdr pane"))?;
@@ -1902,16 +1918,7 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
             Outcome::default()
         }
         Action::TakeOver { id } => {
-            let run = store.run(id)?;
-            // Seconds are added once an agent finishes, so a failed run without
-            // them never started one and left nothing to take over.
-            if run.state == RunState::Failed && run.seconds.is_none() {
-                let why = run.error.as_deref().unwrap_or("no reason recorded");
-                return Err(format!(
-                    "run #{id} failed before its agent started ({why}); dispatch it again"
-                )
-                .into());
-            }
+            let run = taken_over(store, id)?;
             // The change is on disk, so any agent can read it: the run's own
             // when it has an interactive form, else the default one.
             let own = store
@@ -1922,6 +1929,19 @@ pub fn act(store: &Store, a: Action) -> Result<Outcome> {
                 Some(w) => (w, run.model.as_deref()),
                 None => (store.agent(&config(store)?.agent)?, None),
             };
+            // A job holds the session, as a pane would, so a front end is not
+            // held by it.
+            if config(store)?.integration == Integration::Minos {
+                let args = ["take-over".to_string(), id.to_string()];
+                let job = jobs::queue(store, &args, &run.repo, Some(&run.project))?;
+                return Ok(Outcome {
+                    said: vec![format!(
+                        "job {job} queued: take over run #{id} in its minos room. An edit made \
+                         there changes run #{id}: read it again before approving."
+                    )],
+                    ..Outcome::default()
+                });
+            }
             let prompt = take_over_prompt(&run.text, &run.prompt);
             let title = format!("#{id} take over");
             let cmd = worker
@@ -2403,7 +2423,7 @@ pub fn shell(project: &str) -> Result<()> {
                 .map(|pane| crate::herdr::wait_closed(&pane))
                 .map_err(Into::into)
         }
-        Integration::None => {
+        Integration::None | Integration::Minos => {
             let shell = std::env::var_os("SHELL").unwrap_or_else(|| "sh".into());
             // A shell exits with its last command's status, which says
             // nothing about the session.
@@ -2707,6 +2727,28 @@ pub fn command_line(a: &Action) -> Option<Vec<String>> {
 
 /// What a person's agent is told on taking over a run: the task, and the
 /// earlier agent's instructions, which carry context such as a failing CI log.
+/// A run that can be taken over. Seconds are added once an agent finishes, so
+/// a failed run without them never started one and left nothing to take over.
+fn taken_over(store: &Store, id: i64) -> Result<Run> {
+    let run = store.run(id)?;
+    if run.state == RunState::Failed && run.seconds.is_none() {
+        let why = run.error.as_deref().unwrap_or("no reason recorded");
+        return Err(format!(
+            "run #{id} failed before its agent started ({why}); dispatch it again"
+        )
+        .into());
+    }
+    Ok(run)
+}
+
+/// `pma take-over <id>` under minos: the session in the run's room, held
+/// until it ends. `T` queues this as a job.
+pub fn take_over_in_room(store: &Store, id: i64) -> Result<String> {
+    let run = taken_over(store, id)?;
+    let prompt = take_over_prompt(&run.text, &run.prompt);
+    crate::dispatch::take_over_in_room(store, &config(store)?, &run, &prompt)
+}
+
 fn take_over_prompt(task: &str, earlier: &str) -> String {
     format!(
         "An earlier agent worked on this task in this directory. Its change, if any, \
@@ -3053,7 +3095,7 @@ mod tests {
         let moved = watch.poll(&reader).unwrap().expect("a commit was seen");
         assert_eq!(moved.len(), 1);
         assert_eq!(moved[0].id, second.id);
-        assert!(moved[0].line().contains("needs you in herdr"));
+        assert!(moved[0].line().contains("needs you"));
         assert!(screen::fits(crate::keys::Act::OpenPane, &moved[0].pick()));
         assert_eq!(
             Watch::new(&reader).unwrap().poll(&reader).unwrap(),

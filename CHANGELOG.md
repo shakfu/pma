@@ -16,11 +16,21 @@ Upgrading from 0.10:
 
 - The database moves from schema 52 to 53 on first open. It adds `runs.pr_head`. A `claude` worker whose `interactive_args` are the form pma shipped gains `--session-id {session}` in `settings.toml`, and `pma` says so.
 
+- The database moves from schema 53 to 54 on first open; `settings.toml` changes, the tables do not. `minos.enabled = on` becomes `integration = minos` when no herdr backend is chosen. With `herdr` or `herdr-app` chosen, that stays and runs get no room; `pma integrate minos` switches. `minos.enabled` is retired either way.
+
 - `--apply` is gone. `prune`, `lint --fix`, `lint --ids`, `sync` and `project import`, `forget` and `clone` act; `-d` previews. Commands that cannot be undone ask first, and with no terminal they refuse: a script passes `-y`. `run`'s `--yes` and `--dry-run` are `-y` and `-d`.
 
 - Inside a project directory, a command that names no project acts on that one. Bare `pma` there shows that project; `-A` shows every project.
 
 ### Added
+
+- **minos as where agents run.** `pma integrate minos` now chooses minos in place of herdr or herdr-app, where it was a room beside either. `I` and `T` are driven from the run's room: the agent starts on its task or the take-over prompt and waits for a person between turns, with no timeout, until it exits. The new `pma take-over <id>` holds a take-over; `T` queues it as a job. Running minos and herdr together wrapped one process in both, which was too complicated to keep; minos's missing pieces are in its own `TODO.md`. A person-driven run needs a worker with a `relay`, which only `claude` ships with.
+
+  A `relay` that names a JSON file is a minos one-shot spec: `minosb -agent-spec` runs the CLI once per turn and resumes its session, so `gilda`, `minima`, `hax`, `myra` and `hilda` can be driven from the room. Such a run's cost is the sum of its turns, as each CLI costs one process only. Entries are in `docs/dev/agent-entries.md`.
+
+  `relay = "acp"` runs the worker as an Agent Client Protocol agent under `minosb -agent acp`. Its stdout is JSON-RPC, so pma reports it from the run's minos events: each turn's reply, the session's cost when in USD, and each permission denied, which keeps `--push` from pushing it. minos answers permission requests with its default, deny.
+
+- **npm and pnpm deps.** `pma scan --deps` measures `package-lock.json` and `pnpm-lock.yaml`, and `pma deps refresh` runs `npm update` or `pnpm update`. The measure updates the lock alone on a copy of `package.json` and the lock, then compares the two locks; transitive packages count, as for cargo and uv. The tools' own dry runs do not work for this: npm compares against `node_modules`, which a clone lacks. Workspaces are reported as not measured. See `docs/dev/deps-refresh.md`.
 
 - **Project context.** A command that names no project takes the one `$PMA_PROJECT` names, else the one whose directory holds the cwd. `.` is that project and `:12` its line 12: `pma dispatch :12`, `pma project tier 2`. `--tag` and `-A` override it. `--all` already meant three different things, so the flag is `-A/--all-projects`. Help starts with what the command acts on here: `Here: acts on argdec (cwd); -A for every project.` Design: `docs/dev/cli-context.md`.
 
@@ -77,6 +87,10 @@ Upgrading from 0.10:
 - A full scan of 117 projects makes 205 to 223 `gh` calls instead of 311, and takes 24 to 26 s instead of 38 s. A repository with no active workflow gets no `run list`. A project's per-workflow reads run in parallel. A workflow read alone is cached in `ci_alone`. It is reused while the 100-run window reaches back to that read, so any newer run of it would be in the window, and for at most 24 h, which bounds a re-run of an old run. A window under 100 runs holds every run, so a workflow missing from it is not asked about. Measurements and the options not built: `docs/dev/gh-optimize.md`.
 
 ### Fixed
+
+- A Python project with a `pyproject.toml` and no `uv.lock` was verified with `python3 -m pytest`, which has neither the project's dependencies nor, often, pytest. pma now runs pytest in a throwaway uv environment that holds the project, its extras and dependency groups, and pytest. It writes no lock or `.venv` to the run's tree. A `poetry.lock` means `poetry run pytest`, because uv cannot read Poetry 1's dependencies. `python3 -m pytest` remains when uv is not on `PATH`.
+
+- A failed job's notice now says why: `job 7 failed: pma prune --bogus: unexpected argument '--bogus' found`. The reason is the last `error:` or `pma:` line of the job's log. Before, a mistyped `:` command looked like any other failure until its log was opened. The TUI, the web and `$PMA_JOB_SUMMARY` all carry it. Checking arguments before queueing was the alternative. It would catch the mistake sooner, but it costs a process per line and misses every failure that is not an argument error.
 
 - `pma scan | head` panicked when `head` closed the pipe. pma now exits with status 141 and prints nothing, as a shell tool ended by SIGPIPE does. It catches only a failed print to stdout: restoring the SIGPIPE default would also kill pma on a write to an agent's or job's pipe.
 

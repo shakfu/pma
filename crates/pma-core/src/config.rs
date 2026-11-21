@@ -64,12 +64,13 @@ pub struct Config {
     pub workspace: Workspace,
     /// What agents run in. One setting because integrations exclude each other.
     pub integration: Integration,
-    /// A minos room per run, beside any `integration`: `pma integrate minos`.
+    /// The server and accounts `integration = minos` uses.
     pub minos: Minos,
     pub projects: BTreeMap<String, ProjectSettings>,
 }
 
-/// What agents run in: `pma integrate`. See docs/dev/herdr-integration.md.
+/// What agents run in: `pma integrate`. See docs/dev/herdr-integration.md and
+/// docs/dev/pma-minos-integration.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Integration {
     /// A child process of `pma`.
@@ -79,6 +80,9 @@ pub enum Integration {
     Herdr,
     /// A tab of Herdr.app, run by herdr-core.
     HerdrApp,
+    /// A child of `pma`, relayed through a minos room where a person reads
+    /// and corrects it.
+    Minos,
 }
 
 impl Integration {
@@ -87,12 +91,13 @@ impl Integration {
             Integration::None => "none",
             Integration::Herdr => "herdr",
             Integration::HerdrApp => "herdr-app",
+            Integration::Minos => "minos",
         }
     }
 
     /// Whether runs open a pane, which a shell can wait on from a job.
     pub fn panes(self) -> bool {
-        self != Integration::None
+        matches!(self, Integration::Herdr | Integration::HerdrApp)
     }
 
     pub fn parse(s: &str) -> Option<Self> {
@@ -100,18 +105,18 @@ impl Integration {
             "none" => Some(Integration::None),
             "herdr" => Some(Integration::Herdr),
             "herdr-app" => Some(Integration::HerdrApp),
+            "minos" => Some(Integration::Minos),
             _ => None,
         }
     }
 }
 
-/// A minos room for each run, where a person reads and corrects the agent.
+/// The minos server a run's room is on, under `integration = minos`.
 /// Passwords come from the environment alone, so `settings.toml` holds none:
 /// `MINOS_PASSWORD` for `user`, `MINOS_ADMIN_PASSWORD` for `admin`.
 /// See docs/dev/pma-minos-integration.md.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Minos {
-    pub enabled: bool,
     pub server: String,
     /// An unset password is the account's name, as in minosd's development
     /// accounts. Off, an unset password means no room.
@@ -135,7 +140,6 @@ impl Default for Minos {
         // minosd's own defaults: its address, its agent account and its
         // administrator.
         Minos {
-            enabled: false,
             server: "http://127.0.0.1:8000".into(),
             dev_passwords: true,
             user: "worker".into(),
@@ -298,7 +302,7 @@ enum Slot<'a> {
 /// stays here so `pma config <old>` explains it. `with_overrides` skips a
 /// stored row for one, because an unknown key is a hard error on every
 /// command and an upgrade must not brick a store that set it.
-pub const RETIRED: [(&str, &str); 14] = [
+pub const RETIRED: [(&str, &str); 15] = [
     (
         "model",
         "a model belongs to a preset: `pma preset set <name> <agent> <model>`",
@@ -330,6 +334,10 @@ pub const RETIRED: [(&str, &str); 14] = [
     (
         "stale_after.5",
         "age no longer makes a task urgent; see `pma stale`",
+    ),
+    (
+        "minos.enabled",
+        "minos is where agents run now, in place of herdr: `pma integrate minos`",
     ),
     ("weights.tasks", WEIGHTS),
     ("weights.activity", WEIGHTS),
@@ -405,7 +413,6 @@ impl Config {
         );
         keys.extend(
             [
-                "enabled",
                 "server",
                 "dev_passwords",
                 "user",
@@ -553,7 +560,7 @@ impl Config {
                 *w = Workspace::parse(value).ok_or("expected clone or worktree")?;
             }
             Slot::Integration(i) => {
-                *i = Integration::parse(value).ok_or("expected none, herdr or herdr-app")?;
+                *i = Integration::parse(value).ok_or("expected none, herdr, herdr-app or minos")?;
             }
             Slot::Rooms(r) => {
                 *r = Rooms::parse(value).ok_or("expected task or run")?;
@@ -625,7 +632,6 @@ impl Config {
             Some(("minos", field)) => {
                 let m = &mut self.minos;
                 match field {
-                    "enabled" => Slot::Switch(&mut m.enabled),
                     "server" => Slot::Text(&mut m.server),
                     "dev_passwords" => Slot::Switch(&mut m.dev_passwords),
                     "user" => Slot::Text(&mut m.user),
@@ -679,7 +685,7 @@ mod tests {
     #[test]
     fn every_key_reads_and_round_trips() {
         let keys = Config::keys();
-        assert_eq!(keys.len(), 48);
+        assert_eq!(keys.len(), 47);
         let defaults = Config::default();
         let mut copy = Config::default();
         for key in &keys {

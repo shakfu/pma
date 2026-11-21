@@ -1,6 +1,6 @@
 use super::*;
 
-const VERSION: i64 = 53;
+const VERSION: i64 = 54;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -480,6 +480,10 @@ ALTER TABLE runs ADD COLUMN ci_verdict TEXT;
 /// Version 53. The commit pma pushed to a run's pull request.
 const PR_HEAD: &str = "ALTER TABLE runs ADD COLUMN pr_head TEXT;";
 
+/// Version 54. `minos.enabled` becomes `integration = minos`, in
+/// `settings.toml` alone: `migrate_settings`.
+const MINOS_BACKEND: &str = "";
+
 /// Version 49. How a worker starts a session a person drives, as a JSON array.
 const INTERACTIVE_ARGS: &str =
     "ALTER TABLE agents ADD COLUMN interactive_args TEXT NOT NULL DEFAULT '[]';";
@@ -825,6 +829,7 @@ pub(super) fn migrate(conn: &Connection, path: &Path) -> Result<i64> {
                 CI_ALONE,
                 CI_VERDICT,
                 PR_HEAD,
+                MINOS_BACKEND,
             ];
             let tx = conn.unchecked_transaction()?;
             for step in &steps[version as usize..] {
@@ -945,6 +950,40 @@ impl Store {
                         w.name,
                         self.settings.display()
                     );
+                }
+            }
+        }
+        // minos was a room beside herdr; it is now where agents run, so one
+        // of the two is kept. A herdr already chosen stays: switching where
+        // agents run is the user's call.
+        if version < 54 {
+            let (_, file) = crate::settings::read(&self.settings)?;
+            let get = |key: &str| {
+                file.config
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.clone())
+            };
+            if let Some(enabled) = get("minos.enabled") {
+                let integration = get("integration").unwrap_or_else(|| "none".into());
+                let moved = enabled == "on" && integration == "none";
+                self.change_settings(|doc| {
+                    crate::settings::reset_config(doc, "minos.enabled");
+                    if moved {
+                        crate::settings::set_config(doc, "integration", "minos");
+                    }
+                })?;
+                let path = self.settings.display();
+                match (enabled == "on", moved) {
+                    (true, true) => {
+                        eprintln!("pma: minos.enabled became integration = minos in {path}")
+                    }
+                    (true, false) => eprintln!(
+                        "pma: minos.enabled is retired; {path} keeps integration = \
+                         {integration}, and runs get no minos room. `pma integrate minos` \
+                         uses minos in its place."
+                    ),
+                    _ => eprintln!("pma: removed minos.enabled from {path}"),
                 }
             }
         }
@@ -1583,6 +1622,46 @@ mod tests {
             "{text}"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Version 54: `minos.enabled` on becomes `integration = minos`, unless a
+    /// herdr is already chosen, which stays. The key goes either way.
+    #[test]
+    fn minos_becomes_where_agents_run_unless_herdr_is() {
+        for (enabled, integration, want) in [
+            ("on", None, "minos"),
+            ("on", Some("herdr"), "herdr"),
+            ("off", None, "none"),
+        ] {
+            let dir = scratch(&format!("minos-backend-{enabled}-{want}"));
+            let path = dir.join("p.db");
+            {
+                let store = Store::open(&path).unwrap();
+                store
+                    .change_settings(|doc| {
+                        crate::settings::set_config(doc, "minos.enabled", enabled);
+                        if let Some(i) = integration {
+                            crate::settings::set_config(doc, "integration", i);
+                        }
+                    })
+                    .unwrap();
+                store.conn.pragma_update(None, "user_version", 53).unwrap();
+            }
+            let store = Store::open(&path).unwrap();
+            let rows = store.config_rows().unwrap();
+            let get = |k: &str| {
+                rows.iter()
+                    .find(|(key, _)| key == k)
+                    .map(|(_, v)| v.as_str())
+            };
+            assert_eq!(get("minos.enabled"), None, "{enabled} {integration:?}");
+            assert_eq!(
+                get("integration").unwrap_or("none"),
+                want,
+                "{enabled} {integration:?}"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// Version 53 adds `--session-id` to a `claude` worker still on the form

@@ -2297,6 +2297,7 @@ fn work(cfg: &Config, job: &Staged) -> Ran {
                 title,
                 interactive: false,
                 close_after: true,
+                room: None,
             },
             cmd,
             &job.log,

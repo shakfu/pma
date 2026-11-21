@@ -111,11 +111,11 @@ enum Needs {
 fn needs(job: &Job) -> Needs {
     let command = job.args.first().map_or("", String::as_str);
     match (command, &job.project) {
-        // A person in a shell: it holds no lock, so other work goes on.
-        // Reads, queued from a `:` line, need no lock either.
+        // A person in a shell or a take-over: it holds no lock, so other
+        // work goes on. Reads, queued from a `:` line, need no lock either.
         (
-            "scan" | "shell" | "next" | "status" | "stale" | "report" | "usage" | "history"
-            | "matrix" | "task" | "job" | "help",
+            "scan" | "shell" | "take-over" | "next" | "status" | "stale" | "report" | "usage"
+            | "history" | "matrix" | "task" | "job" | "help",
             _,
         ) => Needs::Nothing,
         (
@@ -128,7 +128,8 @@ fn needs(job: &Job) -> Needs {
 }
 
 fn interactive(job: &Job) -> bool {
-    job.args.iter().any(|a| a == "--interactive")
+    job.args.first().is_some_and(|c| c == "take-over")
+        || job.args.iter().any(|a| a == "--interactive")
 }
 
 /// Whether a dispatch must wait for its clone: one run holds a clone until it
@@ -314,6 +315,11 @@ fn notify(store: &Store, id: i64) -> Result<()> {
     if job.state == "awaiting-approval" {
         summary.push_str(&format!("; `pma job approve {id}` runs its plan"));
     }
+    if job.state == "failed"
+        && let Some(why) = reason(id)
+    {
+        summary.push_str(&format!(": {why}"));
+    }
     let mut cmd = Command::new("sh");
     cmd.args(["-c", &command])
         .env("PMA_JOB_ID", id.to_string())
@@ -322,6 +328,40 @@ fn notify(store: &Store, id: i64) -> Result<()> {
     let log = log_path(id)?.with_extension("notify.log");
     crate::agent::run_limited(cmd, None, &log, Duration::from_secs(30))?;
     Ok(())
+}
+
+/// Why a failed job failed, from the last 16 KiB of its log.
+pub fn reason(id: i64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(log_path(id).ok()?).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(16 * 1024)))
+        .ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    last_error(&String::from_utf8_lossy(&tail))
+}
+
+/// The last `error:` or `pma:` line, as clap and pma print one, else the
+/// last line; 200 characters at most.
+fn last_error(log: &str) -> Option<String> {
+    let lines: Vec<&str> = log
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let said = lines
+        .iter()
+        .rev()
+        .find_map(|l| {
+            l.strip_prefix("error: ")
+                .or_else(|| l.strip_prefix("pma: "))
+        })
+        .or(lines.last().copied())?;
+    Some(match said.chars().count() > 200 {
+        true => format!("{}...", said.chars().take(197).collect::<String>()),
+        false => said.to_string(),
+    })
 }
 
 pub fn log_path(id: i64) -> Result<PathBuf> {
@@ -382,6 +422,26 @@ pub fn list(jobs: &[Job]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_job_says_why_from_its_log() {
+        let clap = "error: unexpected argument '--bogus' found\n\n  tip: to pass '--bogus' as a value, use '-- --bogus'\n\nUsage: pma prune [OPTIONS] [PATHS]...\n\nFor more information, try '--help'.\n";
+        assert_eq!(
+            last_error(clap).as_deref(),
+            Some("unexpected argument '--bogus' found")
+        );
+        let pma = "scanning\npma: nothing scanned yet; run `pma scan`\n";
+        assert_eq!(
+            last_error(pma).as_deref(),
+            Some("nothing scanned yet; run `pma scan`")
+        );
+        assert_eq!(last_error("one\ntwo\n\n").as_deref(), Some("two"));
+        assert_eq!(last_error(""), None);
+        let long = format!("pma: {}", "x".repeat(300));
+        let said = last_error(&long).unwrap();
+        assert_eq!(said.chars().count(), 200);
+        assert!(said.ends_with("..."));
+    }
 
     fn job(args: &[&str], project: Option<&str>) -> Job {
         Job {

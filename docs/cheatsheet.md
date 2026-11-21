@@ -160,7 +160,7 @@ pma workflow run review-fix alpha --local --unattended --detach
 | `/` | filter list | `#` | scope everything to a tag |
 | `Space` | mark | `*` | mark all shown |
 | `d` | dispatch marked or selected | `D` | dispatch, push if clean |
-| `I` | dispatch to drive in herdr or Herdr.app; stays behind | `Tab` | next list, e.g. `Failing CI` |
+| `I` | dispatch to drive in herdr, Herdr.app or a minos room; stays behind | `Tab` | next list, e.g. `Failing CI` |
 | `P` | prompt an agent (project view) | `z` | `pma run` a name |
 | `v` | diff in pager (run) / verify (task) | `e` | tier, tag, verify, sandbox |
 | `t` | record review minutes | `c` | scan |

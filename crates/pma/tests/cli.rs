@@ -2177,6 +2177,10 @@ fn a_run_shows_as_queued_while_its_base_is_checked() {
 
 /// `minos room ensure` as the administrator: it prints the room id.
 const FAKE_MINOS: &str = r#"#!/bin/sh
+if [ "$1" = ping ]; then
+  echo "{\"server\":\"x\",\"user\":\"$MINOS_USER\",\"capabilities\":[\"minos.ping\",\"minos.room-ensure\",\"minos.room\",\"minos.exit-with\",\"minosb.task\",\"minosb.events\",\"minosb.linger\",\"minosb.interrupters\",\"minosb.end\",\"minosb.pushed\",\"minosb.session\"]}"
+  exit 0
+fi
 echo "user=$MINOS_USER pass=$MINOS_PASSWORD $*" >> "$(dirname "$0")/minos.calls"
 echo room1
 "#;
@@ -2250,7 +2254,8 @@ fn a_minos_run_is_relayed_through_its_room() {
     env.ok(&["config", "minos.server", "http://127.0.0.1:9"]);
     let (out, _, _) = with_minos(&env, &["integrate", "minos"]);
     assert!(
-        out.contains("integration = none") && out.contains("minos = on"),
+        out.contains("integration = minos") && out.contains("minos answers")
+            || out.contains("integration = minos") && out.contains("minos:"),
         "{out}"
     );
     let (out, err, success) = with_minos(&env, &["dispatch", "alpha:5"]);
@@ -2300,6 +2305,87 @@ fn a_minos_run_is_relayed_through_its_room() {
     assert!(detail.contains("$0.25"), "{detail}");
 }
 
+/// `pma integrate` reports what `minos ping` says: a refused account, and a
+/// minos that lacks a capability pma uses.
+#[test]
+fn integrate_reports_what_minos_ping_says() {
+    let s = Scratch::new("minosping");
+    let refusing = "#!/bin/sh\n[ \"$MINOS_USER\" = demo ] && { echo '{\"capabilities\":[\"minos.room-ensure\"]}'; exit 0; }\necho 'login: 403' >&2\nexit 4\n";
+    let (env, _, _) = dispatch_env(
+        &s,
+        &[
+            ("minos", refusing),
+            ("minosb", FAKE_MINOSB),
+            ("minosa", FAKE_MINOSA),
+        ],
+    );
+    env.ok(&["config", "integration", "minos"]);
+    let (out, _, _) = with_minos(&env, &["integrate"]);
+    assert!(out.contains("refused `worker`: login: 403"), "{out}");
+    assert!(
+        out.contains("this minos lacks `minosb.end`; update minos"),
+        "{out}"
+    );
+    assert!(!out.contains("lacks `minos.room-ensure`"), "{out}");
+}
+
+/// Under `integration = minos` a person drives `--interactive` from the run's
+/// room: the relay form, which never lingers out, with no herdr. Its turns
+/// reach the review. `take-over` opens the same room again, its first turn
+/// the earlier instructions. A worker that cannot relay is refused.
+#[test]
+fn a_person_drives_a_minos_run_from_its_room() {
+    let s = Scratch::new("minosperson");
+    let (env, _, _) = dispatch_env(
+        &s,
+        &[
+            ("claude", RELAYED_CLAUDE),
+            ("minos", FAKE_MINOS),
+            ("minosb", FAKE_MINOSB),
+            ("omp", "#!/bin/sh\nexit 0\n"),
+        ],
+    );
+    env.ok(&["config", "integration", "minos"]);
+    let (out, err, success) = with_minos(&env, &["dispatch", "alpha:5", "--interactive"]);
+    assert!(success, "{out}{err}");
+    assert!(err.contains("#1 is in minos room room1 (alpha)"), "{err}");
+    let called = |name: &str| fs::read_to_string(env.bin.join(name)).unwrap_or_default();
+    let broker = called("minosb.calls");
+    assert!(
+        broker.contains("-linger 0s") && broker.contains("-- claude -p --input-format stream-json"),
+        "{broker}"
+    );
+    let detail = env.ok(&["review", "1"]);
+    assert!(
+        detail.contains("room room1") && detail.contains("Turn 2: Renamed it."),
+        "{detail}"
+    );
+
+    fs::remove_file(env.bin.join("minosb.calls")).unwrap();
+    let (out, err, success) = with_minos(&env, &["take-over", "1"]);
+    assert!(success, "{out}{err}");
+    assert!(out.contains("Take-over of run #1 ended."), "{out}");
+    assert!(err.contains("#1 take-over is in minos room room1"), "{err}");
+    let broker = called("minosb.calls");
+    assert!(
+        broker.contains("-room room1") && broker.contains("-linger 0s"),
+        "{broker}"
+    );
+    assert!(
+        called("agent.seen").contains("task=An earlier agent worked on this task"),
+        "the take-over prompt is the first turn"
+    );
+
+    env.ok(&["close", "1", "-y"]);
+    env.ok(&["config", "agent", "omp"]);
+    let (out, err, _) = with_minos(&env, &["dispatch", "alpha:7", "--interactive"]);
+    assert!(out.contains("#2  failed"), "{out}{err}");
+    assert!(
+        format!("{out}{err}").contains("needs a worker with a relay form; `omp` has none"),
+        "{out}{err}"
+    );
+}
+
 /// A broker that cannot enter its room ran no agent. The run goes on without
 /// the room, as it would with no server, and records none.
 #[test]
@@ -2315,7 +2401,7 @@ fn a_run_minos_cannot_seat_goes_on_without_a_room() {
             ("minosb", REFUSING_MINOSB),
         ],
     );
-    env.ok(&["config", "minos.enabled", "on"]);
+    env.ok(&["config", "integration", "minos"]);
     let (out, err, success) = with_minos(&env, &["dispatch", "alpha:5"]);
     assert!(success, "{out}{err}");
     assert!(
@@ -2336,7 +2422,7 @@ fn a_run_minos_cannot_seat_goes_on_without_a_room() {
             ("minosb", FAKE_MINOSB),
         ],
     );
-    env.ok(&["config", "minos.enabled", "on"]);
+    env.ok(&["config", "integration", "minos"]);
     let out = env.ok(&["integrate"]);
     assert!(
         out.contains("MINOS_PASSWORD is not set; using `worker`"),
@@ -2358,7 +2444,7 @@ fn a_run_minos_cannot_seat_goes_on_without_a_room() {
     // found one.
     let s = Scratch::new("minosstrict");
     let (env, _, _) = dispatch_env(&s, &[("claude", RELAYED_CLAUDE), ("minos", FAKE_MINOS)]);
-    env.ok(&["config", "minos.enabled", "on"]);
+    env.ok(&["config", "integration", "minos"]);
     env.ok(&["config", "minos.dev_passwords", "off"]);
     let out = env.ok(&["integrate"]);
     assert!(
@@ -2399,7 +2485,7 @@ echo "added the greeting"
         ],
     );
     env.ok(&["config", "agent", "omp"]);
-    env.ok(&["config", "minos.enabled", "on"]);
+    env.ok(&["config", "integration", "minos"]);
     env.ok(&["config", "minos.rooms", "run"]);
     let (out, err, success) = with_minos(&env, &["dispatch", "alpha:5"]);
     assert!(success, "{out}{err}");
@@ -2430,6 +2516,146 @@ echo "added the greeting"
         "{posts:?}"
     );
     assert!(env.ok(&["review", "1"]).contains("room room1"));
+}
+
+/// A worker whose relay names a JSON spec runs under `minosb -agent-spec`.
+/// `{resume}` and `{text}` reach `minosb`, which fills them per turn, and the
+/// report comes from the worker's own parser, not claude's, with every turn.
+#[test]
+fn a_one_shot_worker_relays_through_an_agent_spec() {
+    const GILDA: &str = r#"#!/bin/sh
+echo "$*" > "$(dirname "$0")/gilda.seen"
+echo hi > hello.txt
+echo '{"text":"first turn","usage":{"cost":0.1}}'
+echo '{"text":"added the greeting","usage":{"cost":0.3}}'
+"#;
+    let s = Scratch::new("minosspec");
+    let (env, _, _) = dispatch_env(
+        &s,
+        &[
+            ("gilda", GILDA),
+            ("minos", FAKE_MINOS),
+            ("minosb", FAKE_MINOSB),
+        ],
+    );
+    env.ok(&["agent", "set", "gilda", "command", "gilda"]);
+    env.ok(&[
+        "agent",
+        "set",
+        "gilda",
+        "args",
+        r#"["-p","{prompt}","--json"]"#,
+    ]);
+    env.ok(&["agent", "set", "gilda", "relay", "/m/agents/gilda.json"]);
+    env.ok(&[
+        "agent",
+        "set",
+        "gilda",
+        "relay-args",
+        r#"["{resume}","-p","{text}","--json","-C","{dir}"]"#,
+    ]);
+    env.ok(&["agent", "set", "gilda", "parse", "json:text:usage.cost"]);
+    env.ok(&["config", "agent", "gilda"]);
+    env.ok(&["config", "integration", "minos"]);
+    let (out, err, success) = with_minos(&env, &["dispatch", "alpha:5"]);
+    assert!(success, "{out}{err}");
+    let broker = fs::read_to_string(env.bin.join("minosb.calls")).unwrap();
+    assert!(
+        broker.contains("-agent-spec /m/agents/gilda.json -task ")
+            && broker.contains(" -- gilda {resume} -p {text} --json -C "),
+        "{broker}"
+    );
+    let seen = fs::read_to_string(env.bin.join("gilda.seen")).unwrap();
+    assert!(seen.starts_with("{resume} -p {text} --json -C "), "{seen}");
+    let review = env.ok(&["review", "1"]);
+    assert!(
+        review.contains("Turn 1: first turn") && review.contains("Turn 2: added the greeting"),
+        "{review}"
+    );
+    assert!(review.contains("room room1"), "{review}");
+    // Each turn's record covers that turn alone, so they add up.
+    let list = env.ok(&["review"]);
+    assert!(list.contains("$0.40"), "{list}");
+    let out = env.ok(&["integrate"]);
+    assert!(
+        out.contains("this minos lacks `minosb.agent-spec`; update minos"),
+        "{out}"
+    );
+}
+
+/// A worker with `relay = "acp"` runs under `minosb -agent acp`, and its
+/// report comes from the events, as its stdout is JSON-RPC. A denial there
+/// keeps `--push` from pushing it, as for claude.
+#[test]
+fn an_acp_worker_is_reported_from_its_events() {
+    /// Runs the agent once, then writes what the ACP kind reports.
+    const ACP_MINOSB: &str = r#"#!/bin/sh
+dir="$(dirname "$0")"
+echo "$*" >> "$dir/minosb.calls"
+events=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -events) events="$2"; shift 2 ;;
+    --) shift; break ;;
+    *) shift ;;
+  esac
+done
+echo '{"event":"ready","room":"room1"}' >> "$events"
+"$@" < /dev/null
+cat >> "$events" <<'END'
+{"event":"permission","tool":"Run cargo fmt","kind":"execute","input":"{}","outcome":"denied","by":"policy"}
+{"event":"usage","cost":0.07,"currency":"USD"}
+{"event":"result","text":"added the greeting","stop_reason":"end_turn"}
+END
+"#;
+    const MYRA: &str = r#"#!/bin/sh
+echo hi > hello.txt
+echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+"#;
+    let s = Scratch::new("minosacp");
+    let (env, origin, _) = dispatch_env(
+        &s,
+        &[
+            ("myra", MYRA),
+            ("minos", FAKE_MINOS),
+            ("minosb", ACP_MINOSB),
+        ],
+    );
+    env.ok(&["agent", "set", "myra", "command", "myra"]);
+    env.ok(&["agent", "set", "myra", "args", r#"["-p","{prompt}"]"#]);
+    env.ok(&["agent", "set", "myra", "relay", "acp"]);
+    env.ok(&[
+        "agent",
+        "set",
+        "myra",
+        "relay-args",
+        r#"["--acp","-C","{dir}"]"#,
+    ]);
+    env.ok(&["config", "agent", "myra"]);
+    env.ok(&["config", "integration", "minos"]);
+    env.ok(&["config", "workspace", "clone"]);
+    let (out, err, success) = with_minos(&env, &["dispatch", "alpha:5", "--push"]);
+    assert!(success, "{out}{err}");
+    assert!(
+        out.contains("waits in `pma review`") && out.contains("denied 1 action"),
+        "{out}"
+    );
+    assert!(git_out(&origin, &["show", "main:hello.txt"]).is_empty());
+    let broker = fs::read_to_string(env.bin.join("minosb.calls")).unwrap();
+    assert!(
+        broker.contains("-agent acp -task ") && broker.contains(" -- myra --acp -C "),
+        "{broker}"
+    );
+    let review = env.ok(&["review", "1"]);
+    assert!(review.contains("added the greeting"), "{review}");
+    assert!(review.contains("execute Run cargo fmt"), "{review}");
+    assert!(!review.contains("jsonrpc"), "{review}");
+    assert!(env.ok(&["review"]).contains("$0.07"));
+    let out = env.ok(&["integrate"]);
+    assert!(
+        out.contains("this minos lacks `minosb.acp`; update minos"),
+        "{out}"
+    );
 }
 
 /// An agent refused an action carries on and reports success, so its run looks
@@ -8782,6 +9008,39 @@ fn the_command_line_runs_any_pma_command() {
     assert_eq!(
         fs::read_to_string(alpha.join("TODO.md")).unwrap(),
         "# TODO\n\n## High\n\n- [ ] open\n"
+    );
+
+    // A job that fails says why in its notice, not only in its log.
+    let mut events = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    events
+        .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+        .unwrap();
+    std::io::Write::write_all(
+        &mut events,
+        format!("GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nCookie: {cookie}\r\n\r\n")
+            .as_bytes(),
+    )
+    .unwrap();
+    let mut got = String::new();
+    let mut buf = [0u8; 4096];
+    while !got.contains("event: tick") {
+        let n = std::io::Read::read(&mut events, &mut buf).unwrap();
+        got.push_str(&String::from_utf8_lossy(&buf[..n]));
+    }
+    web(
+        port,
+        &cookie,
+        "/api/act",
+        Some(page("prune --bogus", "project")),
+    );
+    while !got.contains("failed: pma prune --bogus") {
+        let n = std::io::Read::read(&mut events, &mut buf).unwrap();
+        assert!(n > 0, "the stream closed: {got}");
+        got.push_str(&String::from_utf8_lossy(&buf[..n]));
+    }
+    assert!(
+        got.contains("failed: pma prune --bogus: unexpected argument '--bogus' found"),
+        "{got}"
     );
     drop(child);
 }

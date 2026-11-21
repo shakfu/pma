@@ -35,7 +35,7 @@ pub const OWNED: [&str; 1] = ["TODO.md"];
 
 /// Manifests and lock files a dependency update may touch. One list covers
 /// every ecosystem, so a project needs no per-class setting.
-const MANIFESTS: [&str; 10] = [
+const MANIFESTS: [&str; 11] = [
     "Cargo.toml",
     "Cargo.lock",
     "go.mod",
@@ -45,6 +45,7 @@ const MANIFESTS: [&str; 10] = [
     "requirements*.txt",
     "package.json",
     "package-lock.json",
+    "pnpm-lock.yaml",
     "*.lock",
 ];
 

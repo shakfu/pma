@@ -1,4 +1,4 @@
-//! A minos room for each run: `pma integrate minos`. A person reads the run
+//! A minos room for each run under `pma integrate minos`. A person reads the run
 //! there and corrects it between turns. Design:
 //! docs/dev/pma-minos-integration.md.
 //!
@@ -8,11 +8,12 @@
 //! its stdin. Any other worker runs as usual beside a `minosb` that serves
 //! only the socket, and reaches the room through `minosa` if it calls that.
 //!
-//! The room is never a condition of the run: when minos cannot be reached, the
-//! run goes on without one and says so.
+//! An unattended run goes on without its room when minos cannot be reached,
+//! and says so. A run a person drives from the room fails without it.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::config::{Minos, Rooms};
@@ -177,7 +178,8 @@ fn broker(m: &Minos, link: &Link) -> Result<Command, String> {
 }
 
 /// `agent` under `minosb`, which writes `task` as its first turn and closes
-/// its stdin after `linger` idle. The agent keeps `agent`'s directory and
+/// its stdin after `linger` idle. A run a person drives never lingers out:
+/// `0s` is minosb's never. The agent keeps `agent`'s directory and
 /// environment; `minosb` removes the password from what it passes on.
 pub fn wrap(
     m: &Minos,
@@ -185,10 +187,18 @@ pub fn wrap(
     adapter: &str,
     task: &str,
     agent: &Command,
+    person: bool,
 ) -> Result<Command, String> {
+    let linger = if person { 0 } else { m.linger };
     let mut cmd = broker(m, link)?;
-    cmd.args(["-agent", adapter, "-task", task])
-        .args(["-linger", &format!("{}s", m.linger)])
+    // A relay naming a JSON file is a one-shot spec (minos `docs/one-shot-agents.md`).
+    let flag = if adapter.ends_with(".json") {
+        "-agent-spec"
+    } else {
+        "-agent"
+    };
+    cmd.args([flag, adapter, "-task", task])
+        .args(["-linger", &format!("{linger}s")])
         .arg("--")
         .arg(agent.get_program())
         .args(agent.get_args());
@@ -204,6 +214,115 @@ pub fn wrap(
     // After the agent's own, which `restrict` cleared of it.
     cmd.env(PASSWORD, password(PASSWORD, &m.user, m.dev_passwords)?);
     Ok(cmd)
+}
+
+/// What a run's state becomes on one `-events` line, as minos
+/// `docs/minosb-events.md` defines them. A turn that ends with nothing to
+/// deliver waits on a person; only one who drives the run is needed then.
+pub fn state_of(line: &str, person: bool) -> Option<&'static str> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    match v["event"].as_str()? {
+        "pushed" => Some("working"),
+        "turn" if v["delivering"].as_i64() == Some(0) => {
+            Some(if person { "blocked" } else { "idle" })
+        }
+        _ => None,
+    }
+}
+
+/// Reads `events` as the broker writes it, until `stop`, passing each change
+/// of state to `on_state`.
+fn follow(events: &Path, person: bool, stop: &AtomicBool, on_state: &dyn Fn(&str)) {
+    let (mut read, mut last) = (0, "");
+    loop {
+        let done = stop.load(Ordering::Relaxed);
+        let text = std::fs::read_to_string(events).unwrap_or_default();
+        // A line is complete once its newline is written.
+        let end = text.rfind('\n').map_or(0, |i| i + 1);
+        for line in text.get(read..end).unwrap_or_default().lines() {
+            if let Some(state) = state_of(line, person).filter(|s| *s != last) {
+                on_state(state);
+                last = state;
+            }
+        }
+        read = end.max(read);
+        if done {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// How a broker's run is watched.
+pub struct Watched<'a> {
+    /// The room the person's client opens in, for a run they drive here.
+    pub room: Option<&'a str>,
+    /// The broker's events, read for the run's state.
+    pub events: Option<&'a Path>,
+    /// Whether a person drives the run.
+    pub person: bool,
+}
+
+/// Runs `cmd`, a broker, to its end, following its events for its state. A
+/// run a person drives from a terminal opens their client in the room
+/// meanwhile, which returns once the broker leaves the room; one that ends
+/// first, or never entered, closes it.
+pub fn host(
+    m: &Minos,
+    watched: Watched,
+    cmd: Command,
+    log: &Path,
+    timeout: Duration,
+    on_state: impl Fn(&str) + Send + 'static,
+) -> std::io::Result<crate::agent::Finished> {
+    use std::io::IsTerminal;
+    use std::sync::Arc;
+    let Watched {
+        room,
+        events,
+        person,
+    } = watched;
+    let stop = Arc::new(AtomicBool::new(false));
+    let follower = events.map(|e| {
+        let (e, stop) = (e.to_path_buf(), Arc::clone(&stop));
+        std::thread::spawn(move || follow(&e, person, &stop, &on_state))
+    });
+    let log_path = log.to_path_buf();
+    let agent =
+        std::thread::spawn(move || crate::agent::run_limited(cmd, None, &log_path, timeout));
+    if let Some(room) = room.filter(|_| person && std::io::stdin().is_terminal()) {
+        let client = Command::new("minos")
+            .args(["-server", &m.server, "-room", room, "-exit-with", &m.user])
+            // The person signs in as themselves, not as the run's accounts.
+            .env_remove(PASSWORD)
+            .env_remove(ADMIN_PASSWORD)
+            .spawn();
+        match client {
+            Ok(mut client) => loop {
+                if agent.is_finished() {
+                    let _ = client.kill();
+                    let _ = client.wait();
+                    break;
+                }
+                if let Ok(Some(_)) = client.try_wait() {
+                    if !agent.is_finished() {
+                        eprintln!("The run goes on: `/end` in the room, or Ctrl-C here, ends it.");
+                    }
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            },
+            Err(e) => eprintln!("warning: minos: {e}; enter room {room} from your client"),
+        }
+    }
+    let finished = agent
+        .join()
+        .map_err(|_| std::io::Error::other("the run's thread panicked"))?;
+    stop.store(true, Ordering::Relaxed);
+    if let Some(f) = follower {
+        let _ = f.join();
+    }
+    finished
 }
 
 /// Whether the broker entered its room. It writes `ready` once it has, so a
@@ -301,63 +420,148 @@ impl Drop for Sidecar {
     }
 }
 
+/// What a worker's `relay` needs of minos beyond `NEEDS`: a JSON spec is the
+/// one-shot kind, `acp` the ACP kind.
+pub fn relay_needs(relay: &str) -> Option<&'static str> {
+    match relay {
+        "acp" => Some("minosb.acp"),
+        r if r.ends_with(".json") => Some("minosb.agent-spec"),
+        _ => None,
+    }
+}
+
+/// What minos must offer for what pma asks of it, as `minos ping` names it.
+const NEEDS: [&str; 8] = [
+    "minos.room-ensure",
+    "minos.exit-with",
+    "minosb.task",
+    "minosb.events",
+    "minosb.linger",
+    "minosb.interrupters",
+    "minosb.end",
+    "minosb.pushed",
+];
+
 /// What `pma integrate minos` reports: the programs it needs, the passwords,
-/// and whether the server takes a connection.
-pub fn check(m: &Minos) -> Vec<String> {
+/// and what `minos ping` says of the server, each account, and the
+/// capabilities pma uses.
+/// `extra` names what the configured workers' relays need beyond `NEEDS`.
+pub fn check(m: &Minos, extra: &[&str]) -> Vec<String> {
     let mut problems = Vec::new();
     for program in ["minos", "minosb", "minosa"] {
-        if !on_path(program) {
+        if !crate::agent::on_path(program) {
             problems.push(format!("{program} is not on PATH"));
         }
     }
+    let can_ping = crate::agent::on_path("minos");
     for (var, account) in [(PASSWORD, &m.user), (ADMIN_PASSWORD, &m.admin)] {
-        if let Err(e) = password(var, account, m.dev_passwords) {
-            problems.push(e);
+        match password(var, account, m.dev_passwords) {
+            Ok(_) if !can_ping => {}
+            Ok(pass) => match ping(&m.server, account, &pass) {
+                Ok(offered) => problems.extend(
+                    NEEDS
+                        .iter()
+                        .chain(extra)
+                        .filter(|n| !offered.iter().any(|o| o == *n))
+                        .map(|n| format!("this minos lacks `{n}`; update minos")),
+                ),
+                Err(e) => problems.push(e),
+            },
+            Err(e) => problems.push(e),
         }
     }
-    if let Err(e) = reachable(&m.server) {
-        problems.push(format!("{}: {e}", m.server));
-    }
+    problems.sort();
+    problems.dedup();
     problems
 }
 
-fn on_path(program: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|dir| {
-            std::fs::metadata(dir.join(program)).is_ok_and(|m| {
-                use std::os::unix::fs::PermissionsExt;
-                m.is_file() && m.permissions().mode() & 0o111 != 0
-            })
-        })
-    })
-}
-
-/// A TCP connection to the server's host and port; no request is made.
-fn reachable(server: &str) -> Result<(), String> {
-    let rest = server
-        .strip_prefix("http://")
-        .or_else(|| server.strip_prefix("https://"))
-        .ok_or("expected an http:// or https:// address")?;
-    let host = rest.split('/').next().unwrap_or(rest);
-    let addr = match host.contains(':') {
-        true => host.to_string(),
-        false if server.starts_with("https") => format!("{host}:443"),
-        false => format!("{host}:80"),
+/// `minos ping` as `account`: the capabilities it lists, or why it failed. A
+/// minos without `ping` would start its client, so it gets no terminal and
+/// five seconds.
+fn ping(server: &str, account: &str, pass: &std::ffi::OsStr) -> Result<Vec<String>, String> {
+    let mut child = Command::new("minos")
+        .args(["ping", "-server", server])
+        .env("MINOS_USER", account)
+        .env("MINOS_PASSWORD", pass)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("minos: {e}"))?;
+    let until = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match child.try_wait().map_err(|e| format!("minos: {e}"))? {
+            Some(status) => break status,
+            None if Instant::now() >= until => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("`minos ping` did not answer; update minos".into());
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
     };
-    use std::net::ToSocketAddrs;
-    let to = addr
-        .to_socket_addrs()
-        .map_err(|e| e.to_string())?
-        .next()
-        .ok_or("no address")?;
-    std::net::TcpStream::connect_timeout(&to, Duration::from_secs(2))
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("minos: {e}"))?;
+    let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    match status.code() {
+        Some(0) => {
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+                .map_err(|_| "`minos ping` printed no capabilities; update minos".to_string())?;
+            Ok(v["capabilities"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|c| c.as_str().map(str::to_string))
+                .collect())
+        }
+        Some(3) => Err(format!("{server}: no minos server answers: {said}")),
+        Some(4) => Err(format!("{server} refused `{account}`: {said}")),
+        _ => Err(format!(
+            "`minos ping` failed ({status}); update minos: {said}"
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// As minos `docs/minosb-events.md` names them: a push starts work, a
+    /// turn with nothing to deliver waits, and only a driven run waits on you.
+    #[test]
+    fn events_become_a_runs_state() {
+        let turn = r#"{"event":"turn","delivering":0}"#;
+        assert_eq!(
+            state_of(r#"{"event":"pushed","messages":1}"#, true),
+            Some("working")
+        );
+        assert_eq!(state_of(turn, true), Some("blocked"));
+        assert_eq!(state_of(turn, false), Some("idle"));
+        assert_eq!(state_of(r#"{"event":"turn","delivering":2}"#, true), None);
+        assert_eq!(state_of(r#"{"event":"ready","room":"r"}"#, true), None);
+        assert_eq!(state_of("not json", true), None);
+
+        let events = std::env::temp_dir().join(format!("pma-follow-{}.events", std::process::id()));
+        let lines = [
+            r#"{"event":"ready","room":"r"}"#,
+            r#"{"event":"pushed","messages":1}"#,
+            r#"{"event":"pushed","messages":1}"#,
+            turn,
+        ];
+        std::fs::write(&events, lines.join("\n") + "\n" + r#"{"event":"pushed""#).unwrap();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let stop = AtomicBool::new(true);
+        follow(&events, true, &stop, &|s| {
+            seen.lock().unwrap().push(s.to_string())
+        });
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["working", "blocked"],
+            "each change once; a line still being written waits"
+        );
+        let _ = std::fs::remove_file(events);
+    }
 
     fn args_of(cmd: &Command) -> Vec<String> {
         cmd.get_args()
@@ -387,15 +591,25 @@ mod tests {
             .current_dir("/w")
             .env("GH_CONFIG_DIR", "/g")
             .env_remove(PASSWORD);
-        let cmd = wrap(&m, &link(), "claude", "fix it", &agent).unwrap();
+        let cmd = wrap(&m, &link(), "claude", "fix it", &agent, false).unwrap();
         assert_eq!(cmd.get_program(), "minosb");
         let args = args_of(&cmd);
         let after = |flag: &str| &args[args.iter().position(|a| a == flag).unwrap() + 1];
         assert_eq!(after("-room"), "r1");
         assert_eq!(after("-socket"), "/s/1-1.sock");
         assert_eq!(after("-events"), "/e/minos-1.events");
+        assert_eq!(after("-agent"), "claude");
         assert_eq!(after("-task"), "fix it");
         assert_eq!(after("-linger"), "120s");
+        let spec = wrap(&m, &link(), "/m/agents/gilda.json", "fix it", &agent, false).unwrap();
+        let spec = args_of(&spec);
+        let at = spec.iter().position(|a| a == "-agent-spec").unwrap();
+        assert_eq!(spec[at + 1], "/m/agents/gilda.json");
+        assert!(!spec.iter().any(|a| a == "-agent"));
+        let person = wrap(&m, &link(), "claude", "fix it", &agent, true).unwrap();
+        let args = args_of(&person);
+        let at = args.iter().position(|a| a == "-linger").unwrap();
+        assert_eq!(args[at + 1], "0s", "a person ends the run, not the linger");
         assert_eq!(after("-interrupters"), "sa,demo");
         assert_eq!(after("-user"), "worker");
         let dash = args.iter().position(|a| a == "--").unwrap();
@@ -460,15 +674,5 @@ mod tests {
         std::fs::write(&events, "{\"event\":\"ready\",\"room\":\"r1\"}\n").unwrap();
         assert!(ready(&events));
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn an_address_is_checked_by_connecting() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        assert_eq!(reachable(&format!("http://127.0.0.1:{port}")), Ok(()));
-        // Not the freed port: a test running beside this one may be given it.
-        assert!(reachable("http://127.0.0.1:0/").is_err());
-        assert!(reachable("127.0.0.1:8000").is_err(), "no scheme");
     }
 }

@@ -53,6 +53,10 @@ Each measure is its fix run as a dry run, so the fix clears the state by constru
 | cargo | `Cargo.lock` | `cargo update --dry-run` | `cargo update` |
 | uv | `uv.lock` | `uv lock --upgrade --dry-run` | `uv lock --upgrade` |
 | go | `go.mod` | `go list -u -m all`, direct | `go get -u ./... && go mod tidy` |
+| npm | `package-lock.json` | lock diff after `npm update --package-lock-only` on a copy | `npm update` |
+| pnpm | `pnpm-lock.yaml` | lock diff after `pnpm update --lockfile-only` on a copy | `pnpm update` |
+
+npm and pnpm, added 2026-11-20: `npm update --dry-run` compares against `node_modules`, so in a clone without it every package reads as an addition, and with `--package-lock-only` it reports nothing. Updating the lock alone on a copy of `package.json` and the lock measures the fix without touching the project. Workspaces are refused: the copy lacks the members' manifests.
 
 uv changes from `uv tree --frozen --outdated --depth 1`. The new count includes transitive packages, like cargo's. cargo and go are unchanged.
 
@@ -62,7 +66,7 @@ Held back is a second number, read from cargo's `behind latest` note. It is show
 
 ## Lock age
 
-Lock age is the commit time of the newest change to each lock (`Cargo.lock`, `uv.lock`, `go.sum`) on HEAD or its upstream; the upstream counts a refresh published but not yet pulled. With several locks, the oldest decides. It is one `git log` per lock with no network, so every scan computes it, not only `--deps`.
+Lock age is the commit time of the newest change to each lock (`Cargo.lock`, `uv.lock`, `go.sum`, `package-lock.json`, `pnpm-lock.yaml`) on HEAD or its upstream; the upstream counts a refresh published but not yet pulled. With several locks, the oldest decides. It is one `git log` per lock with no network, so every scan computes it, not only `--deps`.
 
 A lock with uncommitted changes counts as fresh: someone is refreshing it. A lock never committed has no age.
 

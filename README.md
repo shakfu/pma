@@ -98,7 +98,7 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 - `pma` reads two passwords from its environment and stores neither: `MINOS_PASSWORD` for the run's account (`minos.user`, default `worker`) and `MINOS_ADMIN_PASSWORD` for the administrator who founds rooms (`minos.admin`, default `demo`). An unset one is the account name, as in minosd's development accounts; `pma config minos.dev_passwords off` makes it mean no room. Agents get neither.
 
-- A worker with a `relay` runs under `minosb`, which writes the task and each correction to its stdin; `claude` ships with one. A `relay` naming a `.json` file is a minos one-shot spec, which runs the CLI once per turn; see `docs/dev/agent-entries.md`. `relay = "acp"` runs an ACP agent (minos `docs/acp.md`), reported from the run's events. Any other worker runs beside a broker and is told to read the room with `minosa messages`.
+- A worker with a `relay` runs under `minosb`, which writes the task and each correction to its stdin; `claude` ships with one. A `relay` naming a `.json` file is a minos one-shot spec, which runs the CLI once per turn; see `docs/dev/agent-entries.md`. `relay = "acp"` opts into running an ACP agent instead (minos `docs/acp.md`), reported from the run's events with each permission request. Any other worker runs beside a broker and is told to read the room with `minosa messages`.
 
 - `minos.rooms` is `task` (default), one room a task's runs share, or `run`, one room per run. minos seats one run per room, so a second run of a task in progress goes without one. With no server, an unattended run goes on without a room and warns; `I` and `T` fail.
 

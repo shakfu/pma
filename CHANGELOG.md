@@ -88,6 +88,8 @@ Upgrading from 0.10:
 
 ### Fixed
 
+- An ACP run's cost now comes from the last minosb `usage` event that has a `cost`. minosb now sends a `usage` event on every ACP `usage_update`, with the context's `used` and `size`, and a `cost` only when the update has one. Reading the last event of all lost the cost whenever an update with no cost came last.
+
 - A Python project with a `pyproject.toml` and no `uv.lock` was verified with `python3 -m pytest`, which has neither the project's dependencies nor, often, pytest. pma now runs pytest in a throwaway uv environment that holds the project, its extras and dependency groups, and pytest. It writes no lock or `.venv` to the run's tree. A `poetry.lock` means `poetry run pytest`, because uv cannot read Poetry 1's dependencies. `python3 -m pytest` remains when uv is not on `PATH`.
 
 - A failed job's notice now says why: `job 7 failed: pma prune --bogus: unexpected argument '--bogus' found`. The reason is the last `error:` or `pma:` line of the job's log. Before, a mistyped `:` command looked like any other failure until its log was opened. The TUI, the web and `$PMA_JOB_SUMMARY` all carry it. Checking arguments before queueing was the alternative. It would catch the mistake sooner, but it costs a process per line and misses every failure that is not an argument error.

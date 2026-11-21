@@ -288,8 +288,10 @@ pub fn parse_acp(events: &str, exit_ok: bool) -> Report {
                 .collect::<Vec<_>>()
                 .join("\n\n"),
         },
+        // Only some usage events carry a cost; the last that does is the total.
         cost_usd: of("usage")
-            .last()
+            .into_iter()
+            .rfind(|v| v.get("cost").is_some())
             .filter(|v| v["currency"] == "USD")
             .and_then(|v| v["cost"].as_f64()),
         denied: of("permission")
@@ -661,6 +663,7 @@ mod tests {
             r#"{"event":"usage","cost":0.02,"currency":"USD"}"#,
             r#"{"event":"result","text":"Added it.","stop_reason":"end_turn"}"#,
             r#"{"event":"usage","cost":0.05,"currency":"USD"}"#,
+            r#"{"event":"usage","used":1089,"size":1000000}"#,
             r#"{"event":"result","text":"Renamed it.","stop_reason":"cancelled"}"#,
             r#"{"event":"turn","delivering":0}"#,
         ]

@@ -1099,7 +1099,7 @@ pub const CLI_TABLE: &[(&str, &str, Scope)] = &[
     ),
     (
         "integrate",
-        "Where agents run: `herdr`, `herdr-app`, `minos` or `none`",
+        "Where agents run: herdr, herdr-app, rex, minos or none",
         Scope::None,
     ),
     ("agent", "The workers `pma dispatch` can run", Scope::None),

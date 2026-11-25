@@ -66,11 +66,13 @@ pub struct Config {
     pub integration: Integration,
     /// The server and accounts `integration = minos` uses.
     pub minos: Minos,
+    /// Which runs share a session under `integration = rex`.
+    pub rex_sessions: RexSessions,
     pub projects: BTreeMap<String, ProjectSettings>,
 }
 
-/// What agents run in: `pma integrate`. See docs/dev/herdr-integration.md and
-/// docs/dev/pma-minos-integration.md.
+/// What agents run in: `pma integrate`. See docs/dev/herdr-integration.md,
+/// docs/dev/rex-integration.md and docs/dev/pma-minos-integration.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Integration {
     /// A child process of `pma`.
@@ -80,6 +82,8 @@ pub enum Integration {
     Herdr,
     /// A tab of Herdr.app, run by herdr-core.
     HerdrApp,
+    /// A window of a Rex session.
+    Rex,
     /// A child of `pma`, relayed through a minos room where a person reads
     /// and corrects it.
     Minos,
@@ -91,13 +95,17 @@ impl Integration {
             Integration::None => "none",
             Integration::Herdr => "herdr",
             Integration::HerdrApp => "herdr-app",
+            Integration::Rex => "rex",
             Integration::Minos => "minos",
         }
     }
 
     /// Whether runs open a pane, which a shell can wait on from a job.
     pub fn panes(self) -> bool {
-        matches!(self, Integration::Herdr | Integration::HerdrApp)
+        matches!(
+            self,
+            Integration::Herdr | Integration::HerdrApp | Integration::Rex
+        )
     }
 
     pub fn parse(s: &str) -> Option<Self> {
@@ -105,6 +113,7 @@ impl Integration {
             "none" => Some(Integration::None),
             "herdr" => Some(Integration::Herdr),
             "herdr-app" => Some(Integration::HerdrApp),
+            "rex" => Some(Integration::Rex),
             "minos" => Some(Integration::Minos),
             _ => None,
         }
@@ -174,6 +183,32 @@ impl Rooms {
         match s {
             "task" => Some(Rooms::Task),
             "run" => Some(Rooms::Run),
+            _ => None,
+        }
+    }
+}
+
+/// Which runs share a Rex session. See docs/dev/rex-integration.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RexSessions {
+    /// One `pma` session, a tab per run titled `<project>: <task>`.
+    Single,
+    /// One `pma: <project>` session per project, as herdr's workspaces.
+    Project,
+}
+
+impl RexSessions {
+    pub fn name(self) -> &'static str {
+        match self {
+            RexSessions::Single => "single",
+            RexSessions::Project => "project",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<RexSessions> {
+        match s {
+            "single" => Some(RexSessions::Single),
+            "project" => Some(RexSessions::Project),
             _ => None,
         }
     }
@@ -269,6 +304,7 @@ impl Default for Config {
             workspace: Workspace::Clone,
             integration: Integration::None,
             minos: Minos::default(),
+            rex_sessions: RexSessions::Single,
             projects: BTreeMap::new(),
         }
     }
@@ -290,6 +326,7 @@ enum Slot<'a> {
     Workspace(&'a mut Workspace),
     Integration(&'a mut Integration),
     Rooms(&'a mut Rooms),
+    RexSessions(&'a mut RexSessions),
     /// Empty text is `None`.
     OptText(&'a mut Option<String>),
     /// Text that may not be empty.
@@ -424,6 +461,7 @@ impl Config {
             ]
             .map(|k| format!("minos.{k}")),
         );
+        keys.push("rex.sessions".into());
         keys
     }
 
@@ -458,6 +496,7 @@ impl Config {
             | Slot::Workspace(_)
             | Slot::Integration(_)
             | Slot::Rooms(_)
+            | Slot::RexSessions(_)
             | Slot::OptText(_)
             | Slot::Text(_) => "text",
         })
@@ -479,6 +518,7 @@ impl Config {
             Slot::Workspace(w) => w.name().into(),
             Slot::Integration(i) => i.name().into(),
             Slot::Rooms(r) => r.name().into(),
+            Slot::RexSessions(r) => r.name().into(),
             Slot::OptText(v) => v.clone().unwrap_or_default(),
             Slot::Text(v) => v.clone(),
             Slot::Switch(v) => if *v { "on" } else { "off" }.into(),
@@ -560,10 +600,14 @@ impl Config {
                 *w = Workspace::parse(value).ok_or("expected clone or worktree")?;
             }
             Slot::Integration(i) => {
-                *i = Integration::parse(value).ok_or("expected none, herdr, herdr-app or minos")?;
+                *i = Integration::parse(value)
+                    .ok_or("expected none, herdr, herdr-app, rex or minos")?;
             }
             Slot::Rooms(r) => {
                 *r = Rooms::parse(value).ok_or("expected task or run")?;
+            }
+            Slot::RexSessions(r) => {
+                *r = RexSessions::parse(value).ok_or("expected single or project")?;
             }
             Slot::OptText(v) => *v = (!value.is_empty()).then(|| value.to_string()),
             Slot::Text(v) => {
@@ -629,6 +673,7 @@ impl Config {
             Some(("activity", "ignore")) => Slot::List(&mut self.activity_ignore),
             Some(("deps", "days")) => Slot::Count(&mut self.deps_days, 0, i64::MAX),
             Some(("scan", "every")) => Slot::Count(&mut self.scan_every, 0, i64::MAX),
+            Some(("rex", "sessions")) => Slot::RexSessions(&mut self.rex_sessions),
             Some(("minos", field)) => {
                 let m = &mut self.minos;
                 match field {
@@ -685,7 +730,7 @@ mod tests {
     #[test]
     fn every_key_reads_and_round_trips() {
         let keys = Config::keys();
-        assert_eq!(keys.len(), 47);
+        assert_eq!(keys.len(), 48);
         let defaults = Config::default();
         let mut copy = Config::default();
         for key in &keys {

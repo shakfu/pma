@@ -394,7 +394,7 @@ enum Command {
         #[arg(long, conflicts_with = "local")]
         push: bool,
         /// Run `claude` for you to drive in a herdr pane, not headless. It
-        /// needs `pma integrate herdr` or `herdr-app`, and reports no cost or
+        /// needs `pma integrate herdr`, `herdr-app` or `rex`, and reports no cost or
         /// summary.
         #[arg(long, conflicts_with = "push")]
         interactive: bool,
@@ -622,16 +622,16 @@ enum Command {
         #[arg(required = true)]
         ids: Vec<i64>,
     },
-    /// Where agents run: `herdr`, `herdr-app`, `minos` or `none`
+    /// Where agents run: herdr, herdr-app, rex, minos or none
     ///
-    /// Bare, it says which is on; one at a time. Under `herdr` or `herdr-app`,
-    /// each run gets a tab in a `pma: <project>` workspace. Under `minos`, each
+    /// Bare, it says which is on; one at a time. Under `herdr`, `herdr-app`
+    /// or `rex`, each run gets a tab in a `pma: <project>` workspace. Under `minos`, each
     /// run gets a room where a person reads and corrects it between turns, and
     /// `I` and `T` are driven from the room. With no server, an unattended
     /// run goes on without a pane or room and warns.
     Integrate {
         /// `herdr` (the TUI's server), `herdr-app` (Herdr.app over
-        /// herdr-core), `minos` or `none`.
+        /// herdr-core), `rex`, `minos` or `none`.
         name: Option<String>,
         /// Turn the one named off.
         #[arg(long, requires = "name")]
@@ -639,7 +639,7 @@ enum Command {
     },
     /// Open an interactive agent on a finished run's directory.
     ///
-    /// Under `herdr` or `herdr-app`, in a tab, as `T` does. Under `minos`, in
+    /// Under `herdr`, `herdr-app` or `rex`, in a tab, as `T` does. Under `minos`, in
     /// the run's room, held here until the agent exits; `T` queues this as a
     /// job. An edit made there changes the run: read it again before approving.
     TakeOver {
@@ -696,7 +696,7 @@ enum Command {
     },
     /// A shell in a project's clone, for a fix by hand.
     ///
-    /// In a herdr pane or Herdr.app tab under `pma integrate`, else on this
+    /// In a herdr pane, Herdr.app tab or Rex window under `pma integrate`, else on this
     /// terminal.
     /// When it ends the project is re-read, so an unstaged edit shows at once.
     Shell {
@@ -4805,7 +4805,7 @@ fn run_integrate(name: Option<&str>, off: bool) -> Result<()> {
         }
         (Some(name), _) => {
             return Err(format!(
-                "unknown integration `{name}`; expected herdr, herdr-app, minos or none"
+                "unknown integration `{name}`; expected herdr, herdr-app, rex, minos or none"
             )
             .into());
         }
@@ -4814,6 +4814,8 @@ fn run_integrate(name: Option<&str>, off: bool) -> Result<()> {
     println!("integration = {}", cfg.integration.name());
     use pma_core::herdr_app::Reach;
     let tui = pma_core::herdr::check();
+    // `rex` is run with `--autostart=false`, so this never starts a server.
+    let rex = pma_core::rex::check();
     // Only when chosen: `hc server status` may start a core.
     let app = match cfg.integration {
         config::Integration::HerdrApp => pma_core::herdr_app::check(),
@@ -4833,6 +4835,17 @@ fn run_integrate(name: Option<&str>, off: bool) -> Result<()> {
                 "Herdr.app's window is closed; runs go to herdr-core unseen until it opens"
             ),
             Err(e) => println!("herdr-app: {e}; runs go on without a pane until it answers"),
+        },
+        config::Integration::Rex => match &rex {
+            Ok(()) => match cfg.rex_sessions {
+                config::RexSessions::Single => println!(
+                    "Rex answers; each run opens a tab `<project>: <task>` in session `pma`"
+                ),
+                config::RexSessions::Project => {
+                    println!("Rex answers; each run opens a tab in session `pma: <project>`")
+                }
+            },
+            Err(e) => println!("rex: {e}; runs go on without a pane until it answers"),
         },
         config::Integration::Minos => {
             let m = &cfg.minos;
@@ -4870,6 +4883,9 @@ fn run_integrate(name: Option<&str>, off: bool) -> Result<()> {
     }
     if cfg.integration != config::Integration::Herdr && tui.is_ok() {
         println!("a herdr server is running: `pma integrate herdr` uses it");
+    }
+    if cfg.integration != config::Integration::Rex && rex.is_ok() {
+        println!("a Rex server is running: `pma integrate rex` uses it");
     }
     Ok(())
 }

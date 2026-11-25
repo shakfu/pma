@@ -138,7 +138,7 @@ fn tab_id() -> String {
 
 /// `argv` as the app runs it: in a login shell, which stays once it ends.
 /// The words go to the shell as `"$@"`, so only Bourne-style shells are used.
-fn wrapped(argv: &[String], shell: Option<&str>) -> Vec<String> {
+pub(crate) fn wrapped(argv: &[String], shell: Option<&str>) -> Vec<String> {
     if argv.is_empty() {
         return Vec::new();
     }

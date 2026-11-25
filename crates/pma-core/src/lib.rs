@@ -34,6 +34,7 @@ pub mod rank;
 pub mod refresh;
 pub mod report;
 pub mod report_runs;
+pub mod rex;
 pub mod route;
 pub mod scan;
 pub mod screen;

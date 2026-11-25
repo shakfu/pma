@@ -24,6 +24,15 @@ Upgrading from 0.10:
 
 ### Added
 
+- **Rex as where agents run.** `pma integrate rex` runs each agent in a tab of a [Rex](https://www.superlogical.com/rex/) server, alongside the herdr and Herdr.app backends. `H`, `T`, `S` and `--interactive` work as under `herdr`. A headless run reports `working`, then `done` or `error`, in Rex's activity view, and Rex.app alerts on a blocked agent itself. `H` and `T` switch the app to the run's session only when Remote Control is on in Rex.app. pma never starts a Rex server. `make rex-check` runs a dispatch under each layout; `make rex-manual-check` asks a person to confirm `--interactive`, `H` and take-over. Design: `docs/dev/rex-integration.md`.
+
+  ```sh
+  pma config rex.sessions single    # default: one `pma` session, tabs `<project>: <task>`
+  pma config rex.sessions project   # one `pma: <project>` session per project
+  ```
+
+  `single` is the default over `project` because a session per project stays in Rex's sidebar after its runs are reviewed.
+
 - **minos as where agents run.** `pma integrate minos` now chooses minos in place of herdr or herdr-app, where it was a room beside either. `I` and `T` are driven from the run's room: the agent starts on its task or the take-over prompt and waits for a person between turns, with no timeout, until it exits. The new `pma take-over <id>` holds a take-over; `T` queues it as a job. Running minos and herdr together wrapped one process in both, which was too complicated to keep; minos's missing pieces are in its own `TODO.md`. A person-driven run needs a worker with a `relay`, which only `claude` ships with.
 
   A `relay` that names a JSON file is a minos one-shot spec: `minosb -agent-spec` runs the CLI once per turn and resumes its session, so `gilda`, `minima`, `hax`, `myra` and `hilda` can be driven from the room. Such a run's cost is the sum of its turns, as each CLI costs one process only. Entries are in `docs/dev/agent-entries.md`.
@@ -87,6 +96,8 @@ Upgrading from 0.10:
 - A full scan of 117 projects makes 205 to 223 `gh` calls instead of 311, and takes 24 to 26 s instead of 38 s. A repository with no active workflow gets no `run list`. A project's per-workflow reads run in parallel. A workflow read alone is cached in `ci_alone`. It is reused while the 100-run window reaches back to that read, so any newer run of it would be in the window, and for at most 24 h, which bounds a re-run of an old run. A window under 100 runs holds every run, so a workflow missing from it is not asked about. Measurements and the options not built: `docs/dev/gh-optimize.md`.
 
 ### Fixed
+
+- An agent dispatched from a Rex pane inherited `REX_SERVER`, `REX_BLOCK` and `REX_SESSION`. With them it could type `git push` into another pane that holds credentials. `restrict` now removes them and points `REX_SERVER` at a dead socket, because `rex` falls back to its default socket when the variable is unset.
 
 - An ACP run's cost now comes from the last minosb `usage` event that has a `cost`. minosb now sends a `usage` event on every ACP `usage_update`, with the context's `used` and `size`, and a `cost` only when the update has one. Reading the last event of all lost the cost whenever an update with no cost came last.
 

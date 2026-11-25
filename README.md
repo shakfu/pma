@@ -31,7 +31,7 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 - Failing CI, outdated dependencies, idle repositories and dirty working trees appear as tasks beside the written ones.
 
-- Two front ends with the same views and actions: `pma tui` in a terminal, over SSH too, and `pma web` in a local browser, on 127.0.0.1 behind a one-time token. Both act on what is selected: dispatch a task, approve or reject a run, approve a plan, stop a job. Space marks tasks, and `d` dispatches the marked ones, one run per project. On the projects tab, Space marks projects, `z` runs one name over them, `e` sets their tier or tag together, `x` forgets a deleted project, and `d` or `I` dispatches each one's next task, or `project:ci` from the `Failing CI` list. `P` in a project view dispatches a prompt you type. `O` opens a project by a few letters of its name or a tag, `/` filters any list the same way and `*` marks what it keeps, `#` scopes every view and portfolio act to a tag, `v` reads a run's diff in your pager, `E` opens the project in `$EDITOR` and `S` a shell in it, in herdr when integrated, for a fix by hand.
+- Two front ends with the same views and actions: `pma tui` in a terminal, over SSH too, and `pma web` in a local browser, on 127.0.0.1 behind a one-time token. Both act on what is selected: dispatch a task, approve or reject a run, approve a plan, stop a job. Space marks tasks, and `d` dispatches the marked ones, one run per project. On the projects tab, Space marks projects, `z` runs one name over them, `e` sets their tier or tag together, `x` forgets a deleted project, and `d` or `I` dispatches each one's next task, or `project:ci` from the `Failing CI` list. `P` in a project view dispatches a prompt you type. `O` opens a project by a few letters of its name or a tag, `/` filters any list the same way and `*` marks what it keeps, `#` scopes every view and portfolio act to a tag, `v` reads a run's diff in your pager, `E` opens the project in `$EDITOR` and `S` a shell in it, in herdr, Herdr.app or Rex when integrated, for a fix by hand.
 
 - A view of each project: its state and why, CI, dependencies, local changes, open tasks and every run, with how old the scan behind it is. `pma project show <name>`, or `o` on any row.
 
@@ -57,7 +57,7 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 - By default an agent edits your clone, from the working tree as it is, and its change waits there unstaged: `git diff` shows it, `pma review` approves it, and a rejection reverts it. Your own files are left alone: a rejection reverses only what the agent changed, and refuses once the clone has moved past the run. `pma close <id>`, or `X`, ends a run and touches nothing; it counts neither for nor against the agent. One run per project at a time. `pma config workspace worktree`, or `--worktree` on one command, gives each run a worktree of the remote default branch instead, so your checkout is never touched and runs can share a project.
 
-- The agent's environment holds no push credentials: tokens, the SSH agent, askpass helpers and the control sockets of terminal multiplexers (herdr, herdr-core, tmux, screen, zellij, kitty, WezTerm, Neovim) are removed, and git's pushes are redirected. Credentials on disk, such as `~/.ssh` keys or `~/.git-credentials`, stay readable, and a terminal scripted through AppleScript (Ghostty, iTerm2, Terminal.app) has no variable to remove; this stops an accidental push, not a determined one. `pma` runs the project's test command itself, before and after, and reports both ends.
+- The agent's environment holds no push credentials: tokens, the SSH agent, askpass helpers and the control sockets of terminal multiplexers (herdr, herdr-core, Rex, tmux, screen, zellij, kitty, WezTerm, Neovim) are removed, and git's pushes are redirected. Credentials on disk, such as `~/.ssh` keys or `~/.git-credentials`, stay readable, and a terminal scripted through AppleScript (Ghostty, iTerm2, Terminal.app) has no variable to remove; this stops an accidental push, not a determined one. `pma` runs the project's test command itself, before and after, and reports both ends.
 
 - `claude` runs with `--permission-mode auto`: a [classifier](https://code.claude.com/docs/en/permission-modes) reviews each action, and nothing stops to ask. A model or organization without auto mode starts in Manual, where `-p` denies what needs approval. `pma agent set claude args` changes it. A refused action does not stop a run, so `pma review` lists what the agent was denied, and such a run is not clean: `b` and `--push` leave it for you to read.
 
@@ -73,11 +73,15 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 - An agent drafts a changelog entry per change in `.pma/changelog.md`, not in `CHANGELOG.md`, so changes running together do not conflict; `pma review` shows the draft, or says there is none.
 
-**Running in herdr or Herdr.app**
+**Running in herdr, Herdr.app or Rex**
 
 - `pma integrate herdr` runs every agent in a [herdr](https://herdr.dev) pane you can watch: a tab per run, in a `pma: <project>` workspace. Cost, verdict and review stay as they are. With no server, a run goes on without a pane and warns. `pma integrate none` turns it off.
 
-- `pma integrate herdr-app` does the same in [Herdr.app](https://github.com/herdrdev/herdr-app): a tab per run in a `pma: <project>` space, opened behind the tab you are on. With the window closed, a headless run goes to herdr-core unseen, and `H` gives it a tab later; an interactive run needs the window. Herdr.app alerts on a blocked agent itself. `pma integrate` names whichever of the two is running.
+- `pma integrate herdr-app` does the same in [Herdr.app](https://github.com/herdrdev/herdr-app): a tab per run in a `pma: <project>` space, opened behind the tab you are on. With the window closed, a headless run goes to herdr-core unseen, and `H` gives it a tab later; an interactive run needs the window. Herdr.app alerts on a blocked agent itself.
+
+- `pma integrate rex` does the same in [Rex](https://www.superlogical.com/rex/): a tab per run titled `<project>: <task>` in one `pma` session, opened in the background. `pma config rex.sessions project` gives each project a `pma: <project>` session instead. A headless run reports `working`, then `done` or `error`, in Rex's activity view, and Rex.app alerts on a blocked agent itself. `H` and `T` switch the app to the run's session only when Remote Control is on in Rex.app (Settings, General). pma never starts a Rex server. Design: `docs/dev/rex-integration.md`.
+
+- `pma integrate` names whichever of herdr, Herdr.app and Rex is running, and never switches on its own.
 
 - `H` opens a run's pane, and `T` opens an interactive agent on its directory: the run's own, or the default one if the run's agent has no interactive form. `I`, or `pma dispatch --interactive`, gives you a live agent to drive for the whole run; the run ends when you exit it, and reports no cost or summary.
 
@@ -92,7 +96,7 @@ pma push 1                     # commit and push it; or `pma pr 1` after --appro
 
 **Talking to a run in minos**
 
-- `pma integrate minos` makes [minos](https://github.com/shakfu/minos) where agents run, in place of `herdr` or `herdr-app`. Each run gets a room where you read the agent and correct it between turns. `pma integrate minos --off` turns it off; `pma integrate` shows which backend is on.
+- `pma integrate minos` makes [minos](https://github.com/shakfu/minos) where agents run, in place of `herdr`, `herdr-app` or `rex`. Each run gets a room where you read the agent and correct it between turns. `pma integrate minos --off` turns it off; `pma integrate` shows which backend is on.
 
 - `I` (`dispatch --interactive`) and `T` (`pma take-over <id>`) are driven from the room. The agent starts on the task, or on the take-over prompt, and waits for you between turns. It ends when the agent exits: `/end` in the room, Ctrl-C on a foreground run, or `pma job stop` on one the TUI or web queued. Such a run needs a worker with a `relay`. Started from a terminal, it opens the `minos` client in the room, which returns when the run stops; one queued from the TUI or web leaves you to enter the room, which `H` names. A run waiting on you between turns shows as blocked and raises a notice, as herdr's do.
 
@@ -232,7 +236,7 @@ pma web --app                   # as an app window, in Chrome or Chromium
 pma project show myproject      # one project: state, open tasks, runs and jobs; `o` in the TUI and web
 pma web --no-open --port 9000   # for `ssh -L 9000:127.0.0.1:9000 host` from another machine
 pma note add "move CI to a reusable workflow"
-pma shell myproject             # a shell in its clone, in herdr or Herdr.app if integrated; re-read on exit
+pma shell myproject             # a shell in its clone, in herdr, Herdr.app or Rex if integrated; re-read on exit
 ```
 
 After the first scan you rarely need to scan again. `next`, `matrix`, `status`, `task` and `dispatch` re-read a project whose `TODO.md` or git state changed, and the TUI and web do so every 5 seconds, plus a full scan with CI every `scan.every` minutes (30; 0 turns it off). An unstaged edit shows at the next full scan. See [docs/dev/refresh.md](docs/dev/refresh.md).

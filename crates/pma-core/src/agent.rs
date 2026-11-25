@@ -42,6 +42,11 @@ pub fn restrict(cmd: &mut Command, dir: &Path) -> std::io::Result<()> {
         "HC_TERMINAL_SOCKET",
         "HC_TERMINAL_ID",
         "HC_SCOPE",
+        // Rex; `REX_SERVER` is named below.
+        "REX_SESSION",
+        "REX_BLOCK",
+        "REX_BIN_DIR",
+        "REX_CLIENT",
         "TMUX",
         "TMUX_PANE",
         "STY",
@@ -68,6 +73,11 @@ pub fn restrict(cmd: &mut Command, dir: &Path) -> std::io::Result<()> {
     cmd.env(
         "HERDR_SOCKET_PATH",
         "/nonexistent/pma-agents-cannot-reach-herdr.sock",
+    );
+    // Rex too finds its default socket; this address outranks it.
+    cmd.env(
+        "REX_SERVER",
+        "unix:///nonexistent/pma-agents-cannot-reach-rex.sock",
     );
     cmd.env("GH_CONFIG_DIR", &gh)
         .env("GIT_TERMINAL_PROMPT", "0");
@@ -874,6 +884,10 @@ mod tests {
             "HC_TERMINAL_SOCKET",
             "HC_TERMINAL_ID",
             "HC_SCOPE",
+            "REX_SESSION",
+            "REX_BLOCK",
+            "REX_BIN_DIR",
+            "REX_CLIENT",
         ];
         let script = vars
             .iter()
@@ -903,7 +917,7 @@ mod tests {
             "-c",
             "echo \"${GH_TOKEN-unset} ${GH_ENTERPRISE_TOKEN-unset} ${GIT_ASKPASS-unset} \
              ${HERDR_ENV-unset} ${HERDR_SOCKET_PATH-unset} ${HERDR_PANE_ID-unset} $GIT_TERMINAL_PROMPT \
-             ${MINOS_PASSWORD-unset} ${MINOS_ADMIN_PASSWORD-unset}\"",
+             ${MINOS_PASSWORD-unset} ${MINOS_ADMIN_PASSWORD-unset} ${REX_SERVER-unset}\"",
         ])
         .env("MINOS_PASSWORD", "worker")
         .env("MINOS_ADMIN_PASSWORD", "demo")
@@ -913,12 +927,14 @@ mod tests {
         .env("HERDR_ENV", "1")
         .env("HERDR_SOCKET_PATH", "/tmp/herdr.sock")
         .env("HERDR_PANE_ID", "w1:p1")
+        .env("REX_SERVER", "unix:///tmp/rex.sock")
         .current_dir(&dir);
         restrict(&mut cmd, &dir).unwrap();
         let out = cmd.output().unwrap();
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
-            "unset unset unset unset /nonexistent/pma-agents-cannot-reach-herdr.sock unset 0 unset unset\n"
+            "unset unset unset unset /nonexistent/pma-agents-cannot-reach-herdr.sock unset 0 unset unset \
+             unix:///nonexistent/pma-agents-cannot-reach-rex.sock\n"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

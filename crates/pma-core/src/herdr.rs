@@ -21,8 +21,9 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::agent::{self, Finished};
-use crate::config::{Config, Integration};
+use crate::config::{Config, Integration, RexSessions};
 use crate::herdr_app as app;
+use crate::rex;
 
 /// How long a request may take; a subscription polls its stop flag this often.
 const REQUEST: Duration = Duration::from_secs(10);
@@ -124,6 +125,9 @@ pub fn close(pane: &str) {
     if app::is_app(pane) {
         return app::close(pane);
     }
+    if rex::is_rex(pane) {
+        return rex::close(pane);
+    }
     let _ = call("pane.close", json!({ "pane_id": pane }));
 }
 
@@ -140,6 +144,9 @@ fn type_line(pane: &str, line: &str) -> Result<(), String> {
 pub fn focus(pane: &str) -> Result<(), String> {
     if app::is_app(pane) {
         return app::focus(pane);
+    }
+    if rex::is_rex(pane) {
+        return rex::focus(pane);
     }
     let got =
         call("pane.get", json!({ "pane_id": pane })).map_err(|e| format!("pane {pane}: {e}"))?;
@@ -159,15 +166,20 @@ pub fn wait_closed(pane: &str) {
 /// person is at its keyboard, so it has their environment rather than
 /// `restrict`'s; only what the worker sets itself is added.
 pub fn take_over(
-    integration: Integration,
+    cfg: &Config,
     project: &str,
     title: &str,
     cwd: &Path,
     cmd: &Command,
 ) -> Result<String, String> {
-    if integration == Integration::HerdrApp {
-        let argv = ["sh".into(), "-c".into(), command_line(cmd)];
-        return app::start(project, title, cwd, &argv, app::Show::Front);
+    let argv = ["sh".into(), "-c".into(), command_line(cmd)];
+    match cfg.integration {
+        Integration::HerdrApp => return app::start(project, title, cwd, &argv, app::Show::Front),
+        Integration::Rex => {
+            let show = rex::Show::Front;
+            return rex::start(cfg.rex_sessions, project, title, cwd, &argv, show);
+        }
+        _ => {}
     }
     let pane = open(project, title, cwd)?;
     type_line(&pane, &command_line(cmd))?;
@@ -189,8 +201,9 @@ fn command_line(cmd: &Command) -> String {
 }
 
 /// `idle`, not `done`: herdr refuses a reported `done` and infers it itself.
+/// A Rex run reports through its wrapper (`rex::REPORTED`).
 fn report(pane: &str, agent: &str, state: &str) {
-    if app::is_app(pane) {
+    if app::is_app(pane) || rex::is_rex(pane) {
         return;
     }
     let _ = call(
@@ -238,6 +251,9 @@ fn hear(line: &str, pane: &str) -> Heard {
 fn follow(pane: &str, closed: &AtomicBool, stop: &AtomicBool, on_state: &dyn Fn(&str)) {
     if app::is_app(pane) {
         return app::follow(pane, closed, stop, on_state);
+    }
+    if rex::is_rex(pane) {
+        return rex::follow(pane, closed, stop, on_state);
     }
     let mut failures = 0;
     let mut last = String::new();
@@ -479,6 +495,12 @@ enum Target<'a> {
     Pane(String),
     /// A new Herdr.app tab, which runs the script itself.
     App { project: &'a str, show: app::Show },
+    /// A new Rex window, which runs the script itself.
+    Rex {
+        sessions: RexSessions,
+        project: &'a str,
+        show: rex::Show,
+    },
 }
 
 /// Runs `cmd` in `target` and waits for it, up to `timeout` when it has one.
@@ -536,6 +558,36 @@ fn run_in(
                 }
             }
         }
+        Target::Rex {
+            sessions,
+            project,
+            show,
+        } => {
+            let cwd = cmd
+                .get_current_dir()
+                .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+            let script = path.to_string_lossy().into_owned();
+            let argv: Vec<String> = if headless {
+                let status = status.to_string_lossy().into_owned();
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    rex::REPORTED.into(),
+                    "sh".into(),
+                    script,
+                    status,
+                ]
+            } else {
+                vec!["sh".into(), script]
+            };
+            match rex::start(sessions, project, title, &cwd, &argv, show) {
+                Ok(pane) => (pane, None),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&secret);
+                    return Err(std::io::Error::other(e));
+                }
+            }
+        }
     };
     let pane = pane.as_str();
     on_pane(pane);
@@ -549,8 +601,8 @@ fn run_in(
         std::thread::spawn(move || {
             follow(&pane, &closed, &stop, &|state| {
                 on_state(state);
-                // Herdr.app alerts on a blocked agent itself.
-                if state == "blocked" && !app::is_app(&pane) {
+                // Herdr.app and Rex.app alert on a blocked agent themselves.
+                if state == "blocked" && !app::is_app(&pane) && !rex::is_rex(&pane) {
                     notify("pma: an agent needs you", &title);
                 }
             });
@@ -576,7 +628,7 @@ fn run_in(
         if closed.load(Ordering::Relaxed) {
             end("125")?;
             let mut file = std::fs::OpenOptions::new().append(true).open(log)?;
-            writeln!(file, "the herdr pane closed before the agent finished")?;
+            writeln!(file, "the pane closed before the agent finished")?;
             break Some(false);
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -609,7 +661,7 @@ pub struct Host<'a> {
     pub room: Option<(&'a str, &'a Path)>,
 }
 
-/// Runs an agent: in a herdr pane or Herdr.app tab under `pma integrate`,
+/// Runs an agent: in a herdr pane, Herdr.app tab or Rex window under `pma integrate`,
 /// otherwise, minos included, as a child. `on_pane` hears which pane. With neither server the
 /// run goes on as a child and says so, so unattended work does not stop with
 /// the terminal.
@@ -643,7 +695,7 @@ pub fn host(
         Integration::None => {
             if host.interactive {
                 return Err(std::io::Error::other(
-                    "an interactive run needs `pma integrate herdr`, `herdr-app` or `minos`",
+                    "an interactive run needs `pma integrate herdr`, `herdr-app`, `rex` or `minos`",
                 ));
             }
             return without(cmd, String::new());
@@ -675,6 +727,23 @@ pub fn host(
                 (false, false) => app::Show::Anywhere,
             };
             let target = Target::App {
+                project: host.project,
+                show,
+            };
+            run_in(
+                target, &cmd, log, limit, headless, host.title, on_pane, on_state,
+            )?
+        }
+        Integration::Rex => {
+            if let Err(e) = rex::check() {
+                return without(cmd, e);
+            }
+            let show = match front {
+                true => rex::Show::Front,
+                false => rex::Show::Back,
+            };
+            let target = Target::Rex {
+                sessions: cfg.rex_sessions,
                 project: host.project,
                 show,
             };

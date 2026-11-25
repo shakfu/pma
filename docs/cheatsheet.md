@@ -24,6 +24,7 @@ pma scan --deps                         # lock staleness; every <= 30 days
 pma config projects.alpha.verify "make check"   # when detection is wrong
 pma verify alpha                        # run the check where a dispatch would
 pma preset set claude-haiku claude haiku   # cheap option for mechanical work
+pma integrate rex                       # agents in tabs: herdr, herdr-app, rex or minos
 ```
 
 ## Targets
@@ -49,7 +50,7 @@ pma preset set claude-haiku claude haiku   # cheap option for mechanical work
 | `--detach` | queue and return; follow with `pma job`, `pma watch` |
 | `--push` | push each run whose gates are clean; others wait in review |
 | `--retry` | reset used attempts on a target and dispatch again |
-| `--interactive` | drive the agent yourself in a herdr pane or Herdr.app tab; needs its `interactive_args` |
+| `--interactive` | drive the agent yourself in a herdr pane, Herdr.app tab or Rex tab; needs its `interactive_args` |
 
 Precedence: `-a`/`-m` > `-p` > active route > default preset.
 
@@ -119,6 +120,8 @@ pma workflow run review-fix alpha --local --unattended --detach
 | `projects.<p>.verify` | detected | the test command `pma` trusts |
 | `projects.<p>.sandbox` | off | confine the check's writes |
 | `usage_log` | on | log tab, pane and act use locally; `pma usage` reads it |
+| `integration` | `none` | where agents run; set with `pma integrate` |
+| `rex.sessions` | `single` | one `pma` session; `project` for one per project |
 
 `pma config <key> <value>` sets one; `--reset` clears it.
 
@@ -160,12 +163,12 @@ pma workflow run review-fix alpha --local --unattended --detach
 | `/` | filter list | `#` | scope everything to a tag |
 | `Space` | mark | `*` | mark all shown |
 | `d` | dispatch marked or selected | `D` | dispatch, push if clean |
-| `I` | dispatch to drive in herdr, Herdr.app or a minos room; stays behind | `Tab` | next list, e.g. `Failing CI` |
+| `I` | dispatch to drive in herdr, Herdr.app, Rex or a minos room; stays behind | `Tab` | next list, e.g. `Failing CI` |
 | `P` | prompt an agent (project view) | `z` | `pma run` a name |
 | `v` | diff in pager (run) / verify (task) | `e` | tier, tag, verify, sandbox |
 | `t` | record review minutes | `c` | scan |
-| `H` / `T` | herdr pane or Herdr.app tab / take over | `Esc` | back |
-| `E` | project in `$EDITOR`, re-read on exit (TUI only) | `S` | shell in project, herdr pane or Herdr.app tab if integrated; re-read on exit |
+| `H` / `T` | the run's pane or tab / take over | `Esc` | back |
+| `E` | project in `$EDITOR`, re-read on exit (TUI only) | `S` | shell in project, in a pane or tab if integrated; re-read on exit |
 
 All typing happens on the bottom line, as in vim: `:` a command, `/` the list filter, `>` the text an act asks for.
 

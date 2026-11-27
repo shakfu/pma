@@ -40,11 +40,16 @@ impl Drop for Scratch {
 /// `pma`'s own verify, `agent::restrict` sets them to block every push, and
 /// the fixtures here push to local repositories. It also ignores `PMA_JOB`: under
 /// a `pma` job, a plan would print `pma job approve` instead of `--approve <id>`.
+/// Its `PMA_HOME` is a fresh directory unless the caller sets one: `lint` and
+/// `prune` open the store, and without it they migrated the developer's own.
 fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let n = SCRATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let home = std::env::temp_dir().join(format!("pma-test-{}-home-{n}", std::process::id()));
     let mut cmd = Command::new(program);
     cmd.env_remove("GIT_CONFIG_COUNT")
         .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("PMA_JOB");
+        .env_remove("PMA_JOB")
+        .env("PMA_HOME", home);
     cmd
 }
 
@@ -8610,6 +8615,58 @@ case "$1 $2" in
   *) echo "fake gh: unexpected $*" >&2; exit 1 ;;
 esac
 "#;
+
+/// `test` fails; then its failed run is gone and a newer one is going, with
+/// an older pass behind it; then the newer one passes.
+const PENDING_CI_GH: &str = r#"#!/bin/sh
+u=https://github.com/me/alpha/actions/runs
+case "$1 $2" in
+  "workflow list") echo '[{"id":11,"name":"test","state":"active"}]' ;;
+  "run list")
+    if [ -e 'DONE' ]; then printf "11\tcompleted\tsuccess\t$u/101\t2026-11-03T00:00:00Z\n"
+    elif [ -e 'GOING' ]; then printf "11\tin_progress\t\t$u/101\t2026-11-03T00:00:00Z\n"
+    else printf "11\tcompleted\tfailure\t$u/99\t2026-11-02T00:00:00Z\n"; fi
+    printf "11\tcompleted\tsuccess\t$u/50\t2026-11-01T00:00:00Z\n" ;;
+  *) echo "fake gh: unexpected $*" >&2; exit 1 ;;
+esac
+"#;
+
+/// A run still going clears no failure: the task stays, marked pending, with
+/// its text unchanged, until that run passes.
+#[test]
+fn a_fix_ci_task_stays_while_a_newer_run_is_going() {
+    let s = Scratch::new("ci-pending");
+    let (going, done) = (s.0.join("going"), s.0.join("done"));
+    let gh = PENDING_CI_GH
+        .replace("'GOING'", &format!("'{}'", going.display()))
+        .replace("'DONE'", &format!("'{}'", done.display()));
+    let (env, _, alpha) = dispatch_env(&s, &[("gh", &gh)]);
+    git(
+        &alpha,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/me/alpha.git",
+        ],
+        None,
+    );
+    env.ok(&["scan"]);
+    let next = env.ok(&["next"]);
+    assert!(
+        next.contains("fix CI: test") && !next.contains("pending"),
+        "{next}"
+    );
+
+    fs::write(&going, "").unwrap();
+    env.ok(&["scan"]);
+    let next = env.ok(&["next"]);
+    assert!(next.contains("fix CI: test (CI pending)"), "{next}");
+
+    fs::write(&done, "").unwrap();
+    env.ok(&["scan"]);
+    assert!(!env.ok(&["next"]).contains("fix CI"));
+}
 
 #[test]
 fn a_ci_task_drops_the_workflows_that_pass_since_the_scan() {

@@ -211,6 +211,7 @@ mod tests {
             )],
             ci_alone: Vec::new(),
             ci_seen: Vec::new(),
+            ci_pending: Vec::new(),
             lock_at: None,
             deps: None,
             faults: vec![(

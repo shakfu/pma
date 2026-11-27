@@ -1,6 +1,6 @@
 use super::*;
 
-const VERSION: i64 = 54;
+const VERSION: i64 = 55;
 
 const SCHEMA: &str = "
 CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -484,6 +484,10 @@ const PR_HEAD: &str = "ALTER TABLE runs ADD COLUMN pr_head TEXT;";
 /// `settings.toml` alone: `migrate_settings`.
 const MINOS_BACKEND: &str = "";
 
+/// Version 55. The workflows whose newest run had not completed at the last
+/// CI read, one per line; `scan::CiRead::pending`.
+const CI_PENDING: &str = "ALTER TABLE projects ADD COLUMN ci_pending TEXT NOT NULL DEFAULT '';";
+
 /// Version 49. How a worker starts a session a person drives, as a JSON array.
 const INTERACTIVE_ARGS: &str =
     "ALTER TABLE agents ADD COLUMN interactive_args TEXT NOT NULL DEFAULT '[]';";
@@ -830,6 +834,7 @@ pub(super) fn migrate(conn: &Connection, path: &Path) -> Result<i64> {
                 CI_VERDICT,
                 PR_HEAD,
                 MINOS_BACKEND,
+                CI_PENDING,
             ];
             let tx = conn.unchecked_transaction()?;
             for step in &steps[version as usize..] {
@@ -1386,9 +1391,10 @@ mod tests {
         }
     }
 
-    /// Undoes versions 52 and 53, for a test that rewinds the schema past
+    /// Undoes versions 52 to 55, for a test that rewinds the schema past
     /// them.
     const UNDO_CI_VERDICT: &str = "
+        ALTER TABLE projects DROP COLUMN ci_pending;
         ALTER TABLE runs DROP COLUMN pr_head;
         ALTER TABLE runs DROP COLUMN landed_sha;
         ALTER TABLE runs DROP COLUMN landed_at;
@@ -1645,6 +1651,10 @@ mod tests {
                         }
                     })
                     .unwrap();
+                store
+                    .conn
+                    .execute_batch("ALTER TABLE projects DROP COLUMN ci_pending;")
+                    .unwrap();
                 store.conn.pragma_update(None, "user_version", 53).unwrap();
             }
             let store = Store::open(&path).unwrap();
@@ -1687,7 +1697,10 @@ mod tests {
                 .unwrap();
             store
                 .conn
-                .execute_batch("ALTER TABLE runs DROP COLUMN pr_head;")
+                .execute_batch(
+                    "ALTER TABLE runs DROP COLUMN pr_head;
+                     ALTER TABLE projects DROP COLUMN ci_pending;",
+                )
                 .unwrap();
             store.conn.pragma_update(None, "user_version", 52).unwrap();
         }

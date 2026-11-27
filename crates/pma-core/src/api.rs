@@ -824,6 +824,14 @@ pub fn next_lists(store: &Store, p: &Portfolio) -> Result<next::Next> {
         .filter(|r| matches!(r.ci, crate::scan::Ci::Failing(_)))
         .map(|r| r.name.clone())
         .collect();
+    let pending: Vec<String> = projects
+        .iter()
+        .filter(|r| match &r.ci {
+            crate::scan::Ci::Failing(w) => w.iter().any(|w| r.ci_pending.contains(w)),
+            _ => false,
+        })
+        .map(|r| r.name.clone())
+        .collect();
     let placed = rank::place(&p.cfg, p.tasks.clone(), p.today);
     let mut spent = std::collections::HashMap::new();
     for x in placed.iter().filter(|x| x.task.eligible) {
@@ -853,6 +861,7 @@ pub fn next_lists(store: &Store, p: &Portfolio) -> Result<next::Next> {
     };
     let mut lists = next::build(&placed, &active, p.today, taken);
     next::flag_landed(&mut lists, &active, &failing);
+    next::flag_pending(&mut lists, &pending);
     Ok(lists)
 }
 
@@ -3010,6 +3019,7 @@ mod tests {
             ci_runs: vec![],
             ci_alone: vec![],
             ci_seen: vec![],
+            ci_pending: vec![],
             lock_at: None,
             deps: None,
             faults: vec![],

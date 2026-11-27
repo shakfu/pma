@@ -87,6 +87,8 @@ pub struct ProjectRow {
     pub ci: Ci,
     /// Each failing workflow's latest failed run, as `(workflow, url)`.
     pub ci_runs: Vec<(String, String)>,
+    /// Workflows whose newest run had not completed at the last CI read.
+    pub ci_pending: Vec<String>,
     /// Each fault the last scan found, worst first, with its cause.
     pub faults: Vec<(Fault, String)>,
     /// Outdated dependencies at the last measurement; `None` if never measured.
@@ -144,7 +146,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT name, path, tier, scanned_at, has_todo, lint_errors, dirty, ahead,
                     last_activity, ci, ci_detail, deps, deps_detail, deps_at,
-                    leftover, slug, absent_since, d.held_back, d.lock_at
+                    leftover, slug, absent_since, d.held_back, d.lock_at, ci_pending
              FROM projects LEFT JOIN project_deps d ON d.project = projects.name
              ORDER BY name",
         )?;
@@ -168,6 +170,7 @@ impl Store {
                 absent_since: r.get(16)?,
                 held_back: r.get(17)?,
                 lock_at: r.get(18)?,
+                ci_pending: r.get::<_, String>(19)?.lines().map(String::from).collect(),
                 ci_runs: Vec::new(),
                 faults: Vec::new(),
             })
@@ -287,7 +290,23 @@ impl Store {
                 save_faults(&tx)?;
                 continue;
             }
-            let (ci, ci_detail) = f.ci.to_columns();
+            let (mut ci, mut ci_runs) = (f.ci.clone(), f.ci_runs.clone());
+            if let Some(was) = before.get(&f.name) {
+                let was_runs: Vec<(String, String)> = {
+                    let mut stmt =
+                        tx.prepare("SELECT workflow, url FROM ci_runs WHERE project = ?1")?;
+                    stmt.query_map([&f.name], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect::<rusqlite::Result<_>>()?
+                };
+                crate::scan::hold_failures(
+                    &mut ci,
+                    &mut ci_runs,
+                    &f.ci_pending,
+                    &was.ci,
+                    &was_runs,
+                );
+            }
+            let (ci, ci_detail) = ci.to_columns();
             let leftover = f
                 .pma_branches
                 .iter()
@@ -299,8 +318,8 @@ impl Store {
                 .count() as i64;
             tx.execute(
                 "INSERT INTO projects (name, path, scanned_at, has_todo, lint_errors, dirty, ahead,
-                                       last_activity, ci, ci_detail, leftover, slug)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                                       last_activity, ci, ci_detail, leftover, slug, ci_pending)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?14)
                  ON CONFLICT (name) DO UPDATE SET
                     path = excluded.path, scanned_at = excluded.scanned_at,
                     has_todo = CASE WHEN ?13 THEN projects.has_todo ELSE excluded.has_todo END,
@@ -310,7 +329,7 @@ impl Store {
                     last_activity = excluded.last_activity, ci = excluded.ci,
                     ci_detail = excluded.ci_detail,
                     leftover = excluded.leftover, slug = excluded.slug,
-                    absent_since = NULL",
+                    ci_pending = excluded.ci_pending, absent_since = NULL",
                 params![
                     f.name,
                     path_str(&f.path)?,
@@ -325,6 +344,7 @@ impl Store {
                     leftover,
                     f.slug,
                     f.todo_unread,
+                    f.ci_pending.join("\n"),
                 ],
             )?;
             save_faults(&tx)?;
@@ -345,7 +365,7 @@ impl Store {
                 }
             }
             tx.execute("DELETE FROM ci_runs WHERE project = ?1", [&f.name])?;
-            for (workflow, url) in &f.ci_runs {
+            for (workflow, url) in &ci_runs {
                 tx.execute(
                     "INSERT OR REPLACE INTO ci_runs (project, workflow, url) VALUES (?1, ?2, ?3)",
                     params![f.name, workflow, url],
@@ -822,6 +842,42 @@ mod tests {
             .save_quiet_scan(&[facts("two", vec![])], false, 4000)
             .unwrap();
         assert_eq!(count(&store), 3, "a new project is news");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read whose newest run is going keeps the stored failure and its run,
+    /// and says the workflow is pending; the run's end decides it.
+    #[test]
+    fn a_pending_ci_keeps_the_stored_failure() {
+        let dir = scratch("ci-pending");
+        let mut store = Store::open(&dir.join("p.db")).unwrap();
+        let failing = facts("one", vec![]);
+        assert_eq!(
+            failing.ci,
+            Ci::Failing(vec!["test".into(), "wheels".into()])
+        );
+        store.save_scan(&[failing], true, 1000).unwrap();
+
+        let mut going = facts("one", vec![]);
+        (going.ci, going.ci_runs) = (Ci::Passing, Vec::new());
+        going.ci_pending = vec!["test".into()];
+        store.save_scan(&[going.clone()], true, 2000).unwrap();
+        let row = store.project("one").unwrap().unwrap();
+        assert_eq!(row.ci, Ci::Failing(vec!["test".into()]));
+        assert_eq!(row.ci_pending, ["test"]);
+        assert_eq!(
+            row.ci_runs,
+            [(
+                "test".to_string(),
+                "https://github.com/shakfu/x/actions/runs/7".to_string()
+            )]
+        );
+
+        going.ci_pending.clear();
+        store.save_scan(&[going], true, 3000).unwrap();
+        let row = store.project("one").unwrap().unwrap();
+        assert_eq!(row.ci, Ci::Passing);
+        assert!(row.ci_pending.is_empty() && row.ci_runs.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

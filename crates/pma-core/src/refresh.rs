@@ -2,6 +2,7 @@
 //! when a project's files change; CI, which needs the network, on a timer while
 //! a front end is open. Design: docs/dev/refresh.md.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -13,6 +14,14 @@ use crate::store::{Result, RunState, Store};
 
 /// How often a front end looks for changed files. 112 projects take 61 ms.
 const TICK: Duration = Duration::from_secs(5);
+
+/// How often, in seconds, a front end reads the CI of a project it watches.
+const CI_POLL: i64 = 60;
+
+/// How long, in seconds, after a run lands its project's CI is watched while
+/// CI has not judged the commit. A run starts within seconds of a push, and
+/// `ci_pending` watches it from then on.
+const LANDED_WATCH: i64 = 15 * 60;
 
 /// Reads `selected`, leaving unread a clone whose git would run a setting a
 /// failed run added.
@@ -62,7 +71,7 @@ fn offline(store: &Store, projects: &[(String, PathBuf)]) -> Result<Vec<Facts>> 
     );
     for f in &mut facts {
         if let Some(row) = store.project(&f.name)? {
-            (f.ci, f.ci_runs) = (row.ci, row.ci_runs);
+            (f.ci, f.ci_runs, f.ci_pending) = (row.ci, row.ci_runs, row.ci_pending);
         }
     }
     Ok(facts)
@@ -89,8 +98,21 @@ pub fn ci(store: &mut Store, projects: &[(String, PathBuf)]) -> Result<Vec<Strin
         let kept = prior.get(&f.name).map_or(&[][..], Vec::as_slice);
         match scan::ci_state(&f.path, kept, dates::now()) {
             Ok(read) => {
-                (f.ci, f.ci_runs, f.ci_alone, f.ci_seen, f.ci_read) =
-                    (read.ci, read.runs, read.alone, read.seen, true);
+                (
+                    f.ci,
+                    f.ci_runs,
+                    f.ci_alone,
+                    f.ci_seen,
+                    f.ci_pending,
+                    f.ci_read,
+                ) = (
+                    read.ci,
+                    read.runs,
+                    read.alone,
+                    read.seen,
+                    read.pending,
+                    true,
+                );
             }
             Err(why) => warnings.push(format!(
                 "{}: CI not read, using the last scan's: {why}",
@@ -157,6 +179,54 @@ fn everything(store: &mut Store) -> Result<()> {
     Ok(())
 }
 
+/// Projects whose CI a front end reads every `CI_POLL`: one failing with a
+/// newer run still going, and one a run landed on within `LANDED_WATCH` that
+/// CI has not judged. A clone an agent is running in waits, as in `changed`.
+fn ci_watched(store: &Store, now: i64) -> Result<Vec<(String, PathBuf)>> {
+    let runs = store.runs()?;
+    Ok(store
+        .projects()?
+        .into_iter()
+        .filter(|p| p.absent_since.is_none())
+        .filter(|p| {
+            let pending = match &p.ci {
+                scan::Ci::Failing(w) => w.iter().any(|w| p.ci_pending.contains(w)),
+                _ => false,
+            };
+            pending
+                || runs.iter().any(|r| {
+                    r.project == p.name
+                        && r.ci_verdict.is_none()
+                        && r.landed_at.is_some_and(|at| now - at < LANDED_WATCH)
+                })
+        })
+        .filter(|p| {
+            !runs
+                .iter()
+                .any(|r| r.state == RunState::Running && r.worktree == p.path)
+        })
+        .map(|p| (p.name, p.path))
+        .collect())
+}
+
+/// Reads the CI of each watched project not read in the last `CI_POLL`;
+/// `read_at` holds when each was last read.
+fn watch(store: &mut Store, read_at: &mut HashMap<String, i64>) -> Result<()> {
+    let now = dates::now();
+    let due: Vec<(String, PathBuf)> = ci_watched(store, now)?
+        .into_iter()
+        .filter(|(name, _)| read_at.get(name).is_none_or(|at| now - at >= CI_POLL))
+        .collect();
+    if due.is_empty() {
+        return Ok(());
+    }
+    for (name, _) in &due {
+        read_at.insert(name.clone(), now);
+    }
+    ci(store, &due)?;
+    Ok(())
+}
+
 /// Keeps the store current while a front end is open. Failures are dropped: a
 /// terminal UI has nowhere to print them, and `c` scans by hand.
 pub fn start(open: impl Fn() -> Result<Store> + Send + 'static) {
@@ -164,11 +234,14 @@ pub fn start(open: impl Fn() -> Result<Store> + Send + 'static) {
         let Ok(mut store) = open() else {
             return;
         };
+        let mut read_at = HashMap::new();
         loop {
             std::thread::sleep(TICK);
             let _ = changed(&mut store);
             if ci_due(&store).unwrap_or(false) {
                 let _ = everything(&mut store);
+            } else {
+                let _ = watch(&mut store, &mut read_at);
             }
         }
     });
@@ -178,6 +251,74 @@ pub fn start(open: impl Fn() -> Result<Store> + Send + 'static) {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    /// The timer watches a failing project whose CI is going, and one a run
+    /// landed on until CI judges it or `LANDED_WATCH` passes; never a clone an
+    /// agent is running in.
+    #[test]
+    fn ci_is_watched_while_it_can_change_a_task() {
+        let dir = std::env::temp_dir().join(format!("pma-ci-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = Store::open(&dir.join("p.db")).unwrap();
+        let blank = scan::Facts::held("x", &dir, String::new());
+        let project = |name: &str, ci: scan::Ci, pending: &[&str]| scan::Facts {
+            name: name.into(),
+            path: dir.join(name),
+            held: false,
+            faults: Vec::new(),
+            ci,
+            ci_pending: pending.iter().map(|w| w.to_string()).collect(),
+            ci_read: true,
+            ..blank.clone()
+        };
+        let failing = || scan::Ci::Failing(vec!["test".into()]);
+        let facts = [
+            project("going", failing(), &["test"]),
+            project("other", failing(), &["docs"]),
+            project("passing", scan::Ci::Passing, &["test"]),
+            project("landed", scan::Ci::Passing, &[]),
+            project("judged", scan::Ci::Passing, &[]),
+            project("busy", failing(), &["test"]),
+        ];
+        store.save_scan(&facts, true, dates::now()).unwrap();
+        let add = |name: &str, state: RunState, landed: bool, judged: bool| {
+            let mut run = crate::store::Run {
+                project: name.into(),
+                state,
+                worktree: dir.join(name),
+                ..crate::store::Run::default()
+            };
+            store.insert_run(&mut run).unwrap();
+            if landed {
+                store.set_landed(run.id, "abc").unwrap();
+            }
+            // Only a scan writes a verdict, so the test writes it directly.
+            if judged {
+                rusqlite::Connection::open(dir.join("p.db"))
+                    .unwrap()
+                    .execute(
+                        "UPDATE runs SET ci_verdict = 'fixed' WHERE id = ?1",
+                        [run.id],
+                    )
+                    .unwrap();
+            }
+        };
+        add("landed", RunState::Pushed, true, false);
+        add("judged", RunState::Pushed, true, true);
+        add("busy", RunState::Running, false, false);
+        let names = |now| -> Vec<String> {
+            ci_watched(&store, now)
+                .unwrap()
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect()
+        };
+        let now = dates::now();
+        assert_eq!(names(now), ["going", "landed"]);
+        assert_eq!(names(now + LANDED_WATCH), ["going"], "the watch ends");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// An unstaged edit changes no stamp, so the timer misses it; a reread
     /// after the editor counts it, and adds no row to `pma history`.

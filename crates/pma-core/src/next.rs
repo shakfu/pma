@@ -234,6 +234,25 @@ pub fn flag_landed(next: &mut Next, runs: &[Run], failing: &[String]) {
     }
 }
 
+/// Marks each project's fix-CI task in `pending`: CI on a newer commit has not
+/// finished, and may clear it. The task text stays as dispatch reads it.
+pub fn flag_pending(next: &mut Next, pending: &[String]) {
+    for row in next.agents.iter_mut().chain(next.tasks.iter_mut()) {
+        let Subject::Task {
+            project, target, ..
+        } = &row.subject
+        else {
+            continue;
+        };
+        if pending.contains(project)
+            && *target == format!("{project}:ci")
+            && let Some(text) = row.cells.last_mut()
+        {
+            text.push_str(" (CI pending)");
+        }
+    }
+}
+
 /// The two lists as text. `limit` caps the rows of each, and the count says
 /// what was left out.
 pub fn render(next: &Next, limit: Option<usize>) -> String {
@@ -369,6 +388,26 @@ mod tests {
             next.tasks[0].command.as_deref(),
             Some("pma dispatch spent:8 --retry")
         );
+    }
+
+    /// Only the fix-CI task of a project in `pending` is marked, and only its
+    /// shown text: dispatch keeps reading the task's own.
+    #[test]
+    fn a_fix_ci_task_with_ci_going_is_marked_pending() {
+        let placed = [
+            placed("a", None, Priority::High, true),
+            placed("b", None, Priority::High, true),
+            placed("a", Some(4), Priority::High, true),
+        ];
+        let mut next = build(&placed, &[], 0, |_| Taken::Free);
+        flag_pending(&mut next, &["a".into()]);
+        let texts: Vec<&str> = next
+            .agents
+            .iter()
+            .map(|r| r.cells.last().unwrap().as_str())
+            .collect();
+        assert_eq!(texts, ["text of a (CI pending)", "text of b", "text of a"]);
+        assert_eq!(placed[0].task.text, "text of a");
     }
 
     /// Only a project's last landed run, only with a bad verdict, and only

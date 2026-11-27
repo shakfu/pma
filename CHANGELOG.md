@@ -18,6 +18,8 @@ Upgrading from 0.10:
 
 - The database moves from schema 53 to 54 on first open; `settings.toml` changes, the tables do not. `minos.enabled = on` becomes `integration = minos` when no herdr backend is chosen. With `herdr` or `herdr-app` chosen, that stays and runs get no room; `pma integrate minos` switches. `minos.enabled` is retired either way.
 
+- The database moves from schema 54 to 55 on first open. It adds `projects.ci_pending`, which the next CI read fills.
+
 - `--apply` is gone. `prune`, `lint --fix`, `lint --ids`, `sync` and `project import`, `forget` and `clone` act; `-d` previews. Commands that cannot be undone ask first, and with no terminal they refuse: a script passes `-y`. `run`'s `--yes` and `--dry-run` are `-y` and `-d`.
 
 - Inside a project directory, a command that names no project acts on that one. Bare `pma` there shows that project; `-A` shows every project.
@@ -96,6 +98,10 @@ Upgrading from 0.10:
 - A full scan of 117 projects makes 205 to 223 `gh` calls instead of 311, and takes 24 to 26 s instead of 38 s. A repository with no active workflow gets no `run list`. A project's per-workflow reads run in parallel. A workflow read alone is cached in `ci_alone`. It is reused while the 100-run window reaches back to that read, so any newer run of it would be in the window, and for at most 24 h, which bounds a re-run of an old run. A window under 100 runs holds every run, so a workflow missing from it is not asked about. Measurements and the options not built: `docs/dev/gh-optimize.md`.
 
 ### Fixed
+
+- A CI run still in progress cleared a failure. CI was judged by each workflow's newest completed run. While a newer run was going, the read fell back to an older commit's run. That run could predate the failure, or the failed run could have been deleted, as in myra. The fix-CI task then vanished. A read now keeps a stored failure while its workflow's newest run is unfinished, and `pma next` marks the task `(CI pending)`. The task text is unchanged, since the attempt counter keys on it. A pending run cannot turn a stored pass into a failure: the older failure must still be in the window.
+
+- CI was read only by the 30-minute scan, so a fix-CI run that landed showed the old failure, and had no verdict, for up to 30 minutes. While a front end is open, the timer now reads a project's CI every 60 s in two cases: it fails with a newer run going, or a run landed on it in the last 15 minutes and CI has not judged that commit. A clone an agent is running in waits, as for local reads.
 
 - An agent dispatched from a Rex pane inherited `REX_SERVER`, `REX_BLOCK` and `REX_SESSION`. With them it could type `git push` into another pane that holds credentials. `restrict` now removes them and points `REX_SERVER` at a dead socket, because `rex` falls back to its default socket when the variable is unset.
 

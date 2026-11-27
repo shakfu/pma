@@ -102,6 +102,8 @@ pub struct Facts {
     pub ci_alone: Vec<Alone>,
     /// Each run in the window, newest first, by commit; `ci_verdict`.
     pub ci_seen: Vec<crate::ci_verdict::Seen>,
+    /// Workflows whose newest run has not completed; `CiRead::pending`.
+    pub ci_pending: Vec<String>,
     /// When the stalest lock last changed; see `lock_changed_at`.
     pub lock_at: Option<i64>,
     /// `None` when this scan did not measure dependencies.
@@ -173,6 +175,7 @@ impl Facts {
             ci_runs: Vec::new(),
             ci_alone: Vec::new(),
             ci_seen: Vec::new(),
+            ci_pending: Vec::new(),
             lock_at: None,
             deps: None,
             faults: Vec::new(),
@@ -409,8 +412,13 @@ pub fn scan_project(
         facts.ci_read = true;
         match ci_state(path, prior, crate::dates::now()) {
             Ok(read) => {
-                (facts.ci, facts.ci_runs, facts.ci_alone, facts.ci_seen) =
-                    (read.ci, read.runs, read.alone, read.seen)
+                (
+                    facts.ci,
+                    facts.ci_runs,
+                    facts.ci_alone,
+                    facts.ci_seen,
+                    facts.ci_pending,
+                ) = (read.ci, read.runs, read.alone, read.seen, read.pending)
             }
             Err(why) => {
                 facts.faults.push((Fault::CiUnknown, why.clone()));
@@ -965,6 +973,8 @@ pub struct CiRead {
     pub alone: Vec<Alone>,
     /// The window's runs of active workflows, newest first, by commit.
     pub seen: Vec<crate::ci_verdict::Seen>,
+    /// Active workflows whose newest run has not completed, sorted.
+    pub pending: Vec<String>,
 }
 
 /// The CI state, and each failing workflow's latest failed run, judged over
@@ -979,6 +989,7 @@ pub fn ci_state(dir: &Path, prior: &[Alone], now: i64) -> Result<CiRead, String>
         runs: Vec::new(),
         alone: Vec::new(),
         seen: Vec::new(),
+        pending: Vec::new(),
     };
     let unknown = |why: &str| only(Ci::Unknown(why.into()));
     let Some(url) = git(dir, &["remote", "get-url", "origin"]) else {
@@ -1088,7 +1099,62 @@ pub fn ci_state(dir: &Path, prior: &[Alone], now: i64) -> Result<CiRead, String>
         runs: failed_runs(&active, &verdicts),
         alone,
         seen,
+        pending: pending_of(&active, &window),
     })
+}
+
+/// Active workflows whose newest run in `window` has not completed. A workflow
+/// absent from the window has no run newer than it, so none is pending.
+fn pending_of(active: &[(u64, String)], window: &[RunRow]) -> Vec<String> {
+    let mut pending: Vec<String> = active
+        .iter()
+        .filter(|(id, _)| {
+            window
+                .iter()
+                .find(|r| r.workflow == *id)
+                .is_some_and(|r| r.status != "completed")
+        })
+        .map(|(_, name)| name.clone())
+        .collect();
+    pending.sort();
+    pending.dedup();
+    pending
+}
+
+/// Keeps each failure the store held for a workflow whose newest run is still
+/// going: a run that has not finished clears nothing. Without this, the read
+/// falls back to an older commit's run, which may have passed.
+pub fn hold_failures(
+    ci: &mut Ci,
+    runs: &mut Vec<(String, String)>,
+    pending: &[String],
+    before: &Ci,
+    before_runs: &[(String, String)],
+) {
+    let Ci::Failing(held) = before else {
+        return;
+    };
+    let mut failing = match ci {
+        Ci::Failing(names) => names.clone(),
+        Ci::Passing => Vec::new(),
+        Ci::Unknown(_) | Ci::NoRuns => return,
+    };
+    for w in held.iter().filter(|w| pending.contains(w)) {
+        if failing.contains(w) {
+            continue;
+        }
+        failing.push(w.clone());
+        if let Some(run) = before_runs.iter().find(|(name, _)| name == w)
+            && !runs.iter().any(|(name, _)| name == w)
+        {
+            runs.push(run.clone());
+        }
+    }
+    failing.sort();
+    runs.sort();
+    if !failing.is_empty() {
+        *ci = Ci::Failing(failing);
+    }
 }
 
 /// One row of `gh run list`.
@@ -1607,6 +1673,65 @@ mod tests {
             ci_of(&active(&["a"]), &latest_decisive(&run_rows(""))),
             Ci::NoRuns
         );
+    }
+
+    /// A workflow is pending when its newest run has not completed, whatever
+    /// its older runs say; one with no run in the window is not.
+    #[test]
+    fn a_workflow_whose_newest_run_is_going_is_pending() {
+        let active = vec![
+            (1, "test".to_string()),
+            (2, "lint".to_string()),
+            (3, "docs".to_string()),
+        ];
+        let window = run_rows(
+            "1\tin_progress\t\tu/9\tT\n\
+             2\tcompleted\tsuccess\tu/8\tT\n\
+             2\tqueued\t\tu/7\tT\n\
+             1\tcompleted\tsuccess\tu/6\tT\n",
+        );
+        assert_eq!(pending_of(&active, &window), ["test"]);
+    }
+
+    /// A stored failure stands while its workflow's newest run is going, even
+    /// when the read fell back to an older pass. A pending workflow that did
+    /// not fail, or a failure whose workflow is not pending, changes nothing.
+    #[test]
+    fn a_pending_run_clears_no_failure() {
+        let before = Ci::Failing(vec!["lint".into(), "test".into()]);
+        let before_runs = vec![
+            ("lint".to_string(), "u/3".to_string()),
+            ("test".to_string(), "u/5".to_string()),
+        ];
+        let (mut ci, mut runs) = (Ci::Passing, Vec::new());
+        let pending = ["test".to_string(), "docs".to_string()];
+        hold_failures(&mut ci, &mut runs, &pending, &before, &before_runs);
+        assert_eq!(ci, Ci::Failing(vec!["test".into()]));
+        assert_eq!(runs, [("test".to_string(), "u/5".to_string())]);
+
+        let mut ci = Ci::Failing(vec!["test".into()]);
+        let mut runs = vec![("test".to_string(), "u/9".to_string())];
+        hold_failures(&mut ci, &mut runs, &["test".into()], &before, &before_runs);
+        assert_eq!(ci, Ci::Failing(vec!["test".into()]));
+        assert_eq!(
+            runs,
+            [("test".to_string(), "u/9".to_string())],
+            "the newer failure"
+        );
+
+        let (mut ci, mut runs) = (Ci::Passing, Vec::new());
+        hold_failures(&mut ci, &mut runs, &[], &before, &before_runs);
+        assert_eq!(ci, Ci::Passing, "nothing pending");
+        let mut ci = Ci::Unknown("gh: down".into());
+        hold_failures(&mut ci, &mut runs, &pending, &before, &before_runs);
+        assert_eq!(
+            ci,
+            Ci::Unknown("gh: down".into()),
+            "an unread CI stays unread"
+        );
+        let (mut ci, mut runs) = (Ci::Passing, Vec::new());
+        hold_failures(&mut ci, &mut runs, &pending, &Ci::Passing, &[]);
+        assert_eq!(ci, Ci::Passing);
     }
 
     /// Runs are matched by workflow id: a second workflow file named `audit`

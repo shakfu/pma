@@ -8,6 +8,7 @@ Decision, 2026-11-01. After the first scan the store follows the files; `pma sca
 | New repositories | the same check | one directory read per root |
 | CI, absent projects | a full scan every `scan.every` minutes (30; 0 turns it off) while a front end is open | one `pma scan` |
 | CI of a project a CI task is dispatched from | before that dispatch | one project's CI read |
+| CI of a project failing with a newer run going, or landed on in the last 15 minutes without a verdict | every 60 s while a front end is open | one project's CI read each |
 | Dependencies | `pma scan --deps`, unchanged | seconds per project |
 
 Limits:

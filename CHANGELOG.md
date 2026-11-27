@@ -26,6 +26,13 @@ Upgrading from 0.10:
 
 ### Added
 
+- **The fix-CI loop.** A headless `pma dispatch <project>:ci` now works on a pull request. pma pushes each round and waits for the checks. It re-runs failed jobs once. While they still fail, the agent gets the new log for another round. After `ci_loop.max` rounds (3) the loop stops, and the pull request waits for `pma merge`. The agent never pushes, and pma never merges. A round goes to `pma review` when verify fails or the change edits `.github/`. Deleting a test, adding a skip marker, or changing nothing does the same. A loop that runs out of rounds charges one attempt. A round's code runs in CI unreviewed. So a workflow must trigger on `pull_request`. No workflow a round's push or pull request starts may get a secret or a write token. The repository's default `GITHUB_TOKEN` must only read. `ci_loop.max 0` turns the loop off; `--local`, `--push` and `--interactive` skip it. Design: `docs/dev/ci-loop.md`.
+
+  ```sh
+  pma config ci_loop.max 3     # rounds; 0 turns the loop off
+  pma config ci_loop.wait 30   # minutes a round waits for checks
+  ```
+
 - **Rex as where agents run.** `pma integrate rex` runs each agent in a tab of a [Rex](https://www.superlogical.com/rex/) server, alongside the herdr and Herdr.app backends. `H`, `T`, `S` and `--interactive` work as under `herdr`. A headless run reports `working`, then `done` or `error`, in Rex's activity view, and Rex.app alerts on a blocked agent itself. `H` and `T` switch the app to the run's session only when Remote Control is on in Rex.app. pma never starts a Rex server. `make rex-check` runs a dispatch under each layout; `make rex-manual-check` asks a person to confirm `--interactive`, `H` and take-over. Design: `docs/dev/rex-integration.md`.
 
   ```sh
@@ -98,6 +105,8 @@ Upgrading from 0.10:
 - A full scan of 117 projects makes 205 to 223 `gh` calls instead of 311, and takes 24 to 26 s instead of 38 s. A repository with no active workflow gets no `run list`. A project's per-workflow reads run in parallel. A workflow read alone is cached in `ci_alone`. It is reused while the 100-run window reaches back to that read, so any newer run of it would be in the window, and for at most 24 h, which bounds a re-run of an old run. A window under 100 runs holds every run, so a workflow missing from it is not asked about. Measurements and the options not built: `docs/dev/gh-optimize.md`.
 
 ### Fixed
+
+- `make test` opened the developer's own store. The CLI tests' bare `pma` calls set no `PMA_HOME`, and `lint` and `prune` open the store. A schema bump in the tests then migrated the real store past the installed `pma`. Each such call now gets a fresh `PMA_HOME`.
 
 - A CI run still in progress cleared a failure. CI was judged by each workflow's newest completed run. While a newer run was going, the read fell back to an older commit's run. That run could predate the failure, or the failed run could have been deleted, as in myra. The fix-CI task then vanished. A read now keeps a stored failure while its workflow's newest run is unfinished, and `pma next` marks the task `(CI pending)`. The task text is unchanged, since the attempt counter keys on it. A pending run cannot turn a stored pass into a failure: the older failure must still be in the window.
 

@@ -32,6 +32,17 @@ fn drivers(command: &str) -> &'static [&'static str] {
 /// does not mean the change is correct, only that nothing the tool checks
 /// objects to it.
 pub fn review_reasons(run: &Run) -> Vec<String> {
+    reasons(run, false)
+}
+
+/// `review_reasons` for a fix-CI loop round, whose pull request's checks
+/// judge the change: verify must pass at the head, and the base result is not
+/// needed. docs/dev/ci-loop.md.
+pub fn loop_reasons(run: &Run) -> Vec<String> {
+    reasons(run, true)
+}
+
+fn reasons(run: &Run, ci_judges: bool) -> Vec<String> {
     if run.state != RunState::Ready {
         return vec![format!("run is {}", run.state.name())];
     }
@@ -107,18 +118,25 @@ pub fn review_reasons(run: &Run) -> Vec<String> {
             run.denied.join("; ")
         ));
     }
-    reasons.extend(verify_reason(run, class));
+    reasons.extend(verify_reason(run, class, ci_judges));
     reasons
 }
 
 /// The base and head results read together. Base alone says whether the
 /// repository was already broken; head alone says whether it is green now.
 /// What each class needs of the pair differs.
-fn verify_reason(run: &Run, class: Class) -> Option<String> {
+fn verify_reason(run: &Run, class: Class, ci_judges: bool) -> Option<String> {
     if run.verify.is_none() {
         return Some("no verify command; set projects.<name>.verify".into());
     }
     let (base, head) = (run.verify_base_ok, run.verify_ok);
+    if ci_judges {
+        return match head {
+            None => Some("verify did not run at the head".into()),
+            Some(false) => Some("verify failed at the head".into()),
+            Some(true) => None,
+        };
+    }
     match (base, head) {
         // A base that could not be measured is unknown, not passing.
         (None, _) => Some("the base was not verified".into()),
@@ -167,6 +185,30 @@ mod tests {
             changed_paths: Some(vec!["Cargo.lock".into()]),
             ..Run::blank()
         }
+    }
+
+    /// In a CI loop the pull request's checks judge the change, so a green
+    /// base or an unmeasured one is no reason to stop; a red or unrun head is.
+    #[test]
+    fn a_loop_round_needs_only_a_green_head() {
+        let green = ready(Class::Specified, Some(true), Some(true));
+        assert!(
+            !review_reasons(&green).is_empty(),
+            "green to green proves nothing"
+        );
+        assert!(
+            loop_reasons(&green).is_empty(),
+            "{:?}",
+            loop_reasons(&green)
+        );
+        assert!(loop_reasons(&ready(Class::Specified, None, Some(true))).is_empty());
+        for (head, why) in [(Some(false), "failed at the head"), (None, "did not run")] {
+            let r = loop_reasons(&ready(Class::Specified, Some(true), head));
+            assert!(r.len() == 1 && r[0].contains(why), "{r:?}");
+        }
+        let mut committed = green.clone();
+        committed.commits = Some(1);
+        assert!(loop_reasons(&committed)[0].contains("committed"));
     }
 
     #[test]

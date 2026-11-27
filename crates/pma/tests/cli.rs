@@ -8616,6 +8616,221 @@ case "$1 $2" in
 esac
 "#;
 
+/// A worker for the CI loop: it always writes `hello.txt`, which verify needs,
+/// and `fixed.txt`, which the pull request's checks need, only once told CI
+/// still fails. Each prompt is appended to `$PMA_HOME/prompts`.
+const LOOP_CLAUDE: &str = r#"#!/bin/sh
+printf '%s\n---\n' "$2" >> "$PMA_HOME/prompts"
+case "$2" in *"CI still fails"*) echo fixed > fixed.txt ;; esac
+echo hi > hello.txt
+echo '{"type":"result","subtype":"success","is_error":false,"result":"did it","total_cost_usd":0.1}'
+"#;
+
+/// `gh` for the CI loop. `test` fails on main. A pull request's check passes
+/// once the branch on origin holds `fixed.txt`. A re-run bumps its run's
+/// attempt and changes nothing else.
+const LOOP_GH: &str = r#"#!/bin/sh
+o="$PMA_HOME/../origin.git"
+case "$1 $2" in
+  "workflow list") echo '[{"id":11,"name":"test","state":"active"}]' ;;
+  "run list") printf '11\tcompleted\tfailure\thttps://github.com/me/alpha/actions/runs/99\t2026-11-01T00:00:00Z\n' ;;
+  "run view")
+    case "$*" in
+      *attempt*) a=$((1 + $(cat "$PMA_HOME/rerun-$3" 2>/dev/null | wc -l)))
+        echo "{\"attempt\":$a,\"status\":\"completed\"}" ;;
+      *jobs*) echo "- test: failure" ;;
+      *) echo "log of run $3" ;;
+    esac ;;
+  "run rerun") echo x >> "$PMA_HOME/rerun-$3" ;;
+  "api repos/me/alpha/actions/permissions/workflow") echo read ;;
+  "pr list") if [ -e "$PMA_HOME/pr-made" ]; then echo https://github.com/me/alpha/pull/1; fi ;;
+  "pr create") echo x >> "$PMA_HOME/pr-made"; echo https://github.com/me/alpha/pull/1 ;;
+  "pr view")
+    tip=$(git --git-dir "$o" for-each-ref --format='%(objectname)' 'refs/heads/pma/*' | head -1)
+    if git --git-dir "$o" cat-file -e "$tip:fixed.txt" 2>/dev/null; then c=SUCCESS; else c=FAILURE; fi
+    echo "{\"headRefOid\":\"$tip\",\"statusCheckRollup\":[{\"name\":\"test\",\"workflowName\":\"test\",\"status\":\"COMPLETED\",\"conclusion\":\"$c\",\"detailsUrl\":\"https://github.com/me/alpha/actions/runs/101/job/1\"}]}" ;;
+  *) echo "fake gh: unexpected $*" >&2; exit 1 ;;
+esac
+"#;
+
+/// An env whose clone's origin reads as `git@github.com:me/alpha.git`, served
+/// by a stand-in ssh from the local bare repository, with a workflow that runs
+/// on pull requests; scanned, so `test` fails.
+fn ci_loop_env(s: &Scratch, claude: &str, gh: &str) -> (Env, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (env, origin, alpha) = dispatch_env(s, &[("claude", claude), ("gh", gh)]);
+    fs::create_dir_all(s.0.join("me")).unwrap();
+    std::os::unix::fs::symlink(&origin, s.0.join("me/alpha.git")).unwrap();
+    let ssh = s.0.join("bin/fake-ssh");
+    let script = format!(
+        "#!/bin/sh\nfor last; do :; done\ncd '{}' || exit 1\neval \"git ${{last#git-}}\"\n",
+        s.0.display()
+    );
+    fs::write(&ssh, script).unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::create_dir_all(alpha.join(".github/workflows")).unwrap();
+    fs::write(
+        alpha.join(".github/workflows/ci.yml"),
+        "on:\n  push:\n  pull_request:\n",
+    )
+    .unwrap();
+    git(&alpha, &["add", "."], None);
+    git(&alpha, &["commit", "-qm", "ci"], None);
+    git(&alpha, &["push", "-q", "origin", "main"], None);
+    git(
+        &alpha,
+        &["config", "core.sshCommand", ssh.to_str().unwrap()],
+        None,
+    );
+    git(
+        &alpha,
+        &["remote", "set-url", "origin", "git@github.com:me/alpha.git"],
+        None,
+    );
+    env.ok(&["scan"]);
+    assert!(env.ok(&["next"]).contains("fix CI: test"));
+    (env, origin)
+}
+
+/// A headless fix-CI run loops on a pull request: round 1's checks fail and
+/// fail again on a re-run, so round 2 starts from round 1's fix with the new
+/// log. Its checks pass, and the pull request waits for review with one
+/// commit. The agent never pushed.
+#[test]
+fn a_fix_ci_run_loops_on_its_pull_request_until_checks_pass() {
+    let s = Scratch::new("ci-loop");
+    let (env, origin) = ci_loop_env(&s, LOOP_CLAUDE, LOOP_GH);
+
+    let out = env.ok(&["dispatch", "alpha:ci"]);
+    assert!(out.contains("round 1: checks failed; re-running"), "{out}");
+    assert!(
+        out.contains("round 1: CI still fails: test; round 2 starts"),
+        "{out}"
+    );
+    assert!(
+        out.contains("CI passed on https://github.com/me/alpha/pull/1 after 2 round(s)"),
+        "{out}"
+    );
+    assert!(
+        env.home.join("rerun-101").exists(),
+        "the failed run was re-run once"
+    );
+    let made = fs::read_to_string(env.home.join("pr-made")).unwrap();
+    assert_eq!(made.lines().count(), 1, "one pull request, updated");
+
+    let prompts = fs::read_to_string(env.home.join("prompts")).unwrap();
+    let rounds: Vec<&str> = prompts.split("\n---\n").filter(|p| !p.is_empty()).collect();
+    assert_eq!(rounds.len(), 2, "{prompts}");
+    assert!(rounds[0].contains("log of run 99"), "{}", rounds[0]);
+    assert!(
+        rounds[1].contains("CI still fails") && rounds[1].contains("log of run 101"),
+        "{}",
+        rounds[1]
+    );
+    let branch = git_out(
+        &origin,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/pma/",
+        ],
+    );
+    let branch = branch.trim();
+    let count = git_out(
+        &origin,
+        &["rev-list", "--count", &format!("main..{branch}")],
+    );
+    assert_eq!(count.trim(), "1", "one commit on the base");
+    git_out(&origin, &["cat-file", "-e", &format!("{branch}:fixed.txt")]);
+    let shown = env.ok(&["review", "1"]);
+    assert!(shown.contains("pr-open"), "{shown}");
+    assert!(
+        !fs::read_to_string(&env.push_log)
+            .unwrap_or_default()
+            .contains("pushed"),
+        "the agent never pushed"
+    );
+}
+
+/// A loop out of rounds leaves the pull request open with why, and charges
+/// the task one attempt. A repository whose workflows get a token that can
+/// write does not loop, and its run waits for review as before.
+#[test]
+fn a_loop_stops_after_its_rounds_and_needs_a_read_only_token() {
+    let s = Scratch::new("ci-loop-spent");
+    let stuck = LOOP_CLAUDE.replace("echo fixed > fixed.txt", "echo again >> tries.txt");
+    let gh = LOOP_GH.replace(
+        "echo read ;;",
+        "cat \"$PMA_HOME/token\" 2>/dev/null || echo read ;;",
+    );
+    let (env, _) = ci_loop_env(&s, &stuck, &gh);
+    env.ok(&["config", "ci_loop.max", "2"]);
+    let out = env.ok(&["dispatch", "alpha:ci"]);
+    assert!(
+        out.contains("CI still failing after 2 round(s): test: https://github.com/me/alpha/pull/1"),
+        "{out}"
+    );
+    let shown = env.ok(&["review", "1"]);
+    assert!(
+        shown.contains("pr-open") && shown.contains("CI still failing"),
+        "{shown}"
+    );
+    let prompts = fs::read_to_string(env.home.join("prompts")).unwrap();
+    assert_eq!(prompts.matches("\n---\n").count(), 2, "two rounds");
+    let charged: i64 = rusqlite::Connection::open(env.home.join("projects.db"))
+        .unwrap()
+        .query_row("SELECT total(attempts) FROM exhaustion", [], |r| {
+            r.get::<_, f64>(0)
+        })
+        .map(|n| n as i64)
+        .unwrap();
+    assert_eq!(charged, 1, "an unfixed loop charges one attempt");
+
+    let s = Scratch::new("ci-loop-write");
+    let (env, _) = ci_loop_env(&s, &stuck, &gh);
+    fs::write(env.home.join("token"), "write\n").unwrap();
+    let out = env.ok(&["dispatch", "alpha:ci"]);
+    assert!(
+        out.contains("alpha: no CI loop: its workflows get a `write` GITHUB_TOKEN"),
+        "{out}"
+    );
+    assert!(!out.contains("round 1"), "{out}");
+}
+
+/// A round whose agent fails leaves the run on its pull request, which still
+/// holds the round before's change; a skip in a new file stops round 1.
+#[test]
+fn a_failed_round_keeps_its_pull_request_and_new_files_are_guarded() {
+    let s = Scratch::new("ci-loop-fails");
+    let failing = LOOP_CLAUDE.replace(
+        "echo fixed > fixed.txt ;;",
+        "echo '{\"type\":\"result\",\"subtype\":\"error\",\"is_error\":true,\"result\":\"gave up\"}'; exit 1 ;;",
+    );
+    let (env, _) = ci_loop_env(&s, &failing, LOOP_GH);
+    let (out, err, _) = env.run(&["dispatch", "alpha:ci"]);
+    assert!(out.contains("round 2 ended failed"), "{out}{err}");
+    let shown = env.ok(&["review", "1"]);
+    assert!(
+        shown.contains("pr-open") && shown.contains("the pull request keeps round 1's change"),
+        "{shown}"
+    );
+
+    let s = Scratch::new("ci-loop-new-skip");
+    let skipping = LOOP_CLAUDE.replace(
+        "echo hi > hello.txt",
+        "mkdir -p tests; printf 'import pytest\\npytest.skip(\"flaky\", allow_module_level=True)\\n' > tests/test_new.py",
+    );
+    let (env, _) = ci_loop_env(&s, &skipping, LOOP_GH);
+    let out = env.ok(&["dispatch", "alpha:ci"]);
+    assert!(
+        out.contains("round 1: waits in `pma review`")
+            && out.contains("it skips a test: +pytest.skip(\"flaky\""),
+        "{out}"
+    );
+    assert!(!env.home.join("pr-made").exists(), "{out}");
+}
+
 /// `test` fails; then its failed run is gone and a newer one is going, with
 /// an older pass behind it; then the newer one passes.
 const PENDING_CI_GH: &str = r#"#!/bin/sh

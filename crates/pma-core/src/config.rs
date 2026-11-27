@@ -25,6 +25,11 @@ pub struct Config {
     pub deps_days: i64,
     /// Minutes between full scans while a front end is open; 0 turns them off.
     pub scan_every: i64,
+    /// Rounds a headless fix-CI run takes on its pull request; 0 turns the
+    /// loop off. docs/dev/ci-loop.md.
+    pub ci_loop_max: i64,
+    /// Minutes a round waits for its pull request's checks.
+    pub ci_loop_wait: i64,
     /// Starts the agent at once and measures an uncached base beside it, in a
     /// checkout of its own, over measuring it first.
     pub verify_base_alongside: bool,
@@ -288,6 +293,8 @@ impl Default for Config {
             activity_horizon: [30, 60, 120, 240, 365],
             deps_days: 30,
             scan_every: 30,
+            ci_loop_max: 3,
+            ci_loop_wait: 30,
             verify_base_alongside: false,
             usage_log: true,
             agent: "claude".into(),
@@ -428,6 +435,7 @@ impl Config {
         keys.extend(per_tier("activity.horizon"));
         keys.push("deps.days".into());
         keys.push("scan.every".into());
+        keys.extend(["ci_loop.max", "ci_loop.wait"].map(String::from));
         keys.push("verify_base_alongside".into());
         keys.push("usage_log".into());
         keys.extend(
@@ -673,6 +681,8 @@ impl Config {
             Some(("activity", "ignore")) => Slot::List(&mut self.activity_ignore),
             Some(("deps", "days")) => Slot::Count(&mut self.deps_days, 0, i64::MAX),
             Some(("scan", "every")) => Slot::Count(&mut self.scan_every, 0, i64::MAX),
+            Some(("ci_loop", "max")) => Slot::Count(&mut self.ci_loop_max, 0, 10),
+            Some(("ci_loop", "wait")) => Slot::Count(&mut self.ci_loop_wait, 1, 240),
             Some(("rex", "sessions")) => Slot::RexSessions(&mut self.rex_sessions),
             Some(("minos", field)) => {
                 let m = &mut self.minos;
@@ -730,7 +740,7 @@ mod tests {
     #[test]
     fn every_key_reads_and_round_trips() {
         let keys = Config::keys();
-        assert_eq!(keys.len(), 48);
+        assert_eq!(keys.len(), 50);
         let defaults = Config::default();
         let mut copy = Config::default();
         for key in &keys {

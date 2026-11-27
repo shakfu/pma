@@ -785,27 +785,64 @@ pub fn checks(rollup: &[serde_json::Value]) -> Checks {
         ..Checks::default()
     };
     for c in rollup {
-        let text = |k: &str| {
-            c.get(k)
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-        };
-        let state = Some(text("conclusion"))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| text("state"))
-            .to_ascii_uppercase();
-        let name = Some(text("name"))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| text("context"))
-            .to_string();
-        match state.as_str() {
-            "SUCCESS" | "NEUTRAL" | "SKIPPED" => {}
-            "FAILURE" | "TIMED_OUT" | "STARTUP_FAILURE" | "ERROR" | "CANCELLED"
-            | "ACTION_REQUIRED" => out.failed.push(name),
-            _ => out.pending.push(name),
+        let (name, state) = check_state(c);
+        match state {
+            CheckState::Passed => {}
+            CheckState::Failed => out.failed.push(name),
+            CheckState::Pending => out.pending.push(name),
         }
     }
     out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CheckState {
+    Passed,
+    Failed,
+    Pending,
+}
+
+fn check_state(c: &serde_json::Value) -> (String, CheckState) {
+    let text = |k: &str| {
+        c.get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    };
+    let state = Some(text("conclusion"))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| text("state"))
+        .to_ascii_uppercase();
+    let name = Some(text("name"))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| text("context"))
+        .to_string();
+    let state = match state.as_str() {
+        "SUCCESS" | "NEUTRAL" | "SKIPPED" => CheckState::Passed,
+        "FAILURE" | "TIMED_OUT" | "STARTUP_FAILURE" | "ERROR" | "CANCELLED" | "ACTION_REQUIRED" => {
+            CheckState::Failed
+        }
+        _ => CheckState::Pending,
+    };
+    (name, state)
+}
+
+/// Each failed check run's workflow and link, as `checks` counts failures. A
+/// status context has no workflow, and is named by its context.
+pub fn failed_checks(rollup: &[serde_json::Value]) -> Vec<(String, String)> {
+    rollup
+        .iter()
+        .filter_map(|c| {
+            let (name, state) = check_state(c);
+            (state == CheckState::Failed).then(|| {
+                let field = |k: &str| c.get(k).and_then(serde_json::Value::as_str);
+                let workflow = field("workflowName").filter(|w| !w.is_empty());
+                let url = field("detailsUrl")
+                    .or(field("targetUrl"))
+                    .unwrap_or_default();
+                (workflow.map_or(name, str::to_string), url.to_string())
+            })
+        })
+        .collect()
 }
 
 /// Merges a `pr-open` run's pull request. Squashes, as a publish makes one

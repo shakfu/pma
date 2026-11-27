@@ -616,9 +616,12 @@ fn on_origin(file: Option<&str>, key: &str, text: &str) -> OnOrigin {
     }
 }
 
-/// The failed-job log of each failing workflow's latest failed run, as the
-/// last CI read linked it.
-fn failed_ci_logs(repo: &Path, workflows: &[String], runs: &[(String, String)]) -> Result<String> {
+/// The prompt's part for each failing workflow: its failed run's log tail.
+pub fn failed_ci_logs(
+    repo: &Path,
+    workflows: &[String],
+    runs: &[(String, String)],
+) -> Result<String> {
     use crate::sync::gh;
     let url = git(repo, &["remote", "get-url", "origin"])?;
     let slug = scan::github_slug(&url).ok_or("origin is not on GitHub")?;

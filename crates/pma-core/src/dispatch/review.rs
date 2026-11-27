@@ -450,6 +450,67 @@ pub fn pr_tip_ref(run: &Run) -> String {
     format!("refs/pma/pr-tip/{}", run.id)
 }
 
+/// Sends a `pr-open` run of the fix-CI loop back to its agent with the pull
+/// request's failed logs, `logs`. docs/dev/ci-loop.md.
+pub fn fix_checks(
+    store: &Store,
+    home: &Path,
+    cfg: &Config,
+    run: &mut Run,
+    logs: &str,
+) -> Result<()> {
+    if run.state != RunState::PrOpen {
+        return Err(format!(
+            "run #{} is {}; it has no open pull request",
+            run.id,
+            run.state.name()
+        )
+        .into());
+    }
+    clone_unchanged(store, &run.repo)?;
+    git(&run.repo, &["fetch", "--quiet", "origin"])?;
+    let tip = git(
+        &run.repo,
+        &["rev-parse", &format!("refs/remotes/origin/{}", run.branch)],
+    )?;
+    // Publishing may have left the last round's worktree behind, with a warning.
+    if run.worktree.exists() {
+        remove_worktree(&run.repo, &run.worktree, &run.branch)?;
+    }
+    git(
+        &run.repo,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-B",
+            &run.branch,
+            path_arg(&run.worktree)?,
+            &run.base,
+        ],
+    )?;
+    wt_git(run, &["read-tree", "--reset", "-u", &tip])?;
+    wt_git(run, &["reset", "--quiet", &run.base])?;
+    git(&run.repo, &["update-ref", &pr_tip_ref(run), &tip])?;
+    let feedback = format!(
+        "CI still fails on this change's pull request. Your previous fix is in the \
+         working tree. Fix the failures below, and run the tests. Do not commit.\n\n{logs}"
+    );
+    run.feedback = Some(feedback.clone());
+    run.approved_tree = None;
+    run.approved_head = None;
+    run.approved_by = None;
+    run.state = RunState::Running;
+    store.update_run(run)?;
+    let a = attempt(home, cfg, &store.agents()?, run, Some(&feedback));
+    store.update_run(run)?;
+    store.insert_attempt(&a)?;
+    if consumes(run) {
+        store.consume_attempt(&run.project, &attempt_key(run))?;
+    }
+    Ok(())
+}
+
 /// Sends a `pr-open` run back to review with its pull request's conflicts
 /// resolved by the agent. The run's worktree is rebuilt from the branch, with
 /// the default branch merged in and the markers left for the agent. Publishing

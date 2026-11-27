@@ -3016,11 +3016,72 @@ pub fn run_dispatch(
         pick.interactive = flags.interactive;
         pick.workspace = workspace;
     }
+    let looping = ci_loop_picks(&p.cfg, flags, &mut picks);
     let finished = run_picks(&store, &home, &p.cfg, over, &picks, wanted, retry)?;
+    let (looped, finished): (Vec<store::Run>, Vec<store::Run>) = finished
+        .into_iter()
+        .partition(|r| r.task_key == "ci" && looping.contains(&r.project));
     if flags.push {
         push_clean(&store, &home, &p.cfg, finished)?;
     }
+    if !looped.is_empty() {
+        // Each round takes the project's lock while it works, not while CI runs.
+        drop(session);
+        drive_ci_loops(&home, &p.cfg, looped)?;
+    }
     Ok(())
+}
+
+/// The fix-CI picks that loop on a pull request, each moved to a worktree;
+/// says why each other one does not. Only a headless run that would otherwise
+/// wait for review loops. docs/dev/ci-loop.md.
+fn ci_loop_picks(
+    cfg: &config::Config,
+    flags: DispatchFlags,
+    picks: &mut [dispatch::Pick],
+) -> Vec<String> {
+    if cfg.ci_loop_max == 0 || flags.local || flags.push || flags.interactive {
+        return Vec::new();
+    }
+    let mut looping = Vec::new();
+    for pick in picks.iter_mut().filter(|p| p.key == "ci") {
+        match pma_core::ci_loop::refused(&pick.repo) {
+            None => {
+                pick.workspace = config::Workspace::Worktree;
+                looping.push(pick.project.clone());
+            }
+            Some(why) => println!("{}: no CI loop: {why}", pick.project),
+        }
+    }
+    looping
+}
+
+/// Runs each project's fix-CI loop, in parallel, each with its own store.
+fn drive_ci_loops(
+    home: &std::path::Path,
+    cfg: &config::Config,
+    runs: Vec<store::Run>,
+) -> store::Result<()> {
+    let stopped = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for run in runs {
+            let stopped = &stopped;
+            s.spawn(move || {
+                let (id, project) = (run.id, run.project.clone());
+                let mut say = |line: String| println!("#{id} {project}: {line}");
+                let driven = Store::open_default()
+                    .and_then(|store| pma_core::ci_loop::drive(&store, home, cfg, run, &mut say));
+                if let Err(e) = driven {
+                    say(e.to_string());
+                    stopped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    match stopped.into_inner() {
+        0 => Ok(()),
+        n => Err(format!("{n} CI loop(s) stopped on an error").into()),
+    }
 }
 
 /// Each project's TODO.md items as one bundle pick, in the order named; a

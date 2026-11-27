@@ -10,6 +10,7 @@ pub mod accept;
 pub mod agent;
 pub mod api;
 pub mod catalog;
+pub mod ci_loop;
 pub mod ci_verdict;
 pub mod class;
 pub mod complexity;

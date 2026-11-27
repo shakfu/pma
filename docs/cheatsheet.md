@@ -116,6 +116,8 @@ pma workflow run review-fix alpha --local --unattended --detach
 | `batch_budget` | 5 | USD per batch |
 | `timeout` | 30 | minutes per run |
 | `scan.every` | 30 | minutes between full scans in TUI/web |
+| `ci_loop.max` | 3 | rounds a headless fix-CI run takes on its pull request; 0 off |
+| `ci_loop.wait` | 30 | minutes a round waits for its checks |
 | `default_tier` | 5 | rank of untiered projects |
 | `projects.<p>.verify` | detected | the test command `pma` trusts |
 | `projects.<p>.sandbox` | off | confine the check's writes |
